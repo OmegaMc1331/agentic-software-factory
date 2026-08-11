@@ -1,0 +1,27 @@
+# Rust
+/target/
+**/*.rs.bk
+*.profraw
+
+# Factory runtime state
+.factory/
+
+# Environment
+.env
+.env.local
+
+# Node
+node_modules/
+dist/
+*.log
+.vite/
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Test / coverage output
+coverage/

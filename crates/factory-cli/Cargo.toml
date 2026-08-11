@@ -1,0 +1,20 @@
+[package]
+name = "factory-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "factory"
+path = "src/main.rs"
+
+[dependencies]
+factory-core = { workspace = true }
+factory-db = { workspace = true }
+factory-models = { workspace = true }
+factory-api = { workspace = true }
+clap = { version = "4", features = ["derive", "env"] }
+anyhow = { workspace = true }
+serde = { workspace = true }
+dotenvy = "0.15"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

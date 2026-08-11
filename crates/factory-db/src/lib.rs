@@ -1,0 +1,347 @@
+pub mod error;
+
+pub use error::DbError;
+
+use chrono::Utc;
+use factory_models::{ModelUsage, Run, RunStatus, Task, TaskState};
+use rusqlite::{params, Connection, OptionalExtension};
+use std::path::Path;
+
+pub type Result<T> = std::result::Result<T, DbError>;
+
+pub struct FactoryDb {
+    conn: Connection,
+}
+
+fn now() -> String {
+    Utc::now().to_rfc3339()
+}
+
+impl FactoryDb {
+    pub fn open(path: &Path) -> Result<Self> {
+        let conn = Connection::open(path)?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        migrate(&conn)?;
+        Ok(FactoryDb { conn })
+    }
+
+    pub fn create_run(
+        &self,
+        objective: &str,
+        model: Option<&str>,
+        usage: &ModelUsage,
+    ) -> Result<Run> {
+        let ts = now();
+        self.conn.execute(
+            "INSERT INTO runs (objective, status, model, prompt_tokens, completion_tokens, total_tokens, created_at, updated_at)
+             VALUES (?1, 'planned', ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                objective,
+                model,
+                usage.prompt_tokens,
+                usage.completion_tokens,
+                usage.total_tokens,
+                ts,
+                ts
+            ],
+        )?;
+        let id = self.conn.last_insert_rowid();
+        self.get_run(id)?.ok_or(DbError::NotFound("run"))
+    }
+
+    pub fn get_run(&self, id: i64) -> Result<Option<Run>> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT id, objective, status, model, prompt_tokens, completion_tokens, total_tokens, created_at, updated_at
+                 FROM runs WHERE id = ?1",
+                params![id],
+                |r| {
+                    Ok(Run {
+                        id: r.get(0)?,
+                        objective: r.get(1)?,
+                        status: run_status(r.get::<_, String>(2)?),
+                        model: r.get(3)?,
+                        prompt_tokens: r.get(4)?,
+                        completion_tokens: r.get(5)?,
+                        total_tokens: r.get(6)?,
+                        created_at: r.get(7)?,
+                        updated_at: r.get(8)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    pub fn list_runs(&self) -> Result<Vec<Run>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, objective, status, model, prompt_tokens, completion_tokens, total_tokens, created_at, updated_at
+             FROM runs ORDER BY id DESC",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(Run {
+                    id: r.get(0)?,
+                    objective: r.get(1)?,
+                    status: run_status(r.get::<_, String>(2)?),
+                    model: r.get(3)?,
+                    prompt_tokens: r.get(4)?,
+                    completion_tokens: r.get(5)?,
+                    total_tokens: r.get(6)?,
+                    created_at: r.get(7)?,
+                    updated_at: r.get(8)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn set_run_status(&self, id: i64, status: RunStatus) -> Result<()> {
+        self.conn.execute(
+            "UPDATE runs SET status = ?1, updated_at = ?2 WHERE id = ?3",
+            params![status.as_str(), now(), id],
+        )?;
+        Ok(())
+    }
+
+    pub fn create_task(
+        &self,
+        run_id: i64,
+        title: &str,
+        objective: &str,
+        acceptance_criteria: &[String],
+        state: TaskState,
+        position: i32,
+    ) -> Result<i64> {
+        let ts = now();
+        let criteria = serde_json::to_string(acceptance_criteria)?;
+        self.conn.execute(
+            "INSERT INTO tasks (run_id, title, objective, acceptance_criteria, state, position, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![run_id, title, objective, criteria, state.as_str(), position, ts, ts],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn add_dependency(&self, task_id: i64, depends_on: i64) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO task_dependencies (task_id, depends_on) VALUES (?1, ?2)",
+            params![task_id, depends_on],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_task(&self, id: i64) -> Result<Option<Task>> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT t.id, t.run_id, t.title, t.objective, t.acceptance_criteria, t.state, t.position, t.worktree_path, t.created_at, t.updated_at
+                 FROM tasks t WHERE t.id = ?1",
+                params![id],
+                build_task,
+            )
+            .optional()?;
+        if let Some(mut task) = row {
+            task.dependencies = self.dependencies_of(task.id)?;
+            return Ok(Some(task));
+        }
+        Ok(None)
+    }
+
+    pub fn list_tasks(&self, run_id: i64) -> Result<Vec<Task>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT t.id, t.run_id, t.title, t.objective, t.acceptance_criteria, t.state, t.position, t.worktree_path, t.created_at, t.updated_at
+             FROM tasks t WHERE t.run_id = ?1 ORDER BY t.position",
+        )?;
+        let mut tasks = Vec::new();
+        let rows = stmt.query_map(params![run_id], build_task)?;
+        for row in rows {
+            let mut task = row?;
+            task.dependencies = self.dependencies_of(task.id)?;
+            tasks.push(task);
+        }
+        Ok(tasks)
+    }
+
+    pub fn dependencies_of(&self, task_id: i64) -> Result<Vec<i64>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT depends_on FROM task_dependencies WHERE task_id = ?1 ORDER BY depends_on",
+        )?;
+        let ids = stmt
+            .query_map(params![task_id], |r| r.get(0))?
+            .collect::<std::result::Result<Vec<i64>, _>>()?;
+        Ok(ids)
+    }
+
+    pub fn set_task_state(&self, id: i64, state: TaskState) -> Result<()> {
+        self.conn.execute(
+            "UPDATE tasks SET state = ?1, updated_at = ?2 WHERE id = ?3",
+            params![state.as_str(), now(), id],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_worktree_path(&self, id: i64, path: Option<&str>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE tasks SET worktree_path = ?1, updated_at = ?2 WHERE id = ?3",
+            params![path, now(), id],
+        )?;
+        Ok(())
+    }
+}
+
+fn build_task(r: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
+    let criteria_json: String = r.get(4)?;
+    let criteria = serde_json::from_str(&criteria_json).unwrap_or_default();
+    Ok(Task {
+        id: r.get(0)?,
+        run_id: r.get(1)?,
+        title: r.get(2)?,
+        objective: r.get(3)?,
+        acceptance_criteria: criteria,
+        state: task_state(r.get::<_, String>(5)?),
+        position: r.get(6)?,
+        dependencies: Vec::new(),
+        worktree_path: r.get(7)?,
+        created_at: r.get(8)?,
+        updated_at: r.get(9)?,
+    })
+}
+
+fn task_state(s: String) -> TaskState {
+    s.parse().unwrap_or(TaskState::Pending)
+}
+
+fn run_status(s: String) -> RunStatus {
+    match s.as_str() {
+        "active" => RunStatus::Active,
+        "completed" => RunStatus::Completed,
+        "failed" => RunStatus::Failed,
+        _ => RunStatus::Planned,
+    }
+}
+
+fn migrate(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            objective TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'planned',
+            model TEXT,
+            prompt_tokens INTEGER NOT NULL DEFAULT 0,
+            completion_tokens INTEGER NOT NULL DEFAULT 0,
+            total_tokens INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+            title TEXT NOT NULL,
+            objective TEXT NOT NULL,
+            acceptance_criteria TEXT NOT NULL DEFAULT '[]',
+            state TEXT NOT NULL DEFAULT 'pending',
+            position INTEGER NOT NULL,
+            worktree_path TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS task_dependencies (
+            task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            depends_on INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            PRIMARY KEY (task_id, depends_on)
+        );
+        CREATE INDEX IF NOT EXISTS idx_tasks_run ON tasks(run_id);
+        CREATE INDEX IF NOT EXISTS idx_task_deps_dep ON task_dependencies(depends_on);
+        PRAGMA foreign_keys = ON;
+        ",
+    )?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use factory_models::{ModelUsage, TaskState};
+    use tempfile::TempDir;
+
+    use crate::FactoryDb;
+
+    #[test]
+    fn persists_run_tasks_and_dependencies() {
+        let dir = TempDir::new().unwrap();
+        let db = FactoryDb::open(&dir.path().join("test.db")).unwrap();
+
+        let run = db
+            .create_run("build a thing", Some("test-model"), &ModelUsage::none())
+            .unwrap();
+        assert_eq!(run.id, 1);
+        assert_eq!(run.status.as_str(), "planned");
+
+        let a = db
+            .create_task(
+                run.id,
+                "Task A",
+                "do A",
+                &["a works".into()],
+                TaskState::Ready,
+                0,
+            )
+            .unwrap();
+        let b = db
+            .create_task(
+                run.id,
+                "Task B",
+                "do B",
+                &["b works".into()],
+                TaskState::Pending,
+                1,
+            )
+            .unwrap();
+        db.add_dependency(b, a).unwrap();
+
+        let tasks = db.list_tasks(run.id).unwrap();
+        assert_eq!(tasks.len(), 2);
+        let b_loaded = tasks.iter().find(|t| t.id == b).unwrap();
+        assert_eq!(b_loaded.dependencies, vec![a]);
+        assert_eq!(b_loaded.state, TaskState::Pending);
+        assert!(b_loaded.created_at.starts_with("202"));
+
+        let a_loaded = db.get_task(a).unwrap().unwrap();
+        assert_eq!(a_loaded.acceptance_criteria, vec!["a works".to_string()]);
+    }
+
+    #[test]
+    fn updates_task_state_and_worktree_path() {
+        let dir = TempDir::new().unwrap();
+        let db = FactoryDb::open(&dir.path().join("test.db")).unwrap();
+        let run = db
+            .create_run("objective", Some("m"), &ModelUsage::none())
+            .unwrap();
+        let task = db
+            .create_task(run.id, "T", "objective", &[], TaskState::Ready, 0)
+            .unwrap();
+
+        db.set_task_state(task, TaskState::Running).unwrap();
+        let loaded = db.get_task(task).unwrap().unwrap();
+        assert_eq!(loaded.state, TaskState::Running);
+
+        db.set_worktree_path(task, Some("C:\\worktrees\\t1"))
+            .unwrap();
+        let loaded = db.get_task(task).unwrap().unwrap();
+        assert_eq!(loaded.worktree_path.as_deref(), Some("C:\\worktrees\\t1"));
+
+        db.set_worktree_path(task, None).unwrap();
+        let loaded = db.get_task(task).unwrap().unwrap();
+        assert!(loaded.worktree_path.is_none());
+    }
+
+    #[test]
+    fn returns_zero_tokens_when_run_has_no_usage() {
+        let dir = TempDir::new().unwrap();
+        let db = FactoryDb::open(&dir.path().join("test.db")).unwrap();
+        let run = db.create_run("x", Some("m"), &ModelUsage::none()).unwrap();
+        let loaded = db.get_run(run.id).unwrap().unwrap();
+        assert_eq!(loaded.total_tokens, 0);
+    }
+}
