@@ -145,16 +145,18 @@ impl CommandAgent {
         let mut child = cmd
             .spawn()
             .map_err(|e| AgentError::Spawn(self.config.command.clone(), e.to_string()))?;
-        let stdin = child.stdin.take().ok_or_else(|| {
+        let mut stdin = child.stdin.take().ok_or_else(|| {
             AgentError::Spawn(self.config.command.clone(), "stdin not available".into())
         })?;
-        let mut stdin = stdin;
-        stdin
-            .write_all(request.mission.as_bytes())
-            .map_err(AgentError::Io)?;
+        let write_error = stdin.write_all(request.mission.as_bytes()).err();
         drop(stdin);
         let output = child.wait_with_output()?;
         let duration = started.elapsed();
+        if let Some(err) = write_error {
+            if err.kind() != std::io::ErrorKind::BrokenPipe {
+                return Err(AgentError::Io(err));
+            }
+        }
         Ok(AgentResult {
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
