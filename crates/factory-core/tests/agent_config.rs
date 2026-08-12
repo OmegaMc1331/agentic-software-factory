@@ -37,19 +37,22 @@ agent = "codex"
 #[test]
 fn resolves_role_to_agent() {
     let dir = TempDir::new().unwrap();
+    let known_good = if cfg!(windows) { "powershell" } else { "sh" };
     write_config(
         dir.path(),
-        r#"
+        &format!(
+            r#"
 [agents.codex]
-command = "codex"
+command = "{known_good}"
 [roles.planner]
 agent = "codex"
-"#,
+"#
+        ),
     );
     let agents = Agents::load(dir.path()).unwrap();
     let command = agents.command_agent("planner").unwrap();
     assert_eq!(command.name(), "codex");
-    assert_eq!(command.command(), "codex");
+    assert_eq!(command.command(), known_good);
 }
 
 #[test]
