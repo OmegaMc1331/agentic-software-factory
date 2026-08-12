@@ -57,7 +57,7 @@ function runIdOf(node: GraphNode): number {
   return Number(node.id.slice("run:".length)) || 0;
 }
 
-function jitter(id: string, salt: number): number {
+export function jitter(id: string, salt: number): number {
   let hash = 0;
   for (let i = 0; i < id.length; i += 1) {
     hash = (hash * 31 + id.charCodeAt(i)) >>> 0;

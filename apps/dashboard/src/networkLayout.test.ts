@@ -6,6 +6,7 @@ import {
   NET_NODE_HEIGHT,
   NODE_WIDTH,
   computeNetworkLayout,
+  jitter,
   neighborsOf,
 } from "./networkLayout";
 import type { GraphEdge, GraphNode } from "./types";
@@ -91,7 +92,7 @@ describe("computeNetworkLayout", () => {
     const run = layout.nodes.find((n) => n.id === "run:1");
     const runLaneHeight = NET_NODE_HEIGHT;
     const expectedTop = Math.max(0, (layout.height - runLaneHeight) / 2);
-    expect(run?.y).toBeCloseTo(expectedTop + jitterOffset("run:1", 2), 0);
+    expect(run?.y).toBeCloseTo(expectedTop + jitter("run:1", 2), 0);
   });
 
   it("builds curved paths for cross-lane edges and bows for dependencies", () => {
@@ -152,11 +153,3 @@ describe("neighborsOf", () => {
     expect(neighborsOf(layout.nodes, layout.edges, "a")).toEqual([]);
   });
 });
-
-function jitterOffset(id: string, salt: number): number {
-  let hash = 0;
-  for (let i = 0; i < id.length; i += 1) {
-    hash = (hash * 31 + id.charCodeAt(i)) >>> 0;
-  }
-  return ((hash + salt) % 25) - 12;
-}
