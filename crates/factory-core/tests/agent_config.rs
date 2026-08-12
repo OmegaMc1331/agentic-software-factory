@@ -110,14 +110,17 @@ agent = "ghost"
 #[test]
 fn lists_configured_agents_with_availability() {
     let dir = TempDir::new().unwrap();
+    let known_good = if cfg!(windows) { "powershell" } else { "sh" };
     write_config(
         dir.path(),
-        r#"
+        &format!(
+            r#"
 [agents.codex]
-command = "codex"
+command = "{known_good}"
 [agents.ghost]
 command = "definitely-not-a-real-factory-test-binary"
-"#,
+"#
+        ),
     );
     let agents = Agents::load(dir.path()).unwrap();
     let infos = agents.list();
