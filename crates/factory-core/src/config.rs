@@ -2,12 +2,12 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use factory_agent::{AgentCapabilities, AgentConfig, CommandAgent};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub const CONFIG_FILE: &str = "config.toml";
 
-#[derive(Debug, Default, Clone, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub agents: BTreeMap<String, AgentEntry>,
@@ -15,18 +15,18 @@ pub struct Config {
     pub roles: BTreeMap<String, RoleEntry>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentEntry {
     pub command: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoleEntry {
     pub agent: String,
 }
@@ -39,15 +39,19 @@ pub enum ConfigError {
     Read(PathBuf, std::io::Error),
     #[error("failed to parse {0}: {1}")]
     Parse(PathBuf, Box<toml::de::Error>),
+    #[error("failed to write {0}: {1}")]
+    Write(PathBuf, std::io::Error),
+    #[error("failed to serialize {0}: {1}")]
+    Serialize(PathBuf, Box<toml::ser::Error>),
 }
 
 #[derive(Debug, Error)]
 pub enum AgentResolutionError {
-    #[error("no agent configured for role `{0}`")]
+    #[error("No agent is assigned to the {0} role. Configure one from the dashboard.")]
     NoRole(String),
     #[error("role `{0}` refers to unknown agent `{1}`; add an [agents.{1}] section")]
     UnknownAgent(String, String),
-    #[error("configured {0} agent `{1}` is not available")]
+    #[error("{0} agent `{1}` is not available. Check the agent configuration.")]
     NotAvailable(String, String),
 }
 
@@ -90,6 +94,73 @@ impl Config {
 
     pub fn agent_for_role(&self, role: &str) -> Option<String> {
         self.roles.get(role).map(|r| r.agent.clone())
+    }
+
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        for role in self.roles.keys() {
+            if !valid_name(role) {
+                return Err(format!("invalid role name '{role}'"));
+            }
+            let agent = self
+                .roles
+                .get(role)
+                .map(|r| r.agent.as_str())
+                .unwrap_or_default();
+            if agent.is_empty() {
+                return Err(format!("role '{role}' has no agent assigned"));
+            }
+            if !self.agents.contains_key(agent) {
+                return Err(format!("role '{role}' refers to unknown agent '{agent}'"));
+            }
+        }
+        for (name, entry) in &self.agents {
+            if !valid_name(name) {
+                return Err(format!("invalid agent name '{name}'"));
+            }
+            let command = entry.command.trim();
+            if command.is_empty() {
+                return Err(format!("agent '{name}' has an empty command"));
+            }
+            if contains_control(&entry.command) {
+                return Err(format!(
+                    "agent '{name}' command contains control characters"
+                ));
+            }
+            for arg in &entry.args {
+                if contains_control(arg) {
+                    return Err(format!(
+                        "agent '{name}' has an argument with control characters"
+                    ));
+                }
+            }
+            for (key, value) in &entry.env {
+                if key.is_empty() || contains_control(key) || key.contains('=') {
+                    return Err(format!(
+                        "agent '{name}' has an invalid environment key '{key}'"
+                    ));
+                }
+                if contains_control(value) {
+                    return Err(format!("agent '{name}' has an invalid environment value"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn write_atomic(&self, root: &Path) -> Result<PathBuf, ConfigError> {
+        self.validate().map_err(|reason| {
+            ConfigError::Write(Self::path(root), std::io::Error::other(reason))
+        })?;
+        let path = Self::path(root);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| ConfigError::Write(path.clone(), e))?;
+        }
+        let text = toml::to_string_pretty(self)
+            .map_err(|e| ConfigError::Serialize(path.clone(), Box::new(e)))?;
+        let tmp = path.with_extension(format!("toml.tmp{}", std::process::id()));
+        std::fs::write(&tmp, text).map_err(|e| ConfigError::Write(tmp.clone(), e))?;
+        std::fs::rename(&tmp, &path).map_err(|e| ConfigError::Write(path.clone(), e))?;
+        Ok(path)
     }
 }
 
@@ -138,6 +209,10 @@ impl Agents {
         })
     }
 
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
+
     pub fn list(&self) -> Vec<AgentInfo> {
         let mut infos = Vec::new();
         for (name, entry) in &self.config.agents {
@@ -153,6 +228,7 @@ impl Agents {
             infos.push(AgentInfo {
                 name: name.clone(),
                 command: format_command(&entry.command, &entry.args),
+                args: entry.args.clone(),
                 available: agent.available(),
             });
         }
@@ -171,15 +247,39 @@ impl Agents {
             .ok_or_else(|| AgentResolutionError::UnknownAgent(role.to_string(), name.clone()))?;
         let command = CommandAgent::new(agent);
         if !command.available() {
-            return Err(AgentResolutionError::NotAvailable(role.to_string(), name));
+            return Err(AgentResolutionError::NotAvailable(capitalized(role), name));
         }
         Ok(command)
     }
 }
 
+fn valid_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+}
+
+fn contains_control(value: &str) -> bool {
+    value
+        .chars()
+        .any(|c| c.is_control() || matches!(c, '\n' | '\r' | '\0'))
+}
+
+fn capitalized(value: &str) -> String {
+    let mut chars = value.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().to_string() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct AgentInfo {
     pub name: String,
     pub command: String,
+    pub args: Vec<String>,
     pub available: bool,
 }
 

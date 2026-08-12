@@ -279,3 +279,98 @@ fn init_writes_a_default_agent_configuration() {
     assert!(config.contains("[agents.codex]"));
     assert!(config.contains("[roles.planner]"));
 }
+
+#[test]
+fn missing_planner_role_fails_clearly() {
+    let dir = TempDir::new().unwrap();
+    let factory_dir = dir.path().join(".factory");
+    std::fs::create_dir_all(&factory_dir).unwrap();
+    std::fs::write(
+        factory_dir.join("config.toml"),
+        r#"
+[agents.codex]
+command = "codex"
+"#,
+    )
+    .unwrap();
+    let factory = Factory::init(dir.path(), false).unwrap();
+    let err = factory.create_run("objective").unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("No agent is assigned to the planner role. Configure one from the dashboard."));
+}
+
+#[test]
+fn missing_planner_executable_fails_clearly() {
+    let dir = TempDir::new().unwrap();
+    let factory_dir = dir.path().join(".factory");
+    std::fs::create_dir_all(&factory_dir).unwrap();
+    std::fs::write(
+        factory_dir.join("config.toml"),
+        r#"
+[agents.ghost]
+command = "definitely-not-a-real-factory-test-binary"
+[roles.planner]
+agent = "ghost"
+"#,
+    )
+    .unwrap();
+    let factory = Factory::init(dir.path(), false).unwrap();
+    let err = factory.create_run("build a calculator").unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("Planner agent `ghost` is not available. Check the agent configuration."));
+}
+
+#[test]
+fn run_status_follows_task_state_transitions() {
+    let (_dir, factory) = with_factory();
+    let outcome = factory.create_run("build a calculator").unwrap();
+    let run_id = outcome.run.id;
+    assert_eq!(
+        factory.get_run(run_id).unwrap().unwrap().status.as_str(),
+        "planned"
+    );
+
+    let t1 = outcome.tasks[0].id;
+    factory.mark_task(t1, TaskState::Running).unwrap();
+    assert_eq!(
+        factory.get_run(run_id).unwrap().unwrap().status.as_str(),
+        "active"
+    );
+
+    factory.mark_task(t1, TaskState::Failed).unwrap();
+    assert_eq!(
+        factory.get_run(run_id).unwrap().unwrap().status.as_str(),
+        "failed"
+    );
+
+    factory.mark_task(t1, TaskState::Ready).unwrap();
+    factory.mark_task(t1, TaskState::Running).unwrap();
+    factory.mark_task(t1, TaskState::Completed).unwrap();
+    for task in outcome.tasks.iter().filter(|t| t.id != t1) {
+        factory.mark_task(task.id, TaskState::Running).unwrap();
+        factory.mark_task(task.id, TaskState::Completed).unwrap();
+    }
+    assert_eq!(
+        factory.get_run(run_id).unwrap().unwrap().status.as_str(),
+        "completed"
+    );
+}
+
+#[test]
+fn worktree_can_be_recreated_after_removal() {
+    let (_dir, factory) = with_factory();
+    let outcome = factory.create_run("build a calculator").unwrap();
+    let t1 = outcome.tasks[0].id;
+
+    let first = factory.create_worktree(t1).unwrap();
+    assert!(first.exists());
+    factory.remove_worktree(t1, false).unwrap();
+    assert!(!first.exists());
+
+    let second = factory.create_worktree(t1).unwrap();
+    assert!(second.exists());
+    let task = factory.get_task(t1).unwrap().unwrap();
+    assert!(task.worktree_path.is_some());
+}
