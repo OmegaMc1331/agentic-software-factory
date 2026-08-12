@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::task::{Task, TaskState};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunStatus {
@@ -16,6 +18,29 @@ impl RunStatus {
             RunStatus::Active => "active",
             RunStatus::Completed => "completed",
             RunStatus::Failed => "failed",
+        }
+    }
+
+    pub fn from_tasks(tasks: &[Task]) -> RunStatus {
+        if tasks.is_empty() {
+            return RunStatus::Planned;
+        }
+        if tasks.iter().all(|t| t.state == TaskState::Completed) {
+            return RunStatus::Completed;
+        }
+        if tasks.iter().any(|t| t.state == TaskState::Failed) {
+            return RunStatus::Failed;
+        }
+        let started = tasks.iter().any(|t| {
+            matches!(
+                t.state,
+                TaskState::Running | TaskState::Completed | TaskState::Blocked
+            )
+        });
+        if started {
+            RunStatus::Active
+        } else {
+            RunStatus::Planned
         }
     }
 }
