@@ -117,13 +117,25 @@ impl Repo {
     }
 
     pub fn remove_worktree(&self, worktree_path: &Path) -> Result<()> {
+        if self.has_uncommitted_changes(worktree_path)? {
+            return Err(GitError::WorktreeDirty(worktree_path.to_path_buf()));
+        }
+        self.remove_internal(worktree_path, false)
+    }
+
+    pub fn remove_worktree_force(&self, worktree_path: &Path) -> Result<()> {
+        self.remove_internal(worktree_path, true)
+    }
+
+    fn remove_internal(&self, worktree_path: &Path, force: bool) -> Result<()> {
         let registered = self.find_worktree(worktree_path)?.is_some();
         if registered {
             let mut cmd = Command::new("git");
-            cmd.arg("-C")
-                .arg(&self.root)
-                .args(["worktree", "remove", "--force"])
-                .arg(worktree_path);
+            cmd.arg("-C").arg(&self.root).args(["worktree", "remove"]);
+            if force {
+                cmd.arg("--force");
+            }
+            cmd.arg(worktree_path);
             let status = cmd.status().map_err(GitError::Io)?;
             if !status.success() {
                 return Err(GitError::WorktreeRemoveFailed(worktree_path.to_path_buf()));
@@ -143,6 +155,9 @@ impl Repo {
     }
 
     pub fn has_uncommitted_changes(&self, worktree_path: &Path) -> Result<bool> {
+        if !worktree_path.exists() {
+            return Ok(false);
+        }
         let out = git(worktree_path, &["status", "--porcelain"], None)?;
         Ok(!out.trim().is_empty())
     }
@@ -278,5 +293,34 @@ mod tests {
         assert!(!repo.has_uncommitted_changes(&worktree).unwrap());
         std::fs::write(worktree.join("new-file.txt"), "hello").unwrap();
         assert!(repo.has_uncommitted_changes(&worktree).unwrap());
+    }
+
+    #[test]
+    fn refuses_to_remove_a_dirty_worktree() {
+        let dir = TempDir::new().unwrap();
+        init_repo(dir.path());
+        let repo = Repo::detect_bounded(dir.path(), dir.path()).unwrap();
+        let worktree = dir.path().join("wt");
+        repo.add_worktree(&worktree, "factory/t1").unwrap();
+        std::fs::write(worktree.join("wip.txt"), "uncommitted").unwrap();
+
+        let err = repo.remove_worktree(&worktree).unwrap_err();
+        assert!(matches!(err, crate::GitError::WorktreeDirty(_)));
+        assert!(worktree.exists());
+        assert!(repo.find_worktree(&worktree).unwrap().is_some());
+    }
+
+    #[test]
+    fn force_removes_a_dirty_worktree() {
+        let dir = TempDir::new().unwrap();
+        init_repo(dir.path());
+        let repo = Repo::detect_bounded(dir.path(), dir.path()).unwrap();
+        let worktree = dir.path().join("wt");
+        repo.add_worktree(&worktree, "factory/t1").unwrap();
+        std::fs::write(worktree.join("wip.txt"), "uncommitted").unwrap();
+
+        repo.remove_worktree_force(&worktree).unwrap();
+        assert!(!worktree.exists());
+        assert!(repo.find_worktree(&worktree).unwrap().is_none());
     }
 }

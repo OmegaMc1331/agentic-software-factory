@@ -1,10 +1,17 @@
 use std::path::Path;
 use std::process::Command;
 
-use factory_core::provider::LocalProvider;
 use factory_core::Factory;
-use factory_models::TaskState;
+use factory_types::TaskState;
 use tempfile::TempDir;
+
+const DEFAULT_PLAN: &str = r#"{"objective":"build a calculator","tasks":[
+{"id":"T1","title":"Clarify the objective","objective":"define requirements","dependencies":[],"acceptanceCriteria":["requirements explicit"]},
+{"id":"T2","title":"Set up the scaffold","objective":"create project skeleton","dependencies":["T1"],"acceptanceCriteria":["project builds"]},
+{"id":"T3","title":"Implement core","objective":"implement behaviour","dependencies":["T2"],"acceptanceCriteria":["core works"]},
+{"id":"T4","title":"Write tests","objective":"add tests","dependencies":["T3"],"acceptanceCriteria":["tests pass"]},
+{"id":"T5","title":"Document","objective":"write docs","dependencies":["T4"],"acceptanceCriteria":["docs written"]}
+]}"#;
 
 fn init_git(dir: &Path) {
     for args in [
@@ -32,12 +39,52 @@ fn init_git(dir: &Path) {
     assert!(ok, "git commit failed");
 }
 
-fn with_factory() -> (TempDir, Factory) {
+fn fake_planner_config(plan_path: &Path) -> String {
+    let (command, args) = if cfg!(windows) {
+        (
+            "powershell".to_string(),
+            vec![
+                "-NoProfile".to_string(),
+                "-Command".to_string(),
+                format!("Get-Content '{}'", plan_path.display()),
+            ],
+        )
+    } else {
+        (
+            "sh".to_string(),
+            vec!["-c".to_string(), format!("cat '{}'", plan_path.display())],
+        )
+    };
+    format!(
+        r#"[agents.fake]
+command = "{command}"
+args = {args:?}
+
+[roles.planner]
+agent = "fake"
+"#
+    )
+}
+
+fn with_factory_and_plan(plan: &str) -> (TempDir, Factory) {
     let dir = TempDir::new().unwrap();
     std::fs::write(dir.path().join("README.md"), "repo").unwrap();
     init_git(dir.path());
-    let factory = Factory::init(dir.path(), false, Box::new(LocalProvider::new())).unwrap();
+    let plan_path = dir.path().join("plan.json");
+    std::fs::write(&plan_path, plan).unwrap();
+    let factory_dir = dir.path().join(".factory");
+    std::fs::create_dir_all(&factory_dir).unwrap();
+    std::fs::write(
+        factory_dir.join("config.toml"),
+        fake_planner_config(&plan_path),
+    )
+    .unwrap();
+    let factory = Factory::init(dir.path(), false).unwrap();
     (dir, factory)
+}
+
+fn with_factory() -> (TempDir, Factory) {
+    with_factory_and_plan(DEFAULT_PLAN)
 }
 
 #[test]
@@ -47,6 +94,7 @@ fn creates_a_planned_run_with_deterministic_states() {
 
     assert_eq!(outcome.run.status.as_str(), "planned");
     assert_eq!(outcome.tasks.len(), 5);
+    assert_eq!(outcome.run.planner_agent.as_deref(), Some("fake"));
 
     let t1 = &outcome.tasks[0];
     assert_eq!(t1.state, TaskState::Ready);
@@ -58,6 +106,21 @@ fn creates_a_planned_run_with_deterministic_states() {
 
     let run = factory.get_run(outcome.run.id).unwrap().unwrap();
     assert!(run.objective.contains("calculator"));
+}
+
+#[test]
+fn persists_a_planner_agent_session() {
+    let (_dir, factory) = with_factory();
+    let outcome = factory.create_run("build a calculator").unwrap();
+    let sessions = factory.list_agent_sessions(Some(outcome.run.id)).unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].role, "planner");
+    assert_eq!(sessions[0].agent, "fake");
+    assert!(sessions[0]
+        .stdout
+        .as_deref()
+        .unwrap()
+        .contains("calculator"));
 }
 
 #[test]
@@ -174,19 +237,45 @@ fn creates_and_removes_a_worktree_for_a_task() {
     let task = factory.get_task(t1).unwrap().unwrap();
     assert!(task.worktree_path.is_some());
 
-    factory.remove_worktree(t1).unwrap();
+    factory.remove_worktree(t1, false).unwrap();
     assert!(!path.exists());
     let task = factory.get_task(t1).unwrap().unwrap();
     assert!(task.worktree_path.is_none());
 }
 
 #[test]
+fn refuses_to_remove_a_dirty_worktree() {
+    let (_dir, factory) = with_factory();
+    let outcome = factory.create_run("build a calculator").unwrap();
+    let t1 = outcome.tasks[0].id;
+
+    let path = factory.create_worktree(t1).unwrap();
+    std::fs::write(path.join("wip.txt"), "uncommitted").unwrap();
+
+    let err = factory.remove_worktree(t1, false).unwrap_err();
+    assert!(err.to_string().contains("uncommitted changes"));
+    assert!(path.exists());
+
+    factory.remove_worktree(t1, true).unwrap();
+    assert!(!path.exists());
+}
+
+#[test]
 fn init_requires_force_to_overwrite_existing_state() {
     let dir = TempDir::new().unwrap();
-    assert!(Factory::init(dir.path(), false, Box::new(LocalProvider::new())).is_ok());
-    match Factory::init(dir.path(), false, Box::new(LocalProvider::new())) {
+    assert!(Factory::init(dir.path(), false).is_ok());
+    match Factory::init(dir.path(), false) {
         Ok(_) => panic!("expected second init to fail"),
         Err(e) => assert!(e.to_string().contains("already initialized")),
     }
-    assert!(Factory::init(dir.path(), true, Box::new(LocalProvider::new())).is_ok());
+    assert!(Factory::init(dir.path(), true).is_ok());
+}
+
+#[test]
+fn init_writes_a_default_agent_configuration() {
+    let dir = TempDir::new().unwrap();
+    Factory::init(dir.path(), false).unwrap();
+    let config = std::fs::read_to_string(dir.path().join(".factory").join("config.toml")).unwrap();
+    assert!(config.contains("[agents.codex]"));
+    assert!(config.contains("[roles.planner]"));
 }

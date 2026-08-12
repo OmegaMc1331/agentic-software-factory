@@ -1,7 +1,7 @@
 # Agentic Software Factory
 
 Agentic Software Factory orchestrates coding agents through structured, verifiable
-execution: a model plans a software objective into ordered tasks, every task runs in
+execution: an agent plans a software objective into ordered tasks, every task runs in
 its own isolated git worktree, and the system persists all state locally in SQLite.
 
 Instead of letting an agent roam freely over a repository, the factory decomposes work
@@ -23,8 +23,10 @@ through a CLI, an HTTP API, and a dashboard.
   dependents. Blocked tasks propagate `blocked` up the graph until their blockers clear.
 - **Isolation.** Each task gets a branch (`factory/t<id>`) and a worktree
   (`.factory/worktrees/t<id>`), so parallel agents never collide.
-- **No magic.** A deterministic local planner is available when no model API key is
-  configured, so the whole system works offline and is testable.
+- **No magic.** Agents are external coding CLIs (Codex, Claude Code, OpenCode, ...) that
+  you install and authenticate yourself. The factory only orchestrates them, and ships
+  with a deterministic local planner as a fallback, so the whole system works offline
+  and is testable.
 
 ## Contents
 
@@ -32,7 +34,7 @@ through a CLI, an HTTP API, and a dashboard.
 2. [Installation](#2-installation)
 3. [The task lifecycle](#3-the-task-lifecycle)
 4. [Worktrees](#4-worktrees)
-5. [Model providers](#5-model-providers)
+5. [Agents](#5-agents)
 6. [The CLI](#6-the-cli)
 7. [The HTTP API](#7-the-http-api)
 8. [The dashboard](#8-the-dashboard)
@@ -59,39 +61,18 @@ cargo build --release
 # binary at target/release/factory
 ```
 
-### Quick start (offline)
-
-The factory ships with a deterministic local planner. Set the provider to `local` and
-everything else works with zero configuration:
+### Quick start
 
 ```bash
-export FACTORY_PROVIDER=local
 factory init
+factory agents            # are the configured agent executables on PATH?
 factory run "Build a small HTTP server in Rust"
 factory status
 ```
 
-### Using a model provider
-
-```bash
-export FACTORY_PROVIDER=openai
-export FACTORY_BASE_URL=https://api.openai.com/v1
-export FACTORY_API_KEY=sk-...
-export FACTORY_MODEL=gpt-4o-mini
-```
-
-All variables are optional with sensible defaults:
-
-| Variable             | Default                | Description                          |
-| -------------------- | ---------------------- | ------------------------------------ |
-| `FACTORY_PROVIDER`   | `openai` if no key     | Provider kind (`openai` or `local`)  |
-| `FACTORY_BASE_URL`   | `https://api.openai.com/v1` | OpenAI-compatible base URL      |
-| `FACTORY_API_KEY`    | *(none)*               | API key; `run` falls back to local   |
-| `FACTORY_MODEL`      | `gpt-4o-mini`          | Model name                           |
-
-`factory init` and most commands work without an API key (they use the local planner).
-`factory run` builds the provider from the environment and fails with a clear message if
-no key is configured and `FACTORY_PROVIDER` is not `local`. See `.env.example`.
+`factory run` asks the planner agent for a strict plan. When the agent or its plan are
+unavailable, the factory falls back to a deterministic local planner, so everything
+works even with no agent installed.
 
 ## 3. The task lifecycle
 
@@ -145,22 +126,35 @@ factory worktree create 3
   remove worktrees with uncommitted changes.
 - `factory worktree status` lists every worktree of the repository.
 
-## 5. Model providers
+## 5. Agents
 
-`factory-core` exposes a `Provider` trait with a single planning method. Two
-implementations exist today:
+The factory never talks to model providers. Agents are external coding CLIs that you
+install and authenticate yourself; the factory spawns them as subprocesses and routes
+their output into the local database and git history.
 
-- `OpenAICompatibleProvider` - calls any OpenAI-compatible chat completions endpoint
-  with your configured model. The planner asks for a strict JSON object with
-  `objective`, `tasks` (with `id`, `title`, `objective`, `acceptance_criteria`,
-  `dependencies`), and `exit_criteria`.
-- `LocalProvider` - a deterministic fallback that plans the objective into a fixed,
-  ordered five-task pipeline with dependency chains and acceptance criteria. It always
-  reports `local-planner` as the model and zero token usage.
+`.factory/config.toml` (created by `factory init`) declares agents and the roles they
+fill:
 
-Plans are validated: non-empty fields, dependency ids must exist, the dependency graph
-must be acyclic, and at most 50 tasks. Invalid responses are rejected and re-requested
-up to three times; code fences around the JSON are stripped automatically.
+```toml
+[agents.codex]
+command = "codex"
+args = ["exec"]
+
+[roles.planner]
+agent = "codex"
+```
+
+- A **role** points to an agent by name; the same agent may fill several roles.
+- `factory agents` lists each configured agent and whether its executable is on `PATH`.
+- `factory config list` shows the resolved role-to-agent mapping.
+- Missing roles, unknown agents, and missing executables produce clear errors.
+
+The planner agent receives the objective via stdin and is asked for a strict JSON plan
+(`objective`, ordered `tasks` with `acceptance_criteria` and `dependencies`,
+`exit_criteria`). Plans are validated: non-empty fields, dependency ids must exist, the
+dependency graph must be acyclic, and at most 50 tasks. Invalid or failed plans fall
+back to the deterministic local planner, which produces a fixed, ordered pipeline and
+records proposed work so you can plan and inspect runs with zero agent configuration.
 
 ## 6. The CLI
 
@@ -173,6 +167,8 @@ factory status                      # summary of the latest run and its tasks
 factory tasks [--run <id>]          # list tasks of a run (latest by default)
 factory inspect <task-id>           # full task detail + acceptance criteria
 factory mark <task-id> <state>      # transition: pending|ready|running|blocked|failed|completed
+factory agents                      # list configured agents and their availability
+factory config list                 # show the role-to-agent mapping
 factory worktree create <task-id>   # create an isolated worktree
 factory worktree remove <task-id>   # remove a clean worktree
 factory worktree status             # list repository worktrees
@@ -188,12 +184,12 @@ dashboard:
 | ------ | ---------------- | ---------------------------------- |
 | GET    | `/api/health`    | Service health                     |
 | GET    | `/api/runs`      | Runs with per-state task counts    |
-| GET    | `/api/runs/:id`  | Full run, tasks, and token usage   |
+| GET    | `/api/runs/:id`  | Full run and its tasks                 |
 
 ## 8. The dashboard
 
 A dev-tool-style web dashboard (Vite + React + TypeScript) that reads the API and shows
-runs, per-task status, token usage, a task list, and a dependency graph.
+runs, per-task status, the planner agent, a task list, and a dependency graph.
 
 ```bash
 cd apps/dashboard
@@ -201,10 +197,9 @@ npm install
 npm run dev        # http://localhost:5173 (proxies /api to the factory API)
 ```
 
-Screenshots below are captured from a real local run (`FACTORY_PROVIDER=local`), not
-mockups. The runs table lists every run with progress and token usage; opening a run
-shows its task graph and the full task list, and a failed dependency renders the
-transitive `blocked` cascade.
+Screenshots below are captured from a real local run, not mockups. The runs table lists
+every run with progress; opening a run shows its task graph and the full task list, and
+a failed dependency renders the transitive `blocked` cascade.
 
 ![Runs overview](docs/assets/dashboard-runs.png)
 ![Run detail with dependency graph](docs/assets/dashboard-run-detail.png)
@@ -225,13 +220,15 @@ npm run lint
 
 The Rust suite covers the state machine and cascade propagation, plan validation
 (unknown/cyclic dependencies, malformed and oversized plans), persistence round-trips,
-and real git worktree creation/removal.
+agent execution (stdout/stderr capture, exit codes, working directory, stdin mission),
+agent configuration parsing and role-to-agent resolution, and real git worktree
+creation/removal.
 
 ## 10. Roadmap
 
 - Replanning for failed tasks with dependency rearrangement
-- Task execution agents (auto-create worktree, run, commit, complete against criteria)
-- Structured model usage tracking and run costing
+- Execution agents (auto-create worktree, run, commit, complete against criteria)
+- Run costing from captured agent sessions
 - Plan review and approval before tasks are persisted
 - Concurrency controls for multiple parallel agents
 - Remote/virtual worktrees and cross-machine orchestration

@@ -2,11 +2,9 @@ use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use factory_core::provider::LocalProvider;
-use factory_core::{config_from_env, provider::build_provider, FACTORY_DIR};
-use factory_core::{Factory, Provider};
+use factory_core::{Agents, Config, Factory, FACTORY_DIR};
 use factory_db::FactoryDb;
-use factory_models::TaskState;
+use factory_types::TaskState;
 
 fn main() -> Result<()> {
     dotenvy::dotenv().ok();
@@ -18,7 +16,7 @@ fn main() -> Result<()> {
 #[command(
     name = "factory",
     version,
-    about = "Agentic Software Factory: orchestrate coding agents across structured tasks, isolated git worktrees and verifiable execution."
+    about = "Agentic Software Factory: coordinate coding agents through structured tasks and isolated git worktrees."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -33,7 +31,14 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
-    /// Plan a run from a software objective
+    /// List configured agents and whether their executable is on PATH
+    Agents,
+    /// Inspect the agent configuration
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
+    /// Plan a run from a software objective using the configured planner agent
     Run {
         /// The objective to plan
         objective: String,
@@ -72,16 +77,25 @@ enum Command {
 }
 
 #[derive(Subcommand)]
+enum ConfigCommand {
+    /// Show the role-to-agent mapping
+    List,
+}
+
+#[derive(Subcommand)]
 enum WorktreeCommand {
     /// Create a worktree for a ready task
     Create {
         /// Task id
         task: i64,
     },
-    /// Remove the worktree of a task
+    /// Remove the worktree of a task (refuses a dirty worktree unless --force)
     Remove {
         /// Task id
         task: i64,
+        /// Remove even with uncommitted changes
+        #[arg(long)]
+        force: bool,
     },
     /// List worktrees of the repository
     Status,
@@ -94,6 +108,12 @@ impl Cli {
             Command::Init { force } => {
                 init(&root, *force)?;
             }
+            Command::Agents => {
+                agents(&root)?;
+            }
+            Command::Config { command } => match command {
+                ConfigCommand::List => config_list(&root)?,
+            },
             Command::Run { objective } => {
                 run(&root, objective)?;
             }
@@ -111,7 +131,7 @@ impl Cli {
             }
             Command::Worktree { command } => match command {
                 WorktreeCommand::Create { task } => worktree_create(&root, *task)?,
-                WorktreeCommand::Remove { task } => worktree_remove(&root, *task)?,
+                WorktreeCommand::Remove { task, force } => worktree_remove(&root, *task, *force)?,
                 WorktreeCommand::Status => worktree_status(&root)?,
             },
             Command::Serve { port } => {
@@ -129,14 +149,10 @@ fn factory_root(root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn fallback_provider() -> Box<dyn Provider> {
-    Box::new(LocalProvider::new())
-}
-
 fn init(root: &Path, force: bool) -> Result<()> {
-    let cfg = config_from_env();
-    let provider = build_provider(&cfg).unwrap_or_else(|_| fallback_provider());
-    let factory = Factory::init(root, force, provider)?;
+    let config_path = root.join(FACTORY_DIR).join("config.toml");
+    let created_config = !config_path.exists();
+    let factory = Factory::init(root, force)?;
     println!(
         "Initialized factory state at {}",
         root.join(FACTORY_DIR).display()
@@ -145,22 +161,57 @@ fn init(root: &Path, force: bool) -> Result<()> {
         "Database: {}",
         root.join(FACTORY_DIR).join("db.sqlite3").display()
     );
-    println!("Provider: {}", factory.provider());
+    if created_config {
+        println!(
+            "Created agent configuration: {}",
+            root.join(FACTORY_DIR).join("config.toml").display()
+        );
+        println!("Planner agent: {}", factory.planner_agent()?);
+    } else {
+        println!("Agent configuration (existing): {}", config_path.display());
+    }
+    Ok(())
+}
+
+fn agents(root: &Path) -> Result<()> {
+    let agents = Agents::load(root).context("run `factory init` to create config.toml first")?;
+    let infos = agents.list();
+    if infos.is_empty() {
+        println!("no agents configured");
+        return Ok(());
+    }
+    println!("{:<12} {:<20} {:<10}", "NAME", "COMMAND", "STATUS");
+    for info in infos {
+        let status = if info.available {
+            "available"
+        } else {
+            "missing"
+        };
+        println!("{:<12} {:<20} {}", info.name, info.command, status);
+    }
+    Ok(())
+}
+
+fn config_list(root: &Path) -> Result<()> {
+    let config = Config::load(root).context("run `factory init` to create config.toml first")?;
+    if config.roles.is_empty() {
+        println!("no roles configured");
+        return Ok(());
+    }
+    for (role, entry) in &config.roles {
+        println!("{:<12} {}", role, entry.agent);
+    }
     Ok(())
 }
 
 fn run(root: &Path, objective: &str) -> Result<()> {
     factory_root(root)?;
-    let cfg = config_from_env();
-    let provider = build_provider(&cfg).context(
-        "cannot configure model provider; set FACTORY_API_KEY or use FACTORY_PROVIDER=local",
-    )?;
-    let factory = Factory::open(root, provider)?;
+    let factory = Factory::open(root)?;
     let outcome = factory.create_run(objective)?;
     println!(
-        "Run #{} planned ({}, {} tasks)",
+        "Run #{} planned (planner: {}, {} tasks)",
         outcome.run.id,
-        outcome.run.model.as_deref().unwrap_or("_"),
+        outcome.run.planner_agent.as_deref().unwrap_or("_"),
         outcome.tasks.len()
     );
     for task in &outcome.tasks {
@@ -258,7 +309,7 @@ fn mark(root: &Path, task_id: i64, state: &str) -> Result<()> {
     let target: TaskState = state
         .parse()
         .map_err(|e| anyhow::anyhow!("invalid state '{state}': {e}"))?;
-    let factory = Factory::open(root, fallback_provider())?;
+    let factory = Factory::open(root)?;
     let outcome = factory.mark_task(task_id, target)?;
     println!(
         "task #{}: {} -> {}",
@@ -274,23 +325,27 @@ fn mark(root: &Path, task_id: i64, state: &str) -> Result<()> {
 
 fn worktree_create(root: &Path, task_id: i64) -> Result<()> {
     factory_root(root)?;
-    let factory = Factory::open(root, fallback_provider())?;
+    let factory = Factory::open(root)?;
     let path = factory.create_worktree(task_id)?;
     println!("created worktree at {}", path.display());
     Ok(())
 }
 
-fn worktree_remove(root: &Path, task_id: i64) -> Result<()> {
+fn worktree_remove(root: &Path, task_id: i64, force: bool) -> Result<()> {
     factory_root(root)?;
-    let factory = Factory::open(root, fallback_provider())?;
-    factory.remove_worktree(task_id)?;
-    println!("removed worktree for task #{task_id}");
+    let factory = Factory::open(root)?;
+    factory.remove_worktree(task_id, force)?;
+    if force {
+        println!("removed worktree for task #{task_id} (--force)");
+    } else {
+        println!("removed worktree for task #{task_id}");
+    }
     Ok(())
 }
 
 fn worktree_status(root: &Path) -> Result<()> {
     factory_root(root)?;
-    let factory = Factory::open(root, fallback_provider())?;
+    let factory = Factory::open(root)?;
     let worktrees = factory
         .list_worktrees()
         .context("not inside a git repository")?;
@@ -317,14 +372,13 @@ fn serve(root: &Path, port: u16) -> Result<()> {
     Ok(())
 }
 
-fn print_run(db: &FactoryDb, run: &factory_models::Run) -> Result<()> {
+fn print_run(db: &FactoryDb, run: &factory_types::Run) -> Result<()> {
     let tasks = db.list_tasks(run.id)?;
     let counts = factory_api::types::TaskCounts::from_tasks(&tasks);
     println!(
-        "  created {}  model {}  tokens {}",
+        "  created {}  planner {}",
         run.created_at,
-        run.model.as_deref().unwrap_or("_"),
-        run.total_tokens
+        run.planner_agent.as_deref().unwrap_or("_")
     );
     println!(
         "  tasks: {} pending, {} ready, {} running, {} blocked, {} failed, {} completed",
@@ -345,7 +399,7 @@ fn deps_label(deps: &[i64]) -> String {
         .join(", ")
 }
 
-fn print_task(task: &factory_models::Task) {
+fn print_task(task: &factory_types::Task) {
     let deps = deps_label(&task.dependencies);
     println!(
         "  #{:<4} {:<9} {}{}",

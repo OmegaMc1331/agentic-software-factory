@@ -1,8 +1,8 @@
 # Dashboard
 
 The dashboard is a read-only developer-tool interface over the factory API. It shows
-what the factory knows: runs, task states, token usage, and the dependency graph. All
-state changes must still go through the CLI; the dashboard never mutates anything.
+what the factory knows: runs, task states, the planner agent, and the dependency graph.
+All state changes must still go through the CLI; the dashboard never mutates anything.
 
 ## Stack
 
@@ -29,13 +29,13 @@ same origin during development and matches the production build's `/api` prefix.
 
 ### Runs table
 
-The main view lists every run: id, objective, status, model, total tokens, a progress
-bar (completed/total), and creation time. Clicking a row opens the run detail.
+The main view lists every run: id, objective, status, planner agent, a progress bar
+(completed/total), and creation time. Clicking a row opens the run detail.
 
 ### Run detail
 
 - Run header: id, status, completion percentage, objective.
-- Meta grid: model, prompt/completion/total tokens, created time.
+- Meta grid: planner agent, created time.
 - **Task graph**: an SVG DAG rendered from actual dependency rows. Tasks are layered by
   longest path from the roots; independent tasks share a level, so the graph reads
   left-to-right like a CI pipeline.

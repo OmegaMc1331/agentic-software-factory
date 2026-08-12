@@ -26,8 +26,7 @@ export function RunList({
           <th>Run</th>
           <th>Objective</th>
           <th>Status</th>
-          <th>Model</th>
-          <th>Tokens</th>
+          <th>Planner</th>
           <th>Progress</th>
           <th>Created</th>
         </tr>
@@ -43,9 +42,8 @@ export function RunList({
               <span className="status-text">{run.status}</span>
             </td>
             <td>
-              <code>{run.model ?? "–"}</code>
+              <code>{run.plannerAgent ?? "–"}</code>
             </td>
-            <td>{run.totalTokens}</td>
             <td>
               <ProgressBar completed={run.counts.completed} total={run.counts.total} />
             </td>

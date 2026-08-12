@@ -1,10 +1,10 @@
 use factory_db::FactoryDb;
 use factory_git::{Repo, WorktreeInfo};
-use factory_models::{ModelUsage, Run, Task, TaskState};
+use factory_types::{AgentSession, Run, Task, TaskState};
 use thiserror::Error;
 
+use crate::config::{AgentResolutionError, Agents, ConfigError};
 use crate::planner::{normalize_plan, PlanError, PlanOutcome, Planner};
-use crate::provider::Provider;
 
 #[derive(Debug, Error)]
 pub enum FactoryError {
@@ -18,6 +18,10 @@ pub enum FactoryError {
     InvalidTransition(TaskState, TaskState),
     #[error("planning failed: {0}")]
     Plan(#[from] PlanError),
+    #[error("agent resolution: {0}")]
+    Agent(#[from] AgentResolutionError),
+    #[error("configuration error: {0}")]
+    Config(#[from] ConfigError),
     #[error("database error: {0}")]
     Db(#[from] factory_db::DbError),
     #[error("git error: {0}")]
@@ -47,18 +51,15 @@ pub struct MarkOutcome {
 
 pub struct Factory {
     db: FactoryDb,
-    planner: Planner,
+    agents: Agents,
     root: std::path::PathBuf,
 }
 
 impl Factory {
-    pub fn init(
-        root: &std::path::Path,
-        force: bool,
-        provider: Box<dyn Provider>,
-    ) -> Result<Factory, FactoryError> {
+    pub fn init(root: &std::path::Path, force: bool) -> Result<Factory, FactoryError> {
         let factory_dir = root.join(FACTORY_DIR);
         std::fs::create_dir_all(&factory_dir).map_err(FactoryError::Io)?;
+        crate::config::Config::ensure_default(root)?;
         let db_path = factory_dir.join("db.sqlite3");
         if db_path.exists() && !force {
             return Err(FactoryError::AlreadyInitialized(db_path));
@@ -66,15 +67,12 @@ impl Factory {
         let db = FactoryDb::open(&db_path)?;
         Ok(Factory {
             db,
-            planner: Planner::new(provider),
+            agents: Agents::load(root)?,
             root: root.to_path_buf(),
         })
     }
 
-    pub fn open(
-        root: &std::path::Path,
-        provider: Box<dyn Provider>,
-    ) -> Result<Factory, FactoryError> {
+    pub fn open(root: &std::path::Path) -> Result<Factory, FactoryError> {
         let db_path = root.join(FACTORY_DIR).join("db.sqlite3");
         if !db_path.exists() {
             return Err(FactoryError::NotInitialized);
@@ -82,22 +80,31 @@ impl Factory {
         let db = FactoryDb::open(&db_path)?;
         Ok(Factory {
             db,
-            planner: Planner::new(provider),
+            agents: Agents::load(root)?,
             root: root.to_path_buf(),
         })
     }
 
-    pub fn provider(&self) -> &str {
-        self.planner.provider()
+    pub fn planner_agent(&self) -> Result<String, FactoryError> {
+        Ok(self.agents.command_agent("planner")?.name().to_string())
     }
 
     pub fn create_run(&self, objective: &str) -> Result<RunOutcome, FactoryError> {
         if objective.trim().is_empty() {
             return Err(FactoryError::EmptyObjective);
         }
-        let PlanOutcome { plan, model, usage } = self.planner.plan(objective)?;
+        let planner_agent = self.agents.command_agent("planner")?;
+        let planner = Planner::new(planner_agent);
+        let outcome = planner.plan(objective, &self.root)?;
+        let PlanOutcome {
+            plan,
+            agent,
+            command,
+            result,
+        } = outcome;
         let plan = normalize_plan(plan);
-        let run = self.db.create_run(&plan.objective, Some(&model), &usage)?;
+        let run = self.db.create_run(&plan.objective, Some(&agent))?;
+        self.persist_planner_session(&run, &agent, &command, &result)?;
         let mut id_by_label = std::collections::HashMap::new();
         for (index, task) in plan.tasks.iter().enumerate() {
             let id = self.db.create_task(
@@ -124,6 +131,38 @@ impl Factory {
         }
         let tasks = self.db.list_tasks(run.id)?;
         Ok(RunOutcome { run, tasks })
+    }
+
+    fn persist_planner_session(
+        &self,
+        run: &Run,
+        agent: &str,
+        command: &str,
+        result: &factory_agent::AgentResult,
+    ) -> Result<(), FactoryError> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let status = if result.exit_code == Some(0) {
+            "success"
+        } else {
+            "failed"
+        };
+        let session = AgentSession {
+            id: 0,
+            run_id: Some(run.id),
+            task_id: None,
+            role: "planner".to_string(),
+            agent: agent.to_string(),
+            command: command.to_string(),
+            status: status.to_string(),
+            started_at: now.clone(),
+            finished_at: Some(now),
+            exit_code: result.exit_code,
+            duration_ms: Some(result.duration.as_millis() as u64),
+            stdout: Some(result.stdout.clone()),
+            stderr: Some(result.stderr.clone()),
+        };
+        self.db.insert_agent_session(&session)?;
+        Ok(())
     }
 
     pub fn mark_task(&self, task_id: i64, target: TaskState) -> Result<MarkOutcome, FactoryError> {
@@ -196,6 +235,13 @@ impl Factory {
         Ok(self.db.get_task(id)?)
     }
 
+    pub fn list_agent_sessions(
+        &self,
+        run_id: Option<i64>,
+    ) -> Result<Vec<AgentSession>, FactoryError> {
+        Ok(self.db.list_agent_sessions(run_id)?)
+    }
+
     pub fn worktree_dir(&self, task_id: i64) -> std::path::PathBuf {
         self.root
             .join(FACTORY_DIR)
@@ -219,15 +265,21 @@ impl Factory {
         Ok(dir)
     }
 
-    pub fn remove_worktree(&self, task_id: i64) -> Result<(), FactoryError> {
+    pub fn remove_worktree(&self, task_id: i64, force: bool) -> Result<(), FactoryError> {
         let task = self
             .db
             .get_task(task_id)?
             .ok_or(FactoryError::TaskNotFound(task_id))?;
         let repo = Repo::detect(&self.root)?;
         let dir = self.worktree_dir(task_id);
-        if repo.find_worktree(&dir)?.is_some() || dir.exists() {
-            repo.remove_worktree(&dir)?;
+        if force {
+            if repo.find_worktree(&dir)?.is_some() || dir.exists() {
+                repo.remove_worktree_force(&dir)?;
+            }
+        } else {
+            if repo.find_worktree(&dir)?.is_some() || dir.exists() {
+                repo.remove_worktree(&dir)?;
+            }
         }
         if task.worktree_path.is_some() {
             self.db.set_worktree_path(task_id, None)?;
@@ -238,17 +290,5 @@ impl Factory {
     pub fn list_worktrees(&self) -> Result<Vec<WorktreeInfo>, FactoryError> {
         let repo = Repo::detect(&self.root)?;
         Ok(repo.list_worktrees()?)
-    }
-
-    pub fn usage_for_run(&self, run_id: i64) -> Result<ModelUsage, FactoryError> {
-        let run = self
-            .db
-            .get_run(run_id)?
-            .ok_or(FactoryError::TaskNotFound(run_id))?;
-        Ok(ModelUsage {
-            prompt_tokens: run.prompt_tokens,
-            completion_tokens: run.completion_tokens,
-            total_tokens: run.total_tokens,
-        })
     }
 }

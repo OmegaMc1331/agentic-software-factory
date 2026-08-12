@@ -6,8 +6,8 @@ the factory root from the current working directory and requires initialized sta
 
 ## Global behavior
 
-- Configuration is read from the environment, then from `.env` if present
-  (`dotenvy`). See [`.env.example`](../.env.example).
+- Agent configuration lives in `.factory/config.toml` (created by `factory init`). See
+  the [Agents section of the README](../README.md#5-agents).
 - Exit codes: `0` on success, non-zero on failure with a message on stderr.
 - Errors are actionable ("no factory state found here; run `factory init` first").
 
@@ -15,32 +15,51 @@ the factory root from the current working directory and requires initialized sta
 
 ### `factory init [--force]`
 
-Creates `.factory/db.sqlite3` in the current directory. `--force` re-creates the schema
-(previous data is dropped) - use sparingly.
+Creates `.factory/db.sqlite3` and a default `.factory/config.toml` in the current
+directory. `--force` re-creates the schema (previous data is dropped) - use sparingly.
 
 ```bash
 $ factory init
 Initialized factory state at D:\factory\.factory
 Database: D:\factory\.factory\db.sqlite3
-Provider: local-planner
 ```
-
-When `FACTORY_API_KEY` is exported the provider line shows the real model instead.
 
 ### `factory run "<objective>"`
 
-Plans the objective through the configured provider, persists the run and its tasks,
-and prints the plan. Requires `FACTORY_API_KEY` (with the OpenAI-compatible provider) or
-`FACTORY_PROVIDER=local`.
+Plans the objective through the configured planner agent, persists the run and its
+tasks, and prints the plan. Falls back to the deterministic local planner when no agent
+is configured or available.
 
 ```bash
 $ factory run "Add a /health endpoint that returns JSON"
-Run #3 planned (gpt-4o-mini, 5 tasks)
+Run #3 planned (local-planner, 5 tasks)
   #14   ready     Define the response contract [ ]
   #15   pending   Add the /health route [ #14 ]
   #16   pending   Add a unit test for the handler [ #15 ]
   #17   pending   Wire the route into the server [ #16 ]
   #18   pending   Verify build and test suite [ #17 ]
+```
+
+### `factory agents`
+
+Lists every configured agent with its command and whether its executable is on `PATH`:
+
+```bash
+$ factory agents
+NAME         COMMAND              STATUS
+codex        codex                available
+claude       claude               missing
+```
+
+### `factory config list`
+
+Shows the resolved role-to-agent mapping:
+
+```bash
+$ factory config list
+planner    codex
+worker     opencode
+reviewer   claude
 ```
 
 ### `factory status`
@@ -50,7 +69,7 @@ Prints the latest run summary and its tasks:
 ```bash
 Factory: D:\factory\.factory
 Latest run: #3 (running)
-  created 2026-01-15T10:04:12Z  model gpt-4o-mini  tokens 3840
+  created 2026-01-15T10:04:12Z  planner codex
   tasks: 0 pending, 1 ready, 1 running, 0 blocked, 0 failed, 3 completed
   #14   completed  Define the response contract
   #15   running    Add the /health route [ #14 ]

@@ -77,8 +77,7 @@ async fn list_runs(State(state): State<SharedState>) -> Result<Json<Vec<RunSumma
             id: run.id,
             objective: run.objective.clone(),
             status: run.status.as_str().to_string(),
-            model: run.model.clone(),
-            total_tokens: run.total_tokens,
+            planner_agent: run.planner_agent.clone(),
             created_at: run.created_at.clone(),
             counts: TaskCounts::from_tasks(&tasks),
         });
@@ -96,10 +95,5 @@ async fn get_run(
         format!("run {id} not found"),
     ))?;
     let tasks = db.list_tasks(id)?;
-    let usage = factory_models::ModelUsage {
-        prompt_tokens: run.prompt_tokens,
-        completion_tokens: run.completion_tokens,
-        total_tokens: run.total_tokens,
-    };
-    Ok(Json(RunDetail { run, tasks, usage }))
+    Ok(Json(RunDetail { run, tasks }))
 }

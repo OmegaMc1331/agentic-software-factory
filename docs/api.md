@@ -32,8 +32,7 @@ List of runs with per-state task counts.
     "id": 2,
     "objective": "Build a small HTTP server in Rust.",
     "status": "running",
-    "model": "gpt-4o-mini",
-    "totalTokens": 3840,
+    "plannerAgent": "codex",
     "createdAt": "2026-01-15T10:04:12Z",
     "counts": {
       "pending": 1,
@@ -50,7 +49,7 @@ List of runs with per-state task counts.
 
 ### `GET /api/runs/:id`
 
-Full detail for one run: the run row, every task, and token usage.
+Full detail for one run: the run row and every task.
 
 ```json
 {
@@ -58,10 +57,7 @@ Full detail for one run: the run row, every task, and token usage.
     "id": 2,
     "objective": "Build a small HTTP server in Rust.",
     "status": "running",
-    "model": "gpt-4o-mini",
-    "promptTokens": 2048,
-    "completionTokens": 1792,
-    "totalTokens": 3840,
+    "plannerAgent": "codex",
     "createdAt": "2026-01-15T10:04:12Z",
     "updatedAt": "2026-01-15T10:07:55Z"
   },
@@ -79,12 +75,7 @@ Full detail for one run: the run row, every task, and token usage.
       "createdAt": "2026-01-15T10:04:12Z",
       "updatedAt": "2026-01-15T10:06:40Z"
     }
-  ],
-  "usage": {
-    "promptTokens": 2048,
-    "completionTokens": 1792,
-    "totalTokens": 3840
-  }
+  ]
 }
 ```
 

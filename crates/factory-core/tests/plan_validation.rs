@@ -1,5 +1,5 @@
 use factory_core::planner::{parse_plan, validate_plan};
-use factory_models::Plan;
+use factory_types::Plan;
 
 fn plan_json(objective: &str) -> String {
     format!(

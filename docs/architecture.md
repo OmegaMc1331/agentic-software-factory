@@ -8,20 +8,22 @@ database; all agent isolation is handled by git worktrees.
 
 ```text
 crates/
-  factory-models   Pure data types: Run, Task, Plan, PlannedTask, ModelUsage, TaskState
+  factory-types   Pure data types: Run, Task, Plan, PlannedTask, TaskState, AgentSession
+  factory-agent   Subprocess execution of external agent CLIs (CommandAgent)
   factory-db       SQLite persistence behind a thin FactoryDb layer
   factory-git      Repository detection and worktree management (git plumbing/porcelain)
-  factory-core     Providers, planning, validation, and the Factory orchestrator
+  factory-core     Agent config, planning, validation, and the Factory orchestrator
   factory-api      Local HTTP API (axum) read endpoints for the dashboard
-  factory-cli      The `factory` binary: init, run, status, tasks, inspect, mark, worktree, serve
+  factory-cli      The `factory` binary: init, run, status, tasks, inspect, mark, agents, config, worktree, serve
 apps/
   dashboard        Vite + React + TypeScript dashboard for runs and tasks
 ```
 
 Dependency direction: `factory-cli -> factory-api -> factory-core -> factory-db`,
-`factory-core -> factory-models`, `factory-core -> factory-git`.
+`factory-core -> factory-types`, `factory-core -> factory-git`,
+`factory-core -> factory-agent`.
 
-### factory-models
+### factory-types
 
 Plain structs with no behavior beyond serialization and parsing:
 
@@ -29,17 +31,20 @@ Plain structs with no behavior beyond serialization and parsing:
 - `Run` / `Task` - persisted shapes (ids, timestamps, token counts).
 - `Plan` / `PlannedTask` - the strict planner contract (`acceptance_criteria` is a list
   of strings, `dependencies` and `exit_criteria` default to empty).
-- `ModelUsage` - prompt/completion/total token counts.
+- `AgentSession` - one recorded invocation of an agent (role, command, status, exit
+  code, timestamps, captured stdout/stderr).
 
 ### factory-db
 
 A single connection, one schema migration run at open. Tables:
 
-- `runs` (`id` PK, `objective`, `status`, `model`, `prompt_tokens`,
-  `completion_tokens`, `total_tokens`, `created_at`, `updated_at`)
+- `runs` (`id` PK, `objective`, `status`, `planner_agent`, `created_at`, `updated_at`)
 - `tasks` (`id` PK, `run_id` FK, `title`, `objective`, `acceptance_criteria` JSON text,
   `state`, `position`, `worktree_path`, `created_at`, `updated_at`)
 - `task_dependencies` (`task_id` FK, `depends_on` FK, PK on both)
+- `agent_sessions` (`id` PK, `run_id`/`task_id` FK, `role`, `agent`, `command`,
+  `status`, `started_at`, `finished_at`, `exit_code`, `duration_ms`, `stdout`,
+  `stderr`)
 
 Transactional writes for runs (root task) and updates; a `TaskCounts` helper computes
 per-state counts for the API and CLI.
@@ -60,17 +65,27 @@ per-state counts for the API and CLI.
 
 The heart of the system.
 
-`Provider` trait - `fn plan(&self, objective) -> Result<Plan, ...>`.
+`config` - the agent contract. `.factory/config.toml` declares `[agents.<name>]`
+sections (command, args, env, capabilities) and `[roles.<role>]` sections mapping a
+role to an agent. `Agents::load` resolves a role to a `CommandAgent` and reports clear
+errors for missing roles, unknown agents, and missing executables; `agents` and
+`config list` CLI commands surface the same resolution to the user.
 
-- `OpenAICompatibleProvider` - HTTP POST to `{base}/chat/completions` with the model
-  name; parses `choices[0].message.content`.
-- `LocalProvider` - deterministic five-task pipeline used offline and in tests.
+`factory-agent` (`CommandAgent`) - executes an agent CLI as a subprocess: writes the
+mission to stdin, sets the working directory, and captures stdout/stderr, exit code,
+and duration. `executable_exists` performs a PATH + PATHEXT lookup so configuration
+errors surface before anything is spawned.
 
-`Planner` - validation and retry loop:
+`Planner` - the plan loop over the configured planner agent:
 
-1. Ask the provider for a plan, stripped of code fences.
+1. Ask the planner agent for a plan (objective on stdin, code fences stripped).
 2. Validate: non-empty tasks, known dependency ids, acyclic graph, at most 50 tasks.
-3. Re-request up to three times on invalid output; fail with the last validation error.
+3. On failure (agent unavailable, non-zero exit, or invalid output) fall back to the
+   deterministic local planner, which produces a fixed, ordered pipeline so `run`
+   always works offline.
+
+Every planner invocation is recorded as an `agent_sessions` row with its exit code and
+captured output.
 
 `workflow` - the state transition table and cascade propagation:
 
@@ -86,16 +101,17 @@ The heart of the system.
 - `factory-core` returns the full set of changed task ids from `mark_task`, so callers
   (CLI, tests) can confirm exactly what a transition changed.
 
-`Factory` - the orchestrator tying it together: `init`, `open`, `create_run` (plan ->
-persist -> derive initial states), `mark_task` (validate -> persist -> propagate,
-returning the full set of changed ids), and worktree operations that mirror
-`factory-git` plus task-state checks (a worktree may only be created for a `ready` or
-`running` task, and removals must leave no uncommitted changes).
+`Factory` - the orchestrator tying it together: `init`, `open`, `create_run` (resolve
+planner agent -> plan -> persist -> derive initial states -> record the planner
+session), `mark_task` (validate -> persist -> propagate, returning the full set of
+changed ids), and worktree operations that mirror `factory-git` plus task-state checks
+(a worktree may only be created for a `ready` or `running` task, and removals must
+leave no uncommitted changes).
 
 ### factory-api
 
 Axum application with three read endpoints proxied by the dashboard dev server. The
-run detail returns the run, every task with its dependency ids, and token usage.
+run detail returns the run and every task with its dependency ids.
 
 ### factory-cli
 
@@ -129,14 +145,15 @@ affected task from its own dependencies, so a task returns directly to `ready` o
 
 ```mermaid
 flowchart TD
-    A[objective] --> B[planner.plan]
-    B --> C{valid plan?}
-    C -- no --> D{attempts < 3?}
-    D -- yes --> E[ask provider again with last error]
-    E --> B
-    D -- no --> F[error: give up]
-    C -- yes --> G[Factory.create_run]
-    G --> H[persist run + tasks + dependencies]
+    A[objective] --> B[resolve planner agent]
+    B --> C{agent available?}
+    C -- yes --> D[ask agent for a plan]
+    D --> E{valid plan?}
+    E -- no --> F[fall back to local planner]
+    C -- no --> F
+    E -- yes --> G[Factory.create_run]
+    F --> G
+    G --> H[persist run + tasks + dependencies + agent session]
     H --> I[derive initial states from dependency order]
 ```
 
@@ -151,10 +168,7 @@ erDiagram
         int id PK
         text objective
         text status
-        text model
-        int prompt_tokens
-        int completion_tokens
-        int total_tokens
+        text planner_agent
         text created_at
         text updated_at
     }
@@ -174,6 +188,21 @@ erDiagram
         int task_id FK
         int depends_on FK
     }
+    agent_sessions {
+        int id PK
+        int run_id FK
+        int task_id FK
+        text role
+        text agent
+        text command
+        text status
+        text started_at
+        text finished_at
+        int exit_code
+        int duration_ms
+        text stdout
+        text stderr
+    }
 ```
 
 ## Isolation and state ownership
@@ -191,8 +220,12 @@ erDiagram
 - `factory-git` - detection, worktree create/list/remove, dirty-tree refusal.
 - `factory-core` unit tests - transition table, cascade propagation both directions,
   reset escape hatch.
+- `factory-agent` unit tests - subprocess execution: stdout/stderr capture, exit codes,
+  working directory, stdin mission, PATH lookup.
 - `plan_validation` integration tests - malformed JSON, unknown ids, cycles, oversized
-  plans against the local provider.
+  plans against the local planner.
+- `agent_config` integration tests - config parsing, role-to-agent resolution, missing
+  role/agent/executable detection.
 - `e2e` integration tests - full lifecycle against a scratch repository: plan a run,
   create worktrees, run tasks to completion, verify persistence and propagation.
 - Dashboard - vitest for graph layout (levels, diamonds, empty graphs) and utilities.

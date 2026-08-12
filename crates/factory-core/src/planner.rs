@@ -1,21 +1,72 @@
-use factory_models::{ModelUsage, Plan};
-use thiserror::Error;
+use std::path::Path;
 
-use crate::provider::Provider;
+use factory_agent::{AgentError, AgentRequest, AgentResult, CommandAgent};
+use factory_types::Plan;
+use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum PlanError {
-    #[error("provider error: {0}")]
-    Provider(#[from] crate::provider::ProviderError),
-    #[error("rejected invalid model output: {0}")]
+    #[error("agent error: {0}")]
+    Agent(#[from] AgentError),
+    #[error("planner agent produced no output")]
+    NoOutput,
+    #[error("rejected invalid plan output: {0}")]
     Invalid(String),
 }
 
 #[derive(Debug, Clone)]
 pub struct PlanOutcome {
     pub plan: Plan,
-    pub model: String,
-    pub usage: ModelUsage,
+    pub agent: String,
+    pub command: String,
+    pub result: AgentResult,
+}
+
+const MAX_ATTEMPTS: u32 = 3;
+
+pub struct Planner {
+    agent: CommandAgent,
+}
+
+impl Planner {
+    pub fn new(agent: CommandAgent) -> Self {
+        Planner { agent }
+    }
+
+    pub fn agent_name(&self) -> &str {
+        self.agent.name()
+    }
+
+    pub fn plan(&self, objective: &str, working_dir: &Path) -> Result<PlanOutcome, PlanError> {
+        let mut instruction = mission(objective, None);
+        for attempt in 0..MAX_ATTEMPTS {
+            let request = AgentRequest::new(&instruction, working_dir);
+            let result = self.agent.run(&request)?;
+            if result.stdout.trim().is_empty() {
+                return Err(PlanError::NoOutput);
+            }
+            match parse_plan(&result.stdout) {
+                Ok(mut plan) => {
+                    if plan.objective.trim().is_empty() {
+                        plan.objective = objective.to_string();
+                    }
+                    return Ok(PlanOutcome {
+                        plan,
+                        agent: self.agent.name().to_string(),
+                        command: self.agent.command_line(),
+                        result,
+                    });
+                }
+                Err(reason) => {
+                    if attempt + 1 >= MAX_ATTEMPTS {
+                        return Err(PlanError::Invalid(reason));
+                    }
+                    instruction = mission(objective, Some(&reason));
+                }
+            }
+        }
+        unreachable!("attempt loop always returns")
+    }
 }
 
 const SYSTEM_PROMPT: &str = "You are the planner of a software factory. Convert the user's objective into a structured implementation plan. Respond with a single JSON object and nothing else. The JSON must match this schema exactly:
@@ -40,55 +91,14 @@ Rules:
 - every task has a distinct responsibility and at least one acceptance criterion.
 - do not include any text outside the JSON object.";
 
-const MAX_TASKS: usize = 50;
-const MAX_ATTEMPTS: u32 = 3;
-
-pub struct Planner {
-    provider: Box<dyn Provider>,
-}
-
-impl Planner {
-    pub fn new(provider: Box<dyn Provider>) -> Self {
-        Planner { provider }
+fn mission(objective: &str, rejection: Option<&str>) -> String {
+    let mut text = format!("{SYSTEM_PROMPT}\n\nObjective: {objective}");
+    if let Some(reason) = rejection {
+        text.push_str("\n\nYour previous output was rejected because: ");
+        text.push_str(reason);
+        text.push_str("\nReturn a corrected plan that matches the schema.");
     }
-
-    pub fn provider(&self) -> &str {
-        self.provider.model()
-    }
-
-    pub fn plan(&self, objective: &str) -> Result<PlanOutcome, PlanError> {
-        let mut user = objective.to_string();
-        for attempt in 0..MAX_ATTEMPTS {
-            let response = self.provider.generate(SYSTEM_PROMPT, &user)?;
-            match parse_plan(&response.content) {
-                Ok(plan) if plan.objective.trim().is_empty() => {
-                    let mut plan = plan;
-                    plan.objective = objective.to_string();
-                    return Ok(PlanOutcome {
-                        plan,
-                        model: response.model,
-                        usage: response.usage,
-                    });
-                }
-                Ok(plan) => {
-                    return Ok(PlanOutcome {
-                        plan,
-                        model: response.model,
-                        usage: response.usage,
-                    });
-                }
-                Err(reason) => {
-                    if attempt + 1 >= MAX_ATTEMPTS {
-                        return Err(PlanError::Invalid(reason));
-                    }
-                    user = format!(
-                        "Objective: {objective}\n\nYour previous output was rejected because {reason}. Return a corrected plan that matches the schema."
-                    );
-                }
-            }
-        }
-        unreachable!("attempt loop always returns")
-    }
+    text
 }
 
 pub fn parse_plan(content: &str) -> std::result::Result<Plan, String> {
@@ -193,3 +203,5 @@ pub fn normalize_plan(mut plan: Plan) -> Plan {
     }
     plan
 }
+
+const MAX_TASKS: usize = 50;

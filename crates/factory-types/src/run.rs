@@ -26,10 +26,7 @@ pub struct Run {
     pub id: i64,
     pub objective: String,
     pub status: RunStatus,
-    pub model: Option<String>,
-    pub prompt_tokens: u32,
-    pub completion_tokens: u32,
-    pub total_tokens: u32,
+    pub planner_agent: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }

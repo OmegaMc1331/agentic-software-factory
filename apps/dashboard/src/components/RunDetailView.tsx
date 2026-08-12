@@ -24,20 +24,8 @@ export function RunDetailView({ detail, onBack }: { detail: RunDetail; onBack: (
 
       <div className="meta-grid">
         <div className="meta-cell">
-          <span className="meta-label">Model</span>
-          <code className="meta-value">{detail.run.model ?? "–"}</code>
-        </div>
-        <div className="meta-cell">
-          <span className="meta-label">Prompt tokens</span>
-          <span className="meta-value">{detail.usage.promptTokens}</span>
-        </div>
-        <div className="meta-cell">
-          <span className="meta-label">Completion tokens</span>
-          <span className="meta-value">{detail.usage.completionTokens}</span>
-        </div>
-        <div className="meta-cell">
-          <span className="meta-label">Total tokens</span>
-          <span className="meta-value">{detail.usage.totalTokens}</span>
+          <span className="meta-label">Planner</span>
+          <code className="meta-value">{detail.run.plannerAgent ?? "–"}</code>
         </div>
         <div className="meta-cell">
           <span className="meta-label">Created</span>

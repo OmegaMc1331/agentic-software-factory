@@ -1,4 +1,4 @@
-use factory_models::TaskState;
+use factory_types::TaskState;
 
 pub struct Workflow;
 
@@ -56,7 +56,7 @@ impl Workflow {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use factory_models::TaskState::*;
+    use factory_types::TaskState::*;
 
     #[test]
     fn initial_state_depends_on_dependencies() {

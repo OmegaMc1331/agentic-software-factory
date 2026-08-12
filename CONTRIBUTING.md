@@ -26,8 +26,8 @@ cargo test
 cd apps/dashboard && npm install
 ```
 
-The whole system works offline via the local planner (`FACTORY_PROVIDER=local`), so a
-full manual pass does not require an API key.
+The whole system works offline via the deterministic local planner, so a full manual
+pass does not require any agent CLI to be installed.
 
 ## Making changes
 

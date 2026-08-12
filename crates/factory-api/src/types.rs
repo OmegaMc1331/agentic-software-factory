@@ -1,6 +1,6 @@
 use serde::Serialize;
 
-use factory_models::{ModelUsage, Run, Task, TaskState};
+use factory_types::{Run, Task, TaskState};
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -52,8 +52,7 @@ pub struct RunSummary {
     pub id: i64,
     pub objective: String,
     pub status: String,
-    pub model: Option<String>,
-    pub total_tokens: u32,
+    pub planner_agent: Option<String>,
     pub created_at: String,
     pub counts: TaskCounts,
 }
@@ -63,5 +62,4 @@ pub struct RunSummary {
 pub struct RunDetail {
     pub run: Run,
     pub tasks: Vec<Task>,
-    pub usage: ModelUsage,
 }

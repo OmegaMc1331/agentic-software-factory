@@ -47,8 +47,9 @@ Worktrees give real isolation with zero copying overhead:
 
 ## What is intentionally *not* stored
 
-- Plan output is not cached. Every `factory run` replans from the provider.
-- Model conversation history is not retained. Only the derived plan, token usage, and
-  task state are stored.
+- Plan output is not cached. Every `factory run` replans through the planner agent (or
+  the deterministic local fallback).
+- Agent conversation history is not retained. Only the derived plan and task state are
+  stored; each planner session is recorded as an `agent_sessions` row for auditability.
 - Nothing is stored in the repository itself: `.factory/` is ignored, so the history
   that ships in the repo is exactly what you intend to share.

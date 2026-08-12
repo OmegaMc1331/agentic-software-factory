@@ -10,6 +10,8 @@ pub enum GitError {
     CommandFailed(String),
     #[error("failed to create worktree at {0}")]
     WorktreeAddFailed(PathBuf),
+    #[error("worktree at {0} has uncommitted changes; commit or discard them first")]
+    WorktreeDirty(PathBuf),
     #[error("failed to remove worktree at {0}")]
     WorktreeRemoveFailed(PathBuf),
     #[error("io error: {0}")]

@@ -14,8 +14,7 @@ export interface RunSummary {
   id: number;
   objective: string;
   status: string;
-  model: string | null;
-  totalTokens: number;
+  plannerAgent: string | null;
   createdAt: string;
   counts: TaskCounts;
 }
@@ -24,10 +23,7 @@ export interface Run {
   id: number;
   objective: string;
   status: string;
-  model: string | null;
-  promptTokens: number;
-  completionTokens: number;
-  totalTokens: number;
+  plannerAgent: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -46,14 +42,7 @@ export interface Task {
   updatedAt: string;
 }
 
-export interface ModelUsage {
-  promptTokens: number;
-  completionTokens: number;
-  totalTokens: number;
-}
-
 export interface RunDetail {
   run: Run;
   tasks: Task[];
-  usage: ModelUsage;
 }

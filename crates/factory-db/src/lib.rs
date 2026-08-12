@@ -3,7 +3,7 @@ pub mod error;
 pub use error::DbError;
 
 use chrono::Utc;
-use factory_models::{ModelUsage, Run, RunStatus, Task, TaskState};
+use factory_types::{AgentSession, Run, RunStatus, Task, TaskState};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 
@@ -25,25 +25,12 @@ impl FactoryDb {
         Ok(FactoryDb { conn })
     }
 
-    pub fn create_run(
-        &self,
-        objective: &str,
-        model: Option<&str>,
-        usage: &ModelUsage,
-    ) -> Result<Run> {
+    pub fn create_run(&self, objective: &str, planner_agent: Option<&str>) -> Result<Run> {
         let ts = now();
         self.conn.execute(
-            "INSERT INTO runs (objective, status, model, prompt_tokens, completion_tokens, total_tokens, created_at, updated_at)
-             VALUES (?1, 'planned', ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                objective,
-                model,
-                usage.prompt_tokens,
-                usage.completion_tokens,
-                usage.total_tokens,
-                ts,
-                ts
-            ],
+            "INSERT INTO runs (objective, status, planner_agent, created_at, updated_at)
+             VALUES (?1, 'planned', ?2, ?3, ?4)",
+            params![objective, planner_agent, ts, ts],
         )?;
         let id = self.conn.last_insert_rowid();
         self.get_run(id)?.ok_or(DbError::NotFound("run"))
@@ -53,22 +40,10 @@ impl FactoryDb {
         let row = self
             .conn
             .query_row(
-                "SELECT id, objective, status, model, prompt_tokens, completion_tokens, total_tokens, created_at, updated_at
+                "SELECT id, objective, status, planner_agent, created_at, updated_at
                  FROM runs WHERE id = ?1",
                 params![id],
-                |r| {
-                    Ok(Run {
-                        id: r.get(0)?,
-                        objective: r.get(1)?,
-                        status: run_status(r.get::<_, String>(2)?),
-                        model: r.get(3)?,
-                        prompt_tokens: r.get(4)?,
-                        completion_tokens: r.get(5)?,
-                        total_tokens: r.get(6)?,
-                        created_at: r.get(7)?,
-                        updated_at: r.get(8)?,
-                    })
-                },
+                build_run,
             )
             .optional()?;
         Ok(row)
@@ -76,23 +51,11 @@ impl FactoryDb {
 
     pub fn list_runs(&self) -> Result<Vec<Run>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, objective, status, model, prompt_tokens, completion_tokens, total_tokens, created_at, updated_at
+            "SELECT id, objective, status, planner_agent, created_at, updated_at
              FROM runs ORDER BY id DESC",
         )?;
         let rows = stmt
-            .query_map([], |r| {
-                Ok(Run {
-                    id: r.get(0)?,
-                    objective: r.get(1)?,
-                    status: run_status(r.get::<_, String>(2)?),
-                    model: r.get(3)?,
-                    prompt_tokens: r.get(4)?,
-                    completion_tokens: r.get(5)?,
-                    total_tokens: r.get(6)?,
-                    created_at: r.get(7)?,
-                    updated_at: r.get(8)?,
-                })
-            })?
+            .query_map([], |r| build_run(r))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
     }
@@ -189,6 +152,54 @@ impl FactoryDb {
         )?;
         Ok(())
     }
+
+    pub fn insert_agent_session(&self, session: &AgentSession) -> Result<AgentSession> {
+        let mut session = session.clone();
+        self.conn.execute(
+            "INSERT INTO agent_sessions (run_id, task_id, role, agent, command, status, started_at, finished_at, exit_code, duration_ms, stdout, stderr)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                session.run_id,
+                session.task_id,
+                session.role,
+                session.agent,
+                session.command,
+                session.status,
+                session.started_at,
+                session.finished_at,
+                session.exit_code,
+                session.duration_ms.map(|d| d as i64),
+                session.stdout,
+                session.stderr
+            ],
+        )?;
+        session.id = self.conn.last_insert_rowid();
+        Ok(session)
+    }
+
+    pub fn list_agent_sessions(&self, run_id: Option<i64>) -> Result<Vec<AgentSession>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, run_id, task_id, role, agent, command, status, started_at, finished_at, exit_code, duration_ms, stdout, stderr
+             FROM agent_sessions
+             WHERE (?1 IS NULL OR run_id = ?1)
+             ORDER BY id",
+        )?;
+        let rows = stmt
+            .query_map(params![run_id], build_session)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+}
+
+fn build_run(r: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
+    Ok(Run {
+        id: r.get(0)?,
+        objective: r.get(1)?,
+        status: run_status(r.get::<_, String>(2)?),
+        planner_agent: r.get(3)?,
+        created_at: r.get(4)?,
+        updated_at: r.get(5)?,
+    })
 }
 
 fn build_task(r: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
@@ -206,6 +217,24 @@ fn build_task(r: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         worktree_path: r.get(7)?,
         created_at: r.get(8)?,
         updated_at: r.get(9)?,
+    })
+}
+
+fn build_session(r: &rusqlite::Row<'_>) -> rusqlite::Result<AgentSession> {
+    Ok(AgentSession {
+        id: r.get(0)?,
+        run_id: r.get(1)?,
+        task_id: r.get(2)?,
+        role: r.get(3)?,
+        agent: r.get(4)?,
+        command: r.get(5)?,
+        status: r.get(6)?,
+        started_at: r.get(7)?,
+        finished_at: r.get(8)?,
+        exit_code: r.get(9)?,
+        duration_ms: r.get(10).map(|v: Option<i64>| v.map(|v| v as u64))?,
+        stdout: r.get(11)?,
+        stderr: r.get(12)?,
     })
 }
 
@@ -228,10 +257,7 @@ fn migrate(conn: &Connection) -> Result<()> {
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             objective TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'planned',
-            model TEXT,
-            prompt_tokens INTEGER NOT NULL DEFAULT 0,
-            completion_tokens INTEGER NOT NULL DEFAULT 0,
-            total_tokens INTEGER NOT NULL DEFAULT 0,
+            planner_agent TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
@@ -252,8 +278,24 @@ fn migrate(conn: &Connection) -> Result<()> {
             depends_on INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
             PRIMARY KEY (task_id, depends_on)
         );
+        CREATE TABLE IF NOT EXISTS agent_sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id INTEGER REFERENCES runs(id) ON DELETE CASCADE,
+            task_id INTEGER REFERENCES tasks(id) ON DELETE CASCADE,
+            role TEXT NOT NULL,
+            agent TEXT NOT NULL,
+            command TEXT NOT NULL,
+            status TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            finished_at TEXT,
+            exit_code INTEGER,
+            duration_ms INTEGER,
+            stdout TEXT,
+            stderr TEXT
+        );
         CREATE INDEX IF NOT EXISTS idx_tasks_run ON tasks(run_id);
         CREATE INDEX IF NOT EXISTS idx_task_deps_dep ON task_dependencies(depends_on);
+        CREATE INDEX IF NOT EXISTS idx_sessions_run ON agent_sessions(run_id);
         PRAGMA foreign_keys = ON;
         ",
     )?;
@@ -262,7 +304,7 @@ fn migrate(conn: &Connection) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use factory_models::{ModelUsage, TaskState};
+    use factory_types::{AgentSession, TaskState};
     use tempfile::TempDir;
 
     use crate::FactoryDb;
@@ -272,11 +314,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = FactoryDb::open(&dir.path().join("test.db")).unwrap();
 
-        let run = db
-            .create_run("build a thing", Some("test-model"), &ModelUsage::none())
-            .unwrap();
+        let run = db.create_run("build a thing", Some("codex")).unwrap();
         assert_eq!(run.id, 1);
         assert_eq!(run.status.as_str(), "planned");
+        assert_eq!(run.planner_agent.as_deref(), Some("codex"));
 
         let a = db
             .create_task(
@@ -315,9 +356,7 @@ mod tests {
     fn updates_task_state_and_worktree_path() {
         let dir = TempDir::new().unwrap();
         let db = FactoryDb::open(&dir.path().join("test.db")).unwrap();
-        let run = db
-            .create_run("objective", Some("m"), &ModelUsage::none())
-            .unwrap();
+        let run = db.create_run("objective", Some("codex")).unwrap();
         let task = db
             .create_task(run.id, "T", "objective", &[], TaskState::Ready, 0)
             .unwrap();
@@ -337,11 +376,36 @@ mod tests {
     }
 
     #[test]
-    fn returns_zero_tokens_when_run_has_no_usage() {
+    fn persists_and_reads_agent_sessions() {
         let dir = TempDir::new().unwrap();
         let db = FactoryDb::open(&dir.path().join("test.db")).unwrap();
-        let run = db.create_run("x", Some("m"), &ModelUsage::none()).unwrap();
-        let loaded = db.get_run(run.id).unwrap().unwrap();
-        assert_eq!(loaded.total_tokens, 0);
+        let run = db.create_run("objective", Some("codex")).unwrap();
+
+        let session = AgentSession {
+            id: 0,
+            run_id: Some(run.id),
+            task_id: None,
+            role: "planner".to_string(),
+            agent: "codex".to_string(),
+            command: "codex exec".to_string(),
+            status: "success".to_string(),
+            started_at: "2026-01-01T00:00:00Z".to_string(),
+            finished_at: Some("2026-01-01T00:00:01Z".to_string()),
+            exit_code: Some(0),
+            duration_ms: Some(1200),
+            stdout: Some("{\"objective\":\"x\"}".to_string()),
+            stderr: Some(String::new()),
+        };
+        let saved = db.insert_agent_session(&session).unwrap();
+        assert!(saved.id > 0);
+
+        let sessions = db.list_agent_sessions(Some(run.id)).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].agent, "codex");
+        assert_eq!(sessions[0].role, "planner");
+        assert_eq!(sessions[0].exit_code, Some(0));
+        assert!(sessions[0].stdout.as_deref().unwrap().contains("objective"));
+
+        assert!(db.list_agent_sessions(None).unwrap().len() >= 1);
     }
 }
