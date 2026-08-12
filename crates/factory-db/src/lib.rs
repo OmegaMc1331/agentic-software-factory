@@ -19,9 +19,9 @@ fn now() -> String {
 
 impl FactoryDb {
     pub fn open(path: &Path) -> Result<Self> {
-        let conn = Connection::open(path)?;
+        let mut conn = Connection::open(path)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
-        migrate(&conn)?;
+        migrate(&mut conn)?;
         Ok(FactoryDb { conn })
     }
 
@@ -142,6 +142,25 @@ impl FactoryDb {
             "UPDATE tasks SET state = ?1, updated_at = ?2 WHERE id = ?3",
             params![state.as_str(), now(), id],
         )?;
+        let run_id: Option<i64> = self
+            .conn
+            .query_row("SELECT run_id FROM tasks WHERE id = ?1", params![id], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        if let Some(run_id) = run_id {
+            self.reconcile_run(run_id)?;
+        }
+        Ok(())
+    }
+
+    pub fn reconcile_run(&self, run_id: i64) -> Result<()> {
+        let tasks = self.list_tasks(run_id)?;
+        let status = RunStatus::from_tasks(&tasks);
+        let current = self.get_run(run_id)?.map(|run| run.status);
+        if current != Some(status) {
+            self.set_run_status(run_id, status)?;
+        }
         Ok(())
     }
 
@@ -251,63 +270,210 @@ fn run_status(s: String) -> RunStatus {
     }
 }
 
-fn migrate(conn: &Connection) -> Result<()> {
+const V1_SCHEMA: &str = "\
+CREATE TABLE IF NOT EXISTS runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    objective TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'planned',
+    planner_agent TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS tasks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    title TEXT NOT NULL,
+    objective TEXT NOT NULL,
+    acceptance_criteria TEXT NOT NULL DEFAULT '[]',
+    state TEXT NOT NULL DEFAULT 'pending',
+    position INTEGER NOT NULL,
+    worktree_path TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS task_dependencies (
+    task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    depends_on INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    PRIMARY KEY (task_id, depends_on)
+);
+CREATE TABLE IF NOT EXISTS agent_sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER REFERENCES runs(id) ON DELETE CASCADE,
+    task_id INTEGER REFERENCES tasks(id) ON DELETE CASCADE,
+    role TEXT NOT NULL,
+    agent TEXT NOT NULL,
+    command TEXT NOT NULL,
+    status TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    exit_code INTEGER,
+    duration_ms INTEGER,
+    stdout TEXT,
+    stderr TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_tasks_run ON tasks(run_id);
+CREATE INDEX IF NOT EXISTS idx_task_deps_dep ON task_dependencies(depends_on);
+CREATE INDEX IF NOT EXISTS idx_sessions_run ON agent_sessions(run_id);
+";
+
+const V2_SCHEMA: &str = "CREATE INDEX IF NOT EXISTS idx_tasks_run_state ON tasks(run_id, state);";
+
+const MIGRATIONS: &[&str] = &[V1_SCHEMA, V2_SCHEMA];
+
+fn migrate(conn: &mut Connection) -> Result<()> {
+    migrate_schemas(conn, MIGRATIONS)
+}
+
+fn migrate_schemas(conn: &mut Connection, schemas: &[&str]) -> Result<()> {
     conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS runs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            objective TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'planned',
-            planner_agent TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS tasks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
-            title TEXT NOT NULL,
-            objective TEXT NOT NULL,
-            acceptance_criteria TEXT NOT NULL DEFAULT '[]',
-            state TEXT NOT NULL DEFAULT 'pending',
-            position INTEGER NOT NULL,
-            worktree_path TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS task_dependencies (
-            task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-            depends_on INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-            PRIMARY KEY (task_id, depends_on)
-        );
-        CREATE TABLE IF NOT EXISTS agent_sessions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            run_id INTEGER REFERENCES runs(id) ON DELETE CASCADE,
-            task_id INTEGER REFERENCES tasks(id) ON DELETE CASCADE,
-            role TEXT NOT NULL,
-            agent TEXT NOT NULL,
-            command TEXT NOT NULL,
-            status TEXT NOT NULL,
-            started_at TEXT NOT NULL,
-            finished_at TEXT,
-            exit_code INTEGER,
-            duration_ms INTEGER,
-            stdout TEXT,
-            stderr TEXT
-        );
-        CREATE INDEX IF NOT EXISTS idx_tasks_run ON tasks(run_id);
-        CREATE INDEX IF NOT EXISTS idx_task_deps_dep ON task_dependencies(depends_on);
-        CREATE INDEX IF NOT EXISTS idx_sessions_run ON agent_sessions(run_id);
-        PRAGMA foreign_keys = ON;
-        ",
+        "CREATE TABLE IF NOT EXISTS schema_migrations (
+            version INTEGER PRIMARY KEY,
+            applied_at TEXT NOT NULL
+        );",
     )?;
+    let applied: Vec<i64> = conn
+        .prepare("SELECT version FROM schema_migrations ORDER BY version")?
+        .query_map([], |r| r.get(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    for (index, schema) in schemas.iter().enumerate() {
+        let version = index as i64 + 1;
+        if applied.contains(&version) {
+            continue;
+        }
+        let tx = conn.transaction()?;
+        tx.execute_batch(schema)?;
+        tx.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+            params![version, now()],
+        )?;
+        tx.commit()?;
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use factory_types::{AgentSession, TaskState};
+    use factory_types::{AgentSession, RunStatus, TaskState};
+    use rusqlite::Connection;
     use tempfile::TempDir;
 
-    use crate::FactoryDb;
+    use crate::{FactoryDb, V1_SCHEMA};
+
+    #[test]
+    fn applies_all_migrations_exactly_once() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.db");
+        let db = FactoryDb::open(&path).unwrap();
+        let versions = schema_versions(&path);
+        assert_eq!(versions, vec![1, 2]);
+        db.create_run("objective", Some("codex")).unwrap();
+        drop(db);
+
+        let db = FactoryDb::open(&path).unwrap();
+        assert_eq!(schema_versions(&path), vec![1, 2]);
+        db.list_runs().unwrap();
+    }
+
+    #[test]
+    fn older_schema_migrates_forward() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("old.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(V1_SCHEMA).unwrap();
+        conn.execute(
+            "INSERT INTO runs (objective, status, planner_agent, created_at, updated_at)
+             VALUES ('legacy', 'planned', NULL, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tasks (run_id, title, objective, acceptance_criteria, state, position, created_at, updated_at)
+             VALUES (1, 'old task', 'old', '[]', 'completed', 0, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let db = FactoryDb::open(&path).unwrap();
+        assert_eq!(schema_versions(&path), vec![1, 2]);
+        let run = db.get_run(1).unwrap().unwrap();
+        assert_eq!(run.objective, "legacy");
+        let tasks = db.list_tasks(1).unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].title, "old task");
+    }
+
+    #[test]
+    fn failed_migration_rolls_back_without_recording() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::migrate_schemas(&mut conn, &[crate::V1_SCHEMA]).unwrap();
+        let result = crate::migrate_schemas(
+            &mut conn,
+            &[crate::V1_SCHEMA, "INSERT INTO missing_table VALUES (1)"],
+        );
+        assert!(result.is_err());
+        let versions = schema_versions_conn(&conn);
+        assert_eq!(versions, vec![1]);
+    }
+
+    #[test]
+    fn run_status_follows_task_state() {
+        let dir = TempDir::new().unwrap();
+        let db = FactoryDb::open(&dir.path().join("test.db")).unwrap();
+        let run = db.create_run("objective", Some("codex")).unwrap();
+        let a = db
+            .create_task(run.id, "A", "a", &[], TaskState::Ready, 0)
+            .unwrap();
+        let b = db
+            .create_task(run.id, "B", "b", &[], TaskState::Ready, 1)
+            .unwrap();
+        assert_eq!(
+            db.get_run(run.id).unwrap().unwrap().status,
+            RunStatus::Planned
+        );
+
+        db.set_task_state(a, TaskState::Running).unwrap();
+        assert_eq!(
+            db.get_run(run.id).unwrap().unwrap().status,
+            RunStatus::Active
+        );
+
+        db.set_task_state(a, TaskState::Failed).unwrap();
+        assert_eq!(
+            db.get_run(run.id).unwrap().unwrap().status,
+            RunStatus::Failed
+        );
+
+        db.set_task_state(a, TaskState::Ready).unwrap();
+        db.set_task_state(a, TaskState::Running).unwrap();
+        db.set_task_state(a, TaskState::Completed).unwrap();
+        assert_eq!(
+            db.get_run(run.id).unwrap().unwrap().status,
+            RunStatus::Active
+        );
+
+        db.set_task_state(b, TaskState::Running).unwrap();
+        db.set_task_state(b, TaskState::Completed).unwrap();
+        assert_eq!(
+            db.get_run(run.id).unwrap().unwrap().status,
+            RunStatus::Completed
+        );
+    }
+
+    fn schema_versions(path: &std::path::Path) -> Vec<i64> {
+        let conn = Connection::open(path).unwrap();
+        schema_versions_conn(&conn)
+    }
+
+    fn schema_versions_conn(conn: &Connection) -> Vec<i64> {
+        let mut stmt = conn
+            .prepare("SELECT version FROM schema_migrations ORDER BY version")
+            .unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
 
     #[test]
     fn persists_run_tasks_and_dependencies() {
