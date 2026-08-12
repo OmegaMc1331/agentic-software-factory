@@ -42,6 +42,33 @@ The main view lists every run: id, objective, status, planner agent, a progress 
 - **Tasks table**: id, title, objective, status badge, dependency list, and worktree
   path.
 
+### Agent Graph
+
+The `Agent Graph` tab (`#/network`) renders the whole factory as a connected,
+brain-like network rather than a single run. It is a separate React route in `App.tsx`,
+read from the `GET /api/graph` endpoint (`fetchGraph` in `api.ts`).
+
+- **Layout**: nodes are placed in left-to-right lanes — `agent`, `role`, `run`, `task` —
+  with each lane spread across the full viewport height and deterministic jitter so the
+  cloud reads as organic rather than gridded. Edges between lanes are curved beziers;
+  same-lane `depends` edges (task → task) bow out as quadratics.
+- **Node kinds**:
+  - `agent` — blue when `available` (its command resolves on `PATH`), red when missing.
+  - `role` — violet.
+  - `run` — sky, with a status dot.
+  - `task` — colored by `state`.
+- **Edge kinds**: `binds` (role → agent), `uses` (run → planner role/agent),
+  `contains` (run → task), `depends` (task → task).
+- **Interaction**: hovering or clicking a node opens a side inspector (`NodeInfo.tsx`)
+  with the node's real fields and — for tasks — its dependency and blocked relationships.
+  The selected node, its neighbors, and connecting edges highlight while everything else
+  dims.
+- **Motion**: running runs and in-flight tasks get a subtle pulse ring; edges out of
+  active runs (and into running tasks) animate a slow dash-flow. Both are suppressed
+  under `prefers-reduced-motion`.
+- The view is hand-rolled SVG/React (`NetworkGraph.tsx` + `NetworkView.tsx`); no graph
+  library was introduced.
+
 ## Layout module
 
 `src/layout.ts` is pure and unit-tested (Vitest):
@@ -49,6 +76,13 @@ The main view lists every run: id, objective, status, planner agent, a progress 
 - `computeLayout(tasks)` - assigns each task a level by longest dependency path, then
   x/y coordinates per level, and returns nodes, edges, and canvas size.
 - `truncate(value, max)` - ellipsized labels for the graph nodes.
+
+`src/networkLayout.ts` is also pure and unit-tested:
+
+- `computeNetworkLayout(nodes, edges, opts)` - groups nodes by `kind` into lanes,
+  positions each lane, and returns positioned nodes, edges (with per-kind control
+  points), and canvas dimensions. Kept free of React imports so it can be unit-tested
+  and reused.
 
 ## Checks
 

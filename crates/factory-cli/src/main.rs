@@ -361,6 +361,7 @@ fn serve(root: &Path, port: u16) -> Result<()> {
     let db = FactoryDb::open(&root.join(FACTORY_DIR).join("db.sqlite3"))?;
     let state = factory_api::ApiState {
         db: std::sync::Mutex::new(db),
+        root: root.to_path_buf(),
     };
     let shared = std::sync::Arc::new(state);
     println!("Factory API listening on http://127.0.0.1:{port}");

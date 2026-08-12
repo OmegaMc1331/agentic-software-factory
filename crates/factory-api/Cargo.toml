@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 factory-types = { workspace = true }
 factory-db = { workspace = true }
+factory-core = { workspace = true }
 axum = "0.7"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 tower-http = { version = "0.5", features = ["cors"] }

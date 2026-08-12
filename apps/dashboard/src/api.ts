@@ -1,4 +1,4 @@
-import type { RunDetail, RunSummary } from "./types";
+import type { GraphData, RunDetail, RunSummary } from "./types";
 
 const API_BASE = "/api";
 
@@ -16,6 +16,10 @@ export function fetchRuns(): Promise<RunSummary[]> {
 
 export function fetchRun(id: number): Promise<RunDetail> {
   return get<RunDetail>(`/runs/${id}`);
+}
+
+export function fetchGraph(): Promise<GraphData> {
+  return get<GraphData>("/graph");
 }
 
 export function progress(counts: { completed: number; total: number }): number {

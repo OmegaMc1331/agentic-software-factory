@@ -1,12 +1,23 @@
 import { useCallback, useEffect, useState } from "react";
 import { fetchRun, fetchRuns } from "./api";
+import { NetworkView } from "./components/NetworkView";
 import { RunDetailView } from "./components/RunDetailView";
 import { RunList } from "./components/RunList";
 import type { RunDetail, RunSummary } from "./types";
 
-function runIdFromHash(): number | null {
-  const match = window.location.hash.match(/^#\/runs\/(\d+)$/);
-  return match ? Number(match[1]) : null;
+type View = { name: "runs" } | { name: "network" } | { name: "run"; id: number };
+
+function viewFromHash(): View {
+  const runMatch = window.location.hash.match(/^#\/runs\/(\d+)$/);
+  if (runMatch) return { name: "run", id: Number(runMatch[1]) };
+  if (window.location.hash.startsWith("#/network")) return { name: "network" };
+  return { name: "runs" };
+}
+
+function hashFor(view: View): string {
+  if (view.name === "run") return `#/runs/${view.id}`;
+  if (view.name === "network") return "#/network";
+  return "#/";
 }
 
 function Loading() {
@@ -16,10 +27,12 @@ function Loading() {
 export default function App() {
   const [runs, setRuns] = useState<RunSummary[] | null>(null);
   const [detail, setDetail] = useState<RunDetail | null>(null);
+  const [view, setView] = useState<View>(viewFromHash);
   const [error, setError] = useState<string | null>(null);
 
   const loadRun = useCallback((id: number) => {
     setDetail(null);
+    setError(null);
     fetchRun(id)
       .then(setDetail)
       .catch((err: Error) => setError(err.message));
@@ -32,25 +45,23 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    const applyHash = () => {
-      const id = runIdFromHash();
-      if (id !== null) {
-        loadRun(id);
-      } else {
-        setDetail(null);
-      }
-    };
+    const applyHash = () => setView(viewFromHash());
     applyHash();
     window.addEventListener("hashchange", applyHash);
     return () => window.removeEventListener("hashchange", applyHash);
-  }, [loadRun]);
+  }, []);
 
-  const openRun = (id: number) => {
-    window.location.hash = `#/runs/${id}`;
-  };
+  useEffect(() => {
+    if (view.name === "run") {
+      loadRun(view.id);
+    } else {
+      setDetail(null);
+    }
+  }, [view, loadRun]);
 
-  const back = () => {
-    window.location.hash = "#/";
+  const navigate = (next: View) => {
+    setError(null);
+    window.location.hash = hashFor(next);
   };
 
   return (
@@ -61,20 +72,36 @@ export default function App() {
           <span className="brand-name">Agentic Software Factory</span>
         </div>
         <nav className="nav">
-          <button className="nav-link nav-active" onClick={back}>
+          <button
+            className={view.name === "network" ? "nav-link" : "nav-link nav-active"}
+            onClick={() => navigate({ name: "runs" })}
+          >
             Runs
+          </button>
+          <button
+            className={view.name === "network" ? "nav-link nav-active" : "nav-link"}
+            onClick={() => navigate({ name: "network" })}
+          >
+            Agent Graph
           </button>
         </nav>
       </header>
 
       <main className="content">
-        {error && <p className="error">{error}</p>}
-        {!error && runs === null && <Loading />}
-        {!error && runs !== null && detail === null && (
-          <RunList runs={runs} onSelect={openRun} />
-        )}
-        {!error && detail !== null && (
-          <RunDetailView detail={detail} onBack={back} />
+        {view.name === "network" ? (
+          <NetworkView />
+        ) : (
+          <>
+            {error && <p className="error">{error}</p>}
+            {view.name === "run" && !error && detail !== null && (
+              <RunDetailView detail={detail} onBack={() => navigate({ name: "runs" })} />
+            )}
+            {view.name === "run" && !error && detail === null && <Loading />}
+            {view.name === "runs" && !error && runs === null && <Loading />}
+            {view.name === "runs" && !error && runs !== null && (
+              <RunList runs={runs} onSelect={(id) => navigate({ name: "run", id })} />
+            )}
+          </>
         )}
       </main>
     </div>

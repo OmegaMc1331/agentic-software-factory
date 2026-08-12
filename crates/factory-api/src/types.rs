@@ -63,3 +63,28 @@ pub struct RunDetail {
     pub run: Run,
     pub tasks: Vec<Task>,
 }
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphNode {
+    pub id: String,
+    pub kind: String,
+    pub label: String,
+    pub meta: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphEdge {
+    pub source: String,
+    pub target: String,
+    pub kind: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphResponse {
+    pub nodes: Vec<GraphNode>,
+    pub edges: Vec<GraphEdge>,
+    pub metadata: serde_json::Value,
+}

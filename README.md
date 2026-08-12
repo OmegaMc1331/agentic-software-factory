@@ -185,6 +185,7 @@ dashboard:
 | GET    | `/api/health`    | Service health                     |
 | GET    | `/api/runs`      | Runs with per-state task counts    |
 | GET    | `/api/runs/:id`  | Full run and its tasks                 |
+| GET    | `/api/graph`     | Agents, roles, runs, and tasks as a network |
 
 ## 8. The dashboard
 
@@ -204,6 +205,17 @@ a failed dependency renders the transitive `blocked` cascade.
 ![Runs overview](docs/assets/dashboard-runs.png)
 ![Run detail with dependency graph](docs/assets/dashboard-run-detail.png)
 ![Blocked cascade after a failed task](docs/assets/dashboard-blocked-cascade.png)
+
+The **Agent Graph** tab (`#/network`) renders the whole factory as a connected,
+brain-like network: agents, roles, runs, and tasks laid out in left-to-right lanes
+(agent → role → run → task) with curved edges. Hover or click a node to open a side
+inspector with its real details and dependency/blocked relationships; neighbors and edges
+highlight while the rest dim. Running runs and in-flight tasks get a subtle pulse, and
+edges from active runs animate a slow dash-flow (both disabled under
+`prefers-reduced-motion`). The graph is a pure SVG/React view — no graph library — and
+its layout is a unit-tested pure function in `apps/dashboard/src/networkLayout.ts`.
+
+> Screenshots of the Agent Graph tab are pending; the view is described above and implemented in `apps/dashboard/src/components/`.
 
 ## 9. Testing
 
