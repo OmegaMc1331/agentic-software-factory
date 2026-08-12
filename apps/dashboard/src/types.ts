@@ -47,6 +47,25 @@ export interface RunDetail {
   tasks: Task[];
 }
 
+export interface AgentEntry {
+  command: string;
+  args: string[];
+  env: Record<string, string>;
+  capabilities?: string[];
+}
+
+export interface ConfigData {
+  agents: Record<string, AgentEntry>;
+  roles: Record<string, { agent: string }>;
+}
+
+export interface AgentStatusInfo {
+  name: string;
+  command: string;
+  args: string[];
+  available: boolean;
+}
+
 export type GraphNodeKind = "agent" | "role" | "run" | "task";
 export type GraphEdgeKind = "binds" | "uses" | "contains" | "depends";
 
@@ -130,12 +149,6 @@ function runNodeId(node: GraphNode): number {
   return Number(node.id.slice("run:".length)) || 0;
 }
 
-/**
- * Activity for an agent, derived from the roles it fills and the runs that use
- * them. The graph endpoint does not expose session records, so this is the
- * closest honest signal: an agent is working when one of its runs is active,
- * surfacing the newest running task in it when present.
- */
 export function agentActivity(
   agentId: string,
   nodesById: Map<string, GraphNode>,

@@ -3,26 +3,36 @@ import { fetchRun, fetchRuns } from "./api";
 import { NetworkView } from "./components/NetworkView";
 import { RunDetailView } from "./components/RunDetailView";
 import { RunList } from "./components/RunList";
+import { SettingsView } from "./components/Settings";
 import type { RunDetail, RunSummary } from "./types";
 
-type View = { name: "runs" } | { name: "network" } | { name: "run"; id: number };
+type View =
+  { name: "runs" } | { name: "network" } | { name: "settings" } | { name: "run"; id: number };
 
 function viewFromHash(): View {
   const runMatch = window.location.hash.match(/^#\/runs\/(\d+)$/);
   if (runMatch) return { name: "run", id: Number(runMatch[1]) };
   if (window.location.hash.startsWith("#/network")) return { name: "network" };
+  if (window.location.hash.startsWith("#/settings")) return { name: "settings" };
   return { name: "runs" };
 }
 
 function hashFor(view: View): string {
   if (view.name === "run") return `#/runs/${view.id}`;
   if (view.name === "network") return "#/network";
+  if (view.name === "settings") return "#/settings";
   return "#/";
 }
 
 function Loading() {
   return <p className="empty-title">Loading…</p>;
 }
+
+const NAV: { view: View["name"]; label: string }[] = [
+  { view: "runs", label: "Runs" },
+  { view: "network", label: "Agent Graph" },
+  { view: "settings", label: "Settings" },
+];
 
 export default function App() {
   const [runs, setRuns] = useState<RunSummary[] | null>(null);
@@ -38,11 +48,16 @@ export default function App() {
       .catch((err: Error) => setError(err.message));
   }, []);
 
-  useEffect(() => {
+  const loadRuns = useCallback(() => {
+    setError(null);
     fetchRuns()
       .then(setRuns)
       .catch((err: Error) => setError(err.message));
   }, []);
+
+  useEffect(() => {
+    loadRuns();
+  }, [loadRuns]);
 
   useEffect(() => {
     const applyHash = () => setView(viewFromHash());
@@ -72,24 +87,31 @@ export default function App() {
           <span className="brand-name">Agentic Software Factory</span>
         </div>
         <nav className="nav">
-          <button
-            className={view.name === "network" ? "nav-link" : "nav-link nav-active"}
-            onClick={() => navigate({ name: "runs" })}
-          >
-            Runs
-          </button>
-          <button
-            className={view.name === "network" ? "nav-link nav-active" : "nav-link"}
-            onClick={() => navigate({ name: "network" })}
-          >
-            Agent Graph
-          </button>
+          {NAV.map((item) => (
+            <button
+              key={item.view}
+              className={view.name === item.view ? "nav-link nav-active" : "nav-link"}
+              onClick={() =>
+                navigate(
+                  item.view === "runs"
+                    ? { name: "runs" }
+                    : item.view === "network"
+                      ? { name: "network" }
+                      : { name: "settings" }
+                )
+              }
+            >
+              {item.label}
+            </button>
+          ))}
         </nav>
       </header>
 
       <main className={view.name === "network" ? "content content--wide" : "content"}>
         {view.name === "network" ? (
           <NetworkView />
+        ) : view.name === "settings" ? (
+          <SettingsView />
         ) : (
           <>
             {error && <p className="error">{error}</p>}

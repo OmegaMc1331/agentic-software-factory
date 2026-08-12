@@ -2,7 +2,7 @@ import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useSta
 import type { GraphNode } from "../types";
 import { taskMeta } from "../types";
 import type { AgentActivity } from "../types";
-import type { NetworkLayout } from "../networkLayout";
+import type { NetworkLayout, NetworkNodePos } from "../networkLayout";
 import { GraphEdge } from "./GraphEdge";
 import { GraphNode as GraphNodeView } from "./GraphNode";
 
@@ -15,6 +15,16 @@ const ZOOM_MIN = 0.12;
 const ZOOM_MAX = 3.2;
 
 const EASE = "transform 0.4s cubic-bezier(0.22, 1, 0.36, 1)";
+
+function topmostHit(wx: number, wy: number, nodes: NetworkNodePos[]): NetworkNodePos | null {
+  for (let i = nodes.length - 1; i >= 0; i -= 1) {
+    const pos = nodes[i];
+    if (wx >= pos.x && wx <= pos.x + pos.width && wy >= pos.y && wy <= pos.y + pos.height) {
+      return pos;
+    }
+  }
+  return null;
+}
 
 export const AgentGraph = forwardRef<
   AgentGraphHandle,
@@ -113,22 +123,13 @@ export const AgentGraph = forwardRef<
     const current = viewRef.current;
     const wx = (px - current.x) / current.s;
     const wy = (py - current.y) / current.s;
-    // Walk boxes in render order (selected drawn last on top) and take the
-    // topmost hit.
     const candidates =
       selectedId === null
         ? layoutRef.current.nodes
         : [...layoutRef.current.nodes].sort(
             (a, b) => Number(a.id === selectedId) - Number(b.id === selectedId)
           );
-    let hit: (typeof layoutRef.current.nodes)[number] | null = null;
-    for (let i = candidates.length - 1; i >= 0; i -= 1) {
-      const pos = candidates[i];
-      if (wx >= pos.x && wx <= pos.x + pos.width && wy >= pos.y && wy <= pos.y + pos.height) {
-        hit = pos;
-        break;
-      }
-    }
+    const hit = topmostHit(wx, wy, candidates);
     if (hit) onNodeClick(hit.id);
     else onBackgroundClick();
   };

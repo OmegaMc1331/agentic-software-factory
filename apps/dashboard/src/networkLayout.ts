@@ -30,7 +30,6 @@ export const MIN_CANVAS_WIDTH = 960;
 export const MIN_CANVAS_HEIGHT = 620;
 export const BOUNDS_PADDING = 150;
 
-// Rest length an edge wants to settle at.
 const EDGE_REST: Record<GraphEdgeKind, number> = {
   binds: 150,
   uses: 175,
@@ -38,9 +37,6 @@ const EDGE_REST: Record<GraphEdgeKind, number> = {
   depends: 105,
 };
 
-// How strongly a node is pinned to its "home" position. Runs and agents hold
-// their place so the composition reads as a stable system; tasks drift freely
-// and only cluster through edges.
 const ANCHOR: Record<GraphNodeKind, number> = {
   agent: 0.115,
   role: 0.08,
@@ -72,7 +68,6 @@ function nodeSize(node: GraphNode): { width: number; height: number } {
   }
 }
 
-/** Deterministic small offset for a node id, in [-0.9, 0.9]. */
 export function jitter(id: string, spread = 1): number {
   let hash = 0;
   for (let i = 0; i < id.length; i += 1) {
@@ -122,8 +117,6 @@ function homes(nodes: GraphNode[], edges: GraphEdge[]): Map<string, { x: number;
     const boundAgent = edges.find((e) => e.source === node.id && e.kind === "binds")?.target;
     const agentPos = boundAgent ? agentLookup.get(boundAgent) : undefined;
     if (agentPos) {
-      // Roles float in the "orchestration" band above the hub, fanned out
-      // sideways so several roles on one agent still stay readable.
       result.set(node.id, {
         x: agentPos.x + jitter(node.id) * 100,
         y: ROLE_BAND_Y + jitter(node.id, 3) * 20,
