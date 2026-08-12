@@ -55,7 +55,7 @@ impl FactoryDb {
              FROM runs ORDER BY id DESC",
         )?;
         let rows = stmt
-            .query_map([], |r| build_run(r))?
+            .query_map([], build_run)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
     }
@@ -406,6 +406,6 @@ mod tests {
         assert_eq!(sessions[0].exit_code, Some(0));
         assert!(sessions[0].stdout.as_deref().unwrap().contains("objective"));
 
-        assert!(db.list_agent_sessions(None).unwrap().len() >= 1);
+        assert!(!db.list_agent_sessions(None).unwrap().is_empty());
     }
 }
