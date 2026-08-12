@@ -9,7 +9,12 @@ factory-types = { workspace = true }
 factory-db = { workspace = true }
 factory-core = { workspace = true }
 axum = "0.7"
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
-tower-http = { version = "0.5", features = ["cors"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs"] }
+tower-http = { version = "0.5", features = ["fs"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+tower = { version = "0.4", features = ["util"] }
+http-body-util = "0.1"

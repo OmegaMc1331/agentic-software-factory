@@ -1,16 +1,16 @@
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use axum::extract::{Path, State};
+use axum::extract::{Path as UrlPath, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
-use factory_core::Agents;
+use factory_core::{Agents, Config, ConfigError};
 use factory_db::FactoryDb;
 use serde_json::json;
-use tower_http::cors::CorsLayer;
+use tower_http::services::{ServeDir, ServeFile};
 
 use crate::types::{GraphEdge, GraphNode, GraphResponse, RunDetail, RunSummary, TaskCounts};
 
@@ -52,20 +52,84 @@ impl From<factory_db::DbError> for ApiError {
     }
 }
 
+impl From<ConfigError> for ApiError {
+    fn from(err: ConfigError) -> Self {
+        let status = match err {
+            ConfigError::Missing(_) | ConfigError::Parse(_, _) => StatusCode::BAD_REQUEST,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        ApiError::new(status, err.to_string())
+    }
+}
+
 pub fn router(state: SharedState) -> Router {
     Router::new()
         .route("/api/health", get(health))
         .route("/api/runs", get(list_runs))
         .route("/api/runs/:id", get(get_run))
         .route("/api/graph", get(get_graph))
+        .route("/api/agents", get(get_agents))
+        .route("/api/config", get(get_config).put(put_config))
+        .route("/api/*rest", get(api_not_found))
+        .fallback_service(dashboard_service(&state.root))
         .with_state(state)
-        .layer(CorsLayer::permissive())
+}
+
+async fn api_not_found() -> ApiError {
+    ApiError::new(StatusCode::NOT_FOUND, "unknown endpoint")
 }
 
 pub async fn run_app(state: SharedState, port: u16) -> std::io::Result<()> {
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, router(state)).await
+}
+
+fn dashboard_service(root: &Path) -> Router {
+    let dir = find_dashboard_dir(root).unwrap_or_else(dashboard_stub_dir);
+    Router::new().fallback_service(
+        ServeDir::new(&dir).not_found_service(ServeFile::new(dir.join("index.html"))),
+    )
+}
+
+fn dashboard_stub_dir() -> PathBuf {
+    let dir = std::env::temp_dir().join("factory-dashboard-stub");
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(
+        dir.join("index.html"),
+        "<!doctype html><meta charset=\"utf-8\"><title>Agentic Software Factory</title>\
+         <style>body{font-family:system-ui,sans-serif;background:#0f1115;color:#d7dce3;margin:48px auto;max-width:560px;line-height:1.6}</style>\
+         <h1>Dashboard not built</h1>\
+         <p>The dashboard has not been built yet. From the project root run:</p>\
+         <pre>cd apps/dashboard\nnpm install\nnpm run build</pre>\
+         <p>Then restart <code>factory start</code>.</p>",
+    )
+    .ok();
+    dir
+}
+
+fn find_dashboard_dir(start: &Path) -> Option<PathBuf> {
+    let mut cursor = Some(start.to_path_buf());
+    while let Some(dir) = cursor {
+        let candidate = dir.join("apps").join("dashboard").join("dist");
+        if candidate.join("index.html").is_file() {
+            return Some(candidate);
+        }
+        cursor = dir.parent().map(Path::to_path_buf);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            let mut cursor = Some(parent.to_path_buf());
+            while let Some(dir) = cursor {
+                let candidate = dir.join("apps").join("dashboard").join("dist");
+                if candidate.join("index.html").is_file() {
+                    return Some(candidate);
+                }
+                cursor = dir.parent().map(Path::to_path_buf);
+            }
+        }
+    }
+    None
 }
 
 async fn health() -> Json<serde_json::Value> {
@@ -92,7 +156,7 @@ async fn list_runs(State(state): State<SharedState>) -> Result<Json<Vec<RunSumma
 
 async fn get_run(
     State(state): State<SharedState>,
-    Path(id): Path<i64>,
+    UrlPath(id): UrlPath<i64>,
 ) -> Result<Json<RunDetail>, ApiError> {
     let db = state.db.lock().expect("db mutex poisoned");
     let run = db.get_run(id)?.ok_or(ApiError::new(
@@ -101,6 +165,32 @@ async fn get_run(
     ))?;
     let tasks = db.list_tasks(id)?;
     Ok(Json(RunDetail { run, tasks }))
+}
+
+async fn get_agents(
+    State(state): State<SharedState>,
+) -> Result<Json<Vec<factory_core::AgentInfo>>, ApiError> {
+    let agents = Agents::load(&state.root)?;
+    Ok(Json(agents.list()))
+}
+
+async fn get_config(State(state): State<SharedState>) -> Result<Json<Config>, ApiError> {
+    let config = Config::load(&state.root)?;
+    Ok(Json(config))
+}
+
+async fn put_config(
+    State(state): State<SharedState>,
+    body: Result<Json<Config>, axum::extract::rejection::JsonRejection>,
+) -> Result<StatusCode, ApiError> {
+    let config = body
+        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "invalid JSON body"))?
+        .0;
+    config
+        .validate()
+        .map_err(|reason| ApiError::new(StatusCode::BAD_REQUEST, reason))?;
+    config.write_atomic(&state.root).map_err(ApiError::from)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn get_graph(State(state): State<SharedState>) -> Result<Json<GraphResponse>, ApiError> {
