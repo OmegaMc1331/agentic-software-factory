@@ -18,7 +18,7 @@ changes aligned with its core principles.
 
 ## Development setup
 
-Requirements: Rust (stable), Node.js 18+ for the dashboard.
+See [docs/development.md](docs/development.md) for the full contributor workflow.
 
 ```bash
 cargo build
@@ -26,19 +26,15 @@ cargo test
 cd apps/dashboard && npm install
 ```
 
-The whole system works offline via the deterministic local planner, so a full manual
-pass does not require any agent CLI to be installed.
-
 ## Making changes
 
 - Run `cargo fmt --all` and `cargo clippy --workspace --all-targets` before committing;
   CI fails on violations.
 - For the dashboard run `npm run format`, `npm test`, `npm run typecheck`, and
   `npm run lint`.
-- Add or update tests for every behavior change. Worktree tests live under
-  `crates/factory-core/tests/` (e2e) and are intentionally slow (they call git).
-- Keep the README section count and headings stable unless a section is genuinely
-  obsolete.
+- Add or update tests for every behavior change. Worktree tests under
+  `crates/factory-core/tests/` (e2e) and `crates/factory-git/` are intentionally slow
+  because they call git.
 
 ## Commit messages
 

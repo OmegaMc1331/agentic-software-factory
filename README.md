@@ -1,139 +1,100 @@
 # Agentic Software Factory
 
-Agentic Software Factory orchestrates coding agents through structured, verifiable
-execution: an agent plans a software objective into ordered tasks, every task runs in
-its own isolated git worktree, and the system persists all state locally in SQLite.
+Agentic Software Factory is a local tool that orchestrates coding agents through
+structured tasks and isolated git worktrees. You install and authenticate the agents
+(Codex, Claude Code, OpenCode, Gemini CLI, or any custom CLI); the factory plans a run
+into tasks with dependencies and acceptance criteria, gives each task its own git
+worktree, and records every step in a local SQLite database.
 
-Instead of letting an agent roam freely over a repository, the factory decomposes work
-into tasks with explicit acceptance criteria and dependencies, tracks their state as a
-strict state machine, and records every step in a local database you can inspect
-through a CLI, an HTTP API, and a dashboard.
+![Factory network](docs/assets/dashboard-network.png)
 
-## Core principles
+## What it does
 
-- **The system owns state.** All of it lives in `.factory/`: the SQLite database, the
-  worktrees, and nothing else. The repository stays clean.
-- **Tasks are verifiable.** Every task carries acceptance criteria. A task is only ever
-  `completed` by a human or agent that confirms those criteria, never by assumption.
-- **Strict transitions.** Each task moves through `pending -> ready -> running ->
-  completed` (or `failed`, with `blocked` derived from dependencies). A worktree is
-  created while a task is `ready`; completing requires the task to be `running`.
-  Invalid transitions are rejected, including any attempt to skip ahead.
-- **Dependencies are transitive.** Marking a task as completed or failed cascades to its
-  dependents. Blocked tasks propagate `blocked` up the graph until their blockers clear.
-- **Isolation.** Each task gets a branch (`factory/t<id>`) and a worktree
-  (`.factory/worktrees/t<id>`), so parallel agents never collide.
-- **No magic.** Agents are external coding CLIs (Codex, Claude Code, OpenCode, ...) that
-  you install and authenticate yourself. The factory only orchestrates them, and ships
-  with a deterministic local planner as a fallback, so the whole system works offline
-  and is testable.
+- Plans a software objective into ordered tasks with acceptance criteria and
+  dependencies using a configured planner agent.
+- Gives each task an isolated git worktree on its own branch.
+- Tracks every task through a strict state machine (`pending -> ready -> running ->
+  completed`, or `failed`/`blocked`).
+- Derives the run status from its tasks (planned, active, completed, failed).
+- Records every agent invocation (command, exit code, output) in SQLite.
+- Serves a local dashboard for runs, the agent network, and configuration.
 
-## Contents
+The factory does **not** manage model providers. It has no API keys and never calls a
+model API. Agents are external coding CLIs that you install and authenticate yourself;
+the factory only runs their commands.
 
-1. [State and filesystem](#1-state-and-filesystem)
-2. [Installation](#2-installation)
-3. [The task lifecycle](#3-the-task-lifecycle)
-4. [Worktrees](#4-worktrees)
-5. [Agents](#5-agents)
-6. [The CLI](#6-the-cli)
-7. [The HTTP API](#7-the-http-api)
-8. [The dashboard](#8-the-dashboard)
-9. [Testing](#9-testing)
-10. [Roadmap](#10-roadmap)
+## How it works
 
-## 1. State and filesystem
+```text
+CLI / Dashboard
+      │
+      ▼
+Factory core ── planner runs a coding agent as a subprocess
+      │
+      ├── SQLite (runs, tasks, sessions)
+      └── git worktrees (.factory/worktrees/t<task-id>)
+```
 
-The factory root is the directory where you run `factory`. All state lives under
-`.factory/`, which is ignored by Git:
+A run is created with `factory run "<objective>"`. The factory resolves the planner
+role from `.factory/config.toml`, asks that agent for a JSON plan, validates it, and
+persists the run and its tasks. Each first task starts `ready`; tasks with dependencies
+start `pending`. You move tasks through the state machine from the dashboard's
+development commands (`factory dev mark`), and each task's work is done in its own
+worktree so parallel agents never collide.
+
+All state lives in `.factory/`:
 
 ```text
 .factory/
-  db.sqlite3                 # SQLite database (runs, tasks, dependencies)
-  worktrees/t<task-id>/      # one isolated git worktree per task
+  db.sqlite3          SQLite database (runs, tasks, agent sessions)
+  config.toml         agents and role assignment
+  worktrees/t<id>/    one git worktree per task
 ```
 
-## 2. Installation
+## Install
 
-Requirements: Rust (stable), Node.js 18+ (for the dashboard).
+Requirements: Rust (stable). Node.js is only needed once, to build the dashboard.
 
 ```bash
+git clone https://github.com/OmegaMc1331/agentic-software-factory
+cd agentic-software-factory
+cd apps/dashboard && npm install && npm run build && cd ../..
 cargo build --release
-# binary at target/release/factory
 ```
 
-### Quick start
+The dashboard build is served by `factory start`; it does not need a separate dev
+server in normal use. Frontend contributors can keep using `npm run dev` (see
+[Development](docs/development.md)).
+
+## Quick start
 
 ```bash
 factory init
-factory agents            # are the configured agent executables on PATH?
-factory run "Build a small HTTP server in Rust"
-factory status
+factory start
 ```
 
-`factory run` asks the planner agent for a strict plan. When the agent or its plan are
-unavailable, the factory falls back to a deterministic local planner, so everything
-works even with no agent installed.
-
-## 3. The task lifecycle
-
-A plan produces tasks with titles, objectives, acceptance criteria, and dependencies.
-Every task exists in exactly one state; transitions are validated against a fixed table:
+`factory init` creates `.factory/` with a default configuration. It works on a machine
+with no coding agent installed. `factory start` runs one process that serves the API
+and the dashboard and opens your browser:
 
 ```text
-pending -> ready      -> running -> completed
-              |            |   |
-              |            |   +--> failed
-              |            +-----> blocked
-              |
-              +--------> blocked (derived, may also be marked directly)
-
-blocked -> ready          (a blocker cleared or a failed task was retried)
-failed  -> ready          (retry/replan the failed task)
-completed                 (terminal: never changes again)
+Agentic Software Factory running at http://127.0.0.1:4321
 ```
 
-- `pending`   - not yet eligible (has uncompleted dependencies)
-- `ready`     - dependencies are all completed; a worktree can be created
-- `running`   - a worktree has been created and work is underway
-- `completed` - acceptance criteria verified; only reachable from `running`
-- `failed`    - work stopped; blocks dependents
-- `blocked`   - at least one dependency is `failed` or `blocked`
+Then, in the dashboard:
 
-**Cascade propagation.** Marking a task `completed`, `failed`, or `blocked` recomputes
-every transitive dependent from its own dependencies: any `failed`/`blocked` dependency
-makes it `blocked`; all dependencies `completed` makes it `ready`; otherwise it stays
-`pending`. Tasks that are already `completed` or `failed` are never re-evaluated by a
-cascade - their state is authoritative.
+1. Go to **Settings** and configure the coding agents you have installed (name,
+   command, arguments).
+2. Assign agents to the **planner**, **worker**, and **reviewer** roles. The config is
+   written to `.factory/config.toml`.
+3. In a terminal run `factory run "your objective"` to create a planned run, then
+   inspect and advance it.
 
-**Recovery.** `blocked -> ready` and `failed -> ready` are the only ways back, and both
-re-evaluate the downstream chain: once the failed blocker is retried (`failed -> ready`)
-or a `blocked` dependency clears, affected tasks move back to `ready` or stay `pending`
-based on their own dependencies. There is no way to silently reorder history: a
-`completed` task is terminal.
+## Configure agents
 
-## 4. Worktrees
-
-Each `ready` task gets a dedicated worktree when you create it:
-
-```bash
-factory worktree create 3
-# created worktree at C:\path\.factory\worktrees\t3
-```
-
-- Branch name is `factory/t<task-id>`.
-- The worktree lives inside `.factory/worktrees/`, so the main tree stays clean.
-- Worktrees must be clean before removal; `factory worktree remove <id>` refuses to
-  remove worktrees with uncommitted changes.
-- `factory worktree status` lists every worktree of the repository.
-
-## 5. Agents
-
-The factory never talks to model providers. Agents are external coding CLIs that you
-install and authenticate yourself; the factory spawns them as subprocesses and routes
-their output into the local database and git history.
-
-`.factory/config.toml` (created by `factory init`) declares agents and the roles they
-fill:
+Agent and role configuration lives in `.factory/config.toml`, created by `factory
+init`. The dashboard's **Settings** tab edits this file for you; you can also edit it
+by hand.
 
 ```toml
 [agents.codex]
@@ -144,112 +105,70 @@ args = ["exec"]
 agent = "codex"
 ```
 
-- A **role** points to an agent by name; the same agent may fill several roles.
-- `factory agents` lists each configured agent and whether its executable is on `PATH`.
-- `factory config list` shows the resolved role-to-agent mapping.
-- Missing roles, unknown agents, and missing executables produce clear errors.
+A role points to an agent by name; the same agent may fill several roles. The factory
+never talks to model providers. If a role has no agent assigned, or the agent's
+executable is not on `PATH`, the factory fails with a clear message instead of using a
+fallback:
 
-The planner agent receives the objective via stdin and is asked for a strict JSON plan
-(`objective`, ordered `tasks` with `acceptance_criteria` and `dependencies`,
-`exit_criteria`). Plans are validated: non-empty fields, dependency ids must exist, the
-dependency graph must be acyclic, and at most 50 tasks. Invalid or failed plans fall
-back to the deterministic local planner, which produces a fixed, ordered pipeline and
-records proposed work so you can plan and inspect runs with zero agent configuration.
-
-## 6. The CLI
-
-`factory` (binary `factory`, crate `factory-cli`):
-
-```bash
-factory init [--force]              # initialize state in this directory
-factory run "<objective>"           # plan a run and persist tasks
-factory status                      # summary of the latest run and its tasks
-factory tasks [--run <id>]          # list tasks of a run (latest by default)
-factory inspect <task-id>           # full task detail + acceptance criteria
-factory mark <task-id> <state>      # transition: pending|ready|running|blocked|failed|completed
-factory agents                      # list configured agents and their availability
-factory config list                 # show the role-to-agent mapping
-factory worktree create <task-id>   # create an isolated worktree
-factory worktree remove <task-id>   # remove a clean worktree
-factory worktree status             # list repository worktrees
-factory serve [--port 4321]         # serve the local HTTP API
+```text
+No agent is assigned to the planner role. Configure one from the dashboard.
+Planner agent `codex` is not available. Check the agent configuration.
 ```
 
-## 7. The HTTP API
+## Dashboard
 
-`factory serve` starts a local API (default `http://127.0.0.1:4321`) consumed by the
-dashboard:
+`factory start` serves the dashboard at `http://127.0.0.1:4321`:
 
-| Method | Route            | Description                        |
-| ------ | ---------------- | ---------------------------------- |
-| GET    | `/api/health`    | Service health                     |
-| GET    | `/api/runs`      | Runs with per-state task counts    |
-| GET    | `/api/runs/:id`  | Full run and its tasks                 |
-| GET    | `/api/graph`     | Agents, roles, runs, and tasks as a network |
-
-## 8. The dashboard
-
-A dev-tool-style web dashboard (Vite + React + TypeScript) that reads the API and shows
-runs, per-task status, the planner agent, a task list, and a dependency graph.
-
-```bash
-cd apps/dashboard
-npm install
-npm run dev        # http://localhost:5173 (proxies /api to the factory API)
-```
-
-Screenshots below are captured from a real local run, not mockups. The runs table lists
-every run with progress; opening a run shows its task graph and the full task list, and
-a failed dependency renders the transitive `blocked` cascade.
+- **Runs** — every run with its status and progress; opening a run shows its task
+  graph and full task list.
+- **Agent Graph** — the whole factory as a network of agents, roles, and runs on a
+  pannable, zoomable canvas.
+- **Settings** — add, edit, and remove agents, test executable availability, and
+  assign the planner/worker/reviewer roles.
 
 ![Runs overview](docs/assets/dashboard-runs.png)
-![Run detail with dependency graph](docs/assets/dashboard-run-detail.png)
-![Blocked cascade after a failed task](docs/assets/dashboard-blocked-cascade.png)
+![Run detail](docs/assets/dashboard-run-detail.png)
+![Blocked cascade](docs/assets/dashboard-blocked-cascade.png)
 
-The **Agent Graph** tab (`#/network`) renders the whole factory as a connected,
-brain-like network. A deterministic spring layout places agents in a central hub, roles
-in an orchestration band above them, and each run's tasks in a fan below — irregular and
-clustered, never gridded. The canvas pans and zooms; hovering or clicking a node opens
-the side inspector with its real details and dependency/blocked relationships; neighbours
-and edges highlight while the rest dims. Running tasks pulse and their incoming edges
-animate a slow dash-flow (disabled under `prefers-reduced-motion`), with missing agents
-kept visible as red markers. The graph is a pure SVG/React view — no graph library — and
-its layout is a unit-tested pure function in `apps/dashboard/src/networkLayout.ts`.
+The local API is bound to `127.0.0.1`:
 
-![Agent network](docs/assets/dashboard-network.png)
+| Method | Route            | Description                                  |
+| ------ | ---------------- | -------------------------------------------- |
+| GET    | `/api/health`    | Service health                               |
+| GET    | `/api/runs`      | Runs with per-state task counts              |
+| GET    | `/api/runs/:id`  | One run and its tasks                        |
+| GET    | `/api/graph`     | Agents, roles, runs, and tasks as a network  |
+| GET    | `/api/agents`    | Configured agents with executable status     |
+| GET    | `/api/config`    | The agent/role configuration                 |
+| PUT    | `/api/config`    | Write a validated configuration (atomic)     |
 
-## 9. Testing
+## Current status
+
+Working today: run creation through a configured planner, task state machine with
+cascade propagation, run-status reconciliation, git worktrees per task, agent session
+recording, versioned SQLite migrations, and a dashboard with runs, an agent network,
+and agent/role configuration.
+
+Not yet implemented: an autonomous worker loop, review execution, parallel agents,
+automatic merging, and anything involving remote/cloud execution.
+
+## Development
+
+See [Development](docs/development.md) for the full contributor workflow.
 
 ```bash
-cargo test              # all Rust crates (models, db, git, core, e2e)
-cargo clippy --workspace --all-targets
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 
 cd apps/dashboard
-npm test                # vitest (graph layout and utilities)
-npm run typecheck
+npm run format:check
 npm run lint
+npm run typecheck
+npm test
+npm run build
 ```
-
-The Rust suite covers the state machine and cascade propagation, plan validation
-(unknown/cyclic dependencies, malformed and oversized plans), persistence round-trips,
-agent execution (stdout/stderr capture, exit codes, working directory, stdin mission),
-agent configuration parsing and role-to-agent resolution, and real git worktree
-creation/removal.
-
-## 10. Roadmap
-
-- Replanning for failed tasks with dependency rearrangement
-- Execution agents (auto-create worktree, run, commit, complete against criteria)
-- Run costing from captured agent sessions
-- Plan review and approval before tasks are persisted
-- Concurrency controls for multiple parallel agents
-- Remote/virtual worktrees and cross-machine orchestration
 
 ## License
 
 MIT. See [LICENSE](LICENSE).
-
-## Copyright
-
-© 2026 OmegaMc1331. See [LICENSE](LICENSE).
