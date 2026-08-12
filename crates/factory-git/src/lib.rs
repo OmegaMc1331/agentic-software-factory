@@ -60,14 +60,32 @@ impl Repo {
         if self.find_worktree(worktree_path)?.is_some() {
             return Ok(());
         }
-        let args = ["worktree", "add", "-b", branch, "--quiet"];
         let mut cmd = Command::new("git");
-        cmd.arg("-C").arg(&self.root).args(args).arg(worktree_path);
+        cmd.arg("-C")
+            .arg(&self.root)
+            .arg("worktree")
+            .arg("add")
+            .arg("--quiet");
+        if self.branch_exists(branch)? {
+            cmd.arg(worktree_path).arg(branch);
+        } else {
+            cmd.arg("-b").arg(branch).arg(worktree_path);
+        }
         let status = cmd.status().map_err(GitError::Io)?;
         if !status.success() {
             return Err(GitError::WorktreeAddFailed(worktree_path.to_path_buf()));
         }
         Ok(())
+    }
+
+    fn branch_exists(&self, branch: &str) -> Result<bool> {
+        let reference = format!("refs/heads/{branch}");
+        Ok(git(
+            &self.root,
+            &["rev-parse", "--verify", "--quiet", &reference],
+            None,
+        )
+        .is_ok())
     }
 
     pub fn find_worktree(&self, worktree_path: &Path) -> Result<Option<WorktreeInfo>> {
@@ -273,13 +291,28 @@ mod tests {
     }
 
     #[test]
-    fn adding_an_existing_worktree_is_a_no_op() {
+    fn adding_an_existing_worktree_path_is_a_no_op() {
         let dir = TempDir::new().unwrap();
         init_repo(dir.path());
         let repo = Repo::detect_bounded(dir.path(), dir.path()).unwrap();
         let worktree = dir.path().join("wt");
         repo.add_worktree(&worktree, "factory/t1").unwrap();
         repo.add_worktree(&worktree, "factory/t1").unwrap();
+        assert_eq!(repo.list_worktrees().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn reattaches_an_existing_branch_after_the_worktree_is_removed() {
+        let dir = TempDir::new().unwrap();
+        init_repo(dir.path());
+        let repo = Repo::detect_bounded(dir.path(), dir.path()).unwrap();
+        let wt_a = dir.path().join("wt-a");
+        let wt_b = dir.path().join("wt-b");
+        repo.add_worktree(&wt_a, "factory/t1").unwrap();
+        repo.remove_worktree(&wt_a).unwrap();
+        repo.add_worktree(&wt_b, "factory/t1").unwrap();
+        let info = repo.find_worktree(&wt_b).unwrap().unwrap();
+        assert_eq!(info.branch.as_deref(), Some("factory/t1"));
         assert_eq!(repo.list_worktrees().unwrap().len(), 2);
     }
 
