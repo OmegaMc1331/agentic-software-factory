@@ -1,4 +1,6 @@
 use std::path::Path;
+use std::process::Command as ProcessCommand;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -31,12 +33,14 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
-    /// List configured agents and whether their executable is on PATH
-    Agents,
-    /// Inspect the agent configuration
-    Config {
-        #[command(subcommand)]
-        command: ConfigCommand,
+    /// Start the local factory application (API + dashboard)
+    Start {
+        /// Port to bind (default: 4321)
+        #[arg(long, default_value_t = 4321)]
+        port: u16,
+        /// Do not open the dashboard in a browser
+        #[arg(long)]
+        no_browser: bool,
     },
     /// Plan a run from a software objective using the configured planner agent
     Run {
@@ -45,6 +49,20 @@ enum Command {
     },
     /// Show the current factory status
     Status,
+    /// Internal and development commands
+    #[command(subcommand)]
+    Dev(DevCommand),
+}
+
+#[derive(Subcommand)]
+enum DevCommand {
+    /// List configured agents and whether their executable is on PATH
+    Agents,
+    /// Inspect the agent configuration
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
     /// List tasks of a run (default: the latest run)
     Tasks {
         /// Run id to list
@@ -108,35 +126,32 @@ impl Cli {
             Command::Init { force } => {
                 init(&root, *force)?;
             }
-            Command::Agents => {
-                agents(&root)?;
+            Command::Start { port, no_browser } => {
+                start(&root, *port, *no_browser)?;
             }
-            Command::Config { command } => match command {
-                ConfigCommand::List => config_list(&root)?,
-            },
             Command::Run { objective } => {
                 run(&root, objective)?;
             }
             Command::Status => {
                 status(&root)?;
             }
-            Command::Tasks { run } => {
-                tasks(&root, *run)?;
-            }
-            Command::Inspect { task } => {
-                inspect(&root, *task)?;
-            }
-            Command::Mark { task, state } => {
-                mark(&root, *task, state)?;
-            }
-            Command::Worktree { command } => match command {
-                WorktreeCommand::Create { task } => worktree_create(&root, *task)?,
-                WorktreeCommand::Remove { task, force } => worktree_remove(&root, *task, *force)?,
-                WorktreeCommand::Status => worktree_status(&root)?,
+            Command::Dev(command) => match command {
+                DevCommand::Agents => agents(&root)?,
+                DevCommand::Config { command } => match command {
+                    ConfigCommand::List => config_list(&root)?,
+                },
+                DevCommand::Tasks { run } => tasks(&root, *run)?,
+                DevCommand::Inspect { task } => inspect(&root, *task)?,
+                DevCommand::Mark { task, state } => mark(&root, *task, state)?,
+                DevCommand::Worktree { command } => match command {
+                    WorktreeCommand::Create { task } => worktree_create(&root, *task)?,
+                    WorktreeCommand::Remove { task, force } => {
+                        worktree_remove(&root, *task, *force)?
+                    }
+                    WorktreeCommand::Status => worktree_status(&root)?,
+                },
+                DevCommand::Serve { port } => serve(&root, *port)?,
             },
-            Command::Serve { port } => {
-                serve(&root, *port)?;
-            }
         }
         Ok(())
     }
@@ -150,26 +165,17 @@ fn factory_root(root: &Path) -> Result<()> {
 }
 
 fn init(root: &Path, force: bool) -> Result<()> {
-    let config_path = root.join(FACTORY_DIR).join("config.toml");
-    let created_config = !config_path.exists();
-    let factory = Factory::init(root, force)?;
+    let factory_dir = root.join(FACTORY_DIR);
+    Factory::init(root, force)?;
+    println!("Initialized factory state at {}", factory_dir.display());
+    println!("Database: {}", factory_dir.join("db.sqlite3").display());
     println!(
-        "Initialized factory state at {}",
-        root.join(FACTORY_DIR).display()
+        "Configuration: {}",
+        factory_dir.join("config.toml").display()
     );
     println!(
-        "Database: {}",
-        root.join(FACTORY_DIR).join("db.sqlite3").display()
+        "Configure coding agents from the dashboard (`factory start`) or edit the file directly."
     );
-    if created_config {
-        println!(
-            "Created agent configuration: {}",
-            root.join(FACTORY_DIR).join("config.toml").display()
-        );
-        println!("Planner agent: {}", factory.planner_agent()?);
-    } else {
-        println!("Agent configuration (existing): {}", config_path.display());
-    }
     Ok(())
 }
 
@@ -219,7 +225,7 @@ fn run(root: &Path, objective: &str) -> Result<()> {
     }
     println!();
     println!(
-        "Inspect tasks with `factory tasks --run {}` or `factory inspect <task-id>`.",
+        "Inspect tasks with `factory dev tasks --run {}` or `factory dev inspect <task-id>`.",
         outcome.run.id
     );
     Ok(())
@@ -356,21 +362,54 @@ fn worktree_status(root: &Path) -> Result<()> {
     Ok(())
 }
 
+fn start(root: &Path, port: u16, no_browser: bool) -> Result<()> {
+    factory_root(root)?;
+    let db = FactoryDb::open(&root.join(FACTORY_DIR).join("db.sqlite3"))?;
+    let state = factory_api::ApiState {
+        db: Mutex::new(db),
+        root: root.to_path_buf(),
+    };
+    let url = format!("http://127.0.0.1:{port}");
+    println!("Agentic Software Factory running at {url}");
+    if !no_browser {
+        open_browser(&url);
+    }
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(factory_api::run_app(Arc::new(state), port))?;
+    Ok(())
+}
+
 fn serve(root: &Path, port: u16) -> Result<()> {
     factory_root(root)?;
     let db = FactoryDb::open(&root.join(FACTORY_DIR).join("db.sqlite3"))?;
     let state = factory_api::ApiState {
-        db: std::sync::Mutex::new(db),
+        db: Mutex::new(db),
         root: root.to_path_buf(),
     };
-    let shared = std::sync::Arc::new(state);
     println!("Factory API listening on http://127.0.0.1:{port}");
-    println!("Run the dashboard from apps/dashboard with `npm run dev`.");
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(factory_api::run_app(shared, port))?;
+    runtime.block_on(factory_api::run_app(Arc::new(state), port))?;
     Ok(())
+}
+
+fn open_browser(url: &str) {
+    let result = if cfg!(windows) {
+        ProcessCommand::new("cmd")
+            .args(["/C", "start", ""])
+            .arg(url)
+            .status()
+    } else if cfg!(target_os = "macos") {
+        ProcessCommand::new("open").arg(url).status()
+    } else {
+        ProcessCommand::new("xdg-open").arg(url).status()
+    };
+    if let Err(err) = result {
+        eprintln!("could not open the browser: {err}");
+    }
 }
 
 fn print_run(db: &FactoryDb, run: &factory_types::Run) -> Result<()> {
