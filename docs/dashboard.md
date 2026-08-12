@@ -45,29 +45,42 @@ The main view lists every run: id, objective, status, planner agent, a progress 
 ### Agent Graph
 
 The `Agent Graph` tab (`#/network`) renders the whole factory as a connected,
-brain-like network rather than a single run. It is a separate React route in `App.tsx`,
-read from the `GET /api/graph` endpoint (`fetchGraph` in `api.ts`).
+brain-like network rather than a single run: once the user's agents exist, it is
+one workspace with a top toolbar, a large pannable/zoomable canvas, and a side
+inspector. It is a separate React route in `App.tsx`, read from the
+`GET /api/graph` endpoint (`fetchGraph` in `api.ts`), and polls every three seconds
+while Live is on (toggle to pause).
 
-- **Layout**: nodes are placed in left-to-right lanes — `agent`, `role`, `run`, `task` —
-  with each lane spread across the full viewport height and deterministic jitter so the
-  cloud reads as organic rather than gridded. Edges between lanes are curved beziers;
-  same-lane `depends` edges (task → task) bow out as quadratics.
+![Agent network](assets/dashboard-network.png)
+
+- **Layout**: a deterministic spring layout (`computeNetworkLayout`). Agents form a
+  central hub on a loose ring; roles float in the orchestration band above them; runs
+  sit below the hub; each run's tasks fan out underneath it, pulled into clusters by
+  `contains` and `depends` edges. Everything is asymmetric — local density, jitter, and
+  curved edges carry the neural feel without a rigid grid. All node boxes are resolved
+  out of overlap and the canvas is sized to fit.
 - **Node kinds**:
-  - `agent` — blue when `available` (its command resolves on `PATH`), red when missing.
-  - `role` — violet.
-  - `run` — sky, with a status dot.
-  - `task` — colored by `state`.
+  - `agent` — a circular node with a status dot; blue outline when `available`, red when
+    the command is missing. Shows the agent name, its assigned roles, and a small
+    mono line when working (`working · #3`) derived from the active runs it pilots.
+  - `role` — small violet pill.
+  - `run` — pill with a status dot (sky when active).
+  - `task` — pill colored by `state` (running/blocked get a stronger stroke, blocked is
+    dashed); the `#id` is mono.
 - **Edge kinds**: `binds` (role → agent), `uses` (run → planner role/agent),
-  `contains` (run → task), `depends` (task → task).
-- **Interaction**: hovering or clicking a node opens a side inspector (`NodeInfo.tsx`)
-  with the node's real fields and — for tasks — its dependency and blocked relationships.
-  The selected node, its neighbors, and connecting edges highlight while everything else
-  dims.
-- **Motion**: running runs and in-flight tasks get a subtle pulse ring; edges out of
-  active runs (and into running tasks) animate a slow dash-flow. Both are suppressed
-  under `prefers-reduced-motion`.
-- The view is hand-rolled SVG/React (`NetworkGraph.tsx` + `NetworkView.tsx`); no graph
-  library was introduced.
+  `contains` (run → task), `depends` (task → task). Edges are thin quadratics; an edge
+  into a `blocked`/`failed` task is tinted, and edges into a `running` task animate a
+  slow dash-flow (suppressed under `prefers-reduced-motion`).
+- **Interaction**: pan by dragging, zoom with the wheel around the cursor, hover to
+  focus, click to select. Selecting a node emphasizes it and its connecting edges,
+  dims the rest without hiding context, and centers the view on it. Details (agent
+  availability and activity, task dependencies, run counts) live in the side inspector.
+- **Toolbar**: run selector (with multiple runs), Tasks/Dependencies toggles, Fit,
+  Center, and Live/Paused. Without any runs the empty state shows the configured
+  agent/role topology; with no agents configured it says so plainly.
+- The view is hand-rolled SVG/React (`AgentGraph.tsx` + `GraphNode.tsx` +
+  `GraphEdge.tsx` + `GraphToolbar.tsx` + `NodeInspector.tsx`, orchestrated by
+  `NetworkView.tsx`); no graph library was introduced.
 
 ## Layout module
 
@@ -79,10 +92,11 @@ read from the `GET /api/graph` endpoint (`fetchGraph` in `api.ts`).
 
 `src/networkLayout.ts` is also pure and unit-tested:
 
-- `computeNetworkLayout(nodes, edges, opts)` - groups nodes by `kind` into lanes,
-  positions each lane, and returns positioned nodes, edges (with per-kind control
-  points), and canvas dimensions. Kept free of React imports so it can be unit-tested
-  and reused.
+- `computeNetworkLayout(nodes, edges)` - assigns deterministic organic homes by kind
+  (agent ring, role band, run band, per-run task fans), relaxes the graph over a fixed
+  number of spring/link/gravity iterations, resolves label collisions, and returns
+  positioned nodes, curved edge paths, and canvas dimensions. Kept free of React
+  imports so it can be unit-tested and reused.
 
 ## Checks
 

@@ -120,3 +120,56 @@ export function runMeta(node: GraphNode): RunMeta {
 export function taskMeta(node: GraphNode): TaskMeta {
   return node.meta as TaskMeta;
 }
+
+export interface AgentActivity {
+  runId: number;
+  taskId: number | null;
+}
+
+function runNodeId(node: GraphNode): number {
+  return Number(node.id.slice("run:".length)) || 0;
+}
+
+/**
+ * Activity for an agent, derived from the roles it fills and the runs that use
+ * them. The graph endpoint does not expose session records, so this is the
+ * closest honest signal: an agent is working when one of its runs is active,
+ * surfacing the newest running task in it when present.
+ */
+export function agentActivity(
+  agentId: string,
+  nodesById: Map<string, GraphNode>,
+  edges: GraphEdge[]
+): AgentActivity | null {
+  const roles = new Set<string>();
+  for (const edge of edges) {
+    if (edge.kind === "binds" && edge.target === agentId) roles.add(edge.source);
+  }
+  const relevant = (id: string) => id === agentId || roles.has(id);
+
+  const activeRuns: GraphNode[] = [];
+  for (const edge of edges) {
+    if (edge.kind !== "uses" || !relevant(edge.target)) continue;
+    const runNode = nodesById.get(edge.source);
+    if (runNode && runNode.kind === "run" && runMeta(runNode).status === "active") {
+      activeRuns.push(runNode);
+    }
+  }
+  if (activeRuns.length === 0) return null;
+  activeRuns.sort((a, b) => runNodeId(b) - runNodeId(a));
+  const runId = runNodeId(activeRuns[0]);
+
+  let taskId: number | null = null;
+  for (const node of nodesById.values()) {
+    if (node.kind !== "task") continue;
+    const meta = taskMeta(node);
+    if (
+      meta.runId === runId &&
+      meta.state === "running" &&
+      (taskId === null || meta.taskId > taskId)
+    ) {
+      taskId = meta.taskId;
+    }
+  }
+  return { runId, taskId };
+}

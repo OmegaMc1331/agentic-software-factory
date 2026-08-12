@@ -207,15 +207,16 @@ a failed dependency renders the transitive `blocked` cascade.
 ![Blocked cascade after a failed task](docs/assets/dashboard-blocked-cascade.png)
 
 The **Agent Graph** tab (`#/network`) renders the whole factory as a connected,
-brain-like network: agents, roles, runs, and tasks laid out in left-to-right lanes
-(agent → role → run → task) with curved edges. Hover or click a node to open a side
-inspector with its real details and dependency/blocked relationships; neighbors and edges
-highlight while the rest dim. Running runs and in-flight tasks get a subtle pulse, and
-edges from active runs animate a slow dash-flow (both disabled under
-`prefers-reduced-motion`). The graph is a pure SVG/React view — no graph library — and
+brain-like network. A deterministic spring layout places agents in a central hub, roles
+in an orchestration band above them, and each run's tasks in a fan below — irregular and
+clustered, never gridded. The canvas pans and zooms; hovering or clicking a node opens
+the side inspector with its real details and dependency/blocked relationships; neighbours
+and edges highlight while the rest dims. Running tasks pulse and their incoming edges
+animate a slow dash-flow (disabled under `prefers-reduced-motion`), with missing agents
+kept visible as red markers. The graph is a pure SVG/React view — no graph library — and
 its layout is a unit-tested pure function in `apps/dashboard/src/networkLayout.ts`.
 
-> Screenshots of the Agent Graph tab are pending; the view is described above and implemented in `apps/dashboard/src/components/`.
+![Agent network](docs/assets/dashboard-network.png)
 
 ## 9. Testing
 

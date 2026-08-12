@@ -87,7 +87,7 @@ export default function App() {
         </nav>
       </header>
 
-      <main className="content">
+      <main className={view.name === "network" ? "content content--wide" : "content"}>
         {view.name === "network" ? (
           <NetworkView />
         ) : (
