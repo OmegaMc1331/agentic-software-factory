@@ -1,0 +1,185 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: windows-x86_64
+            target: x86_64-pc-windows-msvc
+            archive: factory-windows-x86_64.zip
+            binary: factory.exe
+            is_windows: true
+          - os: ubuntu-latest
+            name: linux-x86_64
+            target: x86_64-unknown-linux-gnu
+            archive: factory-linux-x86_64.tar.gz
+            binary: factory
+            is_windows: false
+          - os: macos-14
+            name: macos-aarch64
+            target: aarch64-apple-darwin
+            archive: factory-macos-aarch64.tar.gz
+            binary: factory
+            is_windows: false
+          - os: macos-14
+            name: macos-x86_64
+            target: x86_64-apple-darwin
+            archive: factory-macos-x86_64.tar.gz
+            binary: factory
+            is_windows: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/dashboard/package-lock.json
+
+      - name: Build the dashboard
+        working-directory: apps/dashboard
+        run: |
+          npm ci
+          npm run build
+
+      - name: Install Rust (target ${{ matrix.target }})
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Build the release binary with the embedded dashboard
+        run: cargo build --release --features embedded-dashboard -p factory-cli --target ${{ matrix.target }}
+
+      - name: Run the embedded dashboard tests
+        run: cargo test --release --features embedded-dashboard -p factory-api
+
+      - name: Verify the dashboard assets are embedded in the binary
+        shell: bash
+        run: |
+          if ! grep -aq 'id="root"' "target/${{ matrix.target }}/release/${{ matrix.binary }}"; then
+            echo "embedded dashboard marker not found in the binary" >&2
+            exit 1
+          fi
+          echo "OK: dashboard assets embedded"
+
+      - name: Smoke test a standalone copy of the binary
+        if: matrix.is_windows == 'false'
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir="$(mktemp -d)"
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "$dir/factory"
+          cd "$dir"
+          ./factory --version | grep -q factory
+          ./factory init
+          ./factory start --no-browser &
+          pid=$!
+          trap 'kill $pid 2>/dev/null || true' EXIT
+          for i in $(seq 1 50); do
+            curl -fsS http://127.0.0.1:4321/ >/dev/null 2>&1 && break
+            sleep 0.2
+          done
+          curl -fsS http://127.0.0.1:4321/ | grep -q 'id="root"'
+          echo "OK: standalone binary serves the embedded dashboard"
+
+      - name: Package the archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          if [ "${{ matrix.is_windows }}" = "true" ]; then
+            powershell -NoProfile -Command "Compress-Archive -Path 'target/${{ matrix.target }}/release/${{ matrix.binary }}', 'LICENSE' -DestinationPath 'release/${{ matrix.archive }}' -Force"
+          else
+            tar -czf "release/${{ matrix.archive }}" -C "target/${{ matrix.target }}/release" "${{ matrix.binary }}" -C "$GITHUB_WORKSPACE" LICENSE
+          fi
+
+      - name: Verify the archive and generate its SHA-256 checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.is_windows }}" = "true" ]; then
+            tar -tf "release/${{ matrix.archive }}" | grep -q "${{ matrix.binary }}"
+            tar -tf "release/${{ matrix.archive }}" | grep -q 'LICENSE'
+          else
+            tar -tzf "release/${{ matrix.archive }}" | grep -q "${{ matrix.binary }}"
+            tar -tzf "release/${{ matrix.archive }}" | grep -q 'LICENSE'
+          fi
+          ( sha256sum "release/${{ matrix.archive }}" || shasum -a 256 "release/${{ matrix.archive }}" ) > "release/${{ matrix.archive }}.sha256"
+          echo "OK: archive contents verified, checksum written"
+          ls -la release
+
+      - name: Upload the release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: release/
+          if-no-files-found: error
+
+  release:
+    name: Publish the GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release
+          merge-multiple: true
+
+      - name: Verify all archives and checksums
+        run: |
+          set -euo pipefail
+          cd release
+          for f in \
+            factory-windows-x86_64.zip \
+            factory-linux-x86_64.tar.gz \
+            factory-macos-aarch64.tar.gz \
+            factory-macos-x86_64.tar.gz; do
+            [ -f "$f" ] || { echo "missing artifact: $f"; exit 1; }
+            [ -f "$f.sha256" ] || { echo "missing checksum: $f.sha256"; exit 1; }
+          done
+          tar -tf factory-windows-x86_64.zip | grep -q factory.exe
+          tar -tzf factory-linux-x86_64.tar.gz | grep -qx factory
+          tar -tzf factory-macos-aarch64.tar.gz | grep -qx factory
+          tar -tzf factory-macos-x86_64.tar.gz | grep -qx factory
+          echo "OK: all archives, binaries, and checksums present"
+
+      - name: Combine the checksums
+        run: |
+          cat release/*.sha256 | sort > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          prerelease=""
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+            prerelease="--prerelease"
+          fi
+          gh release create "$GITHUB_REF_NAME" \
+            release/* SHA256SUMS.txt \
+            --title "Agentic Software Factory $GITHUB_REF_NAME" \
+            --notes "Prebuilt binaries for Windows (x86_64), Linux (x86_64), macOS Apple Silicon and macOS Intel." \
+            $prerelease
