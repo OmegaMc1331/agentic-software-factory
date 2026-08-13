@@ -7,8 +7,12 @@ on:
 
 jobs:
   rust:
-    name: Rust (fmt, clippy, test)
-    runs-on: ubuntu-latest
+    name: Rust (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -47,3 +51,97 @@ jobs:
         run: npm test
       - name: Build
         run: npm run build
+
+  embedded-dashboard:
+    name: Release-style embedded dashboard smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/dashboard/package-lock.json
+      - name: Build the dashboard
+        working-directory: apps/dashboard
+        run: |
+          npm ci
+          npm run build
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the release binary with the embedded dashboard
+        run: cargo build --release --features embedded-dashboard -p factory-cli
+      - name: Run the embedded dashboard tests
+        run: cargo test --release --features embedded-dashboard -p factory-api
+      - name: Smoke test a standalone copy of the binary
+        run: |
+          set -euo pipefail
+          dir="$(mktemp -d)"
+          cp target/release/factory "$dir/factory"
+          cd "$dir"
+          ./factory --version | grep -q factory
+          ./factory init
+          ./factory start --no-browser &
+          pid=$!
+          trap 'kill $pid 2>/dev/null || true' EXIT
+          for i in $(seq 1 50); do
+            curl -fsS http://127.0.0.1:4321/ >/dev/null 2>&1 && break
+            sleep 0.2
+          done
+          curl -fsS http://127.0.0.1:4321/ | grep -q 'id="root"'
+          curl -fsS http://127.0.0.1:4321/api/health | grep -q '"status":"ok"'
+          echo "OK: standalone binary serves the embedded dashboard"
+
+  installers:
+    name: Installer end-to-end test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/dashboard/package-lock.json
+      - name: Build the dashboard
+        working-directory: apps/dashboard
+        run: |
+          npm ci
+          npm run build
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the release binary
+        run: cargo build --release --features embedded-dashboard -p factory-cli
+      - name: Package the release-style archives
+        run: |
+          set -euo pipefail
+          mkdir -p assets
+          tar -czf assets/factory-linux-x86_64.tar.gz -C target/release factory -C "$GITHUB_WORKSPACE" LICENSE
+          python3 - "$GITHUB_WORKSPACE" <<'EOF'
+          import sys, zipfile
+          with zipfile.ZipFile("assets/factory-windows-x86_64.zip", "w") as z:
+              z.write("target/release/factory", "factory.exe")
+              z.write(f"{sys.argv[1]}/LICENSE", "LICENSE")
+          EOF
+          ( cd assets && for f in *.tar.gz *.zip; do sha256sum "$f" > "$f.sha256"; done )
+          ls -la assets
+      - name: Exercise install.sh and install.ps1 against the archives
+        run: |
+          set -euo pipefail
+          python3 -m http.server 8765 --bind 127.0.0.1 --directory assets >/tmp/httpserver.log 2>&1 &
+          server=$!
+          trap 'kill $server 2>/dev/null || true' EXIT
+          sleep 1
+
+          export FACTORY_VERSION=v0.1.0-test
+          export FACTORY_BASE_URL=http://127.0.0.1:8765
+
+          sh install.sh
+          "$HOME/.local/bin/factory" --version | grep -q factory
+          sh install.sh
+          "$HOME/.local/bin/factory" --version | grep -q factory
+
+          FACTORY_INSTALL_DIR=/tmp/ps-install pwsh -NoProfile -File install.ps1
+          test -x /tmp/ps-install/factory.exe || test -f /tmp/ps-install/factory.exe
+          FACTORY_INSTALL_DIR=/tmp/ps-install pwsh -NoProfile -File install.ps1
+
+          echo "OK: installers verified end-to-end"
