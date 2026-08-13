@@ -90,7 +90,9 @@ a fallback.
 `factory start` serves the dashboard at `http://127.0.0.1:4321`:
 
 - **Runs** — every run with its status and progress; opening a run shows its task list.
-- **Agent Graph** — the whole factory as a network of agents, roles, and runs.
+- **Agent Graph** — drag and connect Factory nodes, add agents, supported roles,
+  visual groups or notes, fit/zoom/reset the topology, and inspect real agent sessions
+  in the Agent Console. The workspace layout persists in `.factory/graph.json`.
 - **Settings** — add, edit, and remove agents, test executable availability, and assign
   the planner/worker/reviewer roles.
 
@@ -100,15 +102,20 @@ a fallback.
 
 The local API is bound to `127.0.0.1`:
 
-| Method | Route            | Description                                  |
-| ------ | ---------------- | -------------------------------------------- |
-| GET    | `/api/health`    | Service health                               |
-| GET    | `/api/runs`      | Runs with per-state task counts              |
-| GET    | `/api/runs/:id`  | One run and its tasks                        |
-| GET    | `/api/graph`     | Agents, roles, runs, and tasks as a network  |
-| GET    | `/api/agents`    | Configured agents with executable status     |
-| GET    | `/api/config`    | The agent/role configuration                 |
-| PUT    | `/api/config`    | Write a validated configuration (atomic)     |
+| Method | Route                         | Description                                      |
+| ------ | ----------------------------- | ------------------------------------------------ |
+| GET    | `/api/health`                 | Service health                                   |
+| GET    | `/api/runs`                   | Runs with per-state task counts                  |
+| GET    | `/api/runs/:id`               | One run and its tasks                            |
+| GET    | `/api/graph`                  | Agents, roles, runs, and tasks as a network      |
+| GET    | `/api/graph/workspace`        | Saved visual layout and custom topology          |
+| PUT    | `/api/graph/workspace`        | Validate and atomically save the graph workspace |
+| GET    | `/api/agents`                 | Configured agents with executable status         |
+| GET    | `/api/agents/:agent/sessions` | Recent persisted sessions for one agent          |
+| GET    | `/api/sessions/:id`           | One known Factory agent session                  |
+| GET    | `/api/sessions/:id/stream`    | SSE updates for one known session                |
+| GET    | `/api/config`                 | The agent/role configuration                     |
+| PUT    | `/api/config`                 | Write a validated configuration (atomic)         |
 
 ## How it works
 
@@ -135,6 +142,7 @@ All state lives in `.factory/`:
 .factory/
   db.sqlite3          SQLite database (runs, tasks, agent sessions)
   config.toml         agents and role assignment
+  graph.json          saved positions, visual nodes, and custom links
   worktrees/t<id>/    one git worktree per task
 ```
 

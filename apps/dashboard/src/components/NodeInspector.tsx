@@ -1,68 +1,29 @@
-import type { GraphNode, TaskState } from "../types";
-import { agentMeta, roleMeta, runMeta, taskMeta } from "../types";
-import type { AgentActivity } from "../types";
+import { useEffect, useMemo, useState } from "react";
+import type { GraphEdge, GraphNode } from "../types";
+import { roleMeta, runMeta, taskMeta } from "../types";
 import { STATE_META } from "../state";
-
-function taskFlowNote(state: TaskState): string {
-  switch (state) {
-    case "completed":
-      return "completed; terminal";
-    case "running":
-      return "execution in progress";
-    case "failed":
-      return "failed; blocks dependents";
-    case "blocked":
-      return "blocked by unmet dependencies";
-    case "ready":
-      return "ready to run";
-    default:
-      return "waiting on dependencies";
-  }
-}
-
-function StateChip({ state }: { state: TaskState }) {
-  const meta = STATE_META[state];
-  return (
-    <span className="net-chip" style={{ borderColor: meta.color, color: meta.color }}>
-      {meta.label}
-    </span>
-  );
-}
-
-function DepRow({ id, nodesById }: { id: string; nodesById: Map<string, GraphNode> }) {
-  const node = nodesById.get(id);
-  const state = node?.kind === "task" ? taskMeta(node).state : null;
-  const color = state ? STATE_META[state].color : "#8a93a3";
-  const label = node?.kind === "task" ? `#${taskMeta(node).taskId}` : id;
-  return (
-    <div className="net-dep-row">
-      <span className="net-status-dot" style={{ backgroundColor: color }} />
-      <code>{label}</code>
-      {node?.kind === "task" && (
-        <span className="net-dep-state">{STATE_META[taskMeta(node).state].label}</span>
-      )}
-    </div>
-  );
-}
+import { connectionKind } from "../graphWorkspace";
 
 function Frame({
-  node,
+  title,
+  kind,
   onClose,
   children,
 }: {
-  node: GraphNode;
+  title: string;
+  kind: string;
   onClose: () => void;
   children: React.ReactNode;
 }) {
   return (
     <aside className="net-inspector">
       <div className="inspector-header">
-        <span className="inspector-kind">{node.kind}</span>
+        <span className="inspector-kind">{kind}</span>
         <button className="inspector-close" onClick={onClose} aria-label="Close inspector">
-          ×
+          x
         </button>
       </div>
-      <h3 className="inspector-title">{node.label}</h3>
+      <h3 className="inspector-title">{title}</h3>
       <div className="inspector-body">{children}</div>
     </aside>
   );
@@ -72,164 +33,150 @@ function Row({ label, children }: { label: string; children: React.ReactNode }) 
   return (
     <div className="inspector-row">
       <span className="inspector-label">{label}</span>
-      {children}
+      <span className="inspector-value">{children}</span>
     </div>
   );
 }
 
 export function NodeInspector({
   node,
+  edge,
   nodesById,
-  activity,
   onClose,
+  onDelete,
+  onConnect,
 }: {
   node: GraphNode | null;
+  edge: GraphEdge | null;
   nodesById: Map<string, GraphNode>;
-  activity: AgentActivity | null;
   onClose: () => void;
+  onDelete: () => void;
+  onConnect: (targetId: string) => void;
 }) {
+  const [target, setTarget] = useState("");
+  useEffect(() => setTarget(""), [node?.id]);
+  const targets = useMemo(
+    () =>
+      node
+        ? Array.from(nodesById.values())
+            .filter((candidate) => connectionKind(node, candidate) !== null)
+            .sort((a, b) => a.label.localeCompare(b.label))
+        : [],
+    [node, nodesById]
+  );
+
+  if (edge) {
+    return (
+      <Frame title={edge.kind} kind="Connection" onClose={onClose}>
+        <Row label="Source">
+          <code>{nodesById.get(edge.source)?.label ?? edge.source}</code>
+        </Row>
+        <Row label="Target">
+          <code>{nodesById.get(edge.target)?.label ?? edge.target}</code>
+        </Row>
+        <Row label="Meaning">{edge.semantic}</Row>
+        <Row label="Editing">{edge.editable ? "Editable" : "Read-only Factory state"}</Row>
+        {edge.editable && (
+          <button className="button inspector-delete" onClick={onDelete}>
+            Delete connection
+          </button>
+        )}
+      </Frame>
+    );
+  }
+
   if (!node) {
     return (
       <aside className="net-inspector net-inspector--empty">
-        <p className="inspector-hint">Hover or click a node to inspect it.</p>
+        <p className="inspector-hint">Select a node or connection to inspect it.</p>
+        <p className="inspector-hint">Drag from a visible handle to create a supported link.</p>
       </aside>
     );
   }
 
-  if (node.kind === "agent") {
-    const meta = agentMeta(node);
-    return (
-      <Frame node={node} onClose={onClose}>
-        <Row label="Status">
-          <span className={meta.available ? "net-ok" : "net-bad"}>
-            {meta.available ? "available" : "missing"}
-          </span>
-        </Row>
-        <Row label="Roles">
-          <span className="inspector-value">
-            {meta.roles.length === 0 ? "–" : meta.roles.join(", ")}
-          </span>
-        </Row>
-        <Row label="Activity">
-          <span className={activity ? "net-ok" : "inspector-value"}>
-            {activity
-              ? activity.taskId !== null
-                ? `working · #${activity.taskId} (run #${activity.runId})`
-                : `orchestrating run #${activity.runId}`
-              : "idle"}
-          </span>
-        </Row>
-        <Row label="Command">
-          <code>{meta.command}</code>
-        </Row>
-      </Frame>
-    );
-  }
-
+  let details: React.ReactNode;
   if (node.kind === "role") {
-    const meta = roleMeta(node);
-    return (
-      <Frame node={node} onClose={onClose}>
-        <Row label="Bound agent">
-          <code>{meta.agent}</code>
-        </Row>
-      </Frame>
-    );
-  }
-
-  if (node.kind === "run") {
+    details = <Row label="Assigned agent">{roleMeta(node).agent}</Row>;
+  } else if (node.kind === "run") {
     const meta = runMeta(node);
-    const counts = meta.counts;
-    const order: TaskState[] = ["pending", "ready", "running", "blocked", "failed", "completed"];
-    return (
-      <Frame node={node} onClose={onClose}>
-        <Row label="Status">
-          <span className="inspector-value">{meta.status}</span>
+    details = (
+      <>
+        <Row label="Status">{meta.status}</Row>
+        <Row label="Planner">{meta.plannerAgent ?? "None"}</Row>
+        <Row label="Tasks">{meta.counts.total}</Row>
+        {meta.objective && <Row label="Objective">{meta.objective}</Row>}
+      </>
+    );
+  } else if (node.kind === "task") {
+    const meta = taskMeta(node);
+    details = (
+      <>
+        <Row label="State">
+          <span style={{ color: STATE_META[meta.state].color }}>{meta.state}</span>
         </Row>
-        {meta.objective && (
-          <Row label="Objective">
-            <span className="inspector-value inspector-objective">{meta.objective}</span>
+        <Row label="Run">#{meta.runId}</Row>
+        <Row label="Depends on">
+          {meta.dependencies.length ? meta.dependencies.map((id) => `#${id}`).join(", ") : "None"}
+        </Row>
+        {meta.worktreePath && (
+          <Row label="Worktree">
+            <code>{meta.worktreePath}</code>
           </Row>
         )}
-        <Row label="Planner">
-          <code>{meta.plannerAgent ?? "–"}</code>
-        </Row>
-        <Row label="Created">
-          <span className="inspector-value">{new Date(meta.createdAt).toLocaleString()}</span>
-        </Row>
-        <Row label="Tasks">
-          <span className="inspector-value">{counts.total}</span>
-        </Row>
-        <ul className="inspector-counts">
-          {order.map((state) => {
-            if (counts[state] === 0) return null;
-            const metaColor = STATE_META[state];
-            return (
-              <li key={state}>
-                <span className="net-status-dot" style={{ backgroundColor: metaColor.color }} />
-                <span>{state}</span>
-                <code>{counts[state]}</code>
-              </li>
-            );
-          })}
-        </ul>
-      </Frame>
+      </>
     );
+  } else if (node.kind === "group") {
+    details = <Row label="Effect">Visual organization only</Row>;
+  } else if (node.kind === "note") {
+    const text = "text" in node.meta ? String(node.meta.text) : "";
+    details = (
+      <>
+        <Row label="Effect">Workspace metadata only</Row>
+        {text && <Row label="Text">{text}</Row>}
+      </>
+    );
+  } else {
+    details = null;
   }
 
-  const meta = taskMeta(node);
-  const dependents: GraphNode[] = [];
-  for (const other of nodesById.values()) {
-    if (other.kind === "task" && taskMeta(other).dependencies.includes(meta.taskId)) {
-      dependents.push(other);
-    }
-  }
+  const removable = node.kind === "role" || node.kind === "group" || node.kind === "note";
+
   return (
-    <Frame node={node} onClose={onClose}>
-      <Row label="State">
-        <StateChip state={meta.state} />
-      </Row>
-      <Row label="Flow">
-        <span
-          className={STATE_META[meta.state].color === "#dc2626" ? "net-bad" : "inspector-value"}
-        >
-          {taskFlowNote(meta.state)}
-        </span>
-      </Row>
-      {meta.objective && (
-        <Row label="Objective">
-          <span className="inspector-value inspector-objective">{meta.objective}</span>
-        </Row>
+    <Frame title={node.label} kind={node.kind} onClose={onClose}>
+      {details}
+      {targets.length > 0 && (
+        <div className="inspector-connect">
+          <label htmlFor="inspector-connection-target">Add supported connection</label>
+          <div>
+            <select
+              id="inspector-connection-target"
+              value={target}
+              onChange={(event) => setTarget(event.target.value)}
+            >
+              <option value="">Choose target</option>
+              {targets.map((candidate) => (
+                <option key={candidate.id} value={candidate.id}>
+                  {candidate.label} ({candidate.kind})
+                </option>
+              ))}
+            </select>
+            <button
+              className="button"
+              disabled={!target}
+              onClick={() => {
+                onConnect(target);
+                setTarget("");
+              }}
+            >
+              Connect
+            </button>
+          </div>
+        </div>
       )}
-      <Row label="Run">
-        <code>#{meta.runId}</code>
-      </Row>
-      <Row label="Depends on">
-        {meta.dependencies.length === 0 ? (
-          <span className="inspector-value">–</span>
-        ) : (
-          <span className="inspector-deps">
-            {meta.dependencies.map((id) => (
-              <DepRow key={id} id={`task:${id}`} nodesById={nodesById} />
-            ))}
-          </span>
-        )}
-      </Row>
-      <Row label="Blocks">
-        {dependents.length === 0 ? (
-          <span className="inspector-value">–</span>
-        ) : (
-          <span className="inspector-deps">
-            {dependents.map((dep) => (
-              <DepRow key={dep.id} id={dep.id} nodesById={nodesById} />
-            ))}
-          </span>
-        )}
-      </Row>
-      {meta.worktreePath && (
-        <Row label="Worktree">
-          <code className="inspector-objective">{meta.worktreePath}</code>
-        </Row>
+      {removable && (
+        <button className="button inspector-delete" onClick={onDelete}>
+          {node.kind === "role" ? "Unassign role" : `Delete ${node.kind}`}
+        </button>
       )}
     </Frame>
   );

@@ -1,4 +1,12 @@
-import type { AgentStatusInfo, ConfigData, GraphData, RunDetail, RunSummary } from "./types";
+import type {
+  AgentSession,
+  AgentStatusInfo,
+  ConfigData,
+  GraphData,
+  GraphWorkspace,
+  RunDetail,
+  RunSummary,
+} from "./types";
 
 const API_BASE = "/api";
 const REQUEST_TIMEOUT_MS = 5000;
@@ -82,6 +90,20 @@ export function fetchGraph(): Promise<GraphData> {
   return get<GraphData>("/graph");
 }
 
+export function fetchGraphWorkspace(): Promise<GraphWorkspace> {
+  return get<GraphWorkspace>("/graph/workspace");
+}
+
+export function saveGraphWorkspace(workspace: GraphWorkspace): Promise<void> {
+  const body: GraphWorkspace = {
+    version: workspace.version,
+    nodes: workspace.nodes,
+    customNodes: workspace.customNodes,
+    edges: workspace.edges,
+  };
+  return put<void>("/graph/workspace", body);
+}
+
 export function fetchConfig(): Promise<ConfigData> {
   return get<ConfigData>("/config");
 }
@@ -92,6 +114,18 @@ export function saveConfig(config: ConfigData): Promise<void> {
 
 export function fetchAgents(): Promise<AgentStatusInfo[]> {
   return get<AgentStatusInfo[]>("/agents");
+}
+
+export function fetchAgentSessions(agent: string): Promise<AgentSession[]> {
+  return get<AgentSession[]>(`/agents/${encodeURIComponent(agent)}/sessions`);
+}
+
+export function fetchAgentSession(id: number): Promise<AgentSession> {
+  return get<AgentSession>(`/sessions/${id}`);
+}
+
+export function agentSessionStreamUrl(id: number): string {
+  return `${API_BASE}/sessions/${id}/stream`;
 }
 
 export function progress(counts: { completed: number; total: number }): number {

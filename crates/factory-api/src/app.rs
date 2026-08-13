@@ -1,18 +1,25 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::extract::{Path as UrlPath, State};
 use axum::http::StatusCode;
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use factory_core::{Agents, Config, ConfigError};
 use factory_db::FactoryDb;
 use serde_json::json;
+use tokio_stream::wrappers::ReceiverStream;
 
 use crate::dashboard;
-use crate::types::{GraphEdge, GraphNode, GraphResponse, RunDetail, RunSummary, TaskCounts};
+use crate::graph_workspace::{GraphWorkspace, GraphWorkspaceError, GraphWorkspaceResponse};
+use crate::types::{
+    AgentSessionResponse, GraphEdge, GraphNode, GraphResponse, RunDetail, RunSummary, TaskCounts,
+};
 
 pub struct ApiState {
     pub db: Mutex<FactoryDb>,
@@ -62,13 +69,26 @@ impl From<ConfigError> for ApiError {
     }
 }
 
+impl From<GraphWorkspaceError> for ApiError {
+    fn from(err: GraphWorkspaceError) -> Self {
+        ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
+    }
+}
+
 pub fn router(state: SharedState) -> Router {
     Router::new()
         .route("/api/health", get(health))
         .route("/api/runs", get(list_runs))
         .route("/api/runs/:id", get(get_run))
         .route("/api/graph", get(get_graph))
+        .route(
+            "/api/graph/workspace",
+            get(get_graph_workspace).put(put_graph_workspace),
+        )
         .route("/api/agents", get(get_agents))
+        .route("/api/agents/:agent/sessions", get(list_agent_sessions))
+        .route("/api/sessions/:id", get(get_agent_session))
+        .route("/api/sessions/:id/stream", get(stream_agent_session))
         .route("/api/config", get(get_config).put(put_config))
         .route("/api/*rest", get(api_not_found))
         .fallback_service(dashboard::router(&state.root))
@@ -157,7 +177,167 @@ async fn put_config(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn get_graph_workspace(
+    State(state): State<SharedState>,
+) -> Result<Json<GraphWorkspaceResponse>, ApiError> {
+    let mut response = GraphWorkspace::load(&state.root)?;
+    let graph = build_graph(&state)?;
+    let system_nodes: HashMap<String, String> = graph
+        .nodes
+        .into_iter()
+        .map(|node| (node.id, node.kind))
+        .collect();
+    if response.workspace.retain_known(&system_nodes) {
+        response.warning = Some(
+            "Ignored stale graph positions or links for removed Factory entities.".to_string(),
+        );
+    }
+    Ok(Json(response))
+}
+
+async fn put_graph_workspace(
+    State(state): State<SharedState>,
+    body: Result<Json<GraphWorkspace>, axum::extract::rejection::JsonRejection>,
+) -> Result<StatusCode, ApiError> {
+    let workspace = body
+        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "invalid JSON body"))?
+        .0;
+    let graph = build_graph(&state)?;
+    let system_nodes: HashMap<String, String> = graph
+        .nodes
+        .into_iter()
+        .map(|node| (node.id, node.kind))
+        .collect();
+    workspace
+        .validate(&system_nodes)
+        .map_err(|reason| ApiError::new(StatusCode::BAD_REQUEST, reason))?;
+    workspace.write_atomic(&state.root)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn session_response(
+    state: &SharedState,
+    db: &FactoryDb,
+    session: factory_types::AgentSession,
+) -> Result<AgentSessionResponse, ApiError> {
+    let working_directory = match session.task_id {
+        Some(task_id) => db
+            .get_task(task_id)?
+            .and_then(|task| task.worktree_path)
+            .unwrap_or_else(|| state.root.to_string_lossy().into_owned()),
+        None => state.root.to_string_lossy().into_owned(),
+    };
+    Ok(AgentSessionResponse {
+        session,
+        working_directory,
+        interactive: false,
+    })
+}
+
+async fn list_agent_sessions(
+    State(state): State<SharedState>,
+    UrlPath(agent): UrlPath<String>,
+) -> Result<Json<Vec<AgentSessionResponse>>, ApiError> {
+    let db = state.db.lock().expect("db mutex poisoned");
+    let sessions = db.list_agent_sessions_for_agent(&agent, 12)?;
+    if sessions.is_empty() {
+        let config = Config::load(&state.root)?;
+        if !config.agents.contains_key(&agent) {
+            return Err(ApiError::new(
+                StatusCode::NOT_FOUND,
+                format!("agent '{agent}' not found"),
+            ));
+        }
+    }
+    let responses = sessions
+        .into_iter()
+        .map(|session| session_response(&state, &db, session))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Json(responses))
+}
+
+async fn get_agent_session(
+    State(state): State<SharedState>,
+    UrlPath(id): UrlPath<i64>,
+) -> Result<Json<AgentSessionResponse>, ApiError> {
+    let db = state.db.lock().expect("db mutex poisoned");
+    let session = db
+        .get_agent_session(id)?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, format!("session {id} not found")))?;
+    Ok(Json(session_response(&state, &db, session)?))
+}
+
+async fn stream_agent_session(
+    State(state): State<SharedState>,
+    UrlPath(id): UrlPath<i64>,
+) -> Result<Sse<ReceiverStream<Result<Event, Infallible>>>, ApiError> {
+    {
+        let db = state.db.lock().expect("db mutex poisoned");
+        if db.get_agent_session(id)?.is_none() {
+            return Err(ApiError::new(
+                StatusCode::NOT_FOUND,
+                format!("session {id} not found"),
+            ));
+        }
+    }
+
+    let (sender, receiver) = tokio::sync::mpsc::channel(8);
+    tokio::spawn(async move {
+        let mut previous = String::new();
+        loop {
+            let result = {
+                let db = state.db.lock().expect("db mutex poisoned");
+                db.get_agent_session(id)
+                    .map_err(|error| error.to_string())
+                    .and_then(|session| {
+                        session
+                            .map(|session| {
+                                session_response(&state, &db, session)
+                                    .map_err(|error| error.message)
+                            })
+                            .transpose()
+                    })
+            };
+
+            let response = match result {
+                Ok(Some(response)) => response,
+                Ok(None) => break,
+                Err(error) => {
+                    let event = Event::default().event("error").data(&error);
+                    let _ = sender.send(Ok(event)).await;
+                    break;
+                }
+            };
+            let serialized = match serde_json::to_string(&response) {
+                Ok(serialized) => serialized,
+                Err(_) => break,
+            };
+            if serialized != previous {
+                previous = serialized.clone();
+                let event = Event::default().event("session").data(serialized);
+                if sender.send(Ok(event)).await.is_err() {
+                    break;
+                }
+            }
+            if !matches!(response.session.status.as_str(), "running" | "active") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(750)).await;
+        }
+    });
+
+    Ok(Sse::new(ReceiverStream::new(receiver)).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(10))
+            .text("keep-alive"),
+    ))
+}
+
 async fn get_graph(State(state): State<SharedState>) -> Result<Json<GraphResponse>, ApiError> {
+    Ok(Json(build_graph(&state)?))
+}
+
+fn build_graph(state: &SharedState) -> Result<GraphResponse, ApiError> {
     let db = state.db.lock().expect("db mutex poisoned");
 
     let config = factory_core::Config::load(&state.root).ok();
@@ -201,9 +381,12 @@ async fn get_graph(State(state): State<SharedState>) -> Result<Json<GraphRespons
             meta: json!({ "agent": agent }),
         });
         edges.push(GraphEdge {
+            id: format!("assignment:{role}"),
             source: format!("role:{role}"),
             target: format!("agent:{agent}"),
             kind: "binds".into(),
+            editable: true,
+            semantic: "configuration".into(),
         });
     }
 
@@ -234,9 +417,12 @@ async fn get_graph(State(state): State<SharedState>) -> Result<Json<GraphRespons
                 .map(|(role, _)| format!("role:{role}"))
                 .unwrap_or_else(|| format!("agent:{planner}"));
             edges.push(GraphEdge {
+                id: format!("run-use:{}:{target}", run.id),
                 source: format!("run:{}", run.id),
                 target,
                 kind: "uses".into(),
+                editable: false,
+                semantic: "system".into(),
             });
         }
 
@@ -256,9 +442,12 @@ async fn get_graph(State(state): State<SharedState>) -> Result<Json<GraphRespons
                 }),
             });
             edges.push(GraphEdge {
+                id: format!("contains:{}:{}", run.id, task.id),
                 source: format!("run:{}", run.id),
                 target: format!("task:{}", task.id),
                 kind: "contains".into(),
+                editable: false,
+                semantic: "system".into(),
             });
             task_dependencies.push((format!("task:{}", task.id), task.dependencies.clone()));
         }
@@ -267,9 +456,12 @@ async fn get_graph(State(state): State<SharedState>) -> Result<Json<GraphRespons
     for (task_id, dependencies) in task_dependencies {
         for dependency in dependencies {
             edges.push(GraphEdge {
+                id: format!("dependency:{dependency}:{task_id}"),
                 source: format!("task:{dependency}"),
                 target: task_id.clone(),
                 kind: "depends".into(),
+                editable: false,
+                semantic: "execution".into(),
             });
         }
     }
@@ -282,9 +474,9 @@ async fn get_graph(State(state): State<SharedState>) -> Result<Json<GraphRespons
         "roles": role_to_agent.len(),
     });
 
-    Ok(Json(GraphResponse {
+    Ok(GraphResponse {
         nodes,
         edges,
         metadata,
-    }))
+    })
 }

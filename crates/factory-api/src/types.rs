@@ -1,6 +1,6 @@
 use serde::Serialize;
 
-use factory_types::{Run, Task, TaskState};
+use factory_types::{AgentSession, Run, Task, TaskState};
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -76,9 +76,12 @@ pub struct GraphNode {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GraphEdge {
+    pub id: String,
     pub source: String,
     pub target: String,
     pub kind: String,
+    pub editable: bool,
+    pub semantic: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -87,4 +90,13 @@ pub struct GraphResponse {
     pub nodes: Vec<GraphNode>,
     pub edges: Vec<GraphEdge>,
     pub metadata: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSessionResponse {
+    #[serde(flatten)]
+    pub session: AgentSession,
+    pub working_directory: String,
+    pub interactive: bool,
 }

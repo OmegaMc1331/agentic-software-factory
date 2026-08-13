@@ -1,9 +1,9 @@
 # Architecture
 
 Agentic Software Factory is a workspace of seven Rust crates plus a React dashboard.
-The only network service is a local HTTP API bound to `127.0.0.1`. All durable state
-lives in a SQLite database under `.factory/`. Agent isolation is git-based: each task
-works in its own worktree.
+The only network service is a local HTTP API bound to `127.0.0.1`. Durable state lives
+under `.factory/`: execution records use SQLite, configuration uses TOML, and the graph
+workspace uses JSON. Agent isolation is git-based: each task works in its own worktree.
 
 ```mermaid
 flowchart LR
@@ -26,7 +26,7 @@ crates/
   factory-db      SQLite persistence with versioned migrations
   factory-git     Repository detection and worktree management
   factory-core    Agent config, planning, validation, run orchestration
-  factory-api     Local HTTP API (axum): read + configuration endpoints
+  factory-api     Local HTTP API (axum): graph, session, and configuration endpoints
   factory-cli     The `factory` binary: init, start, run, status, dev
 apps/
   dashboard       Vite + React + TypeScript dashboard
@@ -96,15 +96,20 @@ reconcile run status), and worktree operations.
 
 An axum application serving the dashboard and the API from one process. Routes:
 
-| Method | Route            | Purpose                                   |
-| ------ | ---------------- | ----------------------------------------- |
-| GET    | `/api/health`    | Health                                    |
-| GET    | `/api/runs`      | Run summaries with task counts            |
-| GET    | `/api/runs/:id`  | One run and its tasks                     |
-| GET    | `/api/graph`     | Network data for the Agent Graph          |
-| GET    | `/api/agents`    | Agents with executable availability       |
-| GET    | `/api/config`    | Agent/role configuration                  |
-| PUT    | `/api/config`    | Write a validated configuration, atomically |
+| Method | Route                         | Purpose                                     |
+| ------ | ----------------------------- | ------------------------------------------- |
+| GET    | `/api/health`                 | Health                                      |
+| GET    | `/api/runs`                   | Run summaries with task counts              |
+| GET    | `/api/runs/:id`               | One run and its tasks                       |
+| GET    | `/api/graph`                  | Factory entities and semantic connections   |
+| GET    | `/api/graph/workspace`        | Saved visual layout and topology metadata   |
+| PUT    | `/api/graph/workspace`        | Validate and atomically save graph metadata |
+| GET    | `/api/agents`                 | Agents with executable availability         |
+| GET    | `/api/agents/:agent/sessions` | Recent sessions for a configured agent      |
+| GET    | `/api/sessions/:id`           | One known Factory agent session             |
+| GET    | `/api/sessions/:id/stream`    | SSE snapshots for one known session         |
+| GET    | `/api/config`                 | Agent/role configuration                    |
+| PUT    | `/api/config`                 | Write validated configuration atomically    |
 
 The dashboard is served for every non-API path; unknown `/api/*` paths return 404. How
 the dashboard assets are provided depends on the build:
@@ -118,6 +123,40 @@ the dashboard assets are provided depends on the build:
   to build the dashboard when it is missing.
 
 The server binds `127.0.0.1`.
+
+## Agent Graph workspace
+
+The dashboard merges two data sources without changing their ownership:
+
+- Factory state from `/api/graph`: agents, roles, runs, tasks, role assignments,
+  containment, and task dependencies.
+- Visual workspace state from `.factory/graph.json`: manual positions, groups, notes,
+  memberships, and custom agent-to-agent links.
+
+`graph.json` is versioned and written atomically. Manual positions override the
+automatic neural layout until Reset layout removes them. Groups, notes, memberships,
+and custom links organize the workspace only; they do not schedule work. Role
+assignments update `.factory/config.toml`. Run containment and task dependencies remain
+read-only because they represent persisted execution state.
+
+```mermaid
+flowchart TB
+    GRAPH[Dashboard Agent Graph]
+    GRAPH --> LAYOUT[Graph workspace API]
+    GRAPH --> CONFIG[Factory configuration API]
+    GRAPH --> STREAM[Agent session SSE]
+    LAYOUT --> JSON[".factory/graph.json<br/>visual topology"]
+    CONFIG --> TOML[".factory/config.toml<br/>agents and roles"]
+    STREAM --> SESSION["AgentSession<br/>SQLite"]
+    CORE[Factory core] --> SESSION
+    CORE --> EXTERNAL[External coding agent]
+    EXTERNAL --> CORE
+```
+
+The Agent Console reads only known `AgentSession` records. The SSE route polls the
+selected session and closes after a terminal state. Current planner invocations are
+non-interactive, so the UI reports that stdin is unavailable; the route shape remains
+compatible with future live worker sessions.
 
 ### factory-cli
 
@@ -154,6 +193,8 @@ stateDiagram-v2
 - Run status is derived from tasks; the dashboard never guesses it.
 - Agent configuration is a real file shipped through the config API; there is no second
   configuration store.
+- Graph workspace metadata is separate from configuration and execution state. Custom
+  links never trigger agent execution.
 
 Worktrees are isolation for git branches and concurrent work, not a security boundary.
 See [Security](security.md).

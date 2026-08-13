@@ -66,8 +66,8 @@ export interface AgentStatusInfo {
   available: boolean;
 }
 
-export type GraphNodeKind = "agent" | "role" | "run" | "task";
-export type GraphEdgeKind = "binds" | "uses" | "contains" | "depends";
+export type GraphNodeKind = "agent" | "role" | "run" | "task" | "group" | "note";
+export type GraphEdgeKind = "binds" | "uses" | "contains" | "depends" | "custom" | "membership";
 
 export interface AgentMeta {
   command: string;
@@ -97,17 +97,29 @@ export interface TaskMeta {
   worktreePath: string | null;
 }
 
+export interface GroupMeta {
+  visualOnly: true;
+}
+
+export interface NoteMeta {
+  text: string;
+  visualOnly: true;
+}
+
 export interface GraphNode {
   id: string;
   kind: GraphNodeKind;
   label: string;
-  meta: AgentMeta | RoleMeta | RunMeta | TaskMeta;
+  meta: AgentMeta | RoleMeta | RunMeta | TaskMeta | GroupMeta | NoteMeta;
 }
 
 export interface GraphEdge {
+  id: string;
   source: string;
   target: string;
   kind: GraphEdgeKind;
+  editable: boolean;
+  semantic: "configuration" | "execution" | "system" | "visual";
 }
 
 export interface GraphMetadata {
@@ -122,6 +134,51 @@ export interface GraphData {
   nodes: GraphNode[];
   edges: GraphEdge[];
   metadata: GraphMetadata;
+}
+
+export interface GraphPosition {
+  x: number;
+  y: number;
+}
+
+export interface WorkspaceNode {
+  id: string;
+  kind: "group" | "note";
+  label: string;
+  text?: string;
+}
+
+export interface WorkspaceEdge {
+  id: string;
+  source: string;
+  target: string;
+  kind: "custom" | "membership";
+}
+
+export interface GraphWorkspace {
+  version: 1;
+  nodes: Record<string, GraphPosition>;
+  customNodes: WorkspaceNode[];
+  edges: WorkspaceEdge[];
+  warning?: string;
+}
+
+export interface AgentSession {
+  id: number;
+  runId: number | null;
+  taskId: number | null;
+  role: string;
+  agent: string;
+  command: string;
+  status: string;
+  startedAt: string;
+  finishedAt: string | null;
+  exitCode: number | null;
+  durationMs: number | null;
+  stdout: string | null;
+  stderr: string | null;
+  workingDirectory: string;
+  interactive: boolean;
 }
 
 export function agentMeta(node: GraphNode): AgentMeta {

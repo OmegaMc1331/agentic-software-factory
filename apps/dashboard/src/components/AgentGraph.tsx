@@ -1,276 +1,272 @@
-import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState } from "react";
-import type { GraphNode } from "../types";
+import {
+  ConnectionLineType,
+  MarkerType,
+  ReactFlow,
+  ReactFlowProvider,
+  getNodesBounds,
+  useEdgesState,
+  useNodesState,
+  useReactFlow,
+  type Connection,
+  type NodeMouseHandler,
+  type OnConnect,
+  type ReactFlowInstance,
+  type XYPosition,
+} from "@xyflow/react";
+import "@xyflow/react/dist/style.css";
+import { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef } from "react";
+import type {
+  AgentActivity,
+  GraphEdge as GraphEdgeData,
+  GraphNode as GraphNodeData,
+} from "../types";
 import { taskMeta } from "../types";
-import type { AgentActivity } from "../types";
-import type { NetworkLayout, NetworkNodePos } from "../networkLayout";
-import { GraphEdge } from "./GraphEdge";
-import { GraphNode as GraphNodeView } from "./GraphNode";
+import type { NetworkLayout } from "../networkLayout";
+import { GraphEdge, type FactoryFlowEdge } from "./GraphEdge";
+import { GraphNode, type FactoryFlowNode } from "./GraphNode";
 
 export interface AgentGraphHandle {
   fit: () => void;
+  center: () => void;
   centerOn: (id: string) => void;
+  zoomIn: () => void;
+  zoomOut: () => void;
+  viewportCenter: () => XYPosition;
 }
 
-const ZOOM_MIN = 0.12;
-const ZOOM_MAX = 3.2;
+const nodeTypes = { factory: GraphNode };
+const edgeTypes = { factory: GraphEdge };
 
-const EASE = "transform 0.4s cubic-bezier(0.22, 1, 0.36, 1)";
-
-function topmostHit(wx: number, wy: number, nodes: NetworkNodePos[]): NetworkNodePos | null {
-  for (let i = nodes.length - 1; i >= 0; i -= 1) {
-    const pos = nodes[i];
-    if (wx >= pos.x && wx <= pos.x + pos.width && wy >= pos.y && wy <= pos.y + pos.height) {
-      return pos;
-    }
-  }
-  return null;
+interface AgentGraphProps {
+  layout: NetworkLayout;
+  nodesById: Map<string, GraphNodeData>;
+  edges: GraphEdgeData[];
+  positions: Record<string, XYPosition>;
+  positionRevision: number;
+  selectedNodeId: string | null;
+  selectedEdgeId: string | null;
+  neighborIds: string[];
+  activities: Map<string, AgentActivity | null>;
+  onNodeSelect: (id: string) => void;
+  onEdgeSelect: (id: string) => void;
+  onBackgroundClick: () => void;
+  onNodeDragStop: (id: string, position: XYPosition) => void;
+  onConnect: OnConnect;
+  isValidConnection: (connection: Connection | FactoryFlowEdge) => boolean;
+  onZoomChange: (zoom: number) => void;
 }
 
-export const AgentGraph = forwardRef<
-  AgentGraphHandle,
-  {
-    layout: NetworkLayout;
-    nodesById: Map<string, GraphNode>;
-    activeId: string | null;
-    selectedId: string | null;
-    neighborIds: string[];
-    activities: Map<string, AgentActivity | null>;
-    onNodeEnter: (id: string) => void;
-    onNodeLeave: () => void;
-    onNodeClick: (id: string) => void;
-    onBackgroundClick: () => void;
-  }
->(function AgentGraph(
+function GraphSurface(
   {
     layout,
     nodesById,
-    activeId,
-    selectedId,
+    edges: graphEdges,
+    positions,
+    positionRevision,
+    selectedNodeId,
+    selectedEdgeId,
     neighborIds,
     activities,
-    onNodeEnter,
-    onNodeLeave,
-    onNodeClick,
+    onNodeSelect,
+    onEdgeSelect,
     onBackgroundClick,
-  },
-  ref
+    onNodeDragStop,
+    onConnect,
+    isValidConnection,
+    onZoomChange,
+  }: AgentGraphProps,
+  ref: React.ForwardedRef<AgentGraphHandle>
 ) {
-  const svgRef = useRef<SVGSVGElement>(null);
-  const layoutRef = useRef(layout);
-  layoutRef.current = layout;
-  const viewRef = useRef({ x: 0, y: 0, s: 1 });
-  const [view, setView] = useState({ x: 0, y: 0, s: 1 });
-  const [easing, setEasing] = useState(false);
+  const wrapperRef = useRef<HTMLDivElement>(null);
+  const instanceRef = useRef<ReactFlowInstance<FactoryFlowNode, FactoryFlowEdge> | null>(null);
+  const positionRevisionRef = useRef(positionRevision);
+  const { fitView, setCenter, zoomIn, zoomOut, screenToFlowPosition, getNode, getNodes } =
+    useReactFlow<FactoryFlowNode, FactoryFlowEdge>();
+  const neighborSet = useMemo(() => new Set(neighborIds), [neighborIds]);
 
-  const settle = useCallback(() => window.setTimeout(() => setEasing(false), 450), []);
+  const buildNodes = useCallback(
+    (): FactoryFlowNode[] =>
+      layout.nodes.flatMap((position) => {
+        const node = nodesById.get(position.id);
+        if (!node) return [];
+        return [
+          {
+            id: node.id,
+            type: "factory",
+            position: positions[node.id] ?? { x: position.x, y: position.y },
+            selected: node.id === selectedNodeId,
+            draggable: true,
+            selectable: true,
+            deletable: false,
+            zIndex: node.kind === "group" ? -1 : node.id === selectedNodeId ? 4 : 1,
+            style:
+              node.kind === "group"
+                ? { width: position.width, height: position.height }
+                : undefined,
+            data: {
+              node,
+              activity: node.kind === "agent" ? (activities.get(node.id) ?? null) : null,
+              dimmed:
+                selectedNodeId !== null && node.id !== selectedNodeId && !neighborSet.has(node.id),
+            },
+          },
+        ];
+      }),
+    [activities, layout.nodes, neighborSet, nodesById, positions, selectedNodeId]
+  );
 
-  const reduceMotion =
-    typeof window !== "undefined" && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const buildEdges = useCallback(
+    (): FactoryFlowEdge[] =>
+      graphEdges.map((edge) => {
+        const target = nodesById.get(edge.target);
+        const active = target?.kind === "task" && taskMeta(target).state === "running";
+        const connected =
+          selectedNodeId === null ||
+          edge.source === selectedNodeId ||
+          edge.target === selectedNodeId;
+        const directional = !["custom", "membership", "binds"].includes(edge.kind);
+        return {
+          id: edge.id,
+          source: edge.source,
+          target: edge.target,
+          type: "factory",
+          selected: edge.id === selectedEdgeId,
+          selectable: true,
+          deletable: false,
+          animated: active,
+          markerEnd: directional ? { type: MarkerType.ArrowClosed } : undefined,
+          data: {
+            kind: edge.kind,
+            editable: edge.editable,
+            semantic: edge.semantic,
+            dimmed: !connected,
+            active,
+          },
+        };
+      }),
+    [graphEdges, nodesById, selectedEdgeId, selectedNodeId]
+  );
+
+  const [nodes, setNodes, onNodesChange] = useNodesState<FactoryFlowNode>(buildNodes());
+  const [edges, setEdges, onEdgesChange] = useEdgesState<FactoryFlowEdge>(buildEdges());
 
   useEffect(() => {
-    const el = svgRef.current;
-    if (!el) return;
-    const onWheel = (event: WheelEvent) => {
-      event.preventDefault();
-      const rect = el.getBoundingClientRect();
-      const px = event.clientX - rect.left;
-      const py = event.clientY - rect.top;
-      const current = viewRef.current;
-      const nextScale = Math.min(
-        ZOOM_MAX,
-        Math.max(ZOOM_MIN, current.s * Math.exp(-event.deltaY * 0.0014))
-      );
-      const wx = (px - current.x) / current.s;
-      const wy = (py - current.y) / current.s;
-      setView({ x: px - wx * nextScale, y: py - wy * nextScale, s: nextScale });
-      setEasing(false);
-    };
-    el.addEventListener("wheel", onWheel, { passive: false });
-    return () => el.removeEventListener("wheel", onWheel);
-  }, []);
+    setNodes((current) => {
+      const currentById = new Map(current.map((node) => [node.id, node]));
+      const shouldReplacePositions = positionRevisionRef.current !== positionRevision;
+      positionRevisionRef.current = positionRevision;
+      return buildNodes().map((node) => ({
+        ...node,
+        position:
+          shouldReplacePositions || !currentById.has(node.id)
+            ? node.position
+            : currentById.get(node.id)!.position,
+      }));
+    });
+  }, [buildNodes, positionRevision, setNodes]);
 
-  const drag = useRef<{ px: number; py: number; moved: boolean } | null>(null);
+  useEffect(() => setEdges(buildEdges()), [buildEdges, setEdges]);
 
-  const onPointerDown = (event: React.PointerEvent<SVGSVGElement>) => {
-    if (event.button !== 0) return;
-    drag.current = { px: event.clientX, py: event.clientY, moved: false };
-    (event.target as Element).setPointerCapture?.(event.pointerId);
-  };
+  const fit = useCallback(() => {
+    void fitView({ padding: 0.1, minZoom: 0.12, maxZoom: 1.8, duration: 320 });
+  }, [fitView]);
 
-  const onPointerMove = (event: React.PointerEvent<SVGSVGElement>) => {
-    const state = drag.current;
-    if (!state) return;
-    const dx = event.clientX - state.px;
-    const dy = event.clientY - state.py;
-    if (Math.abs(dx) + Math.abs(dy) > 3) state.moved = true;
-    if (state.moved) {
-      setView((current) => ({ ...current, x: current.x + dx, y: current.y + dy }));
-      setEasing(false);
-    }
-    state.px = event.clientX;
-    state.py = event.clientY;
-  };
-
-  const onPointerUp = (event: React.PointerEvent<SVGSVGElement>) => {
-    const state = drag.current;
-    drag.current = null;
-    if (!state || state.moved) return;
-    const el = svgRef.current;
-    if (!el) return;
-    const rect = el.getBoundingClientRect();
-    const px = event.clientX - rect.left;
-    const py = event.clientY - rect.top;
-    const current = viewRef.current;
-    const wx = (px - current.x) / current.s;
-    const wy = (py - current.y) / current.s;
-    const candidates =
-      selectedId === null
-        ? layoutRef.current.nodes
-        : [...layoutRef.current.nodes].sort(
-            (a, b) => Number(a.id === selectedId) - Number(b.id === selectedId)
-          );
-    const hit = topmostHit(wx, wy, candidates);
-    if (hit) onNodeClick(hit.id);
-    else onBackgroundClick();
-  };
+  const centerOn = useCallback(
+    (id: string) => {
+      const node = getNode(id);
+      if (!node) return;
+      const width = node.measured?.width ?? node.width ?? 140;
+      const height = node.measured?.height ?? node.height ?? 70;
+      void setCenter(node.position.x + width / 2, node.position.y + height / 2, {
+        zoom: instanceRef.current?.getZoom() ?? 1,
+        duration: 260,
+      });
+    },
+    [getNode, setCenter]
+  );
 
   useImperativeHandle(
     ref,
     () => ({
-      fit() {
-        const el = svgRef.current;
-        if (!el) return;
-        const cw = el.clientWidth;
-        const ch = el.clientHeight;
-        const lay = layoutRef.current;
-        if (!lay || lay.nodes.length === 0) return;
-        const margin = 56;
-        const scale = Math.min((cw - margin * 2) / lay.width, (ch - margin * 2) / lay.height, 1.15);
-        const s = Math.max(ZOOM_MIN, scale);
-        viewRef.current = { x: (cw - lay.width * s) / 2, y: (ch - lay.height * s) / 2, s };
-        setView(viewRef.current);
-        setEasing(true);
-        settle();
+      fit,
+      center() {
+        if (selectedNodeId) {
+          centerOn(selectedNodeId);
+          return;
+        }
+        const bounds = getNodesBounds(getNodes());
+        void setCenter(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2, {
+          zoom: instanceRef.current?.getZoom() ?? 1,
+          duration: 260,
+        });
       },
-      centerOn(id: string) {
-        const el = svgRef.current;
-        if (!el) return;
-        const cw = el.clientWidth;
-        const ch = el.clientHeight;
-        const pos = layoutRef.current.nodes.find((node) => node.id === id);
-        if (!pos) return;
-        const { s } = viewRef.current;
-        viewRef.current = { x: cw / 2 - pos.cx * s, y: ch / 2 - pos.cy * s, s };
-        setView(viewRef.current);
-        setEasing(true);
-        settle();
+      centerOn,
+      zoomIn() {
+        void zoomIn({ duration: 180 });
+      },
+      zoomOut() {
+        void zoomOut({ duration: 180 });
+      },
+      viewportCenter() {
+        const rect = wrapperRef.current?.getBoundingClientRect();
+        if (!rect) return { x: 0, y: 0 };
+        return screenToFlowPosition({
+          x: rect.left + rect.width / 2,
+          y: rect.top + rect.height / 2,
+        });
       },
     }),
-    [settle]
+    [centerOn, fit, getNodes, screenToFlowPosition, selectedNodeId, setCenter, zoomIn, zoomOut]
   );
 
-  const isConnected = useCallback(
-    (id: string) => {
-      if (selectedId === null) return activeId !== null && id === activeId;
-      return id === selectedId || neighborIds.includes(id);
-    },
-    [selectedId, activeId, neighborIds]
-  );
-
-  const ordered = useCallback(() => {
-    const list = [...layout.nodes];
-    if (selectedId !== null)
-      list.sort((a, b) => Number(a.id === selectedId) - Number(b.id === selectedId));
-    return list;
-  }, [layout.nodes, selectedId]);
-
-  const edges = layout.edges.map((edgePos) => {
-    const target = nodesById.get(edgePos.target);
-    const targetTask = target?.kind === "task" ? taskMeta(target) : null;
-    const tone =
-      targetTask && targetTask.state === "failed"
-        ? "failed"
-        : targetTask && targetTask.state === "blocked"
-          ? "blocked"
-          : "ok";
-    const flowing = targetTask ? targetTask.state === "running" : false;
-    const emphasized = isConnected(edgePos.source) || isConnected(edgePos.target);
-    const dimmed = selectedId !== null && !emphasized;
-    return (
-      <GraphEdge
-        key={`${edgePos.source}->${edgePos.target}`}
-        path={edgePos.path}
-        kind={edgePos.kind}
-        tone={tone}
-        flowing={flowing}
-        emphasized={emphasized}
-        dimmed={dimmed}
-      />
-    );
-  });
-
-  const nodes = ordered().map((pos) => {
-    const node = nodesById.get(pos.id);
-    if (!node) return null;
-    const selected = selectedId === pos.id;
-    const dimmed = selectedId === null ? false : !isConnected(pos.id) && !selected;
-    return (
-      <GraphNodeView
-        key={pos.id}
-        pos={pos}
-        node={node}
-        selected={selected}
-        dimmed={dimmed}
-        activity={node.kind === "agent" ? (activities.get(pos.id) ?? null) : null}
-        onEnter={onNodeEnter}
-        onLeave={onNodeLeave}
-      />
-    );
-  });
-
-  const ease = reduceMotion ? "none" : easing ? EASE : "none";
+  const selectNode: NodeMouseHandler<FactoryFlowNode> = (_event, node) => onNodeSelect(node.id);
 
   return (
-    <svg
-      ref={svgRef}
-      className="agent-canvas"
-      role="img"
-      aria-label="factory agent and task network"
-      onPointerDown={onPointerDown}
-      onPointerMove={onPointerMove}
-      onPointerUp={onPointerUp}
-      onPointerCancel={() => (drag.current = null)}
-    >
-      <defs>
-        <pattern id="net-dots" width="24" height="24" patternUnits="userSpaceOnUse">
-          <circle cx="1.5" cy="1.5" r="1" fill="var(--dot, rgba(148,163,184,0.06))" />
-        </pattern>
-        <marker
-          id="net-arrow"
-          viewBox="0 0 10 10"
-          refX="8"
-          refY="5"
-          markerWidth="5.5"
-          markerHeight="5.5"
-          orient="auto-start-reverse"
-        >
-          <path d="M 0 0 L 10 5 L 0 10 z" fill="context-stroke" />
-        </marker>
-      </defs>
-
-      <rect className="agent-canvas-bg" width="100%" height="100%" fill="url(#net-dots)" />
-      <rect className="agent-canvas-shade" width="100%" height="100%" />
-
-      <g
-        style={{
-          transform: `translate(${view.x}px, ${view.y}px) scale(${view.s})`,
-          transformOrigin: "0 0",
-          transition: ease,
+    <div className="agent-canvas" ref={wrapperRef} aria-label="Factory agent and task graph">
+      <ReactFlow<FactoryFlowNode, FactoryFlowEdge>
+        nodes={nodes}
+        edges={edges}
+        nodeTypes={nodeTypes}
+        edgeTypes={edgeTypes}
+        onNodesChange={onNodesChange}
+        onEdgesChange={onEdgesChange}
+        onNodeClick={selectNode}
+        onEdgeClick={(_event, edge) => onEdgeSelect(edge.id)}
+        onPaneClick={onBackgroundClick}
+        onNodeDragStop={(_event, node) => onNodeDragStop(node.id, node.position)}
+        onConnect={onConnect}
+        isValidConnection={isValidConnection}
+        onInit={(instance) => {
+          instanceRef.current = instance;
+          window.requestAnimationFrame(fit);
         }}
-      >
-        {edges}
-        {nodes}
-      </g>
-    </svg>
+        onMove={(_event, viewport) => onZoomChange(viewport.zoom)}
+        minZoom={0.12}
+        maxZoom={3.2}
+        fitView
+        fitViewOptions={{ padding: 0.1, minZoom: 0.12, maxZoom: 1.8 }}
+        panOnDrag
+        zoomOnScroll
+        zoomOnPinch
+        zoomOnDoubleClick={false}
+        connectionLineType={ConnectionLineType.Bezier}
+        deleteKeyCode={null}
+        selectionKeyCode={null}
+        multiSelectionKeyCode={null}
+        proOptions={{ hideAttribution: true }}
+      />
+    </div>
   );
-});
+}
+
+const ForwardedGraphSurface = forwardRef(GraphSurface);
+
+export const AgentGraph = forwardRef<AgentGraphHandle, AgentGraphProps>(
+  function AgentGraph(props, ref) {
+    return (
+      <ReactFlowProvider>
+        <ForwardedGraphSurface {...props} ref={ref} />
+      </ReactFlowProvider>
+    );
+  }
+);

@@ -35,6 +35,8 @@ const EDGE_REST: Record<GraphEdgeKind, number> = {
   uses: 175,
   contains: 135,
   depends: 105,
+  custom: 190,
+  membership: 130,
 };
 
 const ANCHOR: Record<GraphNodeKind, number> = {
@@ -42,6 +44,8 @@ const ANCHOR: Record<GraphNodeKind, number> = {
   role: 0.08,
   run: 0.17,
   task: 0.05,
+  group: 0.04,
+  note: 0.05,
 };
 
 const ITERATIONS = 180;
@@ -65,6 +69,10 @@ function nodeSize(node: GraphNode): { width: number; height: number } {
       return { width: Math.max(112, node.label.length * 6.4 + 34), height: 26 };
     case "task":
       return { width: 134, height: 22 };
+    case "group":
+      return { width: 230, height: 150 };
+    case "note":
+      return { width: 154, height: 72 };
   }
 }
 
@@ -157,6 +165,21 @@ function homes(nodes: GraphNode[], edges: GraphEdge[]): Map<string, { x: number;
       y: runHome.y + Math.sin(angle) * TASK_FAN_RADIUS + jitter(node.id, 5) * 20,
     });
   }
+
+  const groups = nodes.filter((node) => node.kind === "group");
+  groups.forEach((node, index) => {
+    result.set(node.id, {
+      x: (index % 2 === 0 ? -1 : 1) * (310 + Math.floor(index / 2) * 150),
+      y: -20 + jitter(node.id, 8) * 18,
+    });
+  });
+  const notes = nodes.filter((node) => node.kind === "note");
+  notes.forEach((node, index) => {
+    result.set(node.id, {
+      x: (index % 2 === 0 ? -1 : 1) * (245 + Math.floor(index / 2) * 110),
+      y: -235 + jitter(node.id, 5) * 22,
+    });
+  });
 
   return result;
 }

@@ -51,7 +51,14 @@ function node(id: string, kind: GraphNode["kind"], label = id): GraphNode {
 }
 
 function edge(source: string, target: string, kind: GraphEdge["kind"]): GraphEdge {
-  return { source, target, kind };
+  return {
+    id: `${kind}:${source}:${target}`,
+    source,
+    target,
+    kind,
+    editable: false,
+    semantic: kind === "depends" ? "execution" : "system",
+  };
 }
 
 function task(n: number, runId = 1, position = n): GraphNode {

@@ -884,3 +884,727 @@ code {
     display: none;
   }
 }
+
+/* ---- Interactive Agent Graph workspace ---- */
+
+:focus-visible {
+  outline: 2px solid #77a4ff;
+  outline-offset: 2px;
+}
+
+.network-view {
+  display: flex;
+  flex-direction: column;
+  min-height: calc(100vh - 96px);
+}
+
+.net-toolbar {
+  display: grid;
+  grid-template-columns: minmax(190px, 1fr) auto;
+  gap: 9px 16px;
+  padding: 10px 12px;
+  margin-bottom: 10px;
+}
+
+.net-toolbar-heading {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  min-width: 0;
+}
+
+.net-toolbar-title {
+  margin: 0;
+  line-height: 1.25;
+}
+
+.net-toolbar-subtitle {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.net-toolgroup,
+.net-toolbar-options {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.net-toolbar-options {
+  grid-column: 1 / -1;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+
+.net-btn {
+  min-height: 30px;
+  padding: 5px 10px;
+}
+
+.net-btn--primary {
+  color: #dce8ff;
+  border-color: #4569a8;
+  background: #16233a;
+}
+
+.net-btn--icon {
+  justify-content: center;
+  min-width: 30px;
+  padding-inline: 7px;
+  font-family: var(--mono);
+  font-size: 15px;
+}
+
+.net-btn--reset {
+  margin-left: 3px;
+  color: var(--text-muted);
+}
+
+.net-zoom {
+  width: 48px;
+  text-align: center;
+  color: var(--text-muted);
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.network-stage {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+}
+
+.net-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(300px, 352px);
+  gap: 12px;
+  align-items: stretch;
+}
+
+.net-canvas {
+  height: clamp(540px, calc(100vh - 245px), 820px);
+  border-color: #242b38;
+  background:
+    radial-gradient(circle at 1px 1px, var(--dot) 1px, transparent 1.2px) 0 0 / 24px 24px,
+    var(--canvas-bg);
+}
+
+.agent-canvas {
+  cursor: default;
+}
+
+.agent-canvas .react-flow {
+  background: transparent;
+}
+
+.agent-canvas .react-flow__pane {
+  cursor: grab;
+}
+
+.agent-canvas .react-flow__pane.dragging {
+  cursor: grabbing;
+}
+
+.agent-canvas .react-flow__node-factory {
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.agent-canvas .react-flow__node-factory:focus-visible {
+  outline: 2px solid #77a4ff;
+  outline-offset: 4px;
+}
+
+.graph-node {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  color: var(--text);
+  background: #171b23;
+  border: 1px solid #384151;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.18);
+  user-select: none;
+  transition:
+    border-color 120ms ease,
+    opacity 120ms ease,
+    box-shadow 120ms ease;
+}
+
+.graph-node strong {
+  font-size: 12.5px;
+  font-weight: 620;
+  line-height: 1.25;
+}
+
+.graph-node > span:not(.graph-agent-orbit, .graph-agent-status, .graph-node-kicker) {
+  color: #aeb6c4;
+  font-size: 11px;
+}
+
+.graph-node small {
+  color: var(--text-muted);
+  font-family: var(--mono);
+  font-size: 9.5px;
+}
+
+.graph-node--selected {
+  border-color: #7ba4f5;
+  box-shadow:
+    0 0 0 2px rgba(61, 125, 253, 0.18),
+    0 6px 20px rgba(0, 0, 0, 0.22);
+}
+
+.graph-node--dimmed {
+  opacity: 0.24;
+}
+
+.graph-node--agent {
+  width: 150px;
+  min-height: 108px;
+  align-items: center;
+  gap: 3px;
+  border-radius: 54px;
+  text-align: center;
+  border-color: #4169a9;
+}
+
+.graph-agent-orbit {
+  position: absolute;
+  inset: 8px;
+  border: 1px solid rgba(96, 136, 204, 0.22);
+  border-radius: 50%;
+  pointer-events: none;
+}
+
+.graph-agent-status {
+  position: absolute;
+  top: 16px;
+  right: 24px;
+  width: 7px;
+  height: 7px;
+  border: 1px solid #e06a62;
+  border-radius: 50%;
+  background: #171b23;
+}
+
+.graph-agent-status.is-available {
+  border-color: #4eba7b;
+  background: #4eba7b;
+}
+
+.graph-node--role {
+  width: 118px;
+  min-height: 48px;
+  padding: 7px 12px;
+  border-radius: 14px;
+  border-color: #685f91;
+}
+
+.graph-node--run {
+  width: 124px;
+  min-height: 54px;
+  padding: 8px 12px;
+  border-radius: 12px;
+  border-color: #3f7088;
+}
+
+.graph-node--task {
+  width: 166px;
+  min-height: 48px;
+  display: grid;
+  grid-template-columns: auto 1fr;
+  grid-template-rows: auto auto;
+  gap: 1px 7px;
+  padding: 7px 10px;
+  border-radius: 11px;
+  border-left: 2px solid var(--node-state);
+}
+
+.graph-node--task strong {
+  grid-row: 1 / 3;
+  align-self: center;
+  color: var(--node-state);
+  font-family: var(--mono);
+}
+
+.graph-node--task small {
+  text-transform: capitalize;
+}
+
+.graph-node--group {
+  width: 100%;
+  height: 100%;
+  justify-content: flex-start;
+  padding: 12px 14px;
+  border-style: dashed;
+  border-color: #3b4657;
+  border-radius: 18px;
+  background: rgba(24, 29, 38, 0.42);
+  box-shadow: none;
+}
+
+.graph-node--note {
+  width: 172px;
+  min-height: 78px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border-color: #4a4a43;
+  background: #1a1a19;
+}
+
+.graph-node--note p {
+  margin: 5px 0 0;
+  color: #a9a89f;
+  font-size: 10.5px;
+  line-height: 1.35;
+}
+
+.graph-node-kicker {
+  color: var(--text-muted);
+  font-family: var(--mono);
+  font-size: 8.5px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.graph-handle {
+  width: 10px;
+  height: 10px;
+  border: 2px solid #171b23;
+  background: #7b9bd2;
+  opacity: 0;
+  transition: opacity 100ms ease;
+}
+
+.graph-node:hover .graph-handle,
+.graph-node--selected .graph-handle,
+.react-flow__node:focus-visible .graph-handle {
+  opacity: 1;
+}
+
+.graph-edge {
+  stroke: #4d586b;
+  stroke-width: 1.2;
+  opacity: 0.62;
+}
+
+.graph-edge--binds {
+  stroke: #766e9d;
+}
+
+.graph-edge--depends {
+  stroke: #5871a0;
+}
+
+.graph-edge--custom {
+  stroke: #607a84;
+  stroke-dasharray: 7 5;
+}
+
+.graph-edge--membership {
+  stroke: #505866;
+  stroke-dasharray: 3 5;
+}
+
+.graph-edge--selected {
+  stroke: #a8c2f5;
+  stroke-width: 2.2;
+  opacity: 1;
+}
+
+.graph-edge--dimmed {
+  opacity: 0.1;
+}
+
+.graph-edge--active {
+  stroke-dasharray: 7 7;
+  animation: net-flow 1.6s linear infinite;
+}
+
+.react-flow__arrowhead {
+  fill: #63718a;
+}
+
+.add-node-menu {
+  position: absolute;
+  z-index: 20;
+  top: 12px;
+  left: 12px;
+  width: min(340px, calc(100% - 24px));
+  max-height: calc(100% - 24px);
+  overflow: auto;
+  padding: 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: 9px;
+  background: #171b23;
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.34);
+}
+
+.add-node-menu-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 10px;
+}
+
+.add-node-types {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 7px;
+}
+
+.add-node-type {
+  min-height: 74px;
+  padding: 10px;
+  text-align: left;
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--bg-inset);
+  cursor: pointer;
+}
+
+.add-node-type:hover {
+  border-color: #5273aa;
+}
+
+.add-node-type strong,
+.add-node-type span {
+  display: block;
+}
+
+.add-node-type span {
+  margin-top: 3px;
+  color: var(--text-muted);
+  font-size: 10.5px;
+}
+
+.add-node-form,
+.add-node-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.add-node-form {
+  gap: 9px;
+}
+
+.add-node-form label > span,
+.inspector-connect > label {
+  color: var(--text-muted);
+  font-size: 10.5px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.add-node-form input,
+.add-node-form textarea,
+.add-node-form select,
+.inspector-connect select {
+  width: 100%;
+  padding: 7px 8px;
+  color: var(--text);
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  background: var(--bg-inset);
+  font: inherit;
+}
+
+.add-node-actions,
+.inspector-connect > div {
+  display: flex;
+  gap: 7px;
+}
+
+.inline-error,
+.net-inline-error {
+  color: #ef8178;
+  font-size: 12px;
+}
+
+.net-inline-error {
+  position: absolute;
+  z-index: 18;
+  top: 12px;
+  left: 12px;
+  display: flex;
+  gap: 12px;
+  max-width: 480px;
+  margin: 0;
+  padding: 8px 10px;
+  border: 1px solid #693e3a;
+  border-radius: 6px;
+  background: #211615;
+}
+
+.net-inline-error button {
+  color: inherit;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+}
+
+.net-inspector,
+.agent-console {
+  min-height: 0;
+  height: clamp(540px, calc(100vh - 245px), 820px);
+  overflow: auto;
+}
+
+.net-inspector {
+  width: auto;
+}
+
+.inspector-connect {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-top: 11px;
+  border-top: 1px solid var(--border);
+}
+
+.inspector-delete {
+  align-self: flex-start;
+  margin-top: 7px;
+  color: #ef8178;
+}
+
+.agent-console {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-raised);
+}
+
+.agent-console-head {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 10px;
+  align-items: center;
+  padding: 13px 14px 10px;
+}
+
+.agent-console-head h3 {
+  margin: 2px 0 0;
+  font-size: 15px;
+}
+
+.agent-console-state {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  font-size: 11px;
+}
+
+.agent-console-tabs {
+  display: flex;
+  padding: 0 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.agent-console-tabs button {
+  padding: 8px 9px;
+  color: var(--text-muted);
+  border: 0;
+  border-bottom: 2px solid transparent;
+  background: transparent;
+  cursor: pointer;
+}
+
+.agent-console-tabs button.is-active {
+  color: var(--text);
+  border-bottom-color: var(--accent);
+}
+
+.agent-overview,
+.agent-console-body,
+.agent-session-list {
+  padding: 12px 14px;
+}
+
+.agent-overview dl {
+  margin: 0;
+}
+
+.agent-overview dl > div {
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.agent-overview dt {
+  color: var(--text-muted);
+  font-size: 10px;
+  text-transform: uppercase;
+}
+
+.agent-overview dd {
+  margin: 2px 0 0;
+  overflow-wrap: anywhere;
+}
+
+.agent-console-body {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.agent-console-idle {
+  display: grid;
+  place-content: center;
+  flex: 1;
+  min-height: 260px;
+  color: var(--text-muted);
+  text-align: center;
+}
+
+.agent-console-idle strong {
+  color: var(--text);
+}
+
+.agent-session-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px 10px;
+  color: var(--text-muted);
+  font-size: 10.5px;
+}
+
+.agent-session-meta code {
+  width: 100%;
+  overflow-wrap: anywhere;
+}
+
+.agent-terminal {
+  flex: 1;
+  min-height: 300px;
+  overflow: auto;
+  padding: 10px 11px;
+  border: 1px solid #272d38;
+  border-radius: 6px;
+  background: #0a0c10;
+  color: #d8dce4;
+  scrollbar-color: #394252 #0a0c10;
+}
+
+.agent-terminal pre {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: 11px/1.55 var(--mono);
+}
+
+.agent-terminal-stderr {
+  color: #e7a09a;
+}
+
+.agent-terminal-empty,
+.agent-console-input-note {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 10.5px;
+}
+
+.agent-follow {
+  align-self: flex-end;
+  color: var(--text);
+  border: 1px solid var(--border-strong);
+  border-radius: 5px;
+  background: var(--bg-inset);
+  cursor: pointer;
+}
+
+.agent-session-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.agent-session-list button {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 9px 10px;
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-inset);
+  text-align: left;
+  cursor: pointer;
+}
+
+.agent-session-list button.is-active {
+  border-color: #5273aa;
+}
+
+.agent-session-list small {
+  color: var(--text-muted);
+}
+
+.net-legend {
+  margin: 10px 2px 0;
+  gap: 12px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .graph-node,
+  .graph-handle,
+  .graph-edge--active {
+    transition: none;
+    animation: none;
+  }
+}
+
+@media (max-width: 980px) {
+  .net-toolbar {
+    grid-template-columns: 1fr;
+  }
+
+  .net-toolgroup {
+    grid-row: 2;
+    flex-wrap: wrap;
+  }
+
+  .net-toolbar-options {
+    grid-column: 1;
+  }
+
+  .net-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .net-inspector,
+  .agent-console {
+    width: 100%;
+    height: auto;
+    max-height: 440px;
+  }
+
+  .net-canvas {
+    height: 560px;
+  }
+}
+
+@media (max-width: 720px) {
+  .net-toolbar-options {
+    overflow-x: auto;
+  }
+
+  .net-btn--reset {
+    margin-left: 0;
+  }
+
+  .net-canvas {
+    height: calc(100vh - 260px);
+    min-height: 430px;
+  }
+
+  .add-node-types {
+    grid-template-columns: 1fr;
+  }
+}

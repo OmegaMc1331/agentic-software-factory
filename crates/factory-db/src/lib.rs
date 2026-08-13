@@ -208,6 +208,36 @@ impl FactoryDb {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
     }
+
+    pub fn get_agent_session(&self, id: i64) -> Result<Option<AgentSession>> {
+        self.conn
+            .query_row(
+                "SELECT id, run_id, task_id, role, agent, command, status, started_at, finished_at, exit_code, duration_ms, stdout, stderr
+                 FROM agent_sessions WHERE id = ?1",
+                params![id],
+                build_session,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn list_agent_sessions_for_agent(
+        &self,
+        agent: &str,
+        limit: usize,
+    ) -> Result<Vec<AgentSession>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, run_id, task_id, role, agent, command, status, started_at, finished_at, exit_code, duration_ms, stdout, stderr
+             FROM agent_sessions
+             WHERE agent = ?1
+             ORDER BY id DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![agent, limit as i64], build_session)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
 }
 
 fn build_run(r: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
@@ -573,5 +603,14 @@ mod tests {
         assert!(sessions[0].stdout.as_deref().unwrap().contains("objective"));
 
         assert!(!db.list_agent_sessions(None).unwrap().is_empty());
+        assert_eq!(db.get_agent_session(saved.id).unwrap(), Some(saved.clone()));
+        assert_eq!(
+            db.list_agent_sessions_for_agent("codex", 12).unwrap(),
+            vec![saved]
+        );
+        assert!(db
+            .list_agent_sessions_for_agent("unknown", 12)
+            .unwrap()
+            .is_empty());
     }
 }

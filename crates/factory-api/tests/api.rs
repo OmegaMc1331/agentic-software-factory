@@ -7,6 +7,7 @@ use std::time::Duration;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use factory_db::FactoryDb;
+use factory_types::AgentSession;
 use http_body_util::BodyExt;
 use serde_json::json;
 use tempfile::TempDir;
@@ -175,6 +176,60 @@ async fn config_round_trips_through_put_and_get() {
 }
 
 #[tokio::test]
+async fn role_assignment_can_be_reassigned_to_another_configured_agent() {
+    let dir = TempDir::new().unwrap();
+    init_root(dir.path());
+    let app = factory_api::router(make_state(dir.path()));
+
+    let config = json!({
+        "agents": {
+            "codex": { "command": "codex" },
+            "opencode": { "command": "opencode" }
+        },
+        "roles": { "planner": { "agent": "codex" } }
+    });
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/config")
+                .header("content-type", "application/json")
+                .body(Body::from(config.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let reassigned = json!({
+        "agents": {
+            "codex": { "command": "codex" },
+            "opencode": { "command": "opencode" }
+        },
+        "roles": { "planner": { "agent": "opencode" } }
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/config")
+                .header("content-type", "application/json")
+                .body(Body::from(reassigned.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let config = factory_core::Config::load(dir.path()).unwrap();
+    assert_eq!(
+        config.agent_for_role("planner").as_deref(),
+        Some("opencode")
+    );
+}
+
+#[tokio::test]
 async fn rejects_invalid_configuration_writes() {
     let dir = TempDir::new().unwrap();
     init_root(dir.path());
@@ -306,6 +361,247 @@ async fn serves_the_dashboard_index_from_dist() {
         .oneshot(
             Request::builder()
                 .uri("/api/not-a-route")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn graph_workspace_round_trips_and_rejects_unknown_endpoints() {
+    let dir = TempDir::new().unwrap();
+    init_root(dir.path());
+    let app = factory_api::router(make_state(dir.path()));
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/graph/workspace")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let value: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+    assert_eq!(value["version"], 1);
+    assert_eq!(value["nodes"], json!({}));
+
+    let workspace = json!({
+        "version": 1,
+        "nodes": {
+            "agent:codex": { "x": 418, "y": 216 },
+            "group:production": { "x": 260, "y": 180 }
+        },
+        "customNodes": [
+            { "id": "group:production", "kind": "group", "label": "Production" }
+        ],
+        "edges": [
+            {
+                "id": "edge:membership:one",
+                "source": "agent:codex",
+                "target": "group:production",
+                "kind": "membership"
+            }
+        ]
+    });
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/graph/workspace")
+                .header("content-type", "application/json")
+                .body(Body::from(workspace.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert!(dir.path().join(".factory").join("graph.json").exists());
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/graph/workspace")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+    assert_eq!(value["nodes"]["agent:codex"]["x"], 418.0);
+    assert_eq!(value["edges"][0]["kind"], "membership");
+
+    let invalid = json!({
+        "version": 1,
+        "nodes": {},
+        "customNodes": [],
+        "edges": [{
+            "id": "edge:custom:missing",
+            "source": "agent:codex",
+            "target": "agent:missing",
+            "kind": "custom"
+        }]
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/graph/workspace")
+                .header("content-type", "application/json")
+                .body(Body::from(invalid.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(body_text(response).await.contains("unknown target"));
+}
+
+#[tokio::test]
+async fn malformed_graph_workspace_returns_a_safe_empty_layout() {
+    let dir = TempDir::new().unwrap();
+    init_root(dir.path());
+    std::fs::write(dir.path().join(".factory").join("graph.json"), "{not json").unwrap();
+    let app = factory_api::router(make_state(dir.path()));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/graph/workspace")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let value: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+    assert_eq!(value["nodes"], json!({}));
+    assert!(value["warning"]
+        .as_str()
+        .unwrap()
+        .contains("malformed graph workspace"));
+}
+
+#[tokio::test]
+async fn agent_session_endpoints_return_persisted_output_and_close_completed_streams() {
+    let dir = TempDir::new().unwrap();
+    init_root(dir.path());
+    let state = make_state(dir.path());
+    let session = {
+        let db = state.db.lock().unwrap();
+        db.insert_agent_session(&AgentSession {
+            id: 0,
+            run_id: None,
+            task_id: None,
+            role: "worker".to_string(),
+            agent: "codex".to_string(),
+            command: "codex exec".to_string(),
+            status: "success".to_string(),
+            started_at: "2026-08-13T08:00:00Z".to_string(),
+            finished_at: Some("2026-08-13T08:00:02Z".to_string()),
+            exit_code: Some(0),
+            duration_ms: Some(2_000),
+            stdout: Some("compiled\n".to_string()),
+            stderr: Some("warning\n".to_string()),
+        })
+        .unwrap()
+    };
+    let app = factory_api::router(state);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/agents/codex/sessions")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let value: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+    assert_eq!(value[0]["id"], session.id);
+    assert_eq!(value[0]["stdout"], "compiled\n");
+    assert_eq!(value[0]["stderr"], "warning\n");
+    assert_eq!(value[0]["interactive"], false);
+    assert_eq!(
+        value[0]["workingDirectory"],
+        dir.path().to_string_lossy().as_ref()
+    );
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/sessions/{}", session.id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/sessions/{}/stream", session.id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["content-type"], "text/event-stream");
+    let stream = body_text(response).await;
+    assert!(stream.contains("event: session"));
+    assert!(stream.contains("compiled"));
+    assert!(stream.contains("warning"));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/sessions/999999")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert!(body_text(response)
+        .await
+        .contains("session 999999 not found"));
+}
+
+#[tokio::test]
+async fn configured_idle_agent_has_an_empty_session_history() {
+    let dir = TempDir::new().unwrap();
+    init_root(dir.path());
+    let app = factory_api::router(make_state(dir.path()));
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/agents/codex/sessions")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_text(response).await, "[]");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/agents/unknown/sessions")
                 .body(Body::empty())
                 .unwrap(),
         )

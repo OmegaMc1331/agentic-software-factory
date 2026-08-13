@@ -45,6 +45,23 @@ cd apps/dashboard && npm run dev   # http://localhost:5173
 The dashboard layout modules (`src/layout.ts`, `src/networkLayout.ts`) are pure,
 unit-tested functions; keep them free of React imports.
 
+### Agent Graph development
+
+The Agent Graph uses `@xyflow/react` for pointer dragging, connection handles, and
+viewport controls. Keep Factory entities from `GET /api/graph` separate from visual
+workspace metadata in `.factory/graph.json`. The graph workspace store validates node
+and edge kinds, ignores malformed files safely, and writes atomically. Persist positions
+on drag end, not during pointer movement.
+
+The Agent Console lists persisted `AgentSession` rows and uses a session-scoped SSE
+route for live snapshots. It must not expose a generic process or shell endpoint.
+Current sessions are non-interactive. Add a scoped transport only when the runtime owns
+a live session that explicitly supports stdin.
+
+Run `npm test` for graph state, connection, drag, and console component tests. Run
+`cargo test -p factory-api -p factory-db` for workspace persistence, validation, and
+session API tests.
+
 ## The dashboard in the binary
 
 In release builds the dashboard is embedded into the binary, so copying `factory` (or
