@@ -20,9 +20,12 @@ function node(id: string, kind: GraphNode["kind"], label = id): GraphNode {
     return {
       ...base,
       meta: {
+        runId: Number(id.split(":")[1]),
         objective: "",
         status: "planned",
         plannerAgent: "codex",
+        workerAgent: "opencode",
+        reviewerAgent: "claude",
         createdAt: "2026-01-01T00:00:00Z",
         counts: {
           pending: 0,
@@ -45,7 +48,9 @@ function node(id: string, kind: GraphNode["kind"], label = id): GraphNode {
       state: "pending",
       position: Number(id.split(":")[1]),
       dependencies: [],
+      acceptanceCriteria: [],
       worktreePath: null,
+      currentAttempt: null,
     },
   };
 }
@@ -93,8 +98,8 @@ export function fixture(): { nodes: GraphNode[]; edges: GraphEdge[] } {
     edge("role:planner", "agent:codex", "binds"),
     edge("role:worker", "agent:opencode", "binds"),
     edge("role:reviewer", "agent:claude", "binds"),
-    edge("run:1", "role:planner", "uses"),
-    edge("run:2", "role:planner", "uses"),
+    edge("run:1", "role:planner", "plans"),
+    edge("run:2", "role:planner", "plans"),
   ];
   for (let r = 1; r <= 2; r += 1) {
     for (let i = 1; i <= 6; i += 1) {
@@ -260,7 +265,7 @@ describe("neighborsOf", () => {
   it("returns no neighbors for an isolated node", () => {
     const layout = computeNetworkLayout(
       [node("a", "agent"), node("b", "agent")],
-      [edge("a", "x", "uses")]
+      [edge("a", "x", "plans")]
     );
     expect(neighborsOf(layout.nodes, layout.edges, "a")).toEqual([]);
   });

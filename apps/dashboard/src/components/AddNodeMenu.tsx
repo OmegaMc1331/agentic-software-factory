@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { AgentEntry, ConfigData } from "../types";
 
-type AddKind = "agent" | "role" | "group" | "note";
+type AddKind = "workflow" | "agent" | "role" | "group" | "note";
 const CORE_ROLES = ["planner", "worker", "reviewer"] as const;
 
 function parseLines(text: string): string[] {
@@ -36,7 +36,9 @@ export function AddNodeMenu({
   open,
   config,
   error,
+  initialKind,
   onClose,
+  onCreateWorkflow,
   onCreateAgent,
   onCreateRole,
   onCreateVisual,
@@ -44,7 +46,9 @@ export function AddNodeMenu({
   open: boolean;
   config: ConfigData;
   error: string | null;
+  initialKind?: AddKind | null;
   onClose: () => void;
+  onCreateWorkflow: (objective: string) => void;
   onCreateAgent: (name: string, entry: AgentEntry) => void;
   onCreateRole: (role: string, agent: string) => void;
   onCreateVisual: (kind: "group" | "note", label: string, text: string) => void;
@@ -57,16 +61,19 @@ export function AddNodeMenu({
   const [role, setRole] = useState("");
   const [agent, setAgent] = useState("");
   const [text, setText] = useState("");
+  const [objective, setObjective] = useState("");
   const [validationError, setValidationError] = useState<string | null>(null);
   const firstButton = useRef<HTMLButtonElement>(null);
 
   useEffect(() => {
-    if (open) window.requestAnimationFrame(() => firstButton.current?.focus());
-    else {
+    if (open) {
+      setKind(initialKind ?? null);
+      window.requestAnimationFrame(() => firstButton.current?.focus());
+    } else {
       setKind(null);
       setValidationError(null);
     }
-  }, [open]);
+  }, [initialKind, open]);
 
   useEffect(() => {
     if (!open) return;
@@ -80,10 +87,18 @@ export function AddNodeMenu({
   if (!open) return null;
   const availableRoles = CORE_ROLES.filter((candidate) => !config.roles[candidate]);
   const agents = Object.keys(config.agents).sort();
+  const planner = config.roles.planner?.agent ?? null;
 
   const submit = (event: React.FormEvent) => {
     event.preventDefault();
-    if (kind === "agent") {
+    if (kind === "workflow") {
+      if (!objective.trim()) {
+        setValidationError("Describe what the Factory should build.");
+        return;
+      }
+      setValidationError(null);
+      onCreateWorkflow(objective.trim());
+    } else if (kind === "agent") {
       const parsedEnvironment = parseEnvironment(environmentText);
       if (parsedEnvironment.error) {
         setValidationError(parsedEnvironment.error);
@@ -113,7 +128,7 @@ export function AddNodeMenu({
       </div>
       {kind === null ? (
         <div className="add-node-types">
-          {(["agent", "role", "group", "note"] as AddKind[]).map((option, index) => (
+          {(["workflow", "agent", "role", "group", "note"] as AddKind[]).map((option, index) => (
             <button
               key={option}
               ref={index === 0 ? firstButton : undefined}
@@ -124,17 +139,58 @@ export function AddNodeMenu({
               <span>
                 {option === "agent"
                   ? "Configured external process"
-                  : option === "role"
-                    ? "Core Factory assignment"
-                    : option === "group"
-                      ? "Visual organization"
-                      : "Workspace context"}
+                  : option === "workflow"
+                    ? "Plan work with the configured Planner"
+                    : option === "role"
+                      ? "Core Factory assignment"
+                      : option === "group"
+                        ? "Visual organization"
+                        : "Workspace context"}
               </span>
             </button>
           ))}
         </div>
       ) : (
         <form className="add-node-form" onSubmit={submit}>
+          {kind === "workflow" && (
+            <>
+              {planner ? (
+                <>
+                  <label>
+                    <span>What should the Factory build?</span>
+                    <textarea
+                      rows={5}
+                      value={objective}
+                      onChange={(event) => {
+                        setObjective(event.target.value);
+                        setValidationError(null);
+                      }}
+                      placeholder="Implement authentication with email login and password reset."
+                      required
+                      autoFocus
+                    />
+                  </label>
+                  <div className="workflow-planner-field">
+                    <span>Planner</span>
+                    <strong>{planner}</strong>
+                    <small>From the Planner role in Factory configuration</small>
+                  </div>
+                </>
+              ) : (
+                <div className="workflow-missing-role">
+                  <strong>No planner configured.</strong>
+                  <p>Assign an agent to the Planner role before creating a workflow.</p>
+                  <button
+                    className="button"
+                    type="button"
+                    onClick={() => setKind(agents.length > 0 ? "role" : "agent")}
+                  >
+                    Configure agents
+                  </button>
+                </div>
+              )}
+            </>
+          )}
           {kind === "agent" && (
             <>
               <label>
@@ -231,9 +287,12 @@ export function AddNodeMenu({
             <button
               className="button"
               type="submit"
-              disabled={kind === "role" && availableRoles.length === 0}
+              disabled={
+                (kind === "role" && availableRoles.length === 0) ||
+                (kind === "workflow" && !planner)
+              }
             >
-              Create
+              {kind === "workflow" ? "Plan" : "Create"}
             </button>
             <button className="button" type="button" onClick={() => setKind(null)}>
               Back

@@ -8,22 +8,39 @@ use axum::extract::{Path as UrlPath, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use factory_core::{Agents, Config, ConfigError};
 use factory_db::FactoryDb;
+use factory_runtime::{Runtime, RuntimeError};
+use serde::Deserialize;
 use serde_json::json;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::dashboard;
 use crate::graph_workspace::{GraphWorkspace, GraphWorkspaceError, GraphWorkspaceResponse};
 use crate::types::{
-    AgentSessionResponse, GraphEdge, GraphNode, GraphResponse, RunDetail, RunSummary, TaskCounts,
+    AgentSessionResponse, ExecutionRolesResponse, GraphEdge, GraphNode, GraphResponse,
+    RetryResponse, RunDetail, RunSummary, TaskCounts,
 };
 
 pub struct ApiState {
     pub db: Mutex<FactoryDb>,
     pub root: PathBuf,
+    pub runtime: Runtime,
+}
+
+impl ApiState {
+    pub fn new(root: PathBuf) -> Result<Self, RuntimeError> {
+        let runtime = Runtime::new(&root)?;
+        let db = FactoryDb::open(&root.join(".factory").join("db.sqlite3"))
+            .map_err(factory_core::FactoryError::from)?;
+        Ok(Self {
+            db: Mutex::new(db),
+            root,
+            runtime,
+        })
+    }
 }
 
 pub type SharedState = Arc<ApiState>;
@@ -75,11 +92,40 @@ impl From<GraphWorkspaceError> for ApiError {
     }
 }
 
+impl From<RuntimeError> for ApiError {
+    fn from(error: RuntimeError) -> Self {
+        let status = match &error {
+            RuntimeError::AlreadyActive(_) => StatusCode::CONFLICT,
+            RuntimeError::NotActive(_) => StatusCode::CONFLICT,
+            RuntimeError::Factory(factory_core::FactoryError::RunNotFound(_))
+            | RuntimeError::Factory(factory_core::FactoryError::TaskNotFound(_)) => {
+                StatusCode::NOT_FOUND
+            }
+            RuntimeError::Factory(
+                factory_core::FactoryError::EmptyObjective
+                | factory_core::FactoryError::InvalidRunState(_, _)
+                | factory_core::FactoryError::EmptyPlan(_)
+                | factory_core::FactoryError::InvalidDag(_, _)
+                | factory_core::FactoryError::RetryLimit(_)
+                | factory_core::FactoryError::InvalidTransition(_, _)
+                | factory_core::FactoryError::NotReady(_)
+                | factory_core::FactoryError::Agent(_)
+                | factory_core::FactoryError::Git(_),
+            ) => StatusCode::BAD_REQUEST,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        ApiError::new(status, error.to_string())
+    }
+}
+
 pub fn router(state: SharedState) -> Router {
     Router::new()
         .route("/api/health", get(health))
-        .route("/api/runs", get(list_runs))
+        .route("/api/runs", get(list_runs).post(create_run))
         .route("/api/runs/:id", get(get_run))
+        .route("/api/runs/:id/start", post(start_run))
+        .route("/api/runs/:id/cancel", post(cancel_run))
+        .route("/api/tasks/:id/retry", post(retry_task))
         .route("/api/graph", get(get_graph))
         .route(
             "/api/graph/workspace",
@@ -138,6 +184,53 @@ async fn list_runs(State(state): State<SharedState>) -> Result<Json<Vec<RunSumma
     Ok(Json(summaries))
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateRunRequest {
+    objective: String,
+}
+
+async fn create_run(
+    State(state): State<SharedState>,
+    body: Result<Json<CreateRunRequest>, axum::extract::rejection::JsonRejection>,
+) -> Result<(StatusCode, Json<factory_types::Run>), ApiError> {
+    let request = body
+        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "invalid JSON body"))?
+        .0;
+    let run = state.runtime.create_workflow(&request.objective)?;
+    Ok((StatusCode::ACCEPTED, Json(run)))
+}
+
+async fn start_run(
+    State(state): State<SharedState>,
+    UrlPath(id): UrlPath<i64>,
+) -> Result<(StatusCode, Json<ExecutionRolesResponse>), ApiError> {
+    let roles = state.runtime.start_workflow(id)?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(ExecutionRolesResponse {
+            worker: roles.worker,
+            reviewer: roles.reviewer,
+        }),
+    ))
+}
+
+async fn cancel_run(
+    State(state): State<SharedState>,
+    UrlPath(id): UrlPath<i64>,
+) -> Result<StatusCode, ApiError> {
+    state.runtime.cancel_workflow(id)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn retry_task(
+    State(state): State<SharedState>,
+    UrlPath(id): UrlPath<i64>,
+) -> Result<(StatusCode, Json<RetryResponse>), ApiError> {
+    let run_id = state.runtime.retry_task(id)?;
+    Ok((StatusCode::ACCEPTED, Json(RetryResponse { run_id })))
+}
+
 async fn get_run(
     State(state): State<SharedState>,
     UrlPath(id): UrlPath<i64>,
@@ -148,7 +241,14 @@ async fn get_run(
         format!("run {id} not found"),
     ))?;
     let tasks = db.list_tasks(id)?;
-    Ok(Json(RunDetail { run, tasks }))
+    let attempts = db.list_task_attempts(id)?;
+    let sessions = db.list_agent_sessions(Some(id))?;
+    Ok(Json(RunDetail {
+        run,
+        tasks,
+        attempts,
+        sessions,
+    }))
 }
 
 async fn get_agents(
@@ -396,31 +496,43 @@ fn build_graph(state: &SharedState) -> Result<GraphResponse, ApiError> {
 
     for run in &runs {
         let tasks = db.list_tasks(run.id)?;
+        let attempts = db.list_task_attempts(run.id)?;
+        let sessions = db.list_agent_sessions(Some(run.id))?;
+        let latest_attempts: HashMap<i64, factory_types::TaskAttempt> =
+            attempts
+                .into_iter()
+                .fold(HashMap::new(), |mut latest, attempt| {
+                    latest.insert(attempt.task_id, attempt);
+                    latest
+                });
         total_tasks += tasks.len();
         nodes.push(GraphNode {
             id: format!("run:{}", run.id),
             kind: "run".into(),
-            label: format!("Run #{}", run.id),
+            label: run.objective.clone(),
             meta: json!({
+                "runId": run.id,
                 "objective": run.objective,
                 "status": run.status.as_str(),
                 "plannerAgent": run.planner_agent,
+                "workerAgent": role_to_agent.get("worker"),
+                "reviewerAgent": role_to_agent.get("reviewer"),
                 "createdAt": run.created_at,
                 "counts": TaskCounts::from_tasks(&tasks),
             }),
         });
 
         if let Some(planner) = &run.planner_agent {
-            let target = role_to_agent
-                .iter()
-                .find(|(_, agent)| *agent == planner)
-                .map(|(role, _)| format!("role:{role}"))
-                .unwrap_or_else(|| format!("agent:{planner}"));
+            let target = if role_to_agent.get("planner") == Some(planner) {
+                "role:planner".to_string()
+            } else {
+                format!("agent:{planner}")
+            };
             edges.push(GraphEdge {
-                id: format!("run-use:{}:{target}", run.id),
+                id: format!("run-plan:{}:{target}", run.id),
                 source: format!("run:{}", run.id),
                 target,
-                kind: "uses".into(),
+                kind: "plans".into(),
                 editable: false,
                 semantic: "system".into(),
             });
@@ -438,7 +550,9 @@ fn build_graph(state: &SharedState) -> Result<GraphResponse, ApiError> {
                     "state": task.state.as_str(),
                     "position": task.position,
                     "dependencies": task.dependencies,
+                    "acceptanceCriteria": task.acceptance_criteria,
                     "worktreePath": task.worktree_path,
+                    "currentAttempt": latest_attempts.get(&task.id),
                 }),
             });
             edges.push(GraphEdge {
@@ -450,6 +564,28 @@ fn build_graph(state: &SharedState) -> Result<GraphResponse, ApiError> {
                 semantic: "system".into(),
             });
             task_dependencies.push((format!("task:{}", task.id), task.dependencies.clone()));
+        }
+
+        for session in sessions
+            .iter()
+            .filter(|session| session.status == "running")
+        {
+            let Some(task_id) = session.task_id else {
+                continue;
+            };
+            let (kind, source) = match session.role.as_str() {
+                "worker" => ("works", format!("agent:{}", session.agent)),
+                "reviewer" => ("reviews", format!("agent:{}", session.agent)),
+                _ => continue,
+            };
+            edges.push(GraphEdge {
+                id: format!("activity:{}", session.id),
+                source,
+                target: format!("task:{task_id}"),
+                kind: kind.into(),
+                editable: false,
+                semantic: "system".into(),
+            });
         }
     }
 

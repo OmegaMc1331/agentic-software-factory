@@ -1,28 +1,21 @@
 # Development
 
-Contributor workflow for the Rust workspace and the dashboard. Normal users should use
-the one-command installers in the [README](../README.md) and never build from source.
+Use Rust stable and Node.js 20 or later. Normal users install a release and operate
+workflows from Agent Graph; contributor tests don't use a public workflow CLI command.
 
-## Prerequisites
+## Quality gates
 
-- Rust (stable) with `cargo`
-- Node.js 20+ and npm, only for the dashboard
-
-## Rust workspace
+Run the Rust workspace gates from the repository root:
 
 ```bash
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
 ```
 
-Worktree tests (under `crates/factory-core/tests/e2e.rs` and `crates/factory-git`) call
-real `git` and are intentionally slow.
-
-## Dashboard
+Run the dashboard gates from `apps/dashboard`:
 
 ```bash
-cd apps/dashboard
 npm ci
 npm run format:check
 npm run lint
@@ -31,95 +24,109 @@ npm test
 npm run build
 ```
 
-For frontend development use the Vite dev server, which proxies `/api` to the factory
-API:
+Core and API workflow tests use configured fake executables and temporary Git
+repositories. CI doesn't require Codex, Claude Code, or OpenCode. Git and worktree tests
+are intentionally slower than pure unit tests.
+
+## Local dashboard development
+
+Build the dashboard once, then run the API and Vite in separate terminals:
 
 ```bash
-# terminal 1: run the local API on 4321
-cd <project root> && cargo run -p factory-cli -- dev serve
-
-# terminal 2:
-cd apps/dashboard && npm run dev   # http://localhost:5173
+cd apps/dashboard
+npm ci
+npm run build
+cd ../..
+cargo run -p factory-cli -- dev serve
 ```
 
-The dashboard layout modules (`src/layout.ts`, `src/networkLayout.ts`) are pure,
-unit-tested functions; keep them free of React imports.
+```bash
+cd apps/dashboard
+npm run dev
+```
 
-### Agent Graph development
+Vite serves `http://localhost:5173` and proxies `/api` to the Factory process on port
+4321. The dashboard's pure layout modules (`src/layout.ts` and
+`src/networkLayout.ts`) stay independent of React.
+
+## Workflow runtime
+
+`POST /api/runs` persists a `planning` Run and asks `factory-runtime` to own the
+background operation. Start, cancel, and retry use their explicit routes; don't add a
+generic action, command, or process endpoint.
+
+Factory Core owns workflow transitions and validation. The runtime owns only active
+Tokio jobs and run-scoped cancellation signals. Keep database operations short: never
+hold the API `FactoryDb` mutex or a SQLite transaction while an external agent runs.
+
+Every Planner, Worker, and Reviewer invocation must create an `AgentSession`. Worker
+execution also creates a durable `TaskAttempt` containing status, worktree, exit code,
+evidence, and structured review. Process exit code 0 doesn't complete a task without
+Reviewer approval. The centralized retry limit is `MAX_TASK_ATTEMPTS`.
+
+Opening the API state reconciles records left `running` by a previous process. Add
+migrations for schema changes; don't rewrite existing migrations.
+
+Focused commands:
+
+```bash
+cargo test -p factory-core --test workflow_runtime
+cargo test -p factory-db
+cargo test -p factory-api --test api workflow_
+```
+
+## Agent Graph and sessions
 
 The Agent Graph uses `@xyflow/react` for pointer dragging, connection handles, and
 viewport controls. Keep Factory entities from `GET /api/graph` separate from visual
-workspace metadata in `.factory/graph.json`. The graph workspace store validates node
-and edge kinds, ignores malformed files safely, and writes atomically. Persist positions
-on drag end, not during pointer movement.
+state in `.factory/graph.json`. Save positions on drag end, not during movement.
 
-The Agent Console lists persisted `AgentSession` rows and uses a session-scoped SSE
-route for live snapshots. It must not expose a generic process or shell endpoint.
-Current sessions are non-interactive. Add a scoped transport only when the runtime owns
-a live session that explicitly supports stdin.
+Workflow nodes come from real Runs. Task nodes and dependency edges come from SQLite.
+Role assignments update `.factory/config.toml`; custom links, groups, notes, and
+memberships remain visual-only.
 
-Run `npm test` for graph state, connection, drag, and console component tests. Run
-`cargo test -p factory-api -p factory-db` for workspace persistence, validation, and
-session API tests.
+The Agent Console consumes persisted session data and a session-scoped SSE route. SSE
+is sufficient while sessions are output-only. Add a bidirectional transport only when
+the runtime owns a specific interactive session; never expose an arbitrary shell.
 
-## The dashboard in the binary
-
-In release builds the dashboard is embedded into the binary, so copying `factory` (or
-`factory.exe`) alone is a complete installation. The embedding is driven by the
-`embedded-dashboard` cargo feature on `factory-cli`/`factory-api` (using
-[rust-embed](https://github.com/pyrossh/rust-embed)). The feature requires
-`apps/dashboard/dist` to exist at compile time.
+Frontend tests cover workflow creation, plan inspection, start errors, graph dragging,
+custom edge deletion, and Agent Console states:
 
 ```bash
-cd apps/dashboard && npm ci && npm run build
+cd apps/dashboard
+npm test
+```
+
+## Embedded dashboard build
+
+Release binaries embed `apps/dashboard/dist` with `rust-embed`:
+
+```bash
+cd apps/dashboard
+npm ci
+npm run build
 cd ../..
 cargo build --release --features embedded-dashboard -p factory-cli
 ```
 
-The release build fails at compile time if the dashboard has not been built. Plain
-`cargo build` (debug or release, no feature) still compiles without the dashboard; the
-server then serves `apps/dashboard/dist` from disk when present, or a stub page that
-explains how to build it.
-
-The embedded dashboard is covered by tests in `crates/factory-api/tests/api.rs`:
+The embedded feature fails to compile when `dist` is missing. A normal development
+build reads `apps/dashboard/dist` from disk or serves a page explaining that it must be
+built. Test embedding with:
 
 ```bash
 cargo test --release --features embedded-dashboard -p factory-api
 ```
 
-## CLI smoke test
-
-```bash
-cargo build --release --features embedded-dashboard -p factory-cli
-mkdir -p /tmp/factory-smoke && cd /tmp/factory-smoke
-/home/you/path/to/factory init
-/home/you/path/to/factory start
-```
-
 ## Releasing
 
-Tagging a version builds and publishes prebuilt binaries via
-[`.github/workflows/release.yml`](../.github/workflows/release.yml):
+Pushing a version tag runs [the release workflow](../.github/workflows/release.yml),
+builds all supported platform archives, verifies installers, and creates a GitHub
+Release. Do not tag routine changes automatically.
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.3.0
+git push origin v0.3.0
 ```
 
-The release workflow builds the dashboard, compiles the release binary with the
-dashboard embedded for Windows x86_64, Linux x86_64, macOS Apple Silicon, and macOS
-Intel, packages `factory` + `LICENSE` per platform with SHA-256 checksums, verifies the
-artifacts, and creates a GitHub Release. Tags containing a dash (`v0.2.0-rc.1`) are
-published as prereleases. Installers `install.ps1` and `install.sh` at the repository
-root are exercised against those archives by the CI workflow's `installers` job.
-
-## CI
-
-`.github/workflows/ci.yml` runs on every push and pull request:
-
-- Rust checks on `ubuntu-latest` and `windows-latest` (fmt, clippy with
-  `-D warnings`, full test suite)
-- Dashboard checks (format, lint, typecheck, tests, build)
-- A release-style build with the embedded dashboard plus a smoke test of a standalone
-  copy of the binary outside the repository
-- An end-to-end installer test (both installers against locally packaged archives)
+[CI](../.github/workflows/ci.yml) runs Rust checks on Ubuntu and Windows, dashboard
+checks, an embedded release-style smoke test, and installer tests.

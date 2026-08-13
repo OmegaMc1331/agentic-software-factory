@@ -38,6 +38,7 @@ function session(overrides: Partial<AgentSession> = {}): AgentSession {
     id: 12,
     runId: 7,
     taskId: 17,
+    attemptId: null,
     role: "worker",
     agent: "codex",
     command: "codex exec",

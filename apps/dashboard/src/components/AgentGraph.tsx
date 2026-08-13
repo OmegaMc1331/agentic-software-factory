@@ -20,7 +20,7 @@ import type {
   GraphEdge as GraphEdgeData,
   GraphNode as GraphNodeData,
 } from "../types";
-import { taskMeta } from "../types";
+import { runMeta, taskMeta } from "../types";
 import type { NetworkLayout } from "../networkLayout";
 import { GraphEdge, type FactoryFlowEdge } from "./GraphEdge";
 import { GraphNode, type FactoryFlowNode } from "./GraphNode";
@@ -119,7 +119,14 @@ function GraphSurface(
     (): FactoryFlowEdge[] =>
       graphEdges.map((edge) => {
         const target = nodesById.get(edge.target);
-        const active = target?.kind === "task" && taskMeta(target).state === "running";
+        const source = nodesById.get(edge.source);
+        const active =
+          (edge.kind === "plans" &&
+            source?.kind === "run" &&
+            runMeta(source).status === "planning") ||
+          ((edge.kind === "works" || edge.kind === "reviews") &&
+            target?.kind === "task" &&
+            taskMeta(target).state === "running");
         const connected =
           selectedNodeId === null ||
           edge.source === selectedNodeId ||

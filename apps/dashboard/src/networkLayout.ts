@@ -32,7 +32,9 @@ export const BOUNDS_PADDING = 150;
 
 const EDGE_REST: Record<GraphEdgeKind, number> = {
   binds: 150,
-  uses: 175,
+  plans: 175,
+  works: 150,
+  reviews: 165,
   contains: 135,
   depends: 105,
   custom: 190,
@@ -66,7 +68,7 @@ function nodeSize(node: GraphNode): { width: number; height: number } {
     case "role":
       return { width: Math.max(86, node.label.length * 6 + 28), height: 24 };
     case "run":
-      return { width: Math.max(112, node.label.length * 6.4 + 34), height: 26 };
+      return { width: Math.max(178, Math.min(250, node.label.length * 6.2 + 56)), height: 88 };
     case "task":
       return { width: 134, height: 22 };
     case "group":
@@ -244,8 +246,8 @@ export function computeNetworkLayout(nodes: GraphNode[], edges: GraphEdge[]): Ne
   const indexById = new Map(bodies.map((body, index) => [body.id, index]));
 
   const resolveOverlap = (a: Body, b: Body): boolean => {
-    const dx = b.x - a.x;
-    const dy = b.y - a.y;
+    const dx = b.x + b.width / 2 - (a.x + a.width / 2);
+    const dy = b.y + b.height / 2 - (a.y + a.height / 2);
     const overlapX = (a.width + b.width) / 2 - Math.abs(dx);
     const overlapY = (a.height + b.height) / 2 - Math.abs(dy);
     if (overlapX <= 0 || overlapY <= 0) return false;
@@ -276,8 +278,8 @@ export function computeNetworkLayout(nodes: GraphNode[], edges: GraphEdge[]): Ne
       for (let j = i + 1; j < bodies.length; j += 1) {
         const a = bodies[i];
         const b = bodies[j];
-        const dx = b.x - a.x;
-        const dy = b.y - a.y;
+        const dx = b.x + b.width / 2 - (a.x + a.width / 2);
+        const dy = b.y + b.height / 2 - (a.y + a.height / 2);
         const dist = Math.hypot(dx, dy) || 1;
         const force = REPULSION / (dist * dist + dist * 6 + 60);
         const fx = (-dx / dist) * force;

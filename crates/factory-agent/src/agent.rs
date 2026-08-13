@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::AtomicBool;
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -73,6 +75,13 @@ pub struct AgentResult {
     pub stderr: String,
     pub exit_code: Option<i32>,
     pub duration: Duration,
+    pub cancelled: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputStream {
+    Stdout,
+    Stderr,
 }
 
 #[derive(Debug, Error)]
@@ -126,6 +135,19 @@ impl CommandAgent {
     }
 
     pub fn run(&self, request: &AgentRequest) -> Result<AgentResult, AgentError> {
+        let cancel = AtomicBool::new(false);
+        self.run_observed(request, &cancel, |_, _| {})
+    }
+
+    pub fn run_observed<F>(
+        &self,
+        request: &AgentRequest,
+        cancel: &AtomicBool,
+        mut on_output: F,
+    ) -> Result<AgentResult, AgentError>
+    where
+        F: FnMut(OutputStream, &str),
+    {
         if !executable_exists(&self.config.command) {
             return Err(AgentError::ExecutableNotFound(self.config.command.clone()));
         }
@@ -135,6 +157,11 @@ impl CommandAgent {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
         for (key, value) in &self.config.env {
             cmd.env(key, value);
         }
@@ -150,7 +177,48 @@ impl CommandAgent {
         })?;
         let write_error = stdin.write_all(request.mission.as_bytes()).err();
         drop(stdin);
-        let output = child.wait_with_output()?;
+        let stdout = child.stdout.take().ok_or_else(|| {
+            AgentError::Spawn(self.config.command.clone(), "stdout not available".into())
+        })?;
+        let stderr = child.stderr.take().ok_or_else(|| {
+            AgentError::Spawn(self.config.command.clone(), "stderr not available".into())
+        })?;
+        let (sender, receiver) = mpsc::channel();
+        let stdout_reader = output_reader(stdout, OutputStream::Stdout, sender.clone());
+        let stderr_reader = output_reader(stderr, OutputStream::Stderr, sender);
+        let mut stdout_text = String::new();
+        let mut stderr_text = String::new();
+        let mut was_cancelled = false;
+        let status = loop {
+            while let Ok((stream, chunk)) = receiver.try_recv() {
+                match stream {
+                    OutputStream::Stdout => stdout_text.push_str(&chunk),
+                    OutputStream::Stderr => stderr_text.push_str(&chunk),
+                }
+                on_output(stream, &chunk);
+            }
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) && !was_cancelled {
+                was_cancelled = true;
+                terminate_process_tree(&mut child);
+            }
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            std::thread::sleep(Duration::from_millis(40));
+        };
+        stdout_reader.join().map_err(|_| {
+            AgentError::Spawn(self.config.command.clone(), "stdout reader stopped".into())
+        })??;
+        stderr_reader.join().map_err(|_| {
+            AgentError::Spawn(self.config.command.clone(), "stderr reader stopped".into())
+        })??;
+        while let Ok((stream, chunk)) = receiver.try_recv() {
+            match stream {
+                OutputStream::Stdout => stdout_text.push_str(&chunk),
+                OutputStream::Stderr => stderr_text.push_str(&chunk),
+            }
+            on_output(stream, &chunk);
+        }
         let duration = started.elapsed();
         if let Some(err) = write_error {
             if err.kind() != std::io::ErrorKind::BrokenPipe {
@@ -158,12 +226,56 @@ impl CommandAgent {
             }
         }
         Ok(AgentResult {
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-            exit_code: output.status.code(),
+            stdout: stdout_text,
+            stderr: stderr_text,
+            exit_code: status.code(),
             duration,
+            cancelled: was_cancelled,
         })
     }
+}
+
+fn terminate_process_tree(child: &mut std::process::Child) {
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &child.id().to_string(), "/T", "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    #[cfg(unix)]
+    {
+        let _ = Command::new("kill")
+            .args(["-TERM", "--", &format!("-{}", child.id())])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
+}
+
+fn output_reader<R: Read + Send + 'static>(
+    mut reader: R,
+    stream: OutputStream,
+    sender: mpsc::Sender<(OutputStream, String)>,
+) -> std::thread::JoinHandle<std::io::Result<()>> {
+    std::thread::spawn(move || {
+        let mut buffer = [0_u8; 4096];
+        loop {
+            let read = reader.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            let chunk = String::from_utf8_lossy(&buffer[..read]).into_owned();
+            if sender.send((stream, chunk)).is_err() {
+                break;
+            }
+        }
+        Ok(())
+    })
 }
 
 fn executable_exists(command: &str) -> bool {
@@ -233,6 +345,16 @@ mod tests {
                     ("cmd".into(), vec!["/c".into(), "more".into()])
                 } else {
                     ("sh".into(), vec!["-c".into(), "cat".into()])
+                }
+            }
+            "sleep" => {
+                if cfg!(windows) {
+                    (
+                        "cmd".into(),
+                        vec!["/d".into(), "/c".into(), "ping -n 20 127.0.0.1 >nul".into()],
+                    )
+                } else {
+                    ("sh".into(), vec!["-c".into(), "sleep 20".into()])
                 }
             }
             _ => unreachable!(),
@@ -327,5 +449,23 @@ mod tests {
             .stdout
             .to_lowercase()
             .contains(&cwd_str.to_lowercase()));
+    }
+
+    #[test]
+    fn cancellation_terminates_the_specific_agent_process() {
+        let dir = TempDir::new().unwrap();
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let signal = cancel.clone();
+        let setter = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(120));
+            signal.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+        let started = Instant::now();
+        let result = agent("sleep")
+            .run_observed(&AgentRequest::new("", dir.path()), &cancel, |_, _| {})
+            .unwrap();
+        setter.join().unwrap();
+        assert!(result.cancelled);
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 }

@@ -15,6 +15,7 @@ factory-db = { path = "crates/factory-db" }
 factory-git = { path = "crates/factory-git" }
 factory-core = { path = "crates/factory-core" }
 factory-api = { path = "crates/factory-api" }
+factory-runtime = { path = "crates/factory-runtime" }
 
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }

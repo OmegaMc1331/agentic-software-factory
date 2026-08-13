@@ -7,6 +7,9 @@ pub use config::{
     default_config_text, AgentEntry, AgentInfo, AgentResolutionError, Agents, Config, ConfigError,
     RoleEntry,
 };
-pub use factory::{Factory, MarkOutcome, RunOutcome, FACTORY_DIR};
+pub use factory::{
+    ExecutionRoles, Factory, FactoryError, MarkOutcome, RunOutcome, WorkflowResult, FACTORY_DIR,
+    MAX_TASK_ATTEMPTS,
+};
 pub use planner::{parse_plan, validate_plan, PlanError, PlanOutcome, Planner};
 pub use workflow::Workflow;

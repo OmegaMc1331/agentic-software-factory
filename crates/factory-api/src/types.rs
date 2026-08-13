@@ -1,6 +1,6 @@
 use serde::Serialize;
 
-use factory_types::{AgentSession, Run, Task, TaskState};
+use factory_types::{AgentSession, Run, Task, TaskAttempt, TaskState};
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -62,6 +62,21 @@ pub struct RunSummary {
 pub struct RunDetail {
     pub run: Run,
     pub tasks: Vec<Task>,
+    pub attempts: Vec<TaskAttempt>,
+    pub sessions: Vec<AgentSession>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecutionRolesResponse {
+    pub worker: String,
+    pub reviewer: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RetryResponse {
+    pub run_id: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]

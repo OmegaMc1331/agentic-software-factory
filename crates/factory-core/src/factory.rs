@@ -1,21 +1,45 @@
-use factory_db::FactoryDb;
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
+
+use factory_agent::{AgentError, AgentRequest, AgentResult, CommandAgent, OutputStream};
+use factory_db::{FactoryDb, Reconciliation};
 use factory_git::{Repo, WorktreeInfo};
-use factory_types::{AgentSession, Run, Task, TaskState};
+use factory_types::{
+    AgentSession, AttemptStatus, ReviewDecision, ReviewResult, Run, RunStatus, Task, TaskAttempt,
+    TaskEvidence, TaskState,
+};
+use serde::Deserialize;
 use thiserror::Error;
 
 use crate::config::{AgentResolutionError, Agents, ConfigError};
-use crate::planner::{normalize_plan, PlanError, PlanOutcome, Planner};
+use crate::planner::{mission as planner_mission, normalize_plan, parse_plan, PlanError};
+
+pub const FACTORY_DIR: &str = ".factory";
+pub const MAX_TASK_ATTEMPTS: u32 = 3;
 
 #[derive(Debug, Error)]
 pub enum FactoryError {
     #[error("factory not initialized here; run `factory init` first")]
     NotInitialized,
+    #[error("run {0} not found")]
+    RunNotFound(i64),
     #[error("task {0} not found")]
     TaskNotFound(i64),
     #[error("invalid state transition: {0} -> {1}")]
     InvalidTransition(TaskState, TaskState),
+    #[error("workflow #{0} cannot be started while it is {1}")]
+    InvalidRunState(i64, String),
+    #[error("workflow #{0} has no planned tasks")]
+    EmptyPlan(i64),
+    #[error("workflow #{0} has an invalid task dependency graph: {1}")]
+    InvalidDag(i64, String),
+    #[error("task #{0} reached the retry limit of {MAX_TASK_ATTEMPTS} attempts")]
+    RetryLimit(i64),
     #[error("planning failed: {0}")]
     Plan(#[from] PlanError),
+    #[error("agent process failed: {0}")]
+    AgentProcess(#[from] AgentError),
     #[error("agent resolution: {0}")]
     Agent(#[from] AgentResolutionError),
     #[error("configuration error: {0}")]
@@ -28,11 +52,11 @@ pub enum FactoryError {
     NotReady(i64),
     #[error("objective must not be empty")]
     EmptyObjective,
+    #[error("workflow operation was cancelled")]
+    Cancelled,
     #[error("io error: {0}")]
     Io(std::io::Error),
 }
-
-pub const FACTORY_DIR: &str = ".factory";
 
 #[derive(Debug, Clone)]
 pub struct RunOutcome {
@@ -47,6 +71,32 @@ pub struct MarkOutcome {
     pub updated: Vec<i64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionRoles {
+    pub worker: String,
+    pub reviewer: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkflowResult {
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+struct Invocation {
+    session_id: i64,
+    result: AgentResult,
+}
+
+struct InvocationScope<'a> {
+    run_id: Option<i64>,
+    task_id: Option<i64>,
+    attempt_id: Option<i64>,
+    role: &'a str,
+    working_dir: &'a Path,
+}
+
 pub struct Factory {
     db: FactoryDb,
     agents: Agents,
@@ -54,14 +104,11 @@ pub struct Factory {
 }
 
 impl Factory {
-    /// Create the state directory, default config, and database, or open the
-    /// existing ones. Idempotent: never destroys existing state.
-    pub fn init(root: &std::path::Path) -> Result<Factory, FactoryError> {
+    pub fn init(root: &Path) -> Result<Factory, FactoryError> {
         let factory_dir = root.join(FACTORY_DIR);
         std::fs::create_dir_all(&factory_dir).map_err(FactoryError::Io)?;
         crate::config::Config::ensure_default(root)?;
-        let db_path = factory_dir.join("db.sqlite3");
-        let db = FactoryDb::open(&db_path)?;
+        let db = FactoryDb::open(&factory_dir.join("db.sqlite3"))?;
         Ok(Factory {
             db,
             agents: Agents::load(root)?,
@@ -69,14 +116,13 @@ impl Factory {
         })
     }
 
-    pub fn open(root: &std::path::Path) -> Result<Factory, FactoryError> {
+    pub fn open(root: &Path) -> Result<Factory, FactoryError> {
         let db_path = root.join(FACTORY_DIR).join("db.sqlite3");
         if !db_path.exists() {
             return Err(FactoryError::NotInitialized);
         }
-        let db = FactoryDb::open(&db_path)?;
         Ok(Factory {
-            db,
+            db: FactoryDb::open(&db_path)?,
             agents: Agents::load(root)?,
             root: root.to_path_buf(),
         })
@@ -86,80 +132,517 @@ impl Factory {
         Ok(self.agents.command_agent("planner")?.name().to_string())
     }
 
-    pub fn create_run(&self, objective: &str) -> Result<RunOutcome, FactoryError> {
-        if objective.trim().is_empty() {
+    pub fn begin_run(&self, objective: &str) -> Result<Run, FactoryError> {
+        let objective = objective.trim();
+        if objective.is_empty() {
             return Err(FactoryError::EmptyObjective);
         }
-        let planner_agent = self.agents.command_agent("planner")?;
-        let planner = Planner::new(planner_agent);
-        let outcome = planner.plan(objective, &self.root)?;
-        let PlanOutcome {
-            plan,
-            agent,
-            command,
-            result,
-        } = outcome;
-        let plan = normalize_plan(plan);
-        let run = self.db.create_run(&plan.objective, Some(&agent))?;
-        self.persist_planner_session(&run, &agent, &command, &result)?;
-        let mut id_by_label = std::collections::HashMap::new();
-        for (index, task) in plan.tasks.iter().enumerate() {
-            let id = self.db.create_task(
-                run.id,
-                &task.title,
-                &task.objective,
-                &task.acceptance_criteria,
-                TaskState::Pending,
-                index as i32,
-            )?;
-            id_by_label.insert(task.id.clone(), id);
-        }
-        for task in &plan.tasks {
-            let task_id = id_by_label[&task.id];
-            for dep in &task.dependencies {
-                let dep_id = id_by_label[dep];
-                self.db.add_dependency(task_id, dep_id)?;
-            }
-        }
-        for task in &plan.tasks {
-            let task_id = id_by_label[&task.id];
-            let state = crate::workflow::Workflow::initial_state(!task.dependencies.is_empty());
-            self.db.set_task_state(task_id, state)?;
-        }
-        let tasks = self.db.list_tasks(run.id)?;
-        Ok(RunOutcome { run, tasks })
+        let planner = self.agents.command_agent("planner")?;
+        Ok(self
+            .db
+            .create_run_with_status(objective, Some(planner.name()), RunStatus::Planning)?)
     }
 
-    fn persist_planner_session(
+    pub fn create_run(&self, objective: &str) -> Result<RunOutcome, FactoryError> {
+        let run = self.begin_run(objective)?;
+        self.plan_run(run.id, &AtomicBool::new(false))
+    }
+
+    pub fn plan_run(&self, run_id: i64, cancel: &AtomicBool) -> Result<RunOutcome, FactoryError> {
+        let result = self.plan_run_inner(run_id, cancel);
+        if result.is_err() {
+            let status = if cancel.load(Ordering::Relaxed) {
+                RunStatus::Cancelled
+            } else {
+                RunStatus::Failed
+            };
+            let _ = self.db.set_run_status(run_id, status);
+        }
+        result
+    }
+
+    fn plan_run_inner(&self, run_id: i64, cancel: &AtomicBool) -> Result<RunOutcome, FactoryError> {
+        let run = self
+            .db
+            .get_run(run_id)?
+            .ok_or(FactoryError::RunNotFound(run_id))?;
+        if run.status != RunStatus::Planning {
+            return Err(FactoryError::InvalidRunState(
+                run_id,
+                run.status.as_str().to_string(),
+            ));
+        }
+        let mut rejection: Option<String> = None;
+        for attempt in 0..crate::planner::MAX_ATTEMPTS {
+            let instruction = planner_mission(&run.objective, rejection.as_deref());
+            let invocation = self.invoke(
+                InvocationScope {
+                    run_id: Some(run_id),
+                    task_id: None,
+                    attempt_id: None,
+                    role: "planner",
+                    working_dir: &self.root,
+                },
+                &instruction,
+                cancel,
+            )?;
+            if invocation.result.cancelled {
+                return Err(FactoryError::Cancelled);
+            }
+            if invocation.result.exit_code != Some(0) {
+                return Err(PlanError::Agent(AgentError::Spawn(
+                    invocation.result.exit_code.map_or_else(
+                        || "planner".to_string(),
+                        |code| format!("planner exited with code {code}"),
+                    ),
+                    invocation.result.stderr,
+                ))
+                .into());
+            }
+            match parse_plan(&invocation.result.stdout) {
+                Ok(plan) => {
+                    let plan = normalize_plan(plan);
+                    let tasks = self.db.persist_plan(run_id, &plan)?;
+                    let run = self
+                        .db
+                        .get_run(run_id)?
+                        .ok_or(FactoryError::RunNotFound(run_id))?;
+                    return Ok(RunOutcome { run, tasks });
+                }
+                Err(reason) => {
+                    self.db
+                        .set_agent_session_status(invocation.session_id, "rejected")?;
+                    if attempt + 1 >= crate::planner::MAX_ATTEMPTS {
+                        return Err(PlanError::Invalid(reason).into());
+                    }
+                    rejection = Some(reason);
+                }
+            }
+        }
+        unreachable!("planner attempt loop returns")
+    }
+
+    pub fn execution_roles(&self) -> Result<ExecutionRoles, FactoryError> {
+        Ok(ExecutionRoles {
+            worker: self.agents.command_agent("worker")?.name().to_string(),
+            reviewer: self.agents.command_agent("reviewer")?.name().to_string(),
+        })
+    }
+
+    pub fn prepare_start(&self, run_id: i64) -> Result<ExecutionRoles, FactoryError> {
+        let run = self
+            .db
+            .get_run(run_id)?
+            .ok_or(FactoryError::RunNotFound(run_id))?;
+        if run.status != RunStatus::Planned {
+            return Err(FactoryError::InvalidRunState(
+                run_id,
+                run.status.as_str().to_string(),
+            ));
+        }
+        let tasks = self.db.list_tasks(run_id)?;
+        if tasks.is_empty() {
+            return Err(FactoryError::EmptyPlan(run_id));
+        }
+        validate_task_dag(&tasks).map_err(|reason| FactoryError::InvalidDag(run_id, reason))?;
+        let roles = self.execution_roles()?;
+        Repo::detect_bounded(&self.root, &self.root)?;
+        self.db.set_run_status(run_id, RunStatus::Active)?;
+        Ok(roles)
+    }
+
+    pub fn execute_active_run(
         &self,
-        run: &Run,
-        agent: &str,
-        command: &str,
-        result: &factory_agent::AgentResult,
-    ) -> Result<(), FactoryError> {
-        let now = chrono::Utc::now().to_rfc3339();
-        let status = if result.exit_code == Some(0) {
-            "success"
-        } else {
-            "failed"
-        };
-        let session = AgentSession {
+        run_id: i64,
+        cancel: &AtomicBool,
+    ) -> Result<WorkflowResult, FactoryError> {
+        let result = self.execute_active_run_inner(run_id, cancel);
+        if result.is_err() {
+            let status = if cancel.load(Ordering::Relaxed) {
+                RunStatus::Cancelled
+            } else {
+                RunStatus::Failed
+            };
+            let _ = self.db.set_run_status(run_id, status);
+        }
+        result
+    }
+
+    fn execute_active_run_inner(
+        &self,
+        run_id: i64,
+        cancel: &AtomicBool,
+    ) -> Result<WorkflowResult, FactoryError> {
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                self.db.set_run_status(run_id, RunStatus::Cancelled)?;
+                return Ok(WorkflowResult::Cancelled);
+            }
+            let tasks = self.db.list_tasks(run_id)?;
+            if tasks.iter().all(|task| task.state == TaskState::Completed) {
+                self.db.set_run_status(run_id, RunStatus::Completed)?;
+                return Ok(WorkflowResult::Completed);
+            }
+            let next = tasks
+                .iter()
+                .filter(|task| task.state == TaskState::Ready)
+                .min_by_key(|task| (task.position, task.id))
+                .cloned();
+            let Some(task) = next else {
+                let status = if tasks.iter().any(|task| task.state == TaskState::Failed) {
+                    RunStatus::Failed
+                } else {
+                    RunStatus::Blocked
+                };
+                self.db.set_run_status(run_id, status)?;
+                return Ok(WorkflowResult::Failed);
+            };
+            if !self.execute_task(task.id, cancel)? {
+                if cancel.load(Ordering::Relaxed) {
+                    self.db.set_run_status(run_id, RunStatus::Cancelled)?;
+                    return Ok(WorkflowResult::Cancelled);
+                }
+                self.db.set_run_status(run_id, RunStatus::Failed)?;
+                return Ok(WorkflowResult::Failed);
+            }
+        }
+    }
+
+    pub fn prepare_retry(&self, task_id: i64) -> Result<i64, FactoryError> {
+        let task = self
+            .db
+            .get_task(task_id)?
+            .ok_or(FactoryError::TaskNotFound(task_id))?;
+        if !matches!(task.state, TaskState::Failed | TaskState::Blocked) {
+            return Err(FactoryError::InvalidTransition(
+                task.state,
+                TaskState::Ready,
+            ));
+        }
+        if self
+            .db
+            .latest_task_attempt(task_id)?
+            .is_some_and(|attempt| attempt.attempt_number >= MAX_TASK_ATTEMPTS)
+        {
+            return Err(FactoryError::RetryLimit(task_id));
+        }
+        self.execution_roles()?;
+        self.mark_task(task_id, TaskState::Ready)?;
+        self.db.set_run_status(task.run_id, RunStatus::Active)?;
+        Ok(task.run_id)
+    }
+
+    fn execute_task(&self, task_id: i64, cancel: &AtomicBool) -> Result<bool, FactoryError> {
+        loop {
+            let task = self
+                .db
+                .get_task(task_id)?
+                .ok_or(FactoryError::TaskNotFound(task_id))?;
+            let previous_feedback = self
+                .db
+                .latest_task_attempt(task_id)?
+                .and_then(|attempt| attempt.review)
+                .filter(|review| review.decision == ReviewDecision::RequestChanges);
+            let next_attempt = self
+                .db
+                .latest_task_attempt(task_id)?
+                .map_or(1, |attempt| attempt.attempt_number + 1);
+            if next_attempt > MAX_TASK_ATTEMPTS {
+                return Ok(false);
+            }
+            let worktree = if let Some(path) = &task.worktree_path {
+                std::path::PathBuf::from(path)
+            } else {
+                self.create_worktree(task_id)?
+            };
+            let repo = Repo::detect_bounded(&worktree, &self.root)?;
+            let base_sha = repo.head_sha(&worktree)?;
+            let worker = self.agents.command_agent("worker")?;
+            let attempt =
+                self.db
+                    .create_task_attempt(task_id, worker.name(), &worktree.to_string_lossy())?;
+            self.mark_task(task_id, TaskState::Running)?;
+
+            let worker_instruction = worker_mission(&task, previous_feedback.as_ref());
+            let worker_run = self.invoke_with_agent(
+                worker,
+                InvocationScope {
+                    run_id: Some(task.run_id),
+                    task_id: Some(task.id),
+                    attempt_id: Some(attempt.id),
+                    role: "worker",
+                    working_dir: &worktree,
+                },
+                &worker_instruction,
+                cancel,
+            );
+            let evidence = collect_evidence(
+                &repo,
+                &worktree,
+                &base_sha,
+                &task,
+                worker_run.as_ref().ok().map(|run| &run.result),
+            )?;
+            let worker_run = match worker_run {
+                Ok(run) if run.result.cancelled => {
+                    self.db.finish_task_attempt(
+                        attempt.id,
+                        AttemptStatus::Cancelled,
+                        run.result.exit_code,
+                        evidence.commit_sha.as_deref(),
+                        Some("Workflow cancelled while the Worker was running."),
+                        Some(&evidence),
+                        None,
+                    )?;
+                    self.mark_task(task_id, TaskState::Failed)?;
+                    return Ok(false);
+                }
+                Ok(run) if run.result.exit_code == Some(0) => run,
+                Ok(run) => {
+                    let error = run.result.exit_code.map_or_else(
+                        || "Worker process ended without an exit code.".to_string(),
+                        |code| format!("Worker process exited with code {code}."),
+                    );
+                    self.db.finish_task_attempt(
+                        attempt.id,
+                        AttemptStatus::Failed,
+                        run.result.exit_code,
+                        evidence.commit_sha.as_deref(),
+                        Some(&error),
+                        Some(&evidence),
+                        None,
+                    )?;
+                    self.mark_task(task_id, TaskState::Failed)?;
+                    if attempt.attempt_number >= MAX_TASK_ATTEMPTS {
+                        return Ok(false);
+                    }
+                    self.mark_task(task_id, TaskState::Ready)?;
+                    continue;
+                }
+                Err(error) => {
+                    let message = error.to_string();
+                    self.db.finish_task_attempt(
+                        attempt.id,
+                        AttemptStatus::Failed,
+                        None,
+                        evidence.commit_sha.as_deref(),
+                        Some(&message),
+                        Some(&evidence),
+                        None,
+                    )?;
+                    self.mark_task(task_id, TaskState::Failed)?;
+                    if attempt.attempt_number >= MAX_TASK_ATTEMPTS {
+                        return Ok(false);
+                    }
+                    self.mark_task(task_id, TaskState::Ready)?;
+                    continue;
+                }
+            };
+
+            self.db
+                .set_task_attempt_status(attempt.id, AttemptStatus::Reviewing)?;
+            let reviewer = self.agents.command_agent("reviewer")?;
+            let review_instruction = reviewer_mission(&task, &evidence, &worker_run.result.stdout);
+            let review_run = self.invoke_with_agent(
+                reviewer,
+                InvocationScope {
+                    run_id: Some(task.run_id),
+                    task_id: Some(task.id),
+                    attempt_id: Some(attempt.id),
+                    role: "reviewer",
+                    working_dir: &worktree,
+                },
+                &review_instruction,
+                cancel,
+            );
+            let review = match review_run {
+                Ok(run) if run.result.cancelled => {
+                    self.db.finish_task_attempt(
+                        attempt.id,
+                        AttemptStatus::Cancelled,
+                        worker_run.result.exit_code,
+                        evidence.commit_sha.as_deref(),
+                        Some("Workflow cancelled while the Reviewer was running."),
+                        Some(&evidence),
+                        None,
+                    )?;
+                    self.mark_task(task_id, TaskState::Failed)?;
+                    return Ok(false);
+                }
+                Ok(run) if run.result.exit_code == Some(0) => {
+                    match parse_review(&run.result.stdout) {
+                        Ok(review) => review,
+                        Err(reason) => {
+                            self.db
+                                .set_agent_session_status(run.session_id, "rejected")?;
+                            ReviewResult {
+                                decision: ReviewDecision::RequestChanges,
+                                reason: format!(
+                                    "Reviewer returned invalid structured output: {reason}"
+                                ),
+                                feedback: vec![
+                                    "Return a valid approve or request_changes decision.".into(),
+                                ],
+                            }
+                        }
+                    }
+                }
+                Ok(run) => ReviewResult {
+                    decision: ReviewDecision::RequestChanges,
+                    reason: run.result.exit_code.map_or_else(
+                        || "Reviewer ended without an exit code.".to_string(),
+                        |code| format!("Reviewer exited with code {code}."),
+                    ),
+                    feedback: nonempty_lines(&run.result.stderr),
+                },
+                Err(error) => ReviewResult {
+                    decision: ReviewDecision::RequestChanges,
+                    reason: error.to_string(),
+                    feedback: Vec::new(),
+                },
+            };
+
+            if review.decision == ReviewDecision::Approve {
+                self.db.finish_task_attempt(
+                    attempt.id,
+                    AttemptStatus::Approved,
+                    worker_run.result.exit_code,
+                    evidence.commit_sha.as_deref(),
+                    None,
+                    Some(&evidence),
+                    Some(&review),
+                )?;
+                self.mark_task(task_id, TaskState::Completed)?;
+                return Ok(true);
+            }
+
+            self.db.finish_task_attempt(
+                attempt.id,
+                AttemptStatus::ChangesRequested,
+                worker_run.result.exit_code,
+                evidence.commit_sha.as_deref(),
+                Some(&review.reason),
+                Some(&evidence),
+                Some(&review),
+            )?;
+            self.mark_task(task_id, TaskState::Failed)?;
+            if attempt.attempt_number >= MAX_TASK_ATTEMPTS {
+                return Ok(false);
+            }
+            self.mark_task(task_id, TaskState::Ready)?;
+        }
+    }
+
+    fn invoke(
+        &self,
+        scope: InvocationScope<'_>,
+        mission: &str,
+        cancel: &AtomicBool,
+    ) -> Result<Invocation, FactoryError> {
+        let agent = self.agents.command_agent(scope.role)?;
+        self.invoke_with_agent(agent, scope, mission, cancel)
+    }
+
+    fn invoke_with_agent(
+        &self,
+        agent: CommandAgent,
+        scope: InvocationScope<'_>,
+        mission: &str,
+        cancel: &AtomicBool,
+    ) -> Result<Invocation, FactoryError> {
+        let started = chrono::Utc::now().to_rfc3339();
+        let session = self.db.insert_agent_session(&AgentSession {
             id: 0,
-            run_id: Some(run.id),
-            task_id: None,
-            role: "planner".to_string(),
-            agent: agent.to_string(),
-            command: command.to_string(),
-            status: status.to_string(),
-            started_at: now.clone(),
-            finished_at: Some(now),
-            exit_code: result.exit_code,
-            duration_ms: Some(result.duration.as_millis() as u64),
-            stdout: Some(result.stdout.clone()),
-            stderr: Some(result.stderr.clone()),
-        };
-        self.db.insert_agent_session(&session)?;
+            run_id: scope.run_id,
+            task_id: scope.task_id,
+            attempt_id: scope.attempt_id,
+            role: scope.role.to_string(),
+            agent: agent.name().to_string(),
+            command: agent.command_line(),
+            status: "running".to_string(),
+            started_at: started,
+            finished_at: None,
+            exit_code: None,
+            duration_ms: None,
+            stdout: Some(String::new()),
+            stderr: Some(String::new()),
+        })?;
+        let request = AgentRequest::new(mission, scope.working_dir);
+        let timer = Instant::now();
+        let mut output_error = None;
+        let result = agent.run_observed(&request, cancel, |stream, chunk| {
+            if output_error.is_some() {
+                return;
+            }
+            let update = match stream {
+                OutputStream::Stdout => {
+                    self.db
+                        .append_agent_session_output(session.id, Some(chunk), None)
+                }
+                OutputStream::Stderr => {
+                    self.db
+                        .append_agent_session_output(session.id, None, Some(chunk))
+                }
+            };
+            if let Err(error) = update {
+                output_error = Some(error);
+            }
+        });
+        match result {
+            Ok(result) => {
+                let status = if result.cancelled {
+                    "cancelled"
+                } else if result.exit_code == Some(0) {
+                    "success"
+                } else {
+                    "failed"
+                };
+                self.db.finish_agent_session(
+                    session.id,
+                    status,
+                    result.exit_code,
+                    result.duration.as_millis() as u64,
+                )?;
+                if let Some(error) = output_error {
+                    return Err(error.into());
+                }
+                Ok(Invocation {
+                    session_id: session.id,
+                    result,
+                })
+            }
+            Err(error) => {
+                let message = error.to_string();
+                self.db
+                    .append_agent_session_output(session.id, None, Some(&message))?;
+                self.db.finish_agent_session(
+                    session.id,
+                    "failed",
+                    None,
+                    timer.elapsed().as_millis() as u64,
+                )?;
+                Err(error.into())
+            }
+        }
+    }
+
+    pub fn cancel_run(&self, run_id: i64) -> Result<(), FactoryError> {
+        let run = self
+            .db
+            .get_run(run_id)?
+            .ok_or(FactoryError::RunNotFound(run_id))?;
+        if !matches!(run.status, RunStatus::Planning | RunStatus::Active) {
+            return Err(FactoryError::InvalidRunState(
+                run_id,
+                run.status.as_str().to_string(),
+            ));
+        }
+        self.db.set_run_status(run_id, RunStatus::Cancelled)?;
         Ok(())
+    }
+
+    pub fn reconcile_interrupted(&self) -> Result<Reconciliation, FactoryError> {
+        Ok(self.db.reconcile_interrupted()?)
     }
 
     pub fn mark_task(&self, task_id: i64, target: TaskState) -> Result<MarkOutcome, FactoryError> {
@@ -175,28 +658,29 @@ impl Factory {
         let mut updated = vec![task_id];
         let run_tasks = self.db.list_tasks(task.run_id)?;
         let mut state_of: std::collections::HashMap<i64, TaskState> =
-            run_tasks.iter().map(|t| (t.id, t.state)).collect();
+            run_tasks.iter().map(|task| (task.id, task.state)).collect();
+        state_of.insert(task_id, target);
         let mut visited = std::collections::HashSet::new();
         visited.insert(task_id);
         let mut frontier = vec![task_id];
         while let Some(changed_id) = frontier.pop() {
             for dependent in run_tasks
                 .iter()
-                .filter(|t| t.dependencies.contains(&changed_id))
+                .filter(|candidate| candidate.dependencies.contains(&changed_id))
             {
                 if visited.contains(&dependent.id) {
                     continue;
                 }
                 visited.insert(dependent.id);
-                if matches!(dependent.state, TaskState::Completed | TaskState::Failed) {
+                if dependent.state == TaskState::Completed {
                     continue;
                 }
-                let dep_states: Vec<TaskState> = dependent
+                let dependency_states: Vec<TaskState> = dependent
                     .dependencies
                     .iter()
                     .map(|id| state_of[id])
                     .collect();
-                let next = crate::workflow::Workflow::next_state_for_dependent(&dep_states);
+                let next = crate::workflow::Workflow::next_state_for_dependent(&dependency_states);
                 if next != dependent.state {
                     self.db.set_task_state(dependent.id, next)?;
                     state_of.insert(dependent.id, next);
@@ -232,6 +716,14 @@ impl Factory {
         Ok(self.db.get_task(id)?)
     }
 
+    pub fn list_task_attempts(&self, run_id: i64) -> Result<Vec<TaskAttempt>, FactoryError> {
+        Ok(self.db.list_task_attempts(run_id)?)
+    }
+
+    pub fn latest_task_attempt(&self, task_id: i64) -> Result<Option<TaskAttempt>, FactoryError> {
+        Ok(self.db.latest_task_attempt(task_id)?)
+    }
+
     pub fn list_agent_sessions(
         &self,
         run_id: Option<i64>,
@@ -254,12 +746,11 @@ impl Factory {
         if task.state != TaskState::Ready {
             return Err(FactoryError::NotReady(task_id));
         }
-        let repo = Repo::detect(&self.root)?;
-        let dir = self.worktree_dir(task_id);
-        let branch = format!("factory/t{task_id}");
-        repo.add_worktree(&dir, &branch)?;
-        self.db.set_worktree_path(task_id, dir.to_str())?;
-        Ok(dir)
+        let repo = Repo::detect_bounded(&self.root, &self.root)?;
+        let directory = self.worktree_dir(task_id);
+        repo.add_worktree(&directory, &format!("factory/t{task_id}"))?;
+        self.db.set_worktree_path(task_id, directory.to_str())?;
+        Ok(directory)
     }
 
     pub fn remove_worktree(&self, task_id: i64, force: bool) -> Result<(), FactoryError> {
@@ -267,15 +758,13 @@ impl Factory {
             .db
             .get_task(task_id)?
             .ok_or(FactoryError::TaskNotFound(task_id))?;
-        let repo = Repo::detect(&self.root)?;
-        let dir = self.worktree_dir(task_id);
-        if force {
-            if repo.find_worktree(&dir)?.is_some() || dir.exists() {
-                repo.remove_worktree_force(&dir)?;
-            }
-        } else {
-            if repo.find_worktree(&dir)?.is_some() || dir.exists() {
-                repo.remove_worktree(&dir)?;
+        let repo = Repo::detect_bounded(&self.root, &self.root)?;
+        let directory = self.worktree_dir(task_id);
+        if repo.find_worktree(&directory)?.is_some() || directory.exists() {
+            if force {
+                repo.remove_worktree_force(&directory)?;
+            } else {
+                repo.remove_worktree(&directory)?;
             }
         }
         if task.worktree_path.is_some() {
@@ -285,7 +774,204 @@ impl Factory {
     }
 
     pub fn list_worktrees(&self) -> Result<Vec<WorktreeInfo>, FactoryError> {
-        let repo = Repo::detect(&self.root)?;
-        Ok(repo.list_worktrees()?)
+        Ok(Repo::detect_bounded(&self.root, &self.root)?.list_worktrees()?)
+    }
+}
+
+fn validate_task_dag(tasks: &[Task]) -> Result<(), String> {
+    let ids: std::collections::HashSet<i64> = tasks.iter().map(|task| task.id).collect();
+    for task in tasks {
+        if task.dependencies.contains(&task.id) {
+            return Err(format!("task #{} depends on itself", task.id));
+        }
+        if let Some(unknown) = task
+            .dependencies
+            .iter()
+            .find(|dependency| !ids.contains(dependency))
+        {
+            return Err(format!(
+                "task #{} depends on unknown task #{}",
+                task.id, unknown
+            ));
+        }
+    }
+    let mut indegree: std::collections::HashMap<i64, usize> = tasks
+        .iter()
+        .map(|task| (task.id, task.dependencies.len()))
+        .collect();
+    let mut ready: Vec<i64> = indegree
+        .iter()
+        .filter_map(|(id, degree)| (*degree == 0).then_some(*id))
+        .collect();
+    let mut visited = 0;
+    while let Some(id) = ready.pop() {
+        visited += 1;
+        for task in tasks.iter().filter(|task| task.dependencies.contains(&id)) {
+            let degree = indegree.get_mut(&task.id).expect("known task");
+            *degree -= 1;
+            if *degree == 0 {
+                ready.push(task.id);
+            }
+        }
+    }
+    if visited != tasks.len() {
+        return Err("the task dependency graph contains a cycle".into());
+    }
+    Ok(())
+}
+
+fn worker_mission(task: &Task, previous_review: Option<&ReviewResult>) -> String {
+    let criteria = task
+        .acceptance_criteria
+        .iter()
+        .map(|criterion| format!("- {criterion}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let feedback = previous_review.map_or_else(String::new, |review| {
+        format!(
+            "\n\nPrevious review requested changes:\n{}\n{}",
+            review.reason,
+            review
+                .feedback
+                .iter()
+                .map(|item| format!("- {item}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    });
+    format!(
+        "You are the Worker for one task in Agentic Software Factory. Work only in the current git worktree. Implement the task, run focused verification, and preserve all useful changes. Do not modify Factory orchestration state.\n\nTask: {}\nObjective: {}\nAcceptance criteria:\n{}{}\n\nAt the end, report a concise JSON object with keys `summary` and `commands` (an array of commands/tests you ran).",
+        task.title, task.objective, criteria, feedback
+    )
+}
+
+fn reviewer_mission(task: &Task, evidence: &TaskEvidence, worker_output: &str) -> String {
+    let worker_output = tail(worker_output, 20_000);
+    let criteria = task
+        .acceptance_criteria
+        .iter()
+        .map(|criterion| format!("- {criterion}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "You are the Reviewer for one task in Agentic Software Factory. Review the actual worktree and the evidence below against the task and acceptance criteria. Do not modify files. Return one JSON object only: {{\"decision\":\"approve\"|\"request_changes\",\"reason\":string,\"feedback\":[string]}}. Approve only when the evidence and repository changes satisfy the task.\n\nTask: {}\nObjective: {}\nAcceptance criteria:\n{}\nChanged files: {}\nDiff summary:\n{}\nCommit: {}\nWorker-reported commands: {}\nWorker output:\n{}",
+        task.title,
+        task.objective,
+        criteria,
+        evidence.changed_files.join(", "),
+        evidence.diff_summary,
+        evidence.commit_sha.as_deref().unwrap_or("not committed"),
+        evidence.commands.join(", "),
+        worker_output
+    )
+}
+
+fn collect_evidence(
+    repo: &Repo,
+    worktree: &Path,
+    base_sha: &str,
+    task: &Task,
+    result: Option<&AgentResult>,
+) -> Result<TaskEvidence, FactoryError> {
+    let git = repo.evidence_since(worktree, base_sha)?;
+    Ok(TaskEvidence {
+        changed_files: git.changed_files,
+        diff_summary: git.diff_summary,
+        commit_sha: git.commit_sha,
+        commands: result
+            .map(|result| parse_worker_commands(&result.stdout))
+            .unwrap_or_default(),
+        acceptance_criteria: task.acceptance_criteria.clone(),
+        worker_exit_code: result.and_then(|result| result.exit_code),
+    })
+}
+
+#[derive(Deserialize)]
+struct WorkerReport {
+    #[serde(default)]
+    commands: Vec<String>,
+}
+
+fn parse_worker_commands(output: &str) -> Vec<String> {
+    let trimmed = output.trim();
+    let candidate = trimmed
+        .strip_prefix("```json")
+        .or_else(|| trimmed.strip_prefix("```"))
+        .and_then(|value| value.strip_suffix("```"))
+        .unwrap_or(trimmed)
+        .trim();
+    serde_json::from_str::<WorkerReport>(candidate)
+        .map(|report| report.commands)
+        .unwrap_or_default()
+}
+
+fn parse_review(output: &str) -> Result<ReviewResult, String> {
+    let trimmed = output.trim();
+    let candidate = trimmed
+        .strip_prefix("```json")
+        .or_else(|| trimmed.strip_prefix("```"))
+        .and_then(|value| value.strip_suffix("```"))
+        .unwrap_or(trimmed)
+        .trim();
+    let review: ReviewResult =
+        serde_json::from_str(candidate).map_err(|error| format!("invalid JSON: {error}"))?;
+    if review.reason.trim().is_empty() {
+        return Err("reason must not be empty".into());
+    }
+    Ok(review)
+}
+
+fn nonempty_lines(value: &str) -> Vec<String> {
+    value
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .take(20)
+        .map(str::to_string)
+        .collect()
+}
+
+fn tail(value: &str, max_chars: usize) -> &str {
+    if value.len() <= max_chars {
+        return value;
+    }
+    let mut start = value.len() - max_chars;
+    while !value.is_char_boundary(start) {
+        start += 1;
+    }
+    &value[start..]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn review_output_is_strict_and_structured() {
+        let review = parse_review(
+            r#"{"decision":"request_changes","reason":"tests fail","feedback":["fix test"]}"#,
+        )
+        .unwrap();
+        assert_eq!(review.decision, ReviewDecision::RequestChanges);
+        assert_eq!(review.feedback, vec!["fix test"]);
+        assert!(parse_review("approved").is_err());
+    }
+
+    #[test]
+    fn task_dag_rejects_cycles() {
+        let task = |id, dependencies| Task {
+            id,
+            run_id: 1,
+            title: format!("Task {id}"),
+            objective: "test".into(),
+            acceptance_criteria: vec!["works".into()],
+            state: TaskState::Pending,
+            position: id as i32,
+            dependencies,
+            worktree_path: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        assert!(validate_task_dag(&[task(1, vec![2]), task(2, vec![1])]).is_err());
     }
 }

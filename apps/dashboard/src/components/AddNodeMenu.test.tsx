@@ -5,6 +5,55 @@ import { AddNodeMenu } from "./AddNodeMenu";
 afterEach(cleanup);
 
 describe("Add Node menu", () => {
+  it("puts Workflow first and plans with the configured Planner role", () => {
+    const onCreateWorkflow = vi.fn();
+    render(
+      <AddNodeMenu
+        open
+        config={{
+          agents: { codex: { command: "codex", args: ["exec"], env: {} } },
+          roles: { planner: { agent: "codex" } },
+        }}
+        error={null}
+        onClose={vi.fn()}
+        onCreateWorkflow={onCreateWorkflow}
+        onCreateAgent={vi.fn()}
+        onCreateRole={vi.fn()}
+        onCreateVisual={vi.fn()}
+      />
+    );
+
+    const options = screen.getAllByRole("button");
+    expect(options[1].textContent).toContain("Workflow");
+    fireEvent.click(screen.getByRole("button", { name: /Workflow/ }));
+    expect(screen.getByText("codex")).toBeTruthy();
+    fireEvent.change(screen.getByLabelText("What should the Factory build?"), {
+      target: { value: "Implement authentication" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Plan" }));
+    expect(onCreateWorkflow).toHaveBeenCalledWith("Implement authentication");
+  });
+
+  it("explains how to configure a missing Planner instead of faking an override", () => {
+    render(
+      <AddNodeMenu
+        open
+        initialKind="workflow"
+        config={{ agents: {}, roles: {} }}
+        error={null}
+        onClose={vi.fn()}
+        onCreateWorkflow={vi.fn()}
+        onCreateAgent={vi.fn()}
+        onCreateRole={vi.fn()}
+        onCreateVisual={vi.fn()}
+      />
+    );
+
+    expect(screen.getByText("No planner configured.")).toBeTruthy();
+    expect((screen.getByRole("button", { name: "Plan" }) as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.getByRole("button", { name: "Configure agents" })).toBeTruthy();
+  });
+
   it("rejects malformed environment lines instead of silently dropping them", () => {
     const onCreateAgent = vi.fn();
     render(
@@ -13,6 +62,7 @@ describe("Add Node menu", () => {
         config={{ agents: {}, roles: {} }}
         error={null}
         onClose={vi.fn()}
+        onCreateWorkflow={vi.fn()}
         onCreateAgent={onCreateAgent}
         onCreateRole={vi.fn()}
         onCreateVisual={vi.fn()}

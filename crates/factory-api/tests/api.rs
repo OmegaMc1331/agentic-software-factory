@@ -1,13 +1,15 @@
+use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::process::Command;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use factory_db::FactoryDb;
-use factory_types::AgentSession;
+use factory_core::{AgentEntry, Config, RoleEntry};
+use factory_types::{AgentSession, RunStatus};
 use http_body_util::BodyExt;
 use serde_json::json;
 use tempfile::TempDir;
@@ -18,11 +20,135 @@ fn init_root(root: &Path) {
 }
 
 fn make_state(root: &Path) -> Arc<factory_api::ApiState> {
-    let db = FactoryDb::open(&root.join(".factory").join("db.sqlite3")).unwrap();
-    Arc::new(factory_api::ApiState {
-        db: Mutex::new(db),
-        root: root.to_path_buf(),
-    })
+    Arc::new(factory_api::ApiState::new(root.to_path_buf()).unwrap())
+}
+
+fn command_entry(script: &str) -> AgentEntry {
+    if cfg!(windows) {
+        AgentEntry {
+            command: "cmd".into(),
+            args: vec!["/d".into(), "/c".into(), script.into()],
+            env: BTreeMap::new(),
+            capabilities: Vec::new(),
+        }
+    } else {
+        AgentEntry {
+            command: "sh".into(),
+            args: vec!["-c".into(), script.into()],
+            env: BTreeMap::new(),
+            capabilities: Vec::new(),
+        }
+    }
+}
+
+fn configure_test_agents(root: &Path, slow_planner: bool) {
+    let plan = r#"{"objective":"API workflow","tasks":[{"id":"T1","title":"API task","objective":"exercise the workflow API","dependencies":[],"acceptanceCriteria":["review approved"]}]}"#;
+    let worker_output = r#"{"commands":["test-worker"],"tests":["test-check"]}"#;
+    let review_output = r#"{"decision":"approve","reason":"API evidence accepted"}"#;
+    let plan_path = root.join("test-plan.json");
+    let worker_path = root.join("test-worker.json");
+    let reviewer_path = root.join("test-reviewer.json");
+    std::fs::write(&plan_path, plan).unwrap();
+    std::fs::write(&worker_path, worker_output).unwrap();
+    std::fs::write(&reviewer_path, review_output).unwrap();
+    let planner = if cfg!(windows) {
+        if slow_planner {
+            format!("ping -n 20 127.0.0.1 >nul & type {}", plan_path.display())
+        } else {
+            format!("type {}", plan_path.display())
+        }
+    } else if slow_planner {
+        format!("sleep 20; cat '{}'", plan_path.display())
+    } else {
+        format!("cat '{}'", plan_path.display())
+    };
+    let worker = if cfg!(windows) {
+        format!(
+            "echo done>worker-output.txt & type {}",
+            worker_path.display()
+        )
+    } else {
+        format!(
+            "printf 'done\\n' > worker-output.txt; cat '{}'",
+            worker_path.display()
+        )
+    };
+    let reviewer = if cfg!(windows) {
+        format!("type {}", reviewer_path.display())
+    } else {
+        format!("cat '{}'", reviewer_path.display())
+    };
+    let mut config = Config::default();
+    for (name, script) in [
+        ("planner-test", planner.as_str()),
+        ("worker-test", worker.as_str()),
+        ("reviewer-test", reviewer.as_str()),
+    ] {
+        config.agents.insert(name.into(), command_entry(script));
+    }
+    for (role, agent) in [
+        ("planner", "planner-test"),
+        ("worker", "worker-test"),
+        ("reviewer", "reviewer-test"),
+    ] {
+        config.roles.insert(
+            role.into(),
+            RoleEntry {
+                agent: agent.into(),
+            },
+        );
+    }
+    config.write_atomic(root).unwrap();
+}
+
+fn init_git(root: &Path) {
+    std::fs::write(root.join("README.md"), "API fixture\n").unwrap();
+    for args in [
+        &["init", "-q", "-b", "main"][..],
+        &["config", "user.email", "factory@example.test"][..],
+        &["config", "user.name", "Factory API Test"][..],
+        &["add", "."][..],
+        &["commit", "-q", "-m", "initial"][..],
+    ] {
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .status()
+            .unwrap()
+            .success());
+    }
+}
+
+async fn wait_for_run(root: &Path, id: i64, expected: RunStatus) {
+    // Worktree creation can be slow on loaded Windows CI hosts. Keep a finite
+    // deadline, but do not make the workflow assertion depend on filesystem speed.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let status = factory_core::Factory::open(root)
+            .unwrap()
+            .get_run(id)
+            .unwrap()
+            .unwrap()
+            .status;
+        if status == expected {
+            return;
+        }
+        if matches!(
+            status,
+            RunStatus::Failed | RunStatus::Blocked | RunStatus::Cancelled
+        ) && status != expected
+        {
+            let factory = factory_core::Factory::open(root).unwrap();
+            panic!(
+                "workflow reached {status:?}; sessions: {:#?}; attempts: {:#?}",
+                factory.list_agent_sessions(Some(id)).unwrap(),
+                factory.list_task_attempts(id).unwrap()
+            );
+        }
+        assert!(Instant::now() < deadline, "workflow remained {status:?}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 async fn body_text(response: axum::response::Response) -> String {
@@ -59,13 +185,13 @@ fn bind_returns_a_nonblocking_listener() {
 
 async fn live_get(address: SocketAddr, path: &'static str) -> String {
     tokio::task::spawn_blocking(move || {
-        let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(2)).unwrap();
+        let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(10)).unwrap();
         stream.set_nodelay(true).unwrap();
         stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
+            .set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
         stream
-            .set_write_timeout(Some(Duration::from_secs(2)))
+            .set_write_timeout(Some(Duration::from_secs(10)))
             .unwrap();
         write!(
             stream,
@@ -132,7 +258,8 @@ async fn live_server_handles_sequential_api_requests() {
 async fn config_round_trips_through_put_and_get() {
     let dir = TempDir::new().unwrap();
     init_root(dir.path());
-    let app = factory_api::router(make_state(dir.path()));
+    let state = make_state(dir.path());
+    let app = factory_api::router(state.clone());
 
     let config = json!({
         "agents": {
@@ -499,6 +626,7 @@ async fn agent_session_endpoints_return_persisted_output_and_close_completed_str
             id: 0,
             run_id: None,
             task_id: None,
+            attempt_id: None,
             role: "worker".to_string(),
             agent: "codex".to_string(),
             command: "codex exec".to_string(),
@@ -608,4 +736,140 @@ async fn configured_idle_agent_has_an_empty_session_history() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workflow_api_plans_and_executes_through_factory_core() {
+    let dir = TempDir::new().unwrap();
+    init_root(dir.path());
+    configure_test_agents(dir.path(), false);
+    init_git(dir.path());
+    let app = factory_api::router(make_state(dir.path()));
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/runs")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"objective": "Exercise the API"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let run: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+    let run_id = run["id"].as_i64().unwrap();
+    assert_eq!(run["status"], "planning");
+    wait_for_run(dir.path(), run_id, RunStatus::Planned).await;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/runs/{run_id}/start"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let roles: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+    assert_eq!(roles["worker"], "worker-test");
+    assert_eq!(roles["reviewer"], "reviewer-test");
+    wait_for_run(dir.path(), run_id, RunStatus::Completed).await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/runs/{run_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let detail: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+    assert_eq!(detail["run"]["status"], "completed");
+    assert_eq!(detail["tasks"][0]["state"], "completed");
+    assert_eq!(detail["attempts"][0]["status"], "approved");
+    assert_eq!(detail["sessions"].as_array().unwrap().len(), 3);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workflow_cancel_stops_a_known_planning_session() {
+    let dir = TempDir::new().unwrap();
+    init_root(dir.path());
+    configure_test_agents(dir.path(), true);
+    let state = make_state(dir.path());
+    let app = factory_api::router(state.clone());
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/runs")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"objective": "Cancel planning"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let run: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+    let run_id = run["id"].as_i64().unwrap();
+
+    let session_deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let sessions = factory_core::Factory::open(dir.path())
+            .unwrap()
+            .list_agent_sessions(Some(run_id))
+            .unwrap();
+        if sessions.iter().any(|session| session.status == "running") {
+            break;
+        }
+        assert!(
+            Instant::now() < session_deadline,
+            "planner session did not start"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/runs/{run_id}/cancel"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    wait_for_run(dir.path(), run_id, RunStatus::Cancelled).await;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !state.runtime.active_operations().is_empty() {
+        assert!(Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/runs/{run_id}/start"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(body_text(response).await.contains("while it is cancelled"));
 }

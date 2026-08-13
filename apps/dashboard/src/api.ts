@@ -4,6 +4,7 @@ import type {
   ConfigData,
   GraphData,
   GraphWorkspace,
+  Run,
   RunDetail,
   RunSummary,
 } from "./types";
@@ -78,12 +79,36 @@ async function put<T>(path: string, body: unknown): Promise<T> {
   });
 }
 
+async function post<T>(path: string, body?: unknown): Promise<T> {
+  return request<T>(path, {
+    method: "POST",
+    headers: body === undefined ? undefined : { "Content-Type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+}
+
 export function fetchRuns(): Promise<RunSummary[]> {
   return get<RunSummary[]>("/runs");
 }
 
 export function fetchRun(id: number): Promise<RunDetail> {
   return get<RunDetail>(`/runs/${id}`);
+}
+
+export function createWorkflow(objective: string): Promise<Run> {
+  return post<Run>("/runs", { objective });
+}
+
+export function startWorkflow(id: number): Promise<{ worker: string; reviewer: string }> {
+  return post<{ worker: string; reviewer: string }>(`/runs/${id}/start`);
+}
+
+export function cancelWorkflow(id: number): Promise<void> {
+  return post<void>(`/runs/${id}/cancel`);
+}
+
+export function retryTask(id: number): Promise<{ runId: number }> {
+  return post<{ runId: number }>(`/tasks/${id}/retry`);
 }
 
 export function fetchGraph(): Promise<GraphData> {

@@ -6,6 +6,7 @@ pub struct AgentSession {
     pub id: i64,
     pub run_id: Option<i64>,
     pub task_id: Option<i64>,
+    pub attempt_id: Option<i64>,
     pub role: String,
     pub agent: String,
     pub command: String,

@@ -1,6 +1,6 @@
 use std::path::Path;
 use std::process::Command as ProcessCommand;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -39,11 +39,6 @@ enum Command {
         /// Do not open the dashboard in a browser
         #[arg(long)]
         no_browser: bool,
-    },
-    /// Plan a run from a software objective using the configured planner agent
-    Run {
-        /// The objective to plan
-        objective: String,
     },
     /// Show the current factory status
     Status,
@@ -126,9 +121,6 @@ impl Cli {
             }
             Command::Start { port, no_browser } => {
                 start(&root, *port, *no_browser)?;
-            }
-            Command::Run { objective } => {
-                run(&root, objective)?;
             }
             Command::Status => {
                 status(&root)?;
@@ -213,27 +205,6 @@ fn config_list(root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn run(root: &Path, objective: &str) -> Result<()> {
-    factory_root(root)?;
-    let factory = Factory::open(root)?;
-    let outcome = factory.create_run(objective)?;
-    println!(
-        "Run #{} planned (planner: {}, {} tasks)",
-        outcome.run.id,
-        outcome.run.planner_agent.as_deref().unwrap_or("_"),
-        outcome.tasks.len()
-    );
-    for task in &outcome.tasks {
-        print_task(task);
-    }
-    println!();
-    println!(
-        "Inspect tasks with `factory dev tasks --run {}` or `factory dev inspect <task-id>`.",
-        outcome.run.id
-    );
-    Ok(())
-}
-
 fn status(root: &Path) -> Result<()> {
     factory_root(root)?;
     let db = FactoryDb::open(&root.join(FACTORY_DIR).join("db.sqlite3"))?;
@@ -241,14 +212,46 @@ fn status(root: &Path) -> Result<()> {
     println!("Factory: {}", root.join(FACTORY_DIR).display());
     match runs.first() {
         None => {
-            println!("No runs yet. Create one with `factory run \"<objective>\"`.");
+            println!("No workflows yet. Open Agent Graph with `factory start`.");
         }
         Some(run) => {
-            println!("Latest run: #{} ({})", run.id, run.status.as_str());
-            print_run(&db, run)?;
-            println!();
-            for task in &db.list_tasks(run.id)? {
-                print_task(task);
+            let active = runs.iter().find(|candidate| {
+                matches!(
+                    candidate.status,
+                    factory_types::RunStatus::Planning | factory_types::RunStatus::Active
+                )
+            });
+            let current = active.unwrap_or(run);
+            let tasks = db.list_tasks(current.id)?;
+            let counts = factory_api::types::TaskCounts::from_tasks(&tasks);
+            if active.is_some() {
+                println!(
+                    "Active workflow: #{} ({})",
+                    current.id,
+                    current.status.as_str()
+                );
+            } else {
+                println!(
+                    "Latest workflow: #{} ({})",
+                    current.id,
+                    current.status.as_str()
+                );
+            }
+            println!("Tasks: {}/{} completed", counts.completed, counts.total);
+            if current.status == factory_types::RunStatus::Planning {
+                println!(
+                    "Current: planning with {}",
+                    current
+                        .planner_agent
+                        .as_deref()
+                        .unwrap_or("unassigned planner")
+                );
+            } else if let Some(task) = tasks.iter().find(|task| task.state == TaskState::Running) {
+                let agent = db
+                    .latest_task_attempt(task.id)?
+                    .map(|attempt| attempt.agent)
+                    .unwrap_or_else(|| "configured Worker".into());
+                println!("Current: #{} running with {}", task.id, agent);
             }
         }
     }
@@ -367,11 +370,7 @@ fn worktree_status(root: &Path) -> Result<()> {
 
 fn start(root: &Path, port: u16, no_browser: bool) -> Result<()> {
     factory_root(root)?;
-    let db = FactoryDb::open(&root.join(FACTORY_DIR).join("db.sqlite3"))?;
-    let state = factory_api::ApiState {
-        db: Mutex::new(db),
-        root: root.to_path_buf(),
-    };
+    let state = factory_api::ApiState::new(root.to_path_buf())?;
     let listener = factory_api::bind(port)?;
     let address = listener.local_addr()?;
     let url = format!("http://127.0.0.1:{}", address.port());
@@ -434,11 +433,7 @@ async fn wait_until_ready(address: std::net::SocketAddr) -> Result<()> {
 
 fn serve(root: &Path, port: u16) -> Result<()> {
     factory_root(root)?;
-    let db = FactoryDb::open(&root.join(FACTORY_DIR).join("db.sqlite3"))?;
-    let state = factory_api::ApiState {
-        db: Mutex::new(db),
-        root: root.to_path_buf(),
-    };
+    let state = factory_api::ApiState::new(root.to_path_buf())?;
     let listener = factory_api::bind(port)?;
     println!(
         "Factory API listening on http://127.0.0.1:{}",
@@ -467,26 +462,6 @@ fn open_browser(url: &str) {
     }
 }
 
-fn print_run(db: &FactoryDb, run: &factory_types::Run) -> Result<()> {
-    let tasks = db.list_tasks(run.id)?;
-    let counts = factory_api::types::TaskCounts::from_tasks(&tasks);
-    println!(
-        "  created {}  planner {}",
-        run.created_at,
-        run.planner_agent.as_deref().unwrap_or("_")
-    );
-    println!(
-        "  tasks: {} pending, {} ready, {} running, {} blocked, {} failed, {} completed",
-        counts.pending,
-        counts.ready,
-        counts.running,
-        counts.blocked,
-        counts.failed,
-        counts.completed
-    );
-    Ok(())
-}
-
 fn deps_label(deps: &[i64]) -> String {
     deps.iter()
         .map(|id| format!("#{id}"))
@@ -494,17 +469,26 @@ fn deps_label(deps: &[i64]) -> String {
         .join(", ")
 }
 
-fn print_task(task: &factory_types::Task) {
-    let deps = deps_label(&task.dependencies);
-    println!(
-        "  #{:<4} {:<9} {}{}",
-        task.id,
-        task.state.as_str(),
-        task.title,
-        if deps.is_empty() {
-            String::new()
-        } else {
-            format!(" [{}]", deps)
-        },
-    );
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn public_cli_is_limited_to_bootstrap_and_read_only_status() {
+        assert!(matches!(
+            Cli::try_parse_from(["factory", "init"]).unwrap().command,
+            Command::Init
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["factory", "start", "--no-browser"])
+                .unwrap()
+                .command,
+            Command::Start { .. }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["factory", "status"]).unwrap().command,
+            Command::Status
+        ));
+        assert!(Cli::try_parse_from(["factory", "run", "objective"]).is_err());
+    }
 }

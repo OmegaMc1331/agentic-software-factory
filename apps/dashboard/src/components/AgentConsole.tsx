@@ -113,7 +113,7 @@ export function AgentConsole({
         setSelectedSessionId((current) => current ?? next[0]?.id ?? null);
       })
       .catch((reason: Error) => setError(reason.message));
-  }, [agentName]);
+  }, [activity?.runId, activity?.taskId, agentName]);
 
   const session = useMemo(
     () => sessions.find((candidate) => candidate.id === selectedSessionId) ?? null,

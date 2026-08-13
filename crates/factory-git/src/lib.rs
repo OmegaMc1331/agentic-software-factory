@@ -14,6 +14,13 @@ pub struct WorktreeInfo {
     pub branch: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeEvidence {
+    pub changed_files: Vec<String>,
+    pub diff_summary: String,
+    pub commit_sha: Option<String>,
+}
+
 pub struct Repo {
     root: PathBuf,
 }
@@ -178,6 +185,49 @@ impl Repo {
         }
         let out = git(worktree_path, &["status", "--porcelain"], None)?;
         Ok(!out.trim().is_empty())
+    }
+
+    pub fn head_sha(&self, worktree_path: &Path) -> Result<String> {
+        Ok(git(worktree_path, &["rev-parse", "HEAD"], None)?
+            .trim()
+            .to_string())
+    }
+
+    pub fn evidence_since(&self, worktree_path: &Path, base_sha: &str) -> Result<WorktreeEvidence> {
+        let head = self.head_sha(worktree_path)?;
+        let committed = git(
+            worktree_path,
+            &["diff", "--name-only", base_sha, "HEAD"],
+            None,
+        )?;
+        let working = git(worktree_path, &["status", "--porcelain"], None)?;
+        let mut changed_files = std::collections::BTreeSet::new();
+        for path in committed
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+        {
+            changed_files.insert(path.to_string());
+        }
+        for line in working.lines().filter(|line| line.len() > 3) {
+            let raw_path = &line[3..];
+            let path = raw_path
+                .rsplit_once(" -> ")
+                .map_or(raw_path, |(_, target)| target)
+                .trim();
+            if !path.is_empty() {
+                changed_files.insert(path.to_string());
+            }
+        }
+        let mut diff_summary = git(worktree_path, &["diff", "--stat", base_sha], None)?;
+        if diff_summary.trim().is_empty() && !working.trim().is_empty() {
+            diff_summary = working;
+        }
+        Ok(WorktreeEvidence {
+            changed_files: changed_files.into_iter().collect(),
+            diff_summary: diff_summary.trim().to_string(),
+            commit_sha: (head != base_sha).then_some(head),
+        })
     }
 }
 

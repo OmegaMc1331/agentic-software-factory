@@ -3,7 +3,10 @@ pub mod error;
 pub use error::DbError;
 
 use chrono::Utc;
-use factory_types::{AgentSession, Run, RunStatus, Task, TaskState};
+use factory_types::{
+    AgentSession, AttemptStatus, Plan, ReviewResult, Run, RunStatus, Task, TaskAttempt,
+    TaskEvidence, TaskState,
+};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 
@@ -20,17 +23,28 @@ fn now() -> String {
 impl FactoryDb {
     pub fn open(path: &Path) -> Result<Self> {
         let mut conn = Connection::open(path)?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
         migrate(&mut conn)?;
         Ok(FactoryDb { conn })
     }
 
     pub fn create_run(&self, objective: &str, planner_agent: Option<&str>) -> Result<Run> {
+        self.create_run_with_status(objective, planner_agent, RunStatus::Planned)
+    }
+
+    pub fn create_run_with_status(
+        &self,
+        objective: &str,
+        planner_agent: Option<&str>,
+        status: RunStatus,
+    ) -> Result<Run> {
         let ts = now();
         self.conn.execute(
             "INSERT INTO runs (objective, status, planner_agent, created_at, updated_at)
-             VALUES (?1, 'planned', ?2, ?3, ?4)",
-            params![objective, planner_agent, ts, ts],
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![objective, status.as_str(), planner_agent, ts, ts],
         )?;
         let id = self.conn.last_insert_rowid();
         self.get_run(id)?.ok_or(DbError::NotFound("run"))
@@ -61,11 +75,53 @@ impl FactoryDb {
     }
 
     pub fn set_run_status(&self, id: i64, status: RunStatus) -> Result<()> {
-        self.conn.execute(
+        let changed = self.conn.execute(
             "UPDATE runs SET status = ?1, updated_at = ?2 WHERE id = ?3",
             params![status.as_str(), now(), id],
         )?;
+        if changed == 0 {
+            return Err(DbError::NotFound("run"));
+        }
         Ok(())
+    }
+
+    pub fn persist_plan(&self, run_id: i64, plan: &Plan) -> Result<Vec<Task>> {
+        let tx = self.conn.unchecked_transaction()?;
+        let mut ids = std::collections::HashMap::new();
+        let ts = now();
+        for (position, task) in plan.tasks.iter().enumerate() {
+            let criteria = serde_json::to_string(&task.acceptance_criteria)?;
+            tx.execute(
+                "INSERT INTO tasks (run_id, title, objective, acceptance_criteria, state, position, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?7)",
+                params![run_id, task.title, task.objective, criteria, position as i32, ts, ts],
+            )?;
+            ids.insert(task.id.clone(), tx.last_insert_rowid());
+        }
+        for task in &plan.tasks {
+            let task_id = ids[&task.id];
+            for dependency in &task.dependencies {
+                tx.execute(
+                    "INSERT INTO task_dependencies (task_id, depends_on) VALUES (?1, ?2)",
+                    params![task_id, ids[dependency]],
+                )?;
+            }
+            let state = if task.dependencies.is_empty() {
+                TaskState::Ready
+            } else {
+                TaskState::Pending
+            };
+            tx.execute(
+                "UPDATE tasks SET state = ?1, updated_at = ?2 WHERE id = ?3",
+                params![state.as_str(), ts, task_id],
+            )?;
+        }
+        tx.execute(
+            "UPDATE runs SET objective = ?1, status = 'planned', updated_at = ?2 WHERE id = ?3",
+            params![plan.objective, ts, run_id],
+        )?;
+        tx.commit()?;
+        self.list_tasks(run_id)
     }
 
     pub fn create_task(
@@ -158,6 +214,9 @@ impl FactoryDb {
         let tasks = self.list_tasks(run_id)?;
         let status = RunStatus::from_tasks(&tasks);
         let current = self.get_run(run_id)?.map(|run| run.status);
+        if matches!(current, Some(RunStatus::Planning | RunStatus::Cancelled)) {
+            return Ok(());
+        }
         if current != Some(status) {
             self.set_run_status(run_id, status)?;
         }
@@ -175,11 +234,12 @@ impl FactoryDb {
     pub fn insert_agent_session(&self, session: &AgentSession) -> Result<AgentSession> {
         let mut session = session.clone();
         self.conn.execute(
-            "INSERT INTO agent_sessions (run_id, task_id, role, agent, command, status, started_at, finished_at, exit_code, duration_ms, stdout, stderr)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            "INSERT INTO agent_sessions (run_id, task_id, attempt_id, role, agent, command, status, started_at, finished_at, exit_code, duration_ms, stdout, stderr)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 session.run_id,
                 session.task_id,
+                session.attempt_id,
                 session.role,
                 session.agent,
                 session.command,
@@ -198,7 +258,7 @@ impl FactoryDb {
 
     pub fn list_agent_sessions(&self, run_id: Option<i64>) -> Result<Vec<AgentSession>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, run_id, task_id, role, agent, command, status, started_at, finished_at, exit_code, duration_ms, stdout, stderr
+            "SELECT id, run_id, task_id, attempt_id, role, agent, command, status, started_at, finished_at, exit_code, duration_ms, stdout, stderr
              FROM agent_sessions
              WHERE (?1 IS NULL OR run_id = ?1)
              ORDER BY id",
@@ -212,7 +272,7 @@ impl FactoryDb {
     pub fn get_agent_session(&self, id: i64) -> Result<Option<AgentSession>> {
         self.conn
             .query_row(
-                "SELECT id, run_id, task_id, role, agent, command, status, started_at, finished_at, exit_code, duration_ms, stdout, stderr
+                "SELECT id, run_id, task_id, attempt_id, role, agent, command, status, started_at, finished_at, exit_code, duration_ms, stdout, stderr
                  FROM agent_sessions WHERE id = ?1",
                 params![id],
                 build_session,
@@ -227,7 +287,7 @@ impl FactoryDb {
         limit: usize,
     ) -> Result<Vec<AgentSession>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, run_id, task_id, role, agent, command, status, started_at, finished_at, exit_code, duration_ms, stdout, stderr
+            "SELECT id, run_id, task_id, attempt_id, role, agent, command, status, started_at, finished_at, exit_code, duration_ms, stdout, stderr
              FROM agent_sessions
              WHERE agent = ?1
              ORDER BY id DESC
@@ -238,6 +298,190 @@ impl FactoryDb {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
     }
+
+    pub fn append_agent_session_output(
+        &self,
+        id: i64,
+        stdout: Option<&str>,
+        stderr: Option<&str>,
+    ) -> Result<()> {
+        const MAX_LOG_CHARS: i64 = 1_000_000;
+        self.conn.execute(
+            "UPDATE agent_sessions
+             SET stdout = substr(COALESCE(stdout, '') || COALESCE(?1, ''), -?2),
+                 stderr = substr(COALESCE(stderr, '') || COALESCE(?3, ''), -?2)
+             WHERE id = ?4",
+            params![stdout, MAX_LOG_CHARS, stderr, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn finish_agent_session(
+        &self,
+        id: i64,
+        status: &str,
+        exit_code: Option<i32>,
+        duration_ms: u64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE agent_sessions
+             SET status = ?1, finished_at = ?2, exit_code = ?3, duration_ms = ?4
+             WHERE id = ?5",
+            params![status, now(), exit_code, duration_ms as i64, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_agent_session_status(&self, id: i64, status: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE agent_sessions SET status = ?1 WHERE id = ?2",
+            params![status, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn create_task_attempt(
+        &self,
+        task_id: i64,
+        agent: &str,
+        worktree_path: &str,
+    ) -> Result<TaskAttempt> {
+        let attempt_number: u32 = self.conn.query_row(
+            "SELECT COALESCE(MAX(attempt_number), 0) + 1 FROM task_attempts WHERE task_id = ?1",
+            params![task_id],
+            |row| row.get(0),
+        )?;
+        self.conn.execute(
+            "INSERT INTO task_attempts
+             (task_id, attempt_number, agent, status, started_at, worktree_path)
+             VALUES (?1, ?2, ?3, 'running', ?4, ?5)",
+            params![task_id, attempt_number, agent, now(), worktree_path],
+        )?;
+        self.get_task_attempt(self.conn.last_insert_rowid())?
+            .ok_or(DbError::NotFound("task attempt"))
+    }
+
+    pub fn get_task_attempt(&self, id: i64) -> Result<Option<TaskAttempt>> {
+        self.conn
+            .query_row(
+                "SELECT id, task_id, attempt_number, agent, status, started_at, finished_at,
+                        worktree_path, commit_sha, exit_code, error, evidence, review
+                 FROM task_attempts WHERE id = ?1",
+                params![id],
+                build_attempt,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn list_task_attempts(&self, run_id: i64) -> Result<Vec<TaskAttempt>> {
+        let mut statement = self.conn.prepare(
+            "SELECT a.id, a.task_id, a.attempt_number, a.agent, a.status, a.started_at,
+                    a.finished_at, a.worktree_path, a.commit_sha, a.exit_code, a.error,
+                    a.evidence, a.review
+             FROM task_attempts a
+             JOIN tasks t ON t.id = a.task_id
+             WHERE t.run_id = ?1
+             ORDER BY a.id",
+        )?;
+        let attempts = statement
+            .query_map(params![run_id], build_attempt)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(attempts)
+    }
+
+    pub fn latest_task_attempt(&self, task_id: i64) -> Result<Option<TaskAttempt>> {
+        self.conn
+            .query_row(
+                "SELECT id, task_id, attempt_number, agent, status, started_at, finished_at,
+                        worktree_path, commit_sha, exit_code, error, evidence, review
+                 FROM task_attempts WHERE task_id = ?1 ORDER BY attempt_number DESC LIMIT 1",
+                params![task_id],
+                build_attempt,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn set_task_attempt_status(&self, id: i64, status: AttemptStatus) -> Result<()> {
+        self.conn.execute(
+            "UPDATE task_attempts SET status = ?1 WHERE id = ?2",
+            params![status.as_str(), id],
+        )?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn finish_task_attempt(
+        &self,
+        id: i64,
+        status: AttemptStatus,
+        exit_code: Option<i32>,
+        commit_sha: Option<&str>,
+        error: Option<&str>,
+        evidence: Option<&TaskEvidence>,
+        review: Option<&ReviewResult>,
+    ) -> Result<()> {
+        let evidence = evidence.map(serde_json::to_string).transpose()?;
+        let review = review.map(serde_json::to_string).transpose()?;
+        self.conn.execute(
+            "UPDATE task_attempts
+             SET status = ?1, finished_at = ?2, exit_code = ?3, commit_sha = ?4,
+                 error = ?5, evidence = ?6, review = ?7
+             WHERE id = ?8",
+            params![
+                status.as_str(),
+                now(),
+                exit_code,
+                commit_sha,
+                error,
+                evidence,
+                review,
+                id
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn reconcile_interrupted(&self) -> Result<Reconciliation> {
+        let timestamp = now();
+        let sessions = self.conn.execute(
+            "UPDATE agent_sessions
+             SET status = 'interrupted', finished_at = ?1
+             WHERE status IN ('running', 'active')",
+            params![timestamp],
+        )?;
+        let attempts = self.conn.execute(
+            "UPDATE task_attempts
+             SET status = 'interrupted', finished_at = ?1,
+                 error = COALESCE(error, 'Factory stopped while this attempt was running.')
+             WHERE status IN ('running', 'reviewing')",
+            params![timestamp],
+        )?;
+        let tasks = self.conn.execute(
+            "UPDATE tasks SET state = 'failed', updated_at = ?1 WHERE state = 'running'",
+            params![timestamp],
+        )?;
+        let runs = self.conn.execute(
+            "UPDATE runs SET status = 'failed', updated_at = ?1
+             WHERE status IN ('planning', 'active')",
+            params![timestamp],
+        )?;
+        Ok(Reconciliation {
+            sessions,
+            attempts,
+            tasks,
+            runs,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Reconciliation {
+    pub sessions: usize,
+    pub attempts: usize,
+    pub tasks: usize,
+    pub runs: usize,
 }
 
 fn build_run(r: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
@@ -274,16 +518,40 @@ fn build_session(r: &rusqlite::Row<'_>) -> rusqlite::Result<AgentSession> {
         id: r.get(0)?,
         run_id: r.get(1)?,
         task_id: r.get(2)?,
-        role: r.get(3)?,
-        agent: r.get(4)?,
-        command: r.get(5)?,
-        status: r.get(6)?,
-        started_at: r.get(7)?,
-        finished_at: r.get(8)?,
+        attempt_id: r.get(3)?,
+        role: r.get(4)?,
+        agent: r.get(5)?,
+        command: r.get(6)?,
+        status: r.get(7)?,
+        started_at: r.get(8)?,
+        finished_at: r.get(9)?,
+        exit_code: r.get(10)?,
+        duration_ms: r.get(11).map(|v: Option<i64>| v.map(|v| v as u64))?,
+        stdout: r.get(12)?,
+        stderr: r.get(13)?,
+    })
+}
+
+fn build_attempt(r: &rusqlite::Row<'_>) -> rusqlite::Result<TaskAttempt> {
+    let evidence: Option<String> = r.get(11)?;
+    let review: Option<String> = r.get(12)?;
+    Ok(TaskAttempt {
+        id: r.get(0)?,
+        task_id: r.get(1)?,
+        attempt_number: r.get(2)?,
+        agent: r.get(3)?,
+        status: r
+            .get::<_, String>(4)?
+            .parse()
+            .unwrap_or(AttemptStatus::Interrupted),
+        started_at: r.get(5)?,
+        finished_at: r.get(6)?,
+        worktree_path: r.get(7)?,
+        commit_sha: r.get(8)?,
         exit_code: r.get(9)?,
-        duration_ms: r.get(10).map(|v: Option<i64>| v.map(|v| v as u64))?,
-        stdout: r.get(11)?,
-        stderr: r.get(12)?,
+        error: r.get(10)?,
+        evidence: evidence.and_then(|value| serde_json::from_str(&value).ok()),
+        review: review.and_then(|value| serde_json::from_str(&value).ok()),
     })
 }
 
@@ -292,12 +560,7 @@ fn task_state(s: String) -> TaskState {
 }
 
 fn run_status(s: String) -> RunStatus {
-    match s.as_str() {
-        "active" => RunStatus::Active,
-        "completed" => RunStatus::Completed,
-        "failed" => RunStatus::Failed,
-        _ => RunStatus::Planned,
-    }
+    s.parse().unwrap_or(RunStatus::Planned)
 }
 
 const V1_SCHEMA: &str = "\
@@ -348,7 +611,30 @@ CREATE INDEX IF NOT EXISTS idx_sessions_run ON agent_sessions(run_id);
 
 const V2_SCHEMA: &str = "CREATE INDEX IF NOT EXISTS idx_tasks_run_state ON tasks(run_id, state);";
 
-const MIGRATIONS: &[&str] = &[V1_SCHEMA, V2_SCHEMA];
+const V3_SCHEMA: &str = "
+CREATE TABLE task_attempts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    attempt_number INTEGER NOT NULL,
+    agent TEXT NOT NULL,
+    status TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    worktree_path TEXT NOT NULL,
+    commit_sha TEXT,
+    exit_code INTEGER,
+    error TEXT,
+    evidence TEXT,
+    review TEXT,
+    UNIQUE(task_id, attempt_number)
+);
+ALTER TABLE agent_sessions ADD COLUMN attempt_id INTEGER REFERENCES task_attempts(id) ON DELETE SET NULL;
+CREATE INDEX idx_attempts_task ON task_attempts(task_id, attempt_number);
+CREATE INDEX idx_sessions_attempt ON agent_sessions(attempt_id);
+CREATE INDEX idx_sessions_status ON agent_sessions(status);
+";
+
+const MIGRATIONS: &[&str] = &[V1_SCHEMA, V2_SCHEMA, V3_SCHEMA];
 
 fn migrate(conn: &mut Connection) -> Result<()> {
     migrate_schemas(conn, MIGRATIONS)
@@ -383,7 +669,10 @@ fn migrate_schemas(conn: &mut Connection, schemas: &[&str]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use factory_types::{AgentSession, RunStatus, TaskState};
+    use factory_types::{
+        AgentSession, AttemptStatus, Plan, PlannedTask, ReviewDecision, ReviewResult, RunStatus,
+        TaskEvidence, TaskState,
+    };
     use rusqlite::Connection;
     use tempfile::TempDir;
 
@@ -395,12 +684,12 @@ mod tests {
         let path = dir.path().join("test.db");
         let db = FactoryDb::open(&path).unwrap();
         let versions = schema_versions(&path);
-        assert_eq!(versions, vec![1, 2]);
+        assert_eq!(versions, vec![1, 2, 3]);
         db.create_run("objective", Some("codex")).unwrap();
         drop(db);
 
         let db = FactoryDb::open(&path).unwrap();
-        assert_eq!(schema_versions(&path), vec![1, 2]);
+        assert_eq!(schema_versions(&path), vec![1, 2, 3]);
         db.list_runs().unwrap();
     }
 
@@ -425,7 +714,7 @@ mod tests {
         drop(conn);
 
         let db = FactoryDb::open(&path).unwrap();
-        assert_eq!(schema_versions(&path), vec![1, 2]);
+        assert_eq!(schema_versions(&path), vec![1, 2, 3]);
         let run = db.get_run(1).unwrap().unwrap();
         assert_eq!(run.objective, "legacy");
         let tasks = db.list_tasks(1).unwrap();
@@ -581,6 +870,7 @@ mod tests {
             id: 0,
             run_id: Some(run.id),
             task_id: None,
+            attempt_id: None,
             role: "planner".to_string(),
             agent: "codex".to_string(),
             command: "codex exec".to_string(),
@@ -612,5 +902,134 @@ mod tests {
             .list_agent_sessions_for_agent("unknown", 12)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn persists_a_plan_atomically_with_real_dependency_ids() {
+        let dir = TempDir::new().unwrap();
+        let db = FactoryDb::open(&dir.path().join("test.db")).unwrap();
+        let run = db
+            .create_run_with_status("draft", Some("planner"), RunStatus::Planning)
+            .unwrap();
+        let tasks = db
+            .persist_plan(
+                run.id,
+                &Plan {
+                    objective: "normalized objective".into(),
+                    tasks: vec![
+                        PlannedTask {
+                            id: "A".into(),
+                            title: "First".into(),
+                            objective: "first".into(),
+                            dependencies: Vec::new(),
+                            acceptance_criteria: vec!["done".into()],
+                        },
+                        PlannedTask {
+                            id: "B".into(),
+                            title: "Second".into(),
+                            objective: "second".into(),
+                            dependencies: vec!["A".into()],
+                            acceptance_criteria: vec!["reviewed".into()],
+                        },
+                    ],
+                },
+            )
+            .unwrap();
+        assert_eq!(tasks[0].state, TaskState::Ready);
+        assert_eq!(tasks[1].state, TaskState::Pending);
+        assert_eq!(tasks[1].dependencies, vec![tasks[0].id]);
+        let loaded = db.get_run(run.id).unwrap().unwrap();
+        assert_eq!(loaded.status, RunStatus::Planned);
+        assert_eq!(loaded.objective, "normalized objective");
+    }
+
+    #[test]
+    fn task_attempts_round_trip_evidence_and_review() {
+        let dir = TempDir::new().unwrap();
+        let db = FactoryDb::open(&dir.path().join("test.db")).unwrap();
+        let run = db.create_run("objective", Some("planner")).unwrap();
+        let task = db
+            .create_task(run.id, "Task", "objective", &[], TaskState::Ready, 0)
+            .unwrap();
+        let attempt = db.create_task_attempt(task, "worker", "worktree").unwrap();
+        let evidence = TaskEvidence {
+            changed_files: vec!["src/lib.rs".into()],
+            diff_summary: "1 file changed".into(),
+            commit_sha: Some("abc123".into()),
+            commands: vec!["cargo test".into()],
+            acceptance_criteria: vec!["tests pass".into()],
+            worker_exit_code: Some(0),
+        };
+        let review = ReviewResult {
+            decision: ReviewDecision::Approve,
+            reason: "verified".into(),
+            feedback: Vec::new(),
+        };
+        db.finish_task_attempt(
+            attempt.id,
+            AttemptStatus::Approved,
+            Some(0),
+            Some("abc123"),
+            None,
+            Some(&evidence),
+            Some(&review),
+        )
+        .unwrap();
+
+        let loaded = db.latest_task_attempt(task).unwrap().unwrap();
+        assert_eq!(loaded.status, AttemptStatus::Approved);
+        assert_eq!(loaded.evidence, Some(evidence));
+        assert_eq!(loaded.review, Some(review));
+        assert!(loaded.finished_at.is_some());
+    }
+
+    #[test]
+    fn restart_reconciliation_interrupts_running_state() {
+        let dir = TempDir::new().unwrap();
+        let db = FactoryDb::open(&dir.path().join("test.db")).unwrap();
+        let run = db
+            .create_run_with_status("objective", Some("planner"), RunStatus::Active)
+            .unwrap();
+        let task = db
+            .create_task(run.id, "Task", "objective", &[], TaskState::Running, 0)
+            .unwrap();
+        let attempt = db.create_task_attempt(task, "worker", "worktree").unwrap();
+        let session = db
+            .insert_agent_session(&AgentSession {
+                id: 0,
+                run_id: Some(run.id),
+                task_id: Some(task),
+                attempt_id: Some(attempt.id),
+                role: "worker".into(),
+                agent: "worker".into(),
+                command: "worker --task".into(),
+                status: "running".into(),
+                started_at: "2026-01-01T00:00:00Z".into(),
+                finished_at: None,
+                exit_code: None,
+                duration_ms: None,
+                stdout: Some("partial".into()),
+                stderr: Some(String::new()),
+            })
+            .unwrap();
+
+        let reconciled = db.reconcile_interrupted().unwrap();
+        assert_eq!(reconciled.sessions, 1);
+        assert_eq!(reconciled.attempts, 1);
+        assert_eq!(reconciled.tasks, 1);
+        assert_eq!(reconciled.runs, 1);
+        assert_eq!(
+            db.get_agent_session(session.id).unwrap().unwrap().status,
+            "interrupted"
+        );
+        assert_eq!(
+            db.latest_task_attempt(task).unwrap().unwrap().status,
+            AttemptStatus::Interrupted
+        );
+        assert_eq!(db.get_task(task).unwrap().unwrap().state, TaskState::Failed);
+        assert_eq!(
+            db.get_run(run.id).unwrap().unwrap().status,
+            RunStatus::Failed
+        );
     }
 }

@@ -1,11 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { Connection, XYPosition } from "@xyflow/react";
 import {
+  cancelWorkflow,
+  createWorkflow,
   fetchConfig,
   fetchGraph,
   fetchGraphWorkspace,
+  retryTask,
   saveConfig,
   saveGraphWorkspace,
+  startWorkflow,
 } from "../api";
 import {
   connectionKind,
@@ -31,6 +35,7 @@ import { AgentConsole } from "./AgentConsole";
 import { AgentGraph, type AgentGraphHandle } from "./AgentGraph";
 import { GraphToolbar, type RunOption } from "./GraphToolbar";
 import { NodeInspector } from "./NodeInspector";
+import { WorkflowInspector } from "./WorkflowInspector";
 
 const POLL_MS = 3000;
 const STATE_ORDER: TaskState[] = ["pending", "ready", "running", "blocked", "failed", "completed"];
@@ -74,6 +79,7 @@ export function NetworkView() {
   const [showTasks, setShowTasks] = useState<boolean | null>(null);
   const [showDependencies, setShowDependencies] = useState(true);
   const [addOpen, setAddOpen] = useState(false);
+  const [initialAddKind, setInitialAddKind] = useState<"workflow" | null>(null);
   const [zoom, setZoom] = useState(1);
   const [positionRevision, setPositionRevision] = useState(0);
   const graphRef = useRef<AgentGraphHandle>(null);
@@ -247,6 +253,54 @@ export function NetworkView() {
       });
     },
     [config, freePosition, saveConfiguration, workspace]
+  );
+
+  const createWorkflowNode = useCallback(
+    async (objective: string) => {
+      if (!workspace) return;
+      setOperationError(null);
+      try {
+        const run = await createWorkflow(objective);
+        const nodeId = `run:${run.id}`;
+        const nextWorkspace = {
+          ...workspace,
+          nodes: { ...workspace.nodes, [nodeId]: freePosition() },
+        };
+        await persistWorkspace(nextWorkspace);
+        setAddOpen(false);
+        setInitialAddKind(null);
+        setSelectedNodeId(nodeId);
+        setPositionRevision((value) => value + 1);
+        reloadGraph();
+      } catch (reason) {
+        setOperationError((reason as Error).message);
+      }
+    },
+    [freePosition, persistWorkspace, reloadGraph, workspace]
+  );
+
+  const startRun = useCallback(
+    async (runId: number) => {
+      await startWorkflow(runId);
+      reloadGraph();
+    },
+    [reloadGraph]
+  );
+
+  const cancelRun = useCallback(
+    async (runId: number) => {
+      await cancelWorkflow(runId);
+      reloadGraph();
+    },
+    [reloadGraph]
+  );
+
+  const retryFailedTask = useCallback(
+    async (taskId: number) => {
+      await retryTask(taskId);
+      reloadGraph();
+    },
+    [reloadGraph]
   );
 
   const createRole = useCallback(
@@ -483,7 +537,10 @@ export function NetworkView() {
           setLive(value);
           if (!value) setPollError(null);
         }}
-        onAdd={() => setAddOpen((value) => !value)}
+        onAdd={() => {
+          setInitialAddKind(null);
+          setAddOpen((value) => !value);
+        }}
         onFit={() => graphRef.current?.fit()}
         onCenter={() => graphRef.current?.center()}
         onZoomOut={() => graphRef.current?.zoomOut()}
@@ -496,7 +553,12 @@ export function NetworkView() {
           open={addOpen}
           config={config}
           error={operationError}
-          onClose={() => setAddOpen(false)}
+          initialKind={initialAddKind}
+          onClose={() => {
+            setAddOpen(false);
+            setInitialAddKind(null);
+          }}
+          onCreateWorkflow={(objective) => void createWorkflowNode(objective)}
           onCreateAgent={createAgent}
           onCreateRole={createRole}
           onCreateVisual={createVisual}
@@ -519,7 +581,9 @@ export function NetworkView() {
         {empty ? (
           <div className="empty net-empty">
             <p className="empty-title">No agents configured.</p>
-            <p className="empty-body">Add your first coding agent to build the Factory graph.</p>
+            <p className="empty-body">
+              Add agents, assign Planner / Worker / Reviewer, then create a workflow.
+            </p>
             <button className="button" onClick={() => setAddOpen(true)}>
               + Add agent
             </button>
@@ -585,6 +649,14 @@ export function NetworkView() {
                   })
                 }
               />
+            ) : selectedNode?.kind === "run" ? (
+              <WorkflowInspector
+                node={selectedNode}
+                onClose={() => setSelectedNodeId(null)}
+                onStart={startRun}
+                onCancel={cancelRun}
+                onRetry={retryFailedTask}
+              />
             ) : (
               <NodeInspector
                 node={selectedNode}
@@ -595,6 +667,7 @@ export function NetworkView() {
                   setSelectedEdgeId(null);
                 }}
                 onDelete={deleteSelection}
+                onRetry={(taskId) => void retryFailedTask(taskId)}
                 onConnect={(targetId) => {
                   if (!selectedNode) return;
                   connect({
@@ -606,6 +679,22 @@ export function NetworkView() {
                 }}
               />
             )}
+          </div>
+        )}
+
+        {!empty && data.metadata.runs === 0 && !addOpen && (
+          <div className="net-workflow-cta">
+            <strong>Create your first workflow</strong>
+            <span>Plan work with the configured Planner, then inspect the task graph.</span>
+            <button
+              className="button button-primary"
+              onClick={() => {
+                setInitialAddKind("workflow");
+                setAddOpen(true);
+              }}
+            >
+              + Workflow
+            </button>
           </div>
         )}
 

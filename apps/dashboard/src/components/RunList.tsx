@@ -12,9 +12,7 @@ export function RunList({
     return (
       <div className="empty">
         <p className="empty-title">No runs yet</p>
-        <p className="empty-body">
-          Start a run with <code>factory run</code> to see it here.
-        </p>
+        <p className="empty-body">Create a Workflow in Agent Graph to see it here.</p>
       </div>
     );
   }

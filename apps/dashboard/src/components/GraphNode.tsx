@@ -68,12 +68,16 @@ export function GraphNode({ data, selected }: NodeProps<FactoryFlowNode>) {
   }
 
   if (node.kind === "run") {
-    const status = runMeta(node).status;
+    const meta = runMeta(node);
+    const status = meta.status;
     return (
-      <div className={classes} aria-label={`${node.label} run, ${status}`}>
-        <span className="graph-node-kicker">Run</span>
-        <strong>{node.label}</strong>
+      <div className={classes} aria-label={`${node.label} workflow, ${status}`}>
+        <span className="graph-node-kicker">Workflow #{meta.runId}</span>
+        <strong>{truncate(node.label, 34)}</strong>
         <span>{status}</span>
+        <small>
+          {meta.counts.completed} / {meta.counts.total} tasks
+        </small>
       </div>
     );
   }
@@ -89,7 +93,7 @@ export function GraphNode({ data, selected }: NodeProps<FactoryFlowNode>) {
         <Handles kind={node.kind} />
         <strong>#{meta.taskId}</strong>
         <span>{truncate(node.label, 24)}</span>
-        <small>{meta.state}</small>
+        <small>{meta.currentAttempt?.status === "reviewing" ? "review" : meta.state}</small>
       </div>
     );
   }

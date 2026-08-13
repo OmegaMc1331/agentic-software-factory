@@ -45,6 +45,7 @@ export function NodeInspector({
   onClose,
   onDelete,
   onConnect,
+  onRetry,
 }: {
   node: GraphNode | null;
   edge: GraphEdge | null;
@@ -52,6 +53,7 @@ export function NodeInspector({
   onClose: () => void;
   onDelete: () => void;
   onConnect: (targetId: string) => void;
+  onRetry?: (taskId: number) => void;
 }) {
   const [target, setTarget] = useState("");
   useEffect(() => setTarget(""), [node?.id]);
@@ -122,6 +124,35 @@ export function NodeInspector({
           <Row label="Worktree">
             <code>{meta.worktreePath}</code>
           </Row>
+        )}
+        <Row label="Acceptance criteria">
+          {meta.acceptanceCriteria.length ? (
+            <ul className="inspector-criteria">
+              {meta.acceptanceCriteria.map((criterion) => (
+                <li key={criterion}>{criterion}</li>
+              ))}
+            </ul>
+          ) : (
+            "None"
+          )}
+        </Row>
+        {meta.currentAttempt && (
+          <>
+            <Row label="Current attempt">
+              #{meta.currentAttempt.attemptNumber} —{" "}
+              {meta.currentAttempt.status.replaceAll("_", " ")}
+            </Row>
+            <Row label="Worker">{meta.currentAttempt.agent}</Row>
+            {meta.currentAttempt.error && <Row label="Reason">{meta.currentAttempt.error}</Row>}
+            {meta.currentAttempt.review && (
+              <Row label="Review">{meta.currentAttempt.review.reason}</Row>
+            )}
+          </>
+        )}
+        {onRetry && ["failed", "blocked"].includes(meta.state) && (
+          <button className="button" onClick={() => onRetry(meta.taskId)}>
+            Retry task
+          </button>
         )}
       </>
     );

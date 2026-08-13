@@ -1,21 +1,19 @@
 # Agentic Software Factory
 
-Agentic Software Factory is a local tool that orchestrates coding agents through
-structured tasks and isolated git worktrees. You install and authenticate the agents
-(Codex, Claude Code, OpenCode, Gemini CLI, or any custom CLI); the factory plans a run
-into tasks with dependencies and acceptance criteria, gives each task its own git
-worktree, and records every step in a local SQLite database.
+Agentic Software Factory is a local tool that orchestrates coding agents from an
+interactive Agent Graph. You install and authenticate the agents (Codex, Claude Code,
+OpenCode, Gemini CLI, or another CLI). The Factory plans workflows into real task DAGs,
+runs tasks in isolated git worktrees, reviews evidence, and records each invocation in
+local SQLite state.
 
-![Factory network](docs/assets/dashboard-network.png)
+![Factory Agent Graph](docs/assets/dashboard-network.png)
 
 ## Install
 
-Ready-made binaries for Windows (x86_64), Linux (x86_64), and macOS
+Ready-made binaries are available for Windows (x86_64), Linux (x86_64), and macOS
 (Apple Silicon and Intel). No Rust, Node, or administrator rights are required.
 
 ### Windows
-
-From PowerShell, run:
 
 ```powershell
 irm https://raw.githubusercontent.com/OmegaMc1331/agentic-software-factory/main/install.ps1 | iex
@@ -35,20 +33,19 @@ factory init
 factory start
 ```
 
-If `factory` is not found, open a new terminal (Windows adds the install location to
-your user PATH; macOS/Linux prints the one line to add to your shell profile).
-
-Re-running the same command installs the latest release and replaces an older version.
+If `factory` is not found, open a new terminal. Windows adds the install location to
+your user PATH; macOS and Linux print the line to add to your shell profile. Running the
+installer again replaces an older version with the latest release.
 
 ### Uninstall
 
-Remove the binary (and its PATH entry if you added one manually):
+Remove the binary and any PATH entry you added:
 
-- Windows: delete `%LOCALAPPDATA%\Programs\AgenticSoftwareFactory`, then remove that
-  `bin` directory from your user PATH (`System Properties → Environment Variables`).
+- Windows: delete `%LOCALAPPDATA%\Programs\AgenticSoftwareFactory`, then remove its
+  `bin` directory from your user PATH under **System Properties → Environment Variables**.
 - macOS / Linux: `rm ~/.local/bin/factory`.
 
-Your project-local `.factory/` state is never touched.
+Your project-local `.factory/` state is not removed.
 
 ## Quick start
 
@@ -58,19 +55,19 @@ factory init
 factory start
 ```
 
-`factory init` creates `.factory/` with a default configuration and works on a machine
-with no coding agent installed. `factory start` starts one process that serves the API
-and the dashboard, waits until the server is ready, then opens your browser at
+`factory init` creates `.factory/` with a default configuration. `factory start` serves
+the local API and dashboard, waits until the server is ready, then opens
 `http://127.0.0.1:4321`.
+
+In Agent Graph, configure the Planner, Worker, and Reviewer agents. Create a Workflow,
+review its task plan, then select **Start**. The Rust Factory process owns execution, so
+closing the browser doesn't stop active work.
 
 ## Configure agents
 
-After `factory start`, open **Settings → Agents** in the dashboard to add the coding
-agents you have installed (name, command, arguments) and assign them to the
-**planner**, **worker**, and **reviewer** roles. There is no CLI configuration step.
-
-Configuration lives in `.factory/config.toml`; the dashboard writes it for you, and you
-can also edit it by hand:
+Use Agent Graph or **Settings → Agents** to add installed coding agents and assign the
+**planner**, **worker**, and **reviewer** roles. Configuration lives in
+`.factory/config.toml`; the dashboard writes it for you, and you can edit it directly:
 
 ```toml
 [agents.codex]
@@ -81,86 +78,73 @@ args = ["exec"]
 agent = "codex"
 ```
 
-The factory never talks to model providers. If a role has no agent, or the agent's
-executable is not on your PATH, the factory fails with a clear message instead of using
-a fallback.
+The Factory never talks to model providers. If a required role is missing or its
+executable is unavailable, the operation fails instead of selecting a fallback agent.
 
 ## Dashboard
 
-`factory start` serves the dashboard at `http://127.0.0.1:4321`:
+Agent Graph is the primary operating interface:
 
-- **Runs** — every run with its status and progress; opening a run shows its task list.
-- **Agent Graph** — drag and connect Factory nodes, add agents, supported roles,
-  visual groups or notes, fit/zoom/reset the topology, and inspect real agent sessions
-  in the Agent Console. The workspace layout persists in `.factory/graph.json`.
-- **Settings** — add, edit, and remove agents, test executable availability, and assign
-  the planner/worker/reviewer roles.
+- Create a Workflow from an objective, then inspect its real tasks and dependencies.
+- Start, cancel, and retry supported workflow operations.
+- Drag nodes; add agents, roles, groups, and notes; edit supported links; and use
+  fit, center, zoom, or reset controls. Layout persists in `.factory/graph.json`.
+- Select an agent to inspect real Planner, Worker, and Reviewer sessions in its console.
 
-![Runs overview](docs/assets/dashboard-runs.png)
-![Run detail](docs/assets/dashboard-run-detail.png)
-![Blocked cascade](docs/assets/dashboard-blocked-cascade.png)
+The Runs and Settings views remain available for focused inspection and configuration.
+
+![Factory Agent Console](docs/assets/dashboard-agent-console.png)
 
 The local API is bound to `127.0.0.1`:
 
 | Method | Route                         | Description                                      |
 | ------ | ----------------------------- | ------------------------------------------------ |
 | GET    | `/api/health`                 | Service health                                   |
-| GET    | `/api/runs`                   | Runs with per-state task counts                  |
-| GET    | `/api/runs/:id`               | One run and its tasks                            |
-| GET    | `/api/graph`                  | Agents, roles, runs, and tasks as a network      |
+| GET    | `/api/runs`                   | Workflow summaries and task counts               |
+| POST   | `/api/runs`                   | Create and asynchronously plan a workflow        |
+| GET    | `/api/runs/:id`               | Workflow, tasks, attempts, and sessions           |
+| POST   | `/api/runs/:id/start`         | Validate and start a planned workflow             |
+| POST   | `/api/runs/:id/cancel`        | Cancel a live workflow operation                  |
+| POST   | `/api/tasks/:id/retry`        | Retry an eligible failed task                     |
+| GET    | `/api/graph`                  | Agents, workflows, tasks, and semantic links     |
 | GET    | `/api/graph/workspace`        | Saved visual layout and custom topology          |
 | PUT    | `/api/graph/workspace`        | Validate and atomically save the graph workspace |
-| GET    | `/api/agents`                 | Configured agents with executable status         |
 | GET    | `/api/agents/:agent/sessions` | Recent persisted sessions for one agent          |
-| GET    | `/api/sessions/:id`           | One known Factory agent session                  |
 | GET    | `/api/sessions/:id/stream`    | SSE updates for one known session                |
-| GET    | `/api/config`                 | The agent/role configuration                     |
-| PUT    | `/api/config`                 | Write a validated configuration (atomic)         |
+| GET    | `/api/config`                 | The agent and role configuration                 |
+| PUT    | `/api/config`                 | Write a validated configuration atomically       |
 
 ## How it works
 
 ```text
-CLI / Dashboard
-      │
-      ▼
-Factory core ── planner runs a coding agent as a subprocess
-      │
-      ├── SQLite (runs, tasks, sessions)
-      └── git worktrees (.factory/worktrees/t<task-id>)
+Agent Graph → local API → Factory Core → Planner → task DAG
+                                      → Worker → worktree → evidence
+                                      → Reviewer → approve or retry
 ```
 
-`factory run "<objective>"` resolves the planner role from `.factory/config.toml`, asks
-that agent for a JSON plan, validates it, and persists the run and its tasks. Tasks move
-through a strict state machine (`pending → ready → running → completed`, or
-`failed`/`blocked`) from the dashboard; each task's work is done in its own git worktree
-so parallel agents never collide. Every agent invocation (command, exit code, output) is
-recorded in SQLite.
+**Plan** asks the configured Planner for structured tasks and dependencies without
+changing the repository. **Start** validates the roles, Git repository, and DAG, then
+runs ready tasks sequentially. A task completes only after structured Reviewer
+approval; process exit alone is not completion. Worker failures and change requests
+retry up to three total attempts. Every invocation is an `AgentSession`.
 
 All state lives in `.factory/`:
 
 ```text
 .factory/
-  db.sqlite3          SQLite database (runs, tasks, agent sessions)
-  config.toml         agents and role assignment
+  db.sqlite3          runs, tasks, attempts, and agent sessions
+  config.toml         agents and role assignments
   graph.json          saved positions, visual nodes, and custom links
   worktrees/t<id>/    one git worktree per task
 ```
 
-## Current status
-
-Working today: run creation through a configured planner, task state machine with
-cascade propagation, run-status reconciliation, git worktrees per task, agent session
-recording, versioned SQLite migrations, and a dashboard with runs, an agent network, and
-agent/role configuration.
-
-Not yet implemented: an autonomous worker loop, review execution, parallel agents,
-automatic merging, and anything involving remote/cloud execution.
+Not implemented: parallel scheduling, interactive session stdin, plan editing,
+automatic branch integration, or remote/cloud execution.
 
 ## Development
 
-Contributors build the Rust workspace and the dashboard from source — see
-[docs/development.md](docs/development.md) for the full workflow, including how the
-dashboard is embedded into release binaries.
+See [docs/development.md](docs/development.md) for source builds, tests, and embedded
+dashboard release builds.
 
 ## License
 

@@ -1,6 +1,7 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  createWorkflow,
   fetchAgentSessions,
   fetchConfig,
   fetchGraph,
@@ -12,12 +13,16 @@ import { NetworkView } from "./NetworkView";
 
 vi.mock("../api", () => ({
   agentSessionStreamUrl: (id: number) => `/api/sessions/${id}/stream`,
+  cancelWorkflow: vi.fn(),
+  createWorkflow: vi.fn(),
   fetchAgentSessions: vi.fn(),
   fetchConfig: vi.fn(),
   fetchGraph: vi.fn(),
   fetchGraphWorkspace: vi.fn(),
   saveConfig: vi.fn(),
   saveGraphWorkspace: vi.fn(),
+  startWorkflow: vi.fn(),
+  retryTask: vi.fn(),
 }));
 
 vi.mock("./AgentGraph", async () => {
@@ -108,10 +113,18 @@ beforeEach(() => {
         codex: { command: "codex", args: ["exec"], env: {} },
         opencode: { command: "opencode", args: ["run"], env: {} },
       },
-      roles: {},
+      roles: { planner: { agent: "codex" } },
     });
   vi.mocked(fetchAgentSessions).mockReset().mockResolvedValue([]);
   vi.mocked(saveGraphWorkspace).mockReset().mockResolvedValue();
+  vi.mocked(createWorkflow).mockReset().mockResolvedValue({
+    id: 12,
+    objective: "Implement authentication",
+    status: "planning",
+    plannerAgent: "codex",
+    createdAt: "2026-08-13T18:00:00Z",
+    updatedAt: "2026-08-13T18:00:00Z",
+  });
 });
 
 afterEach(cleanup);
@@ -130,10 +143,28 @@ describe("Agent Graph interactions", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Add graph node" }));
 
     expect(screen.getByRole("dialog", { name: "Add graph node" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /Workflow/ })).toBeTruthy();
     expect(screen.getByRole("button", { name: /Agent/ })).toBeTruthy();
     expect(screen.getByRole("button", { name: /Role/ })).toBeTruthy();
     expect(screen.getByRole("button", { name: /Group/ })).toBeTruthy();
     expect(screen.getByRole("button", { name: /Note/ })).toBeTruthy();
+  });
+
+  it("creates a workflow from the canvas and persists its viewport-centered position", async () => {
+    render(<NetworkView />);
+    fireEvent.click(await screen.findByRole("button", { name: "Add graph node" }));
+    fireEvent.click(screen.getByRole("button", { name: /Workflow/ }));
+    fireEvent.change(screen.getByLabelText("What should the Factory build?"), {
+      target: { value: "Implement authentication" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Plan" }));
+
+    await waitFor(() => expect(createWorkflow).toHaveBeenCalledWith("Implement authentication"));
+    expect(saveGraphWorkspace).toHaveBeenCalledWith(
+      expect.objectContaining({
+        nodes: expect.objectContaining({ "run:12": expect.any(Object) }),
+      })
+    );
   });
 
   it("persists a node position after drag end", async () => {

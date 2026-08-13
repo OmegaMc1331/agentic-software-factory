@@ -45,6 +45,8 @@ export interface Task {
 export interface RunDetail {
   run: Run;
   tasks: Task[];
+  attempts: TaskAttempt[];
+  sessions: AgentSession[];
 }
 
 export interface AgentEntry {
@@ -67,7 +69,8 @@ export interface AgentStatusInfo {
 }
 
 export type GraphNodeKind = "agent" | "role" | "run" | "task" | "group" | "note";
-export type GraphEdgeKind = "binds" | "uses" | "contains" | "depends" | "custom" | "membership";
+export type GraphEdgeKind =
+  "binds" | "plans" | "works" | "reviews" | "contains" | "depends" | "custom" | "membership";
 
 export interface AgentMeta {
   command: string;
@@ -80,11 +83,54 @@ export interface RoleMeta {
 }
 
 export interface RunMeta {
+  runId: number;
   objective: string;
   status: string;
   plannerAgent: string | null;
+  workerAgent: string | null;
+  reviewerAgent: string | null;
   createdAt: string;
   counts: TaskCounts;
+}
+
+export type AttemptStatus =
+  | "running"
+  | "reviewing"
+  | "approved"
+  | "changes_requested"
+  | "failed"
+  | "interrupted"
+  | "cancelled";
+
+export interface TaskEvidence {
+  changedFiles: string[];
+  diffSummary: string;
+  commitSha: string | null;
+  commands: string[];
+  acceptanceCriteria: string[];
+  workerExitCode: number | null;
+}
+
+export interface ReviewResult {
+  decision: "approve" | "request_changes";
+  reason: string;
+  feedback: string[];
+}
+
+export interface TaskAttempt {
+  id: number;
+  taskId: number;
+  attemptNumber: number;
+  agent: string;
+  status: AttemptStatus;
+  startedAt: string;
+  finishedAt: string | null;
+  worktreePath: string;
+  commitSha: string | null;
+  exitCode: number | null;
+  error: string | null;
+  evidence: TaskEvidence | null;
+  review: ReviewResult | null;
 }
 
 export interface TaskMeta {
@@ -94,7 +140,9 @@ export interface TaskMeta {
   state: TaskState;
   position: number;
   dependencies: number[];
+  acceptanceCriteria: string[];
   worktreePath: string | null;
+  currentAttempt: TaskAttempt | null;
 }
 
 export interface GroupMeta {
@@ -167,6 +215,7 @@ export interface AgentSession {
   id: number;
   runId: number | null;
   taskId: number | null;
+  attemptId: number | null;
   role: string;
   agent: string;
   command: string;
@@ -217,11 +266,22 @@ export function agentActivity(
   }
   const relevant = (id: string) => id === agentId || roles.has(id);
 
+  const direct = edges.find(
+    (edge) => edge.source === agentId && (edge.kind === "works" || edge.kind === "reviews")
+  );
+  if (direct) {
+    const task = nodesById.get(direct.target);
+    if (task?.kind === "task") {
+      const meta = taskMeta(task);
+      return { runId: meta.runId, taskId: meta.taskId };
+    }
+  }
+
   const activeRuns: GraphNode[] = [];
   for (const edge of edges) {
-    if (edge.kind !== "uses" || !relevant(edge.target)) continue;
+    if (edge.kind !== "plans" || !relevant(edge.target)) continue;
     const runNode = nodesById.get(edge.source);
-    if (runNode && runNode.kind === "run" && runMeta(runNode).status === "active") {
+    if (runNode && runNode.kind === "run" && runMeta(runNode).status === "planning") {
       activeRuns.push(runNode);
     }
   }

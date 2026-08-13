@@ -1,200 +1,145 @@
 # Architecture
 
-Agentic Software Factory is a workspace of seven Rust crates plus a React dashboard.
-The only network service is a local HTTP API bound to `127.0.0.1`. Durable state lives
-under `.factory/`: execution records use SQLite, configuration uses TOML, and the graph
-workspace uses JSON. Agent isolation is git-based: each task works in its own worktree.
-
-```mermaid
-flowchart LR
-    CLI[factory binary] --> CORE[factory-core]
-    DASH[Dashboard: Vite + React] --> API[factory-api]
-    API --> CORE
-    EMBED["dashboard assets (rust-embed)"] -. release only .-> API
-    CORE --> DB[factory-db / SQLite]
-    CORE --> GIT[factory-git / worktrees]
-    CORE --> AGENT[factory-agent / subprocess]
-    AGENT --> PROC[Coding agent CLI]
-```
-
-## Crate structure
-
-```text
-crates/
-  factory-types   Pure data types: Run, Task, Plan, TaskState, AgentSession
-  factory-agent   Subprocess execution of external agent CLIs (CommandAgent)
-  factory-db      SQLite persistence with versioned migrations
-  factory-git     Repository detection and worktree management
-  factory-core    Agent config, planning, validation, run orchestration
-  factory-api     Local HTTP API (axum): graph, session, and configuration endpoints
-  factory-cli     The `factory` binary: init, start, run, status, dev
-apps/
-  dashboard       Vite + React + TypeScript dashboard
-```
-
-Dependencies flow downward: `factory-cli` and `factory-api` use `factory-core`,
-which uses `factory-db`, `factory-git`, `factory-agent`, and `factory-types`.
-
-### factory-types
-
-Plain structs with serialization and parsing only: `TaskState` (six-state enum),
-`Run`/`Task`, `Plan`/`PlannedTask` (the planner contract: title, objective,
-`acceptanceCriteria`, `dependencies`), and `AgentSession`. `RunStatus::from_tasks`
-derives a run's status from its tasks:
-
-- all tasks completed → `completed`
-- any task failed → `failed`
-- any task running, completed, or blocked → `active`
-- otherwise → `planned`
-
-### factory-db
-
-One SQLite connection per process. Opening a database runs ordered, versioned
-migrations recorded in a `schema_migrations` table; each migration runs once, inside a
-transaction, so a failing migration leaves the schema untouched. Migration 1 is the
-initial schema (idempotent, so databases created before migrations were introduced keep
-working); later migrations change the schema forward.
-
-Every task-state write reconciles the parent run's status from its tasks, so the
-database owns run status. Tables: `runs`, `tasks`, `task_dependencies`,
-`agent_sessions`.
-
-### factory-git
-
-`Repo` wraps `git` for the operations the factory needs: repository discovery (bounded
-by a ceiling so a factory inside a nested path cannot escape into an unrelated parent
-repository), worktree creation, listing, and removal, and dirty-tree detection. Worktree
-creation attaches an existing branch instead of failing when the task branch already
-exists, so retrying a task works deliberately.
-
-### factory-core
-
-`config` — `.factory/config.toml` declares `[agents.<name>]` sections (command, args,
-env) and `[roles.<role>]` sections mapping a role to an agent. Resolving a role to a
-`CommandAgent` reports clear errors for a missing role, an unknown agent, or a missing
-executable. `Config::validate` rejects bad names, empty commands, unknown role
-references, and control characters; `Config::write_atomic` writes the file through a
-temp file and rename.
-
-`Planner` — one shot at asking the configured planner agent for a JSON plan (objective
-on stdin, code fences stripped), validated for known dependency ids, an acyclic graph,
-and at most 50 tasks. There is no fallback planner: if no agent is configured for the
-role, or the agent fails, planning fails with the resolution error. Every planner
-invocation is recorded in `agent_sessions` with its exit code and captured output.
-
-`workflow` — the task transition table and cascade propagation. A task moves
-`pending -> ready|blocked -> running -> completed|failed|blocked`; `blocked` derives
-from failed dependencies, `failed` can be retried to `ready`, and `completed` is
-terminal. Marking a task recomputes every transitive dependent.
-
-`Factory` — ties it together: `init` (creates the state directory, default config, and
-database; never touches agent executables), `open`, `create_run` (resolve planner →
-plan → persist → derive initial states), `mark_task` (validate → persist → propagate →
-reconcile run status), and worktree operations.
-
-### factory-api
-
-An axum application serving the dashboard and the API from one process. Routes:
-
-| Method | Route                         | Purpose                                     |
-| ------ | ----------------------------- | ------------------------------------------- |
-| GET    | `/api/health`                 | Health                                      |
-| GET    | `/api/runs`                   | Run summaries with task counts              |
-| GET    | `/api/runs/:id`               | One run and its tasks                       |
-| GET    | `/api/graph`                  | Factory entities and semantic connections   |
-| GET    | `/api/graph/workspace`        | Saved visual layout and topology metadata   |
-| PUT    | `/api/graph/workspace`        | Validate and atomically save graph metadata |
-| GET    | `/api/agents`                 | Agents with executable availability         |
-| GET    | `/api/agents/:agent/sessions` | Recent sessions for a configured agent      |
-| GET    | `/api/sessions/:id`           | One known Factory agent session             |
-| GET    | `/api/sessions/:id/stream`    | SSE snapshots for one known session         |
-| GET    | `/api/config`                 | Agent/role configuration                    |
-| PUT    | `/api/config`                 | Write validated configuration atomically    |
-
-The dashboard is served for every non-API path; unknown `/api/*` paths return 404. How
-the dashboard assets are provided depends on the build:
-
-- **Release builds** (`--features embedded-dashboard`): the compiled dashboard is
-  embedded into the binary with `rust-embed`. The binary alone is a complete
-  installation; there is no dependency on a `dist` directory beside it. The feature
-  fails at compile time if `apps/dashboard/dist` is missing.
-- **Development builds** (no feature): the server looks for `apps/dashboard/dist`
-  relative to the working directory or the binary, and shows a stub page explaining how
-  to build the dashboard when it is missing.
-
-The server binds `127.0.0.1`.
-
-## Agent Graph workspace
-
-The dashboard merges two data sources without changing their ownership:
-
-- Factory state from `/api/graph`: agents, roles, runs, tasks, role assignments,
-  containment, and task dependencies.
-- Visual workspace state from `.factory/graph.json`: manual positions, groups, notes,
-  memberships, and custom agent-to-agent links.
-
-`graph.json` is versioned and written atomically. Manual positions override the
-automatic neural layout until Reset layout removes them. Groups, notes, memberships,
-and custom links organize the workspace only; they do not schedule work. Role
-assignments update `.factory/config.toml`. Run containment and task dependencies remain
-read-only because they represent persisted execution state.
+Agentic Software Factory is a local Rust application with a React dashboard. The API
+binds to `127.0.0.1`. Durable execution state lives in SQLite, agent configuration in
+TOML, and visual graph state in JSON. Each task runs in a Git worktree.
 
 ```mermaid
 flowchart TB
-    GRAPH[Dashboard Agent Graph]
-    GRAPH --> LAYOUT[Graph workspace API]
-    GRAPH --> CONFIG[Factory configuration API]
-    GRAPH --> STREAM[Agent session SSE]
-    LAYOUT --> JSON[".factory/graph.json<br/>visual topology"]
-    CONFIG --> TOML[".factory/config.toml<br/>agents and roles"]
-    STREAM --> SESSION["AgentSession<br/>SQLite"]
-    CORE[Factory core] --> SESSION
-    CORE --> EXTERNAL[External coding agent]
-    EXTERNAL --> CORE
+    GRAPH[Agent Graph]
+    GRAPH -->|create workflow| API[Local API]
+    GRAPH -->|inspect DAG| API
+    GRAPH -->|start / cancel / retry| API
+    GRAPH -->|agent consoles| API
+    API --> RUNTIME[Factory Runtime]
+    API --> CORE[Factory Core]
+    RUNTIME --> CORE
+    CORE --> P[Planner]
+    CORE --> W[Worker]
+    CORE --> R[Reviewer]
+    P --> S[AgentSessions]
+    W --> S
+    R --> S
+    W --> WT[Git worktrees]
+    R --> WT
+    CORE --> DB[(SQLite)]
 ```
 
-The Agent Console reads only known `AgentSession` records. The SSE route polls the
-selected session and closes after a terminal state. Current planner invocations are
-non-interactive, so the UI reports that stdin is unavailable; the route shape remains
-compatible with future live worker sessions.
+The dashboard requests semantic Factory operations. It does not execute arbitrary
+shell commands.
 
-### factory-cli
+## Workspace structure
 
-The `factory` binary. Public commands are `init`, `start` (one process for API and
-dashboard), `run`, and `status`. Everything else — `agents`, `config list`, `tasks`,
-`inspect`, `mark`, `worktree`, and `serve` — sits under `factory dev` for debugging and
-development.
-
-`init` is idempotent: running it inside an already initialized project prints "Factory
-already initialized." and does not touch existing state. `start` binds the listener
-first, prints the URL, and only then opens the browser (`--no-browser` skips the
-browser), so the browser never races an unready server.
-
-## Task state machine
-
-```mermaid
-stateDiagram-v2
-    [*] --> pending
-    pending --> ready: dependencies met
-    pending --> blocked: dependency failed
-    ready --> running: worktree created
-    running --> completed: acceptance criteria verified
-    running --> failed: work stopped
-    running --> blocked: dependency failed mid-run
-    blocked --> ready: blocker cleared
-    failed --> ready: retry
+```text
+crates/
+  factory-types     Run, Task, TaskAttempt, evidence, review, and session types
+  factory-agent     Configured subprocess execution, output capture, cancellation
+  factory-db        SQLite persistence and versioned migrations
+  factory-git       Repository checks, worktrees, and Git evidence
+  factory-core      Planning, invariants, task transitions, and execution policy
+  factory-runtime   In-process background workflow ownership
+  factory-api       Explicit local HTTP operations and session streams
+  factory-cli       Bootstrap/runtime CLI: init, start, status, dev
+apps/
+  dashboard         React, TypeScript, and @xyflow/react
 ```
 
-## Isolation and state ownership
+Dependencies point toward `factory-types`. The CLI and API use Factory Core; the API
+also owns one `factory-runtime` instance for background operations.
 
-- The factory writes only under its root. State is `.factory/`; worktrees are
-  `.factory/worktrees/t<task-id>` on branch `factory/t<task-id>`.
-- Each task owns its branch and worktree, so concurrent agents cannot collide.
-- Run status is derived from tasks; the dashboard never guesses it.
-- Agent configuration is a real file shipped through the config API; there is no second
-  configuration store.
-- Graph workspace metadata is separate from configuration and execution state. Custom
-  links never trigger agent execution.
+## Workflow lifecycle
 
-Worktrees are isolation for git branches and concurrent work, not a security boundary.
-See [Security](security.md).
+A new workflow is persisted as `planning` before the Planner starts. Planning is a real
+`AgentSession`; successful structured output is validated and persisted atomically as
+tasks and dependencies. The workflow then becomes `planned`, and repository work does
+not begin until **Start** is selected.
+
+```text
+planning → planned → active → completed
+                    │       ├→ failed
+                    │       └→ blocked
+                    └────────→ cancelled
+```
+
+Start validates the configured Worker and Reviewer, the Git repository, the task DAG,
+and the presence of planned tasks. The first runtime is sequential:
+
+```text
+lowest-position ready task
+  → create or reuse its worktree
+  → Worker AgentSession
+  → capture Git and agent-reported evidence
+  → Reviewer AgentSession
+  → approve, retry, or fail
+  → select the next ready task
+```
+
+The Worker and Reviewer come only from `.factory/config.toml`. The Reviewer receives
+the task objective, acceptance criteria, diff evidence, and Worker output. Its JSON
+decision must be `approve` or `request_changes`. Change requests and Worker failures
+are limited to three total `TaskAttempt` records per task.
+
+Cancellation sets a run-scoped signal, stops scheduling, terminates the current
+configured agent process tree, and preserves the worktree and recorded evidence. A
+Factory restart marks formerly running sessions and attempts as `interrupted`, running
+tasks as `failed`, and active/planning workflows as `failed`; the graph can then expose
+the failure and eligible retry.
+
+## Persistence and concurrency
+
+SQLite tables include `runs`, `tasks`, `task_dependencies`, `task_attempts`, and
+`agent_sessions`. `TaskAttempt` stores the attempt number, agent, status, timestamps,
+worktree, commit, exit code, error, evidence, and structured review.
+
+SQLite uses WAL mode and a bounded busy timeout. API handlers hold their shared
+connection only for short reads or writes. Runtime jobs open separate Factory/database
+connections, so no API mutex is held while an external agent runs. Session output is
+appended with short writes and bounded to the latest 1 MB per stream.
+
+The Rust process owns background planning and execution. Browser reloads do not stop a
+workflow. This is an in-process runtime; it does not use an external queue or continue
+subprocesses across a Factory process restart.
+
+## API boundary
+
+| Method | Route                         | Purpose                                      |
+| ------ | ----------------------------- | -------------------------------------------- |
+| POST   | `/api/runs`                   | Persist and begin planning a workflow        |
+| GET    | `/api/runs/:id`               | Read tasks, attempts, and sessions           |
+| POST   | `/api/runs/:id/start`         | Validate and schedule a planned workflow     |
+| POST   | `/api/runs/:id/cancel`        | Cancel that run's live operation             |
+| POST   | `/api/tasks/:id/retry`        | Retry an eligible task within the limit      |
+| GET    | `/api/graph`                  | Read Factory entities and semantic links     |
+| GET    | `/api/sessions/:id/stream`    | Stream one known session through SSE         |
+| GET    | `/api/graph/workspace`        | Read visual workspace state                  |
+| PUT    | `/api/graph/workspace`        | Validate and atomically save visual state    |
+| GET    | `/api/config`                 | Read configured agents and role assignments  |
+| PUT    | `/api/config`                 | Validate and atomically save configuration   |
+
+Agent output uses session-scoped Server-Sent Events because current configured
+invocations are non-interactive. The stream reads only a known persisted session and
+closes at a terminal state. No stdin or WebSocket route is present.
+
+## Agent Graph state ownership
+
+The graph merges state without changing its owner:
+
+- `/api/graph` supplies agents, roles, workflows, tasks, assignments, active execution
+  links, containment, and dependencies.
+- `.factory/graph.json` stores manual positions, groups, notes, memberships, and custom
+  agent-to-agent links.
+- `.factory/config.toml` stores real agents and role assignments.
+- SQLite stores workflows, task DAGs, attempts, evidence, and sessions.
+
+Role assignments are editable configuration semantics. Workflow containment and task
+dependencies are read-only in this release. Groups, notes, memberships, and custom
+agent links are visual topology only and never trigger execution.
+
+## CLI
+
+The public CLI is limited to `factory init`, `factory start`, and read-only
+`factory status`, plus `--help` and `--version`. Debugging commands remain under
+`factory dev`. Normal workflow creation and operation happen in Agent Graph.
+
+Release builds embed the compiled dashboard with `rust-embed`; development builds read
+`apps/dashboard/dist`. See [Development](development.md) and [Security](security.md).

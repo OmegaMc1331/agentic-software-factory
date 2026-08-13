@@ -339,6 +339,7 @@ dependencies = [
  "axum",
  "factory-core",
  "factory-db",
+ "factory-runtime",
  "factory-types",
  "http-body-util",
  "rust-embed",
@@ -401,6 +402,17 @@ version = "0.2.0"
 dependencies = [
  "tempfile",
  "thiserror",
+]
+
+[[package]]
+name = "factory-runtime"
+version = "0.2.0"
+dependencies = [
+ "factory-core",
+ "factory-types",
+ "tempfile",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]

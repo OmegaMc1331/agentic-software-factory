@@ -22,7 +22,7 @@ pub struct PlanOutcome {
     pub result: AgentResult,
 }
 
-const MAX_ATTEMPTS: u32 = 3;
+pub(crate) const MAX_ATTEMPTS: u32 = 3;
 
 pub struct Planner {
     agent: CommandAgent,
@@ -91,7 +91,7 @@ Rules:
 - every task has a distinct responsibility and at least one acceptance criterion.
 - do not include any text outside the JSON object.";
 
-fn mission(objective: &str, rejection: Option<&str>) -> String {
+pub(crate) fn mission(objective: &str, rejection: Option<&str>) -> String {
     let mut text = format!("{SYSTEM_PROMPT}\n\nObjective: {objective}");
     if let Some(reason) = rejection {
         text.push_str("\n\nYour previous output was rejected because: ");
