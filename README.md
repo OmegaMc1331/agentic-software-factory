@@ -71,6 +71,7 @@ Use Agent Graph or **Settings → Agents** to add installed coding agents and as
 
 ```toml
 [agents.codex]
+kind = "codex"
 command = "codex"
 args = ["exec"]
 
@@ -78,8 +79,13 @@ args = ["exec"]
 agent = "codex"
 ```
 
+Known coding agents are configured with their standard non-interactive workflow
+invocation. Custom CLIs can choose whether Factory passes the mission through stdin or
+as one process argument; `{mission}` can set that argument's exact position.
+
 The Factory never talks to model providers. If a required role is missing or its
-executable is unavailable, the operation fails instead of selecting a fallback agent.
+executable or workflow invocation is unavailable, the operation fails instead of
+selecting a fallback agent.
 
 ## Dashboard
 
@@ -89,7 +95,8 @@ Agent Graph is the primary operating interface:
 - Start, cancel, and retry supported workflow operations.
 - Drag nodes; add agents, roles, groups, and notes; edit supported links; and use
   fit, center, zoom, or reset controls. Layout persists in `.factory/graph.json`.
-- Select an agent to inspect real Planner, Worker, and Reviewer sessions in its console.
+- Select an agent to inspect real workflow sessions or explicitly start its interactive
+  console.
 
 The Runs and Settings views remain available for focused inspection and configuration.
 
@@ -110,7 +117,9 @@ The local API is bound to `127.0.0.1`:
 | GET    | `/api/graph/workspace`        | Saved visual layout and custom topology          |
 | PUT    | `/api/graph/workspace`        | Validate and atomically save the graph workspace |
 | GET    | `/api/agents/:agent/sessions` | Recent persisted sessions for one agent          |
+| POST   | `/api/agents/:agent/sessions` | Start an interactive session for that agent       |
 | GET    | `/api/sessions/:id/stream`    | SSE updates for one known session                |
+| GET    | `/api/sessions/:id/terminal`  | WebSocket for one live interactive session       |
 | GET    | `/api/config`                 | The agent and role configuration                 |
 | PUT    | `/api/config`                 | Write a validated configuration atomically       |
 
@@ -138,8 +147,8 @@ All state lives in `.factory/`:
   worktrees/t<id>/    one git worktree per task
 ```
 
-Not implemented: parallel scheduling, interactive session stdin, plan editing,
-automatic branch integration, or remote/cloud execution.
+Not implemented: parallel scheduling, plan editing, automatic branch integration, or
+remote/cloud execution.
 
 ## Development
 

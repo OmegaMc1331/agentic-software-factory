@@ -823,6 +823,55 @@ code {
   margin-bottom: 14px;
 }
 
+.settings-advanced,
+.agent-advanced {
+  padding: 8px 9px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--bg-inset);
+}
+
+.settings-advanced {
+  margin-bottom: 14px;
+}
+
+.settings-advanced summary,
+.agent-advanced summary {
+  color: var(--text-muted);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.settings-advanced[open] summary,
+.agent-advanced[open] summary {
+  margin-bottom: 10px;
+}
+
+.settings-advanced .settings-grid {
+  margin-bottom: 0;
+}
+
+.settings-checkbox,
+.agent-interactive-toggle {
+  flex-direction: row;
+  align-items: center;
+}
+
+.settings-checkbox input,
+.agent-interactive-toggle input {
+  width: auto;
+}
+
+.agent-capability-status {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.agent-capability-status small {
+  color: var(--text-muted);
+}
+
 .settings-field {
   display: flex;
   flex-direction: column;
@@ -1667,6 +1716,32 @@ code {
   background: #0a0c10;
   color: #d8dce4;
   scrollbar-color: #394252 #0a0c10;
+}
+
+.interactive-terminal {
+  flex: 1;
+  min-height: 320px;
+  padding: 8px;
+  border: 1px solid #272d38;
+  border-radius: 6px;
+  background: #11151b;
+}
+
+.interactive-terminal .xterm {
+  height: 100%;
+}
+
+.agent-console-terminal-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--text-muted);
+  font-size: 10.5px;
+}
+
+.agent-start-session {
+  align-self: flex-start;
 }
 
 .agent-terminal pre {

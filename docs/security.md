@@ -18,13 +18,14 @@ are invoked by workflow operations.
 ## Agent Console
 
 The Agent Console is not a general shell. It reads a known Factory-managed
-`AgentSession` and subscribes to that session's scoped SSE stream. The API cannot spawn
-`cmd.exe`, PowerShell, Bash, or another process selected by the browser.
+`AgentSession`. Workflow sessions expose output through scoped SSE. Interactive
+sessions launch only the selected configured agent in a PTY and use a WebSocket scoped
+to that live session ID. The API cannot spawn `cmd.exe`, PowerShell, Bash, or another
+process selected by the browser.
 
-Current sessions are non-interactive, so the dashboard exposes no stdin transport.
-Future stdin support must be enabled only for a specific live session that explicitly
-supports interaction. Arbitrary command execution through the dashboard API is not
-supported.
+Terminal input and resize are accepted only for a Factory-owned interactive session.
+Automated Planner, Worker, and Reviewer sessions remain non-interactive. Arbitrary
+command execution through the dashboard API is not supported.
 
 ## Process permissions
 
@@ -36,6 +37,9 @@ you trust.
 Factory doesn't manage model-provider credentials. Agents are external CLIs that you
 install and authenticate. They inherit Factory's environment, plus any variables in
 their `.factory/config.toml` entry.
+
+PTY sessions run with the same OS permissions as Factory. A PTY is an interaction
+mechanism, not a sandbox.
 
 ## Git worktrees
 

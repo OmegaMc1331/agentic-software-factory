@@ -80,4 +80,35 @@ describe("Add Node menu", () => {
     expect(screen.getByText("Environment line 2 must use KEY=VALUE.")).toBeTruthy();
     expect(onCreateAgent).not.toHaveBeenCalled();
   });
+
+  it("creates a known agent with its workflow preset", () => {
+    const onCreateAgent = vi.fn();
+    render(
+      <AddNodeMenu
+        open
+        initialKind="agent"
+        config={{ agents: {}, roles: {} }}
+        error={null}
+        onClose={vi.fn()}
+        onCreateWorkflow={vi.fn()}
+        onCreateAgent={onCreateAgent}
+        onCreateRole={vi.fn()}
+        onCreateVisual={vi.fn()}
+      />
+    );
+
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "coding" } });
+    fireEvent.change(screen.getByLabelText("Agent type"), {
+      target: { value: "open_code" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Create" }));
+
+    expect(onCreateAgent).toHaveBeenCalledWith("coding", {
+      kind: "open_code",
+      command: "opencode",
+      args: ["run"],
+      env: {},
+      capabilities: [],
+    });
+  });
 });

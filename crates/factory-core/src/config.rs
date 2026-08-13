@@ -1,7 +1,10 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use factory_agent::{AgentCapabilities, AgentConfig, CommandAgent};
+use factory_agent::{
+    AgentCapabilities, AgentConfig, AgentKind, AgentRequest, CommandAgent, PromptTransport,
+    MISSION_PLACEHOLDER,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -17,11 +20,17 @@ pub struct Config {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentEntry {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<AgentKind>,
     pub command: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_transport: Option<PromptTransport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interactive_args: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<String>,
 }
@@ -53,6 +62,8 @@ pub enum AgentResolutionError {
     UnknownAgent(String, String),
     #[error("{0} agent `{1}` is not available. Check the agent configuration.")]
     NotAvailable(String, String),
+    #[error("Agent `{1}` cannot be used as {0} because it has no non-interactive invocation configured.")]
+    AutomatedUnavailable(String, String),
 }
 
 impl Config {
@@ -81,11 +92,21 @@ impl Config {
 
     pub fn agent_config(&self, name: &str) -> Option<AgentConfig> {
         let entry = self.agents.get(name)?;
+        let kind = entry.effective_kind();
+        let args = entry.effective_args(kind);
         Some(AgentConfig {
             name: name.to_string(),
+            kind,
             command: entry.command.clone(),
-            args: entry.args.clone(),
+            args,
             env: entry.env.clone(),
+            prompt_transport: entry
+                .prompt_transport
+                .unwrap_or_else(|| kind.prompt_transport()),
+            interactive_args: entry
+                .interactive_args
+                .clone()
+                .or_else(|| kind.supports_interactive().then(Vec::new)),
             capabilities: AgentCapabilities {
                 roles: entry.capabilities.clone(),
             },
@@ -133,6 +154,41 @@ impl Config {
                     ));
                 }
             }
+            if let Some(interactive_args) = &entry.interactive_args {
+                for arg in interactive_args {
+                    if contains_control(arg) {
+                        return Err(format!(
+                            "agent '{name}' has an interactive argument with control characters"
+                        ));
+                    }
+                }
+            }
+            let placeholder_count = entry
+                .args
+                .iter()
+                .filter(|argument| argument.as_str() == MISSION_PLACEHOLDER)
+                .count();
+            if entry.args.iter().any(|argument| {
+                argument.contains(MISSION_PLACEHOLDER) && argument != MISSION_PLACEHOLDER
+            }) {
+                return Err(format!(
+                    "agent '{name}' must use {MISSION_PLACEHOLDER} as a complete argument"
+                ));
+            }
+            if placeholder_count > 1 {
+                return Err(format!(
+                    "agent '{name}' has more than one {MISSION_PLACEHOLDER} argument"
+                ));
+            }
+            let kind = entry.effective_kind();
+            let transport = entry
+                .prompt_transport
+                .unwrap_or_else(|| kind.prompt_transport());
+            if transport != PromptTransport::Argument && placeholder_count > 0 {
+                return Err(format!(
+                    "agent '{name}' can use {MISSION_PLACEHOLDER} only with argument prompt transport"
+                ));
+            }
             for (key, value) in &entry.env {
                 if key.is_empty() || contains_control(key) || key.contains('=') {
                     return Err(format!(
@@ -175,14 +231,17 @@ pub fn default_config_text() -> String {
 # A role points to an agent by name; the same agent may fill several roles.
 
 [agents.codex]
+kind = \"codex\"
 command = \"codex\"
 args = [\"exec\"]
 
 [agents.opencode]
+kind = \"open_code\"
 command = \"opencode\"
 args = [\"run\"]
 
 [agents.claude]
+kind = \"claude_code\"
 command = \"claude\"
 args = [\"-p\"]
 
@@ -216,20 +275,33 @@ impl Agents {
     pub fn list(&self) -> Vec<AgentInfo> {
         let mut infos = Vec::new();
         for (name, entry) in &self.config.agents {
+            let kind = entry.effective_kind();
+            let args = entry.effective_args(kind);
             let agent = CommandAgent::new(AgentConfig {
                 name: name.clone(),
+                kind,
                 command: entry.command.clone(),
-                args: entry.args.clone(),
+                args: args.clone(),
                 env: entry.env.clone(),
+                prompt_transport: entry
+                    .prompt_transport
+                    .unwrap_or_else(|| kind.prompt_transport()),
+                interactive_args: entry
+                    .interactive_args
+                    .clone()
+                    .or_else(|| kind.supports_interactive().then(Vec::new)),
                 capabilities: AgentCapabilities {
                     roles: entry.capabilities.clone(),
                 },
             });
             infos.push(AgentInfo {
                 name: name.clone(),
-                command: format_command(&entry.command, &entry.args),
-                args: entry.args.clone(),
+                command: format_command(&entry.command, &args),
+                args,
                 available: agent.available(),
+                kind,
+                workflow_available: agent.workflow_available(),
+                interactive_available: agent.interactive_available(),
             });
         }
         infos.sort_by(|a, b| a.name.cmp(&b.name));
@@ -249,7 +321,65 @@ impl Agents {
         if !command.available() {
             return Err(AgentResolutionError::NotAvailable(capitalized(role), name));
         }
+        if command
+            .automated_invocation(&AgentRequest::new("validation", "."))
+            .is_err()
+        {
+            return Err(AgentResolutionError::AutomatedUnavailable(
+                capitalized(role),
+                name,
+            ));
+        }
         Ok(command)
+    }
+
+    pub fn named_agent(&self, name: &str) -> Result<CommandAgent, AgentResolutionError> {
+        let agent = self
+            .config
+            .agent_config(name)
+            .ok_or_else(|| AgentResolutionError::UnknownAgent("console".into(), name.into()))?;
+        let command = CommandAgent::new(agent);
+        if !command.available() {
+            return Err(AgentResolutionError::NotAvailable(
+                "Console".into(),
+                name.into(),
+            ));
+        }
+        Ok(command)
+    }
+}
+
+impl AgentEntry {
+    pub fn effective_kind(&self) -> AgentKind {
+        self.kind
+            .unwrap_or_else(|| infer_kind(&self.command, &self.args))
+    }
+
+    fn effective_args(&self, kind: AgentKind) -> Vec<String> {
+        if self.args.is_empty() && kind != AgentKind::Custom {
+            kind.workflow_args()
+                .iter()
+                .map(|arg| (*arg).into())
+                .collect()
+        } else {
+            self.args.clone()
+        }
+    }
+}
+
+fn infer_kind(command: &str, args: &[String]) -> AgentKind {
+    let executable = Path::new(command)
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or(command)
+        .to_ascii_lowercase();
+    match executable.as_str() {
+        "codex" if args.first().is_some_and(|arg| arg == "exec") => AgentKind::Codex,
+        "claude" if args.iter().any(|arg| arg == "-p" || arg == "--print") => AgentKind::ClaudeCode,
+        "opencode" if args.first().is_some_and(|arg| arg == "run") => AgentKind::OpenCode,
+        "gemini" if args.iter().any(|arg| arg == "-p" || arg == "--prompt") => AgentKind::GeminiCli,
+        "qwen" if args.iter().any(|arg| arg == "-p" || arg == "--prompt") => AgentKind::QwenCode,
+        _ => AgentKind::Custom,
     }
 }
 
@@ -276,11 +406,15 @@ fn capitalized(value: &str) -> String {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AgentInfo {
     pub name: String,
     pub command: String,
     pub args: Vec<String>,
     pub available: bool,
+    pub kind: AgentKind,
+    pub workflow_available: bool,
+    pub interactive_available: bool,
 }
 
 fn format_command(command: &str, args: &[String]) -> String {

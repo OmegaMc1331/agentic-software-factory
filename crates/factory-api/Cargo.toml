@@ -15,7 +15,7 @@ factory-types = { workspace = true }
 factory-db = { workspace = true }
 factory-core = { workspace = true }
 factory-runtime = { workspace = true }
-axum = "0.7"
+axum = { version = "0.7", features = ["ws"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "sync", "time"] }
 tower-http = { version = "0.5", features = ["fs"] }
 serde = { workspace = true }

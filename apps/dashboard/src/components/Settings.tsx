@@ -1,30 +1,71 @@
 import { useCallback, useEffect, useState } from "react";
 import { fetchAgents, fetchConfig, saveConfig } from "../api";
-import type { ConfigData } from "../types";
+import type { AgentKind, AgentStatusInfo, ConfigData, PromptTransport } from "../types";
 
 const ROLES = ["planner", "worker", "reviewer"] as const;
+const PRESETS: Record<
+  Exclude<AgentKind, "custom">,
+  { label: string; command: string; args: string[] }
+> = {
+  codex: { label: "Codex", command: "codex", args: ["exec"] },
+  claude_code: { label: "Claude Code", command: "claude", args: ["-p"] },
+  open_code: { label: "OpenCode", command: "opencode", args: ["run"] },
+  gemini_cli: { label: "Gemini CLI", command: "gemini", args: ["-p"] },
+  qwen_code: { label: "Qwen Code", command: "qwen", args: ["-p"] },
+};
 
 interface Draft {
   originalName: string | null;
   name: string;
+  kind: AgentKind;
   command: string;
   argsText: string;
   envText: string;
+  promptTransport: PromptTransport;
+  interactive: boolean;
+  interactiveArgsText: string;
 }
 
 function emptyDraft(): Draft {
-  return { originalName: null, name: "", command: "", argsText: "", envText: "" };
+  return {
+    originalName: null,
+    name: "",
+    kind: "codex",
+    command: "codex",
+    argsText: "exec",
+    envText: "",
+    promptTransport: "stdin",
+    interactive: true,
+    interactiveArgsText: "",
+  };
+}
+
+function inferredKind(entry: ConfigData["agents"][string]): AgentKind {
+  if (entry.kind) return entry.kind;
+  if (entry.command === "codex" && entry.args[0] === "exec") return "codex";
+  if (entry.command === "opencode" && entry.args[0] === "run") return "open_code";
+  if (entry.command === "claude" && entry.args.some((arg) => arg === "-p" || arg === "--print"))
+    return "claude_code";
+  if (entry.command === "gemini" && entry.args.some((arg) => arg === "-p" || arg === "--prompt"))
+    return "gemini_cli";
+  if (entry.command === "qwen" && entry.args.some((arg) => arg === "-p" || arg === "--prompt"))
+    return "qwen_code";
+  return "custom";
 }
 
 function draftFrom(name: string, entry: ConfigData["agents"][string]): Draft {
   return {
     originalName: name,
     name,
+    kind: inferredKind(entry),
     command: entry.command,
     argsText: entry.args.join("\n"),
     envText: Object.entries(entry.env)
       .map(([key, value]) => `${key}=${value}`)
       .join("\n"),
+    promptTransport: entry.prompt_transport ?? "stdin",
+    interactive: entry.interactive_args !== undefined || inferredKind(entry) !== "custom",
+    interactiveArgsText: (entry.interactive_args ?? []).join("\n"),
   };
 }
 
@@ -49,7 +90,7 @@ function parseEnv(text: string): Record<string, string> {
 
 export function SettingsView() {
   const [config, setConfig] = useState<ConfigData | null>(null);
-  const [available, setAvailable] = useState<Record<string, boolean>>({});
+  const [available, setAvailable] = useState<Record<string, AgentStatusInfo>>({});
   const [draft, setDraft] = useState<Draft | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState<string | null>(null);
@@ -60,7 +101,7 @@ export function SettingsView() {
     Promise.all([fetchConfig(), fetchAgents()])
       .then(([nextConfig, list]) => {
         setConfig(nextConfig);
-        setAvailable(Object.fromEntries(list.map((agent) => [agent.name, agent.available])));
+        setAvailable(Object.fromEntries(list.map((agent) => [agent.name, agent])));
       })
       .catch((err: Error) => setError(err.message));
   }, []);
@@ -98,12 +139,18 @@ export function SettingsView() {
     if (draft.originalName) {
       delete agents[draft.originalName];
     }
-    agents[name] = {
+    const entry: ConfigData["agents"][string] = {
+      kind: draft.kind,
       command: draft.command.trim(),
       args: parseLines(draft.argsText),
       env: parseEnv(draft.envText),
       capabilities: draft.originalName ? config.agents[draft.originalName]?.capabilities : [],
     };
+    if (draft.kind === "custom") {
+      entry.prompt_transport = draft.promptTransport;
+      if (draft.interactive) entry.interactive_args = parseLines(draft.interactiveArgsText);
+    }
+    agents[name] = entry;
     const editing = draft.originalName !== null;
     setDraft(null);
     apply({ ...config, agents }, editing ? `Saved agent ${name}.` : `Added agent ${name}.`);
@@ -133,9 +180,7 @@ export function SettingsView() {
 
   const refreshAvailability = () => {
     fetchAgents()
-      .then((list) =>
-        setAvailable(Object.fromEntries(list.map((agent) => [agent.name, agent.available])))
-      )
+      .then((list) => setAvailable(Object.fromEntries(list.map((agent) => [agent.name, agent]))))
       .catch((err: Error) => setError(err.message));
   };
 
@@ -244,10 +289,18 @@ export function SettingsView() {
                     <td>
                       {status === undefined ? (
                         <span className="muted">checking…</span>
-                      ) : status ? (
-                        <span className="net-ok">available</span>
                       ) : (
-                        <span className="net-bad">missing</span>
+                        <span className="agent-capability-status">
+                          <span className={status.available ? "net-ok" : "net-bad"}>
+                            {status.available ? "Installed" : "Missing"}
+                          </span>
+                          <small>
+                            Workflow {status.workflowAvailable ? "configured" : "unavailable"}
+                          </small>
+                          <small>
+                            Interactive {status.interactiveAvailable ? "configured" : "unavailable"}
+                          </small>
+                        </span>
                       )}
                     </td>
                     <td>
@@ -269,7 +322,7 @@ export function SettingsView() {
         {agentNames.length > 0 && (
           <div className="settings-actions">
             <button className="button" onClick={refreshAvailability}>
-              Test executable availability
+              Test agent configuration
             </button>
           </div>
         )}
@@ -291,35 +344,113 @@ export function SettingsView() {
               />
             </label>
             <label className="settings-field">
-              <span className="meta-label">Command</span>
-              <input
+              <span className="meta-label">Agent type</span>
+              <select
                 className="net-select"
-                value={draft.command}
-                onChange={(event) => setDraft({ ...draft, command: event.target.value })}
-                placeholder="codex"
-              />
-            </label>
-            <label className="settings-field">
-              <span className="meta-label">Arguments (one per line)</span>
-              <textarea
-                className="net-select"
-                rows={3}
-                value={draft.argsText}
-                onChange={(event) => setDraft({ ...draft, argsText: event.target.value })}
-                placeholder={"exec"}
-              />
-            </label>
-            <label className="settings-field">
-              <span className="meta-label">Environment (KEY=VALUE, one per line)</span>
-              <textarea
-                className="net-select"
-                rows={3}
-                value={draft.envText}
-                onChange={(event) => setDraft({ ...draft, envText: event.target.value })}
-                placeholder="OPENAI_API_KEY=…"
-              />
+                value={draft.kind}
+                onChange={(event) => {
+                  const kind = event.target.value as AgentKind;
+                  if (kind === "custom") {
+                    setDraft({ ...draft, kind, command: "", argsText: "", interactive: false });
+                    return;
+                  }
+                  const preset = PRESETS[kind];
+                  setDraft({
+                    ...draft,
+                    kind,
+                    command: preset.command,
+                    argsText: preset.args.join("\n"),
+                    interactive: true,
+                  });
+                }}
+              >
+                {Object.entries(PRESETS).map(([kind, preset]) => (
+                  <option key={kind} value={kind}>
+                    {preset.label}
+                  </option>
+                ))}
+                <option value="custom">Custom</option>
+              </select>
             </label>
           </div>
+          <details className="settings-advanced" open={draft.kind === "custom" || undefined}>
+            <summary>{draft.kind === "custom" ? "Invocation" : "Advanced"}</summary>
+            <div className="settings-grid">
+              <label className="settings-field">
+                <span className="meta-label">Command</span>
+                <input
+                  className="net-select"
+                  value={draft.command}
+                  onChange={(event) => setDraft({ ...draft, command: event.target.value })}
+                  placeholder="codex"
+                />
+              </label>
+              <label className="settings-field">
+                <span className="meta-label">Arguments (one per line)</span>
+                <textarea
+                  className="net-select"
+                  rows={3}
+                  value={draft.argsText}
+                  onChange={(event) => setDraft({ ...draft, argsText: event.target.value })}
+                  placeholder={"exec"}
+                />
+              </label>
+              {draft.kind === "custom" && (
+                <>
+                  <label className="settings-field">
+                    <span className="meta-label">Workflow prompt transport</span>
+                    <select
+                      className="net-select"
+                      value={draft.promptTransport}
+                      onChange={(event) =>
+                        setDraft({
+                          ...draft,
+                          promptTransport: event.target.value as PromptTransport,
+                        })
+                      }
+                    >
+                      <option value="stdin">Pass mission through stdin</option>
+                      <option value="argument">Pass mission as an argument</option>
+                      <option value="disabled">Interactive sessions only</option>
+                    </select>
+                  </label>
+                  <label className="settings-field settings-checkbox">
+                    <input
+                      type="checkbox"
+                      checked={draft.interactive}
+                      onChange={(event) =>
+                        setDraft({ ...draft, interactive: event.target.checked })
+                      }
+                    />
+                    <span>Enable interactive Agent Console sessions</span>
+                  </label>
+                  {draft.interactive && (
+                    <label className="settings-field">
+                      <span className="meta-label">Interactive arguments (one per line)</span>
+                      <textarea
+                        className="net-select"
+                        rows={2}
+                        value={draft.interactiveArgsText}
+                        onChange={(event) =>
+                          setDraft({ ...draft, interactiveArgsText: event.target.value })
+                        }
+                      />
+                    </label>
+                  )}
+                </>
+              )}
+              <label className="settings-field">
+                <span className="meta-label">Environment (KEY=VALUE, one per line)</span>
+                <textarea
+                  className="net-select"
+                  rows={3}
+                  value={draft.envText}
+                  onChange={(event) => setDraft({ ...draft, envText: event.target.value })}
+                  placeholder="OPENAI_API_KEY=…"
+                />
+              </label>
+            </div>
+          </details>
           <div className="settings-actions">
             <button className="button" onClick={saveDraft}>
               {draft.originalName ? "Save changes" : "Add agent"}

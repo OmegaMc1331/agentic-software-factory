@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use factory_agent::{AgentKind, PromptTransport};
 use factory_core::{AgentEntry, AgentResolutionError, Agents, Config};
 use tempfile::TempDir;
 
@@ -12,9 +13,12 @@ fn write_config(dir: &Path, content: &str) {
 
 fn build_entry(command: &str, args: Vec<String>) -> AgentEntry {
     AgentEntry {
+        kind: None,
         command: command.to_string(),
         args,
         env: BTreeMap::new(),
+        prompt_transport: None,
+        interactive_args: None,
         capabilities: Vec::new(),
     }
 }
@@ -42,6 +46,67 @@ agent = "codex"
     assert_eq!(agent.args, vec!["exec".to_string()]);
     assert_eq!(agent.env.get("TEST").map(|s| s.as_str()), Some("1"));
     assert!(agent.capabilities.supports("planner"));
+    assert_eq!(agent.kind, AgentKind::Codex);
+    assert_eq!(agent.prompt_transport, PromptTransport::Argument);
+}
+
+#[test]
+fn legacy_custom_configuration_keeps_stdin_transport() {
+    let entry = build_entry("my-coding-agent", vec!["--batch".into()]);
+    let config = Config {
+        agents: BTreeMap::from([("custom".into(), entry)]),
+        roles: BTreeMap::new(),
+    };
+    let agent = config.agent_config("custom").unwrap();
+    assert_eq!(agent.kind, AgentKind::Custom);
+    assert_eq!(agent.prompt_transport, PromptTransport::Stdin);
+    assert!(agent.interactive_args.is_none());
+}
+
+#[test]
+fn explicit_known_kind_supplies_its_workflow_arguments() {
+    let config: Config = toml::from_str(
+        r#"
+[agents.gemini]
+kind = "gemini_cli"
+command = "gemini"
+"#,
+    )
+    .unwrap();
+    let agent = config.agent_config("gemini").unwrap();
+    assert_eq!(agent.args, vec!["-p"]);
+    assert_eq!(agent.prompt_transport, PromptTransport::Argument);
+}
+
+#[test]
+fn interactive_only_agent_is_rejected_for_a_workflow_role() {
+    let dir = TempDir::new().unwrap();
+    let known_good = if cfg!(windows) { "powershell" } else { "sh" };
+    write_config(
+        dir.path(),
+        &format!(
+            r#"
+[agents.console]
+kind = "custom"
+command = "{known_good}"
+prompt_transport = "disabled"
+interactive_args = []
+[roles.worker]
+agent = "console"
+"#
+        ),
+    );
+    let error = Agents::load(dir.path())
+        .unwrap()
+        .command_agent("worker")
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        AgentResolutionError::AutomatedUnavailable(_, _)
+    ));
+    assert!(error
+        .to_string()
+        .contains("cannot be used as Worker because it has no non-interactive invocation"));
 }
 
 #[test]

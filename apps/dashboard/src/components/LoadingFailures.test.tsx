@@ -47,12 +47,20 @@ describe("secondary view loading failures", () => {
       roles: { planner: { agent: "codex" } },
     });
     vi.mocked(fetchAgents).mockResolvedValue([
-      { name: "codex", command: "codex", args: ["exec"], available: true },
+      {
+        name: "codex",
+        command: "codex",
+        args: ["exec"],
+        available: true,
+        kind: "codex",
+        workflowAvailable: true,
+        interactiveAvailable: true,
+      },
     ]);
     render(<SettingsView />);
 
     expect(await screen.findByRole("heading", { name: "Settings" })).toBeTruthy();
-    expect(screen.getByText("available")).toBeTruthy();
+    expect(screen.getByText("Installed")).toBeTruthy();
   });
 
   it("stops loading the Agent Graph after an API failure", async () => {

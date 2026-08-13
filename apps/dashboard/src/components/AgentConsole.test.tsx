@@ -1,12 +1,21 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { fetchAgentSessions } from "../api";
+import { fetchAgentSessions, startInteractiveAgentSession } from "../api";
 import type { AgentSession } from "../types";
 import { AgentConsole } from "./AgentConsole";
 
 vi.mock("../api", () => ({
   agentSessionStreamUrl: (id: number) => `/api/sessions/${id}/stream`,
+  agentTerminalSocketUrl: (id: number) => `/api/sessions/${id}/terminal`,
   fetchAgentSessions: vi.fn(),
+  startInteractiveAgentSession: vi.fn(),
+  stopInteractiveAgentSession: vi.fn(),
+}));
+
+vi.mock("./InteractiveTerminal", () => ({
+  InteractiveTerminal: ({ sessionId }: { sessionId: number }) => (
+    <div aria-label="Interactive terminal">session {sessionId}</div>
+  ),
 }));
 
 class FakeEventSource {
@@ -30,6 +39,9 @@ class FakeEventSource {
 const meta = {
   command: "codex exec",
   available: true,
+  kind: "codex" as const,
+  workflowAvailable: true,
+  interactiveAvailable: true,
   roles: ["worker"],
 };
 
@@ -41,6 +53,7 @@ function session(overrides: Partial<AgentSession> = {}): AgentSession {
     attemptId: null,
     role: "worker",
     agent: "codex",
+    mode: "automated",
     command: "codex exec",
     status: "success",
     startedAt: "2026-08-13T08:00:00Z",
@@ -57,6 +70,7 @@ function session(overrides: Partial<AgentSession> = {}): AgentSession {
 
 beforeEach(() => {
   vi.mocked(fetchAgentSessions).mockReset();
+  vi.mocked(startInteractiveAgentSession).mockReset();
   FakeEventSource.latest = null;
   vi.stubGlobal("EventSource", FakeEventSource);
 });
@@ -79,9 +93,12 @@ describe("Agent Console", () => {
       />
     );
 
-    expect(await screen.findByText("No active session.")).toBeTruthy();
+    expect(await screen.findByText("No active interactive session.")).toBeTruthy();
     expect(screen.getByText("This configured agent is currently idle.")).toBeTruthy();
     expect(screen.getByText("Available")).toBeTruthy();
+    expect(screen.getByRole<HTMLButtonElement>("button", { name: "Start session" }).disabled).toBe(
+      false
+    );
   });
 
   it("renders persisted completed stdout and stderr without fabricating output", async () => {
@@ -100,7 +117,39 @@ describe("Agent Console", () => {
     expect(screen.getByText("warning")).toBeTruthy();
     expect(screen.getByText("Completed")).toBeTruthy();
     expect(screen.getByText("Exit code 0")).toBeTruthy();
-    expect(screen.getByText("This agent session is non-interactive.")).toBeTruthy();
+    expect(
+      screen.getByText("This workflow session is non-interactive and Factory-controlled.")
+    ).toBeTruthy();
+  });
+
+  it("starts a scoped interactive session on explicit user action", async () => {
+    vi.mocked(fetchAgentSessions).mockResolvedValue([]);
+    vi.mocked(startInteractiveAgentSession).mockResolvedValue(
+      session({
+        id: 44,
+        mode: "interactive",
+        interactive: true,
+        role: "console",
+        status: "running",
+        runId: null,
+        taskId: null,
+        exitCode: null,
+        finishedAt: null,
+      })
+    );
+    render(
+      <AgentConsole
+        agentName="codex"
+        meta={meta}
+        activity={null}
+        onClose={vi.fn()}
+        onDelete={vi.fn()}
+      />
+    );
+
+    fireEvent.click(await screen.findByRole("button", { name: "Start session" }));
+    expect(await screen.findByLabelText("Interactive terminal")).toBeTruthy();
+    expect(startInteractiveAgentSession).toHaveBeenCalledWith("codex");
   });
 
   it("opens the scoped stream for an active session", async () => {
@@ -175,7 +224,13 @@ describe("Agent Console", () => {
           id: "agent:opencode",
           kind: "agent" as const,
           label: "OpenCode",
-          meta: { command: "opencode run", available: true, roles: ["worker"] },
+          meta: {
+            command: "opencode run",
+            available: true,
+            workflowAvailable: true,
+            interactiveAvailable: true,
+            roles: ["worker"],
+          },
         },
       ],
     ]);

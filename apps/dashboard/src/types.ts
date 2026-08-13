@@ -49,10 +49,18 @@ export interface RunDetail {
   sessions: AgentSession[];
 }
 
+export type AgentKind =
+  "codex" | "claude_code" | "open_code" | "gemini_cli" | "qwen_code" | "custom";
+
+export type PromptTransport = "stdin" | "argument" | "disabled";
+
 export interface AgentEntry {
+  kind?: AgentKind;
   command: string;
   args: string[];
   env: Record<string, string>;
+  prompt_transport?: PromptTransport;
+  interactive_args?: string[];
   capabilities?: string[];
 }
 
@@ -66,6 +74,9 @@ export interface AgentStatusInfo {
   command: string;
   args: string[];
   available: boolean;
+  kind?: AgentKind;
+  workflowAvailable?: boolean;
+  interactiveAvailable?: boolean;
 }
 
 export type GraphNodeKind = "agent" | "role" | "run" | "task" | "group" | "note";
@@ -75,6 +86,9 @@ export type GraphEdgeKind =
 export interface AgentMeta {
   command: string;
   available: boolean;
+  kind?: AgentKind;
+  workflowAvailable?: boolean;
+  interactiveAvailable?: boolean;
   roles: string[];
 }
 
@@ -218,6 +232,7 @@ export interface AgentSession {
   attemptId: number | null;
   role: string;
   agent: string;
+  mode?: "automated" | "interactive";
   command: string;
   status: string;
   startedAt: string;

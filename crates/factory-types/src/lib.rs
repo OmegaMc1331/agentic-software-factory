@@ -7,5 +7,5 @@ pub mod task;
 pub use attempt::{AttemptStatus, ReviewDecision, ReviewResult, TaskAttempt, TaskEvidence};
 pub use plan::{Plan, PlannedTask};
 pub use run::{Run, RunStatus};
-pub use session::AgentSession;
+pub use session::{AgentSession, AgentSessionMode};
 pub use task::{Task, TaskState};

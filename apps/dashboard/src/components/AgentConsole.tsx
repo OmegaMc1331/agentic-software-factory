@@ -1,7 +1,13 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { agentSessionStreamUrl, fetchAgentSessions } from "../api";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  agentSessionStreamUrl,
+  fetchAgentSessions,
+  startInteractiveAgentSession,
+  stopInteractiveAgentSession,
+} from "../api";
 import { connectionKind } from "../graphWorkspace";
 import type { AgentActivity, AgentMeta, AgentSession, GraphNode } from "../types";
+import { InteractiveTerminal } from "./InteractiveTerminal";
 
 type AgentTab = "overview" | "console" | "sessions";
 
@@ -80,6 +86,10 @@ function sessionState(session: AgentSession | null): string {
   return session.exitCode === 0 || session.status === "success" ? "Completed" : "Failed";
 }
 
+function isInteractive(session: AgentSession): boolean {
+  return session.mode === "interactive" || session.interactive;
+}
+
 export function AgentConsole({
   agentName,
   meta,
@@ -103,17 +113,26 @@ export function AgentConsole({
   const [error, setError] = useState<string | null>(null);
   const [follow, setFollow] = useState(true);
   const [connectionTarget, setConnectionTarget] = useState("");
+  const [startingInteractive, setStartingInteractive] = useState(false);
   const outputRef = useRef<HTMLDivElement>(null);
 
-  useEffect(() => {
+  const reloadSessions = useCallback(() => {
     setError(null);
     fetchAgentSessions(agentName)
       .then((next) => {
         setSessions(next);
-        setSelectedSessionId((current) => current ?? next[0]?.id ?? null);
+        setSelectedSessionId((current) =>
+          current !== null && next.some((session) => session.id === current)
+            ? current
+            : (next[0]?.id ?? null)
+        );
       })
       .catch((reason: Error) => setError(reason.message));
-  }, [activity?.runId, activity?.taskId, agentName]);
+  }, [agentName]);
+
+  useEffect(() => {
+    reloadSessions();
+  }, [activity?.runId, activity?.taskId, reloadSessions]);
 
   const session = useMemo(
     () => sessions.find((candidate) => candidate.id === selectedSessionId) ?? null,
@@ -121,9 +140,16 @@ export function AgentConsole({
   );
   const sessionId = session?.id;
   const sessionStatus = session?.status;
+  const sessionInteractive = session ? isInteractive(session) : false;
 
   useEffect(() => {
-    if (!sessionId || !sessionStatus || !["running", "active"].includes(sessionStatus)) return;
+    if (
+      !sessionId ||
+      !sessionStatus ||
+      sessionInteractive ||
+      !["running", "active"].includes(sessionStatus)
+    )
+      return;
     const source = new EventSource(agentSessionStreamUrl(sessionId));
     source.addEventListener("session", (event) => {
       const next = JSON.parse((event as MessageEvent).data) as AgentSession;
@@ -137,7 +163,7 @@ export function AgentConsole({
       source.close();
     };
     return () => source.close();
-  }, [sessionId, sessionStatus]);
+  }, [sessionId, sessionInteractive, sessionStatus]);
 
   useEffect(() => {
     if (follow && outputRef.current) outputRef.current.scrollTop = outputRef.current.scrollHeight;
@@ -150,6 +176,24 @@ export function AgentConsole({
         .filter((candidate) => connectionKind(agentNode, candidate) !== null)
         .sort((a, b) => a.label.localeCompare(b.label))
     : [];
+
+  const startInteractive = () => {
+    setStartingInteractive(true);
+    setError(null);
+    startInteractiveAgentSession(agentName)
+      .then((next) => {
+        setSessions((current) => [next, ...current.filter((item) => item.id !== next.id)]);
+        setSelectedSessionId(next.id);
+      })
+      .catch((reason: Error) => setError(reason.message))
+      .finally(() => setStartingInteractive(false));
+  };
+
+  const stopInteractive = () => {
+    if (!session || !isInteractive(session)) return;
+    setError(null);
+    stopInteractiveAgentSession(session.id).catch((reason: Error) => setError(reason.message));
+  };
 
   return (
     <aside className="agent-console" aria-label={`${agentName} Agent Console`}>
@@ -195,6 +239,14 @@ export function AgentConsole({
             <div>
               <dt>Availability</dt>
               <dd>{meta.available ? "Available" : "Missing"}</dd>
+            </div>
+            <div>
+              <dt>Workflow mode</dt>
+              <dd>{meta.workflowAvailable ? "Configured" : "Unavailable"}</dd>
+            </div>
+            <div>
+              <dt>Interactive mode</dt>
+              <dd>{meta.interactiveAvailable ? "Configured" : "Unavailable"}</dd>
             </div>
             <div>
               <dt>Assigned roles</dt>
@@ -244,8 +296,18 @@ export function AgentConsole({
         <div className="agent-console-body">
           {!session ? (
             <div className="agent-console-idle">
-              <strong>No active session.</strong>
+              <strong>No active interactive session.</strong>
               <span>This configured agent is currently idle.</span>
+              <button
+                className="button"
+                disabled={!meta.available || !meta.interactiveAvailable || startingInteractive}
+                onClick={startInteractive}
+              >
+                {startingInteractive ? "Starting…" : "Start session"}
+              </button>
+              {!meta.interactiveAvailable && (
+                <small>This agent has no interactive invocation configured.</small>
+              )}
             </div>
           ) : (
             <>
@@ -256,39 +318,70 @@ export function AgentConsole({
                 <span>{new Date(session.startedAt).toLocaleString()}</span>
                 <code>{session.workingDirectory}</code>
               </div>
-              <div
-                className="agent-terminal"
-                ref={outputRef}
-                tabIndex={0}
-                onScroll={(event) => {
-                  const element = event.currentTarget;
-                  setFollow(element.scrollHeight - element.scrollTop - element.clientHeight < 24);
-                }}
-              >
-                {session.stdout ? (
-                  <pre>
-                    <AnsiText value={session.stdout} />
-                  </pre>
-                ) : null}
-                {session.stderr ? (
-                  <pre className="agent-terminal-stderr">
-                    <AnsiText value={session.stderr} />
-                  </pre>
-                ) : null}
-                {!session.stdout && !session.stderr && (
-                  <p className="agent-terminal-empty">No process output was recorded.</p>
-                )}
-              </div>
-              {!follow && (
-                <button className="agent-follow" onClick={() => setFollow(true)}>
-                  Follow output
-                </button>
+              {isInteractive(session) ? (
+                <>
+                  <InteractiveTerminal
+                    sessionId={session.id}
+                    active={["running", "active"].includes(session.status)}
+                    output={session.stdout ?? ""}
+                    onDisconnect={reloadSessions}
+                    onError={setError}
+                  />
+                  <div className="agent-console-terminal-actions">
+                    <span>PTY-backed interactive session</span>
+                    {["running", "active"].includes(session.status) && (
+                      <button className="button" onClick={stopInteractive}>
+                        Stop session
+                      </button>
+                    )}
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div
+                    className="agent-terminal"
+                    ref={outputRef}
+                    tabIndex={0}
+                    onScroll={(event) => {
+                      const element = event.currentTarget;
+                      setFollow(
+                        element.scrollHeight - element.scrollTop - element.clientHeight < 24
+                      );
+                    }}
+                  >
+                    {session.stdout ? (
+                      <pre>
+                        <AnsiText value={session.stdout} />
+                      </pre>
+                    ) : null}
+                    {session.stderr ? (
+                      <pre className="agent-terminal-stderr">
+                        <AnsiText value={session.stderr} />
+                      </pre>
+                    ) : null}
+                    {!session.stdout && !session.stderr && (
+                      <p className="agent-terminal-empty">No process output was recorded.</p>
+                    )}
+                  </div>
+                  {!follow && (
+                    <button className="agent-follow" onClick={() => setFollow(true)}>
+                      Follow output
+                    </button>
+                  )}
+                  <p className="agent-console-input-note">
+                    This workflow session is non-interactive and Factory-controlled.
+                  </p>
+                  {meta.interactiveAvailable && (
+                    <button
+                      className="button agent-start-session"
+                      disabled={startingInteractive}
+                      onClick={startInteractive}
+                    >
+                      {startingInteractive ? "Starting…" : "Start interactive session"}
+                    </button>
+                  )}
+                </>
               )}
-              <p className="agent-console-input-note">
-                {session.interactive
-                  ? "Interactive input is available for this Factory session."
-                  : "This agent session is non-interactive."}
-              </p>
             </>
           )}
         </div>

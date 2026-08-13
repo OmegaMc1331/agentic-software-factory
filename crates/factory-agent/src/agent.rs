@@ -9,6 +9,62 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub const MISSION_PLACEHOLDER: &str = "{mission}";
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentKind {
+    Codex,
+    ClaudeCode,
+    OpenCode,
+    GeminiCli,
+    QwenCode,
+    #[default]
+    Custom,
+}
+
+impl AgentKind {
+    pub fn default_command(self) -> Option<&'static str> {
+        match self {
+            AgentKind::Codex => Some("codex"),
+            AgentKind::ClaudeCode => Some("claude"),
+            AgentKind::OpenCode => Some("opencode"),
+            AgentKind::GeminiCli => Some("gemini"),
+            AgentKind::QwenCode => Some("qwen"),
+            AgentKind::Custom => None,
+        }
+    }
+
+    pub fn workflow_args(self) -> &'static [&'static str] {
+        match self {
+            AgentKind::Codex => &["exec"],
+            AgentKind::ClaudeCode | AgentKind::GeminiCli | AgentKind::QwenCode => &["-p"],
+            AgentKind::OpenCode => &["run"],
+            AgentKind::Custom => &[],
+        }
+    }
+
+    pub fn prompt_transport(self) -> PromptTransport {
+        match self {
+            AgentKind::Custom => PromptTransport::Stdin,
+            _ => PromptTransport::Argument,
+        }
+    }
+
+    pub fn supports_interactive(self) -> bool {
+        self != AgentKind::Custom
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptTransport {
+    #[default]
+    Stdin,
+    Argument,
+    Disabled,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentCapabilities {
     #[serde(default)]
@@ -25,11 +81,17 @@ impl AgentCapabilities {
 #[serde(rename_all = "camelCase")]
 pub struct AgentConfig {
     pub name: String,
+    #[serde(default)]
+    pub kind: AgentKind,
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    #[serde(default)]
+    pub prompt_transport: PromptTransport,
+    #[serde(default)]
+    pub interactive_args: Option<Vec<String>>,
     #[serde(default)]
     pub capabilities: AgentCapabilities,
 }
@@ -38,11 +100,31 @@ impl AgentConfig {
     pub fn new(name: impl Into<String>, command: impl Into<String>) -> Self {
         AgentConfig {
             name: name.into(),
+            kind: AgentKind::Custom,
             command: command.into(),
             args: Vec::new(),
             env: BTreeMap::new(),
+            prompt_transport: PromptTransport::Stdin,
+            interactive_args: None,
             capabilities: AgentCapabilities::default(),
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessInvocation {
+    pub command: String,
+    pub args: Vec<String>,
+    pub env: BTreeMap<String, String>,
+    pub working_dir: PathBuf,
+    pub stdin_payload: Option<Vec<u8>>,
+}
+
+impl ProcessInvocation {
+    pub fn command_line(&self) -> String {
+        let mut parts = vec![self.command.clone()];
+        parts.extend(self.args.iter().cloned());
+        parts.join(" ")
     }
 }
 
@@ -90,8 +172,30 @@ pub enum AgentError {
     ExecutableNotFound(String),
     #[error("failed to run `{0}`: {1}")]
     Spawn(String, String),
+    #[error("Agent `{0}` has no non-interactive workflow invocation configured.")]
+    AutomatedUnavailable(String),
+    #[error("Agent `{0}` has no interactive invocation configured.")]
+    InteractiveUnavailable(String),
+    #[error("Invalid invocation for agent `{0}`: {1}")]
+    InvalidInvocation(String, String),
+    #[error("Agent `{0}` appears to require an interactive terminal. Configure a non-interactive workflow invocation for this agent.")]
+    RequiresTerminal(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+impl AgentError {
+    pub fn is_configuration(&self) -> bool {
+        matches!(
+            self,
+            AgentError::ExecutableNotFound(_)
+                | AgentError::Spawn(_, _)
+                | AgentError::AutomatedUnavailable(_)
+                | AgentError::InteractiveUnavailable(_)
+                | AgentError::InvalidInvocation(_, _)
+                | AgentError::RequiresTerminal(_)
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -116,6 +220,84 @@ impl CommandAgent {
         let mut parts = vec![self.config.command.clone()];
         parts.extend(self.config.args.iter().cloned());
         parts.join(" ")
+    }
+
+    pub fn kind(&self) -> AgentKind {
+        self.config.kind
+    }
+
+    pub fn prompt_transport(&self) -> PromptTransport {
+        self.config.prompt_transport
+    }
+
+    pub fn automated_invocation(
+        &self,
+        request: &AgentRequest,
+    ) -> Result<ProcessInvocation, AgentError> {
+        if self.config.prompt_transport == PromptTransport::Disabled {
+            return Err(AgentError::AutomatedUnavailable(self.config.name.clone()));
+        }
+        let mut args = self.config.args.clone();
+        let stdin_payload = match self.config.prompt_transport {
+            PromptTransport::Stdin => Some(request.mission.as_bytes().to_vec()),
+            PromptTransport::Argument => {
+                let placeholders = args
+                    .iter()
+                    .filter(|argument| argument.as_str() == MISSION_PLACEHOLDER)
+                    .count();
+                if placeholders > 1 {
+                    return Err(AgentError::InvalidInvocation(
+                        self.config.name.clone(),
+                        "workflow arguments contain more than one {mission} placeholder".into(),
+                    ));
+                }
+                if placeholders == 1 {
+                    for argument in &mut args {
+                        if argument == MISSION_PLACEHOLDER {
+                            *argument = request.mission.clone();
+                        }
+                    }
+                } else {
+                    args.push(request.mission.clone());
+                }
+                None
+            }
+            PromptTransport::Disabled => unreachable!(),
+        };
+        Ok(ProcessInvocation {
+            command: self.config.command.clone(),
+            args,
+            env: merged_env(&self.config.env, &request.env),
+            working_dir: request.working_dir.clone(),
+            stdin_payload,
+        })
+    }
+
+    pub fn interactive_invocation(
+        &self,
+        working_dir: impl Into<PathBuf>,
+    ) -> Result<ProcessInvocation, AgentError> {
+        let args = self
+            .config
+            .interactive_args
+            .clone()
+            .ok_or_else(|| AgentError::InteractiveUnavailable(self.config.name.clone()))?;
+        Ok(ProcessInvocation {
+            command: self.config.command.clone(),
+            args,
+            env: self.config.env.clone(),
+            working_dir: working_dir.into(),
+            stdin_payload: None,
+        })
+    }
+
+    pub fn workflow_available(&self) -> bool {
+        self.automated_invocation(&AgentRequest::new("probe", "."))
+            .is_ok()
+    }
+
+    pub fn interactive_available(&self) -> bool {
+        self.interactive_invocation(".").is_ok()
     }
 
     pub fn config(&self) -> &AgentConfig {
@@ -151,10 +333,15 @@ impl CommandAgent {
         if !executable_exists(&self.config.command) {
             return Err(AgentError::ExecutableNotFound(self.config.command.clone()));
         }
-        let mut cmd = Command::new(&self.config.command);
-        cmd.args(&self.config.args)
-            .current_dir(&request.working_dir)
-            .stdin(Stdio::piped())
+        let invocation = self.automated_invocation(request)?;
+        let mut cmd = Command::new(&invocation.command);
+        cmd.args(&invocation.args)
+            .current_dir(&invocation.working_dir)
+            .stdin(if invocation.stdin_payload.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         #[cfg(unix)]
@@ -162,21 +349,24 @@ impl CommandAgent {
             use std::os::unix::process::CommandExt;
             cmd.process_group(0);
         }
-        for (key, value) in &self.config.env {
-            cmd.env(key, value);
-        }
-        for (key, value) in &request.env {
+        for (key, value) in &invocation.env {
             cmd.env(key, value);
         }
         let started = Instant::now();
         let mut child = cmd
             .spawn()
             .map_err(|e| AgentError::Spawn(self.config.command.clone(), e.to_string()))?;
-        let mut stdin = child.stdin.take().ok_or_else(|| {
-            AgentError::Spawn(self.config.command.clone(), "stdin not available".into())
-        })?;
-        let write_error = stdin.write_all(request.mission.as_bytes()).err();
-        drop(stdin);
+        let write_error = match invocation.stdin_payload {
+            Some(payload) => {
+                let mut stdin = child.stdin.take().ok_or_else(|| {
+                    AgentError::Spawn(self.config.command.clone(), "stdin not available".into())
+                })?;
+                let error = stdin.write_all(&payload).err();
+                drop(stdin);
+                error
+            }
+            None => None,
+        };
         let stdout = child.stdout.take().ok_or_else(|| {
             AgentError::Spawn(self.config.command.clone(), "stdout not available".into())
         })?;
@@ -225,6 +415,9 @@ impl CommandAgent {
                 return Err(AgentError::Io(err));
             }
         }
+        if !status.success() && terminal_required(&stdout_text, &stderr_text) {
+            return Err(AgentError::RequiresTerminal(self.config.name.clone()));
+        }
         Ok(AgentResult {
             stdout: stdout_text,
             stderr: stderr_text,
@@ -233,6 +426,33 @@ impl CommandAgent {
             cancelled: was_cancelled,
         })
     }
+}
+
+fn merged_env(
+    configured: &BTreeMap<String, String>,
+    request: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    let mut env = configured.clone();
+    env.extend(
+        request
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone())),
+    );
+    env
+}
+
+fn terminal_required(stdout: &str, stderr: &str) -> bool {
+    let output = format!("{stdout}\n{stderr}").to_ascii_lowercase();
+    [
+        "stdin is not a terminal",
+        "stdin is not a tty",
+        "the input device is not a tty",
+        "input device is not a tty",
+        "requires an interactive terminal",
+        "requires a tty",
+    ]
+    .iter()
+    .any(|message| output.contains(message))
 }
 
 fn terminate_process_tree(child: &mut std::process::Child) {
@@ -357,6 +577,26 @@ mod tests {
                     ("sh".into(), vec!["-c".into(), "sleep 20".into()])
                 }
             }
+            "tty-error" => {
+                if cfg!(windows) {
+                    (
+                        "cmd".into(),
+                        vec![
+                            "/d".into(),
+                            "/c".into(),
+                            "echo stdin is not a terminal 1>&2 & exit /b 1".into(),
+                        ],
+                    )
+                } else {
+                    (
+                        "sh".into(),
+                        vec![
+                            "-c".into(),
+                            "echo 'stdin is not a terminal' >&2; exit 1".into(),
+                        ],
+                    )
+                }
+            }
             _ => unreachable!(),
         }
     }
@@ -416,6 +656,97 @@ mod tests {
             .run(&AgentRequest::new("hello mission", dir.path()))
             .unwrap();
         assert!(result.stdout.contains("hello mission"));
+    }
+
+    #[test]
+    fn delivers_the_mission_as_one_process_argument() {
+        let dir = TempDir::new().unwrap();
+        let (command, args) = if cfg!(windows) {
+            let script = dir.path().join("print-mission.ps1");
+            std::fs::write(
+                &script,
+                "param([string]$mission)\n[Console]::Out.Write($mission)\n",
+            )
+            .unwrap();
+            (
+                "powershell".to_string(),
+                vec![
+                    "-NoProfile".into(),
+                    "-File".into(),
+                    script.to_string_lossy().into_owned(),
+                    MISSION_PLACEHOLDER.into(),
+                ],
+            )
+        } else {
+            (
+                "sh".to_string(),
+                vec![
+                    "-c".into(),
+                    "printf %s \"$1\"".into(),
+                    "factory-test".into(),
+                    MISSION_PLACEHOLDER.into(),
+                ],
+            )
+        };
+        let mut config = AgentConfig::new("argument-test", command);
+        config.args = args;
+        config.prompt_transport = PromptTransport::Argument;
+        let result = CommandAgent::new(config)
+            .run(&AgentRequest::new("mission with spaces", dir.path()))
+            .unwrap();
+        assert_eq!(result.stdout, "mission with spaces");
+    }
+
+    #[test]
+    fn rejects_automated_use_when_workflow_transport_is_disabled() {
+        let mut config = AgentConfig::new("interactive-only", "unused");
+        config.prompt_transport = PromptTransport::Disabled;
+        config.interactive_args = Some(Vec::new());
+        let error = CommandAgent::new(config)
+            .automated_invocation(&AgentRequest::new("mission", "."))
+            .unwrap_err();
+        assert!(matches!(error, AgentError::AutomatedUnavailable(_)));
+    }
+
+    #[test]
+    fn known_profiles_build_non_interactive_argument_invocations() {
+        for (kind, command, prefix) in [
+            (AgentKind::Codex, "codex", vec!["exec"]),
+            (AgentKind::ClaudeCode, "claude", vec!["-p"]),
+            (AgentKind::OpenCode, "opencode", vec!["run"]),
+            (AgentKind::GeminiCli, "gemini", vec!["-p"]),
+            (AgentKind::QwenCode, "qwen", vec!["-p"]),
+        ] {
+            let config = AgentConfig {
+                name: command.into(),
+                kind,
+                command: command.into(),
+                args: prefix.iter().map(|arg| (*arg).into()).collect(),
+                env: BTreeMap::new(),
+                prompt_transport: kind.prompt_transport(),
+                interactive_args: Some(Vec::new()),
+                capabilities: AgentCapabilities::default(),
+            };
+            let invocation = CommandAgent::new(config)
+                .automated_invocation(&AgentRequest::new("test mission", "."))
+                .unwrap();
+            assert_eq!(invocation.command, command);
+            assert_eq!(
+                invocation.args.last().map(String::as_str),
+                Some("test mission")
+            );
+            assert!(invocation.stdin_payload.is_none());
+        }
+    }
+
+    #[test]
+    fn classifies_terminal_mode_failures() {
+        let dir = TempDir::new().unwrap();
+        let error = agent("tty-error")
+            .run(&AgentRequest::new("mission", dir.path()))
+            .unwrap_err();
+        assert!(matches!(error, AgentError::RequiresTerminal(_)));
+        assert!(error.is_configuration());
     }
 
     #[test]

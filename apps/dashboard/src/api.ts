@@ -87,6 +87,10 @@ async function post<T>(path: string, body?: unknown): Promise<T> {
   });
 }
 
+async function remove(path: string): Promise<void> {
+  return request<void>(path, { method: "DELETE" });
+}
+
 export function fetchRuns(): Promise<RunSummary[]> {
   return get<RunSummary[]>("/runs");
 }
@@ -145,12 +149,28 @@ export function fetchAgentSessions(agent: string): Promise<AgentSession[]> {
   return get<AgentSession[]>(`/agents/${encodeURIComponent(agent)}/sessions`);
 }
 
+export function startInteractiveAgentSession(
+  agent: string,
+  size: { cols: number; rows: number } = { cols: 100, rows: 28 }
+): Promise<AgentSession> {
+  return post<AgentSession>(`/agents/${encodeURIComponent(agent)}/sessions`, size);
+}
+
+export function stopInteractiveAgentSession(id: number): Promise<void> {
+  return remove(`/sessions/${id}`);
+}
+
 export function fetchAgentSession(id: number): Promise<AgentSession> {
   return get<AgentSession>(`/sessions/${id}`);
 }
 
 export function agentSessionStreamUrl(id: number): string {
   return `${API_BASE}/sessions/${id}/stream`;
+}
+
+export function agentTerminalSocketUrl(id: number): string {
+  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  return `${protocol}//${window.location.host}${API_BASE}/sessions/${id}/terminal`;
 }
 
 export function progress(counts: { completed: number; total: number }): number {

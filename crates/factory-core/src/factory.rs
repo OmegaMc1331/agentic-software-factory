@@ -6,8 +6,8 @@ use factory_agent::{AgentError, AgentRequest, AgentResult, CommandAgent, OutputS
 use factory_db::{FactoryDb, Reconciliation};
 use factory_git::{Repo, WorktreeInfo};
 use factory_types::{
-    AgentSession, AttemptStatus, ReviewDecision, ReviewResult, Run, RunStatus, Task, TaskAttempt,
-    TaskEvidence, TaskState,
+    AgentSession, AgentSessionMode, AttemptStatus, ReviewDecision, ReviewResult, Run, RunStatus,
+    Task, TaskAttempt, TaskEvidence, TaskState,
 };
 use serde::Deserialize;
 use thiserror::Error;
@@ -56,6 +56,13 @@ pub enum FactoryError {
     Cancelled,
     #[error("io error: {0}")]
     Io(std::io::Error),
+}
+
+impl FactoryError {
+    pub fn is_agent_configuration(&self) -> bool {
+        matches!(self, FactoryError::AgentProcess(error) if error.is_configuration())
+            || matches!(self, FactoryError::Agent(_))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -126,6 +133,10 @@ impl Factory {
             agents: Agents::load(root)?,
             root: root.to_path_buf(),
         })
+    }
+
+    pub fn agents(&self) -> &Agents {
+        &self.agents
     }
 
     pub fn planner_agent(&self) -> Result<String, FactoryError> {
@@ -431,6 +442,9 @@ impl Factory {
                         None,
                     )?;
                     self.mark_task(task_id, TaskState::Failed)?;
+                    if error.is_agent_configuration() {
+                        return Err(error);
+                    }
                     if attempt.attempt_number >= MAX_TASK_ATTEMPTS {
                         return Ok(false);
                     }
@@ -495,6 +509,20 @@ impl Factory {
                     ),
                     feedback: nonempty_lines(&run.result.stderr),
                 },
+                Err(error) if error.is_agent_configuration() => {
+                    let message = error.to_string();
+                    self.db.finish_task_attempt(
+                        attempt.id,
+                        AttemptStatus::Failed,
+                        worker_run.result.exit_code,
+                        evidence.commit_sha.as_deref(),
+                        Some(&message),
+                        Some(&evidence),
+                        None,
+                    )?;
+                    self.mark_task(task_id, TaskState::Failed)?;
+                    return Err(error);
+                }
                 Err(error) => ReviewResult {
                     decision: ReviewDecision::RequestChanges,
                     reason: error.to_string(),
@@ -558,6 +586,7 @@ impl Factory {
             attempt_id: scope.attempt_id,
             role: scope.role.to_string(),
             agent: agent.name().to_string(),
+            mode: AgentSessionMode::Automated,
             command: agent.command_line(),
             status: "running".to_string(),
             started_at: started,

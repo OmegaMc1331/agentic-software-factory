@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path as UrlPath, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -12,7 +13,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use factory_core::{Agents, Config, ConfigError};
 use factory_db::FactoryDb;
-use factory_runtime::{Runtime, RuntimeError};
+use factory_runtime::{Runtime, RuntimeError, TerminalSubscription};
+use factory_types::AgentSessionMode;
 use serde::Deserialize;
 use serde_json::json;
 use tokio_stream::wrappers::ReceiverStream;
@@ -97,6 +99,8 @@ impl From<RuntimeError> for ApiError {
         let status = match &error {
             RuntimeError::AlreadyActive(_) => StatusCode::CONFLICT,
             RuntimeError::NotActive(_) => StatusCode::CONFLICT,
+            RuntimeError::TerminalNotActive(_) => StatusCode::CONFLICT,
+            RuntimeError::Terminal(_) => StatusCode::BAD_REQUEST,
             RuntimeError::Factory(factory_core::FactoryError::RunNotFound(_))
             | RuntimeError::Factory(factory_core::FactoryError::TaskNotFound(_)) => {
                 StatusCode::NOT_FOUND
@@ -110,6 +114,7 @@ impl From<RuntimeError> for ApiError {
                 | factory_core::FactoryError::InvalidTransition(_, _)
                 | factory_core::FactoryError::NotReady(_)
                 | factory_core::FactoryError::Agent(_)
+                | factory_core::FactoryError::AgentProcess(_)
                 | factory_core::FactoryError::Git(_),
             ) => StatusCode::BAD_REQUEST,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
@@ -132,9 +137,16 @@ pub fn router(state: SharedState) -> Router {
             get(get_graph_workspace).put(put_graph_workspace),
         )
         .route("/api/agents", get(get_agents))
-        .route("/api/agents/:agent/sessions", get(list_agent_sessions))
-        .route("/api/sessions/:id", get(get_agent_session))
+        .route(
+            "/api/agents/:agent/sessions",
+            get(list_agent_sessions).post(start_interactive_session),
+        )
+        .route(
+            "/api/sessions/:id",
+            get(get_agent_session).delete(stop_interactive_session),
+        )
         .route("/api/sessions/:id/stream", get(stream_agent_session))
+        .route("/api/sessions/:id/terminal", get(interactive_terminal))
         .route("/api/config", get(get_config).put(put_config))
         .route("/api/*rest", get(api_not_found))
         .fallback_service(dashboard::router(&state.root))
@@ -328,10 +340,137 @@ fn session_response(
         None => state.root.to_string_lossy().into_owned(),
     };
     Ok(AgentSessionResponse {
+        interactive: session.mode == AgentSessionMode::Interactive,
         session,
         working_directory,
-        interactive: false,
     })
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StartInteractiveSession {
+    #[serde(default = "default_terminal_cols")]
+    cols: u16,
+    #[serde(default = "default_terminal_rows")]
+    rows: u16,
+}
+
+fn default_terminal_cols() -> u16 {
+    100
+}
+
+fn default_terminal_rows() -> u16 {
+    28
+}
+
+async fn start_interactive_session(
+    State(state): State<SharedState>,
+    UrlPath(agent): UrlPath<String>,
+    Json(request): Json<StartInteractiveSession>,
+) -> Result<Json<AgentSessionResponse>, ApiError> {
+    let session = state
+        .runtime
+        .start_interactive_session(&agent, request.cols, request.rows)?;
+    let db = state.db.lock().expect("db mutex poisoned");
+    Ok(Json(session_response(&state, &db, session)?))
+}
+
+async fn stop_interactive_session(
+    State(state): State<SharedState>,
+    UrlPath(id): UrlPath<i64>,
+) -> Result<StatusCode, ApiError> {
+    let session = {
+        let db = state.db.lock().expect("db mutex poisoned");
+        db.get_agent_session(id)?.ok_or_else(|| {
+            ApiError::new(StatusCode::NOT_FOUND, format!("session {id} not found"))
+        })?
+    };
+    if session.mode != AgentSessionMode::Interactive {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!("session {id} is not interactive"),
+        ));
+    }
+    state.runtime.stop_interactive_session(id)?;
+    Ok(StatusCode::ACCEPTED)
+}
+
+async fn interactive_terminal(
+    State(state): State<SharedState>,
+    UrlPath(id): UrlPath<i64>,
+    upgrade: WebSocketUpgrade,
+) -> Result<Response, ApiError> {
+    {
+        let db = state.db.lock().expect("db mutex poisoned");
+        let session = db.get_agent_session(id)?.ok_or_else(|| {
+            ApiError::new(StatusCode::NOT_FOUND, format!("session {id} not found"))
+        })?;
+        if session.mode != AgentSessionMode::Interactive {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                format!("session {id} is not interactive"),
+            ));
+        }
+    }
+    let subscription = state.runtime.subscribe_terminal(id)?;
+    Ok(upgrade
+        .on_upgrade(move |socket| terminal_socket(socket, state, id, subscription))
+        .into_response())
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum TerminalCommand {
+    Input { data: String },
+    Resize { cols: u16, rows: u16 },
+}
+
+async fn terminal_socket(
+    mut socket: WebSocket,
+    state: SharedState,
+    session_id: i64,
+    mut subscription: TerminalSubscription,
+) {
+    if !subscription.snapshot.is_empty()
+        && socket
+            .send(Message::Binary(subscription.snapshot))
+            .await
+            .is_err()
+    {
+        return;
+    }
+    loop {
+        tokio::select! {
+            incoming = socket.recv() => {
+                let Some(Ok(message)) = incoming else { break; };
+                match message {
+                    Message::Text(text) => {
+                        let Ok(command) = serde_json::from_str::<TerminalCommand>(&text) else {
+                            let _ = socket.send(Message::Text("invalid terminal command".into())).await;
+                            continue;
+                        };
+                        let result = match command {
+                            TerminalCommand::Input { data } => state.runtime.write_terminal(session_id, data.as_bytes()),
+                            TerminalCommand::Resize { cols, rows } => state.runtime.resize_terminal(session_id, cols, rows),
+                        };
+                        if let Err(error) = result {
+                            let _ = socket.send(Message::Text(error.to_string())).await;
+                            break;
+                        }
+                    }
+                    Message::Close(_) => break,
+                    Message::Ping(payload) => {
+                        if socket.send(Message::Pong(payload)).await.is_err() { break; }
+                    }
+                    Message::Binary(_) | Message::Pong(_) => {}
+                }
+            }
+            output = subscription.receiver.recv() => {
+                let Some(output) = output else { break; };
+                if socket.send(Message::Binary(output)).await.is_err() { break; }
+            }
+        }
+    }
 }
 
 async fn list_agent_sessions(
@@ -468,6 +607,9 @@ fn build_graph(state: &SharedState) -> Result<GraphResponse, ApiError> {
             meta: json!({
                 "command": agent.command,
                 "available": agent.available,
+                "kind": agent.kind,
+                "workflowAvailable": agent.workflow_available,
+                "interactiveAvailable": agent.interactive_available,
                 "roles": roles_for_agent.get(&agent.name).cloned().unwrap_or_default(),
             }),
         });

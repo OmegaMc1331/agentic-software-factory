@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use factory_core::{AgentEntry, Config, RoleEntry};
-use factory_types::{AgentSession, RunStatus};
+use factory_types::{AgentSession, AgentSessionMode, RunStatus};
 use http_body_util::BodyExt;
 use serde_json::json;
 use tempfile::TempDir;
@@ -23,19 +23,32 @@ fn make_state(root: &Path) -> Arc<factory_api::ApiState> {
     Arc::new(factory_api::ApiState::new(root.to_path_buf()).unwrap())
 }
 
+#[test]
+fn pty_api_child() {
+    if std::env::var("FACTORY_API_PTY_CHILD").as_deref() == Ok("1") {
+        std::thread::sleep(Duration::from_secs(20));
+    }
+}
+
 fn command_entry(script: &str) -> AgentEntry {
     if cfg!(windows) {
         AgentEntry {
+            kind: None,
             command: "cmd".into(),
             args: vec!["/d".into(), "/c".into(), script.into()],
             env: BTreeMap::new(),
+            prompt_transport: None,
+            interactive_args: None,
             capabilities: Vec::new(),
         }
     } else {
         AgentEntry {
+            kind: None,
             command: "sh".into(),
             args: vec!["-c".into(), script.into()],
             env: BTreeMap::new(),
+            prompt_transport: None,
+            interactive_args: None,
             capabilities: Vec::new(),
         }
     }
@@ -629,6 +642,7 @@ async fn agent_session_endpoints_return_persisted_output_and_close_completed_str
             attempt_id: None,
             role: "worker".to_string(),
             agent: "codex".to_string(),
+            mode: AgentSessionMode::Automated,
             command: "codex exec".to_string(),
             status: "success".to_string(),
             started_at: "2026-08-13T08:00:00Z".to_string(),
@@ -705,6 +719,55 @@ async fn agent_session_endpoints_return_persisted_output_and_close_completed_str
     assert!(body_text(response)
         .await
         .contains("session 999999 not found"));
+}
+
+#[tokio::test]
+async fn interactive_session_endpoint_only_starts_a_configured_agent() {
+    let dir = TempDir::new().unwrap();
+    init_root(dir.path());
+    let command = std::env::current_exe()
+        .unwrap()
+        .to_string_lossy()
+        .replace('\\', "\\\\");
+    let arguments = r#"["--exact", "pty_api_child", "--nocapture"]"#;
+    std::fs::write(
+        dir.path().join(".factory").join("config.toml"),
+        format!(
+            r#"
+[agents.console-test]
+kind = "custom"
+command = "{command}"
+prompt_transport = "disabled"
+interactive_args = {arguments}
+
+[agents.console-test.env]
+FACTORY_API_PTY_CHILD = "1"
+"#
+        ),
+    )
+    .unwrap();
+    let state = make_state(dir.path());
+    let app = factory_api::router(state.clone());
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/agents/console-test/sessions")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"cols":90,"rows":24}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let value: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+    assert_eq!(value["mode"], "interactive");
+    assert_eq!(value["interactive"], true);
+    let session_id = value["id"].as_i64().unwrap();
+
+    let _ = state.runtime.stop_interactive_session(session_id);
 }
 
 #[tokio::test]

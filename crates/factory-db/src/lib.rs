@@ -4,8 +4,8 @@ pub use error::DbError;
 
 use chrono::Utc;
 use factory_types::{
-    AgentSession, AttemptStatus, Plan, ReviewResult, Run, RunStatus, Task, TaskAttempt,
-    TaskEvidence, TaskState,
+    AgentSession, AgentSessionMode, AttemptStatus, Plan, ReviewResult, Run, RunStatus, Task,
+    TaskAttempt, TaskEvidence, TaskState,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
@@ -234,14 +234,15 @@ impl FactoryDb {
     pub fn insert_agent_session(&self, session: &AgentSession) -> Result<AgentSession> {
         let mut session = session.clone();
         self.conn.execute(
-            "INSERT INTO agent_sessions (run_id, task_id, attempt_id, role, agent, command, status, started_at, finished_at, exit_code, duration_ms, stdout, stderr)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            "INSERT INTO agent_sessions (run_id, task_id, attempt_id, role, agent, mode, command, status, started_at, finished_at, exit_code, duration_ms, stdout, stderr)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 session.run_id,
                 session.task_id,
                 session.attempt_id,
                 session.role,
                 session.agent,
+                session.mode.as_str(),
                 session.command,
                 session.status,
                 session.started_at,
@@ -258,7 +259,7 @@ impl FactoryDb {
 
     pub fn list_agent_sessions(&self, run_id: Option<i64>) -> Result<Vec<AgentSession>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, run_id, task_id, attempt_id, role, agent, command, status, started_at, finished_at, exit_code, duration_ms, stdout, stderr
+            "SELECT id, run_id, task_id, attempt_id, role, agent, mode, command, status, started_at, finished_at, exit_code, duration_ms, stdout, stderr
              FROM agent_sessions
              WHERE (?1 IS NULL OR run_id = ?1)
              ORDER BY id",
@@ -272,7 +273,7 @@ impl FactoryDb {
     pub fn get_agent_session(&self, id: i64) -> Result<Option<AgentSession>> {
         self.conn
             .query_row(
-                "SELECT id, run_id, task_id, attempt_id, role, agent, command, status, started_at, finished_at, exit_code, duration_ms, stdout, stderr
+                "SELECT id, run_id, task_id, attempt_id, role, agent, mode, command, status, started_at, finished_at, exit_code, duration_ms, stdout, stderr
                  FROM agent_sessions WHERE id = ?1",
                 params![id],
                 build_session,
@@ -287,7 +288,7 @@ impl FactoryDb {
         limit: usize,
     ) -> Result<Vec<AgentSession>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, run_id, task_id, attempt_id, role, agent, command, status, started_at, finished_at, exit_code, duration_ms, stdout, stderr
+            "SELECT id, run_id, task_id, attempt_id, role, agent, mode, command, status, started_at, finished_at, exit_code, duration_ms, stdout, stderr
              FROM agent_sessions
              WHERE agent = ?1
              ORDER BY id DESC
@@ -521,14 +522,18 @@ fn build_session(r: &rusqlite::Row<'_>) -> rusqlite::Result<AgentSession> {
         attempt_id: r.get(3)?,
         role: r.get(4)?,
         agent: r.get(5)?,
-        command: r.get(6)?,
-        status: r.get(7)?,
-        started_at: r.get(8)?,
-        finished_at: r.get(9)?,
-        exit_code: r.get(10)?,
-        duration_ms: r.get(11).map(|v: Option<i64>| v.map(|v| v as u64))?,
-        stdout: r.get(12)?,
-        stderr: r.get(13)?,
+        mode: r
+            .get::<_, String>(6)?
+            .parse()
+            .unwrap_or(AgentSessionMode::Automated),
+        command: r.get(7)?,
+        status: r.get(8)?,
+        started_at: r.get(9)?,
+        finished_at: r.get(10)?,
+        exit_code: r.get(11)?,
+        duration_ms: r.get(12).map(|v: Option<i64>| v.map(|v| v as u64))?,
+        stdout: r.get(13)?,
+        stderr: r.get(14)?,
     })
 }
 
@@ -634,7 +639,12 @@ CREATE INDEX idx_sessions_attempt ON agent_sessions(attempt_id);
 CREATE INDEX idx_sessions_status ON agent_sessions(status);
 ";
 
-const MIGRATIONS: &[&str] = &[V1_SCHEMA, V2_SCHEMA, V3_SCHEMA];
+const V4_SCHEMA: &str = "
+ALTER TABLE agent_sessions ADD COLUMN mode TEXT NOT NULL DEFAULT 'automated';
+CREATE INDEX idx_sessions_mode_status ON agent_sessions(mode, status);
+";
+
+const MIGRATIONS: &[&str] = &[V1_SCHEMA, V2_SCHEMA, V3_SCHEMA, V4_SCHEMA];
 
 fn migrate(conn: &mut Connection) -> Result<()> {
     migrate_schemas(conn, MIGRATIONS)
@@ -670,8 +680,8 @@ fn migrate_schemas(conn: &mut Connection, schemas: &[&str]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use factory_types::{
-        AgentSession, AttemptStatus, Plan, PlannedTask, ReviewDecision, ReviewResult, RunStatus,
-        TaskEvidence, TaskState,
+        AgentSession, AgentSessionMode, AttemptStatus, Plan, PlannedTask, ReviewDecision,
+        ReviewResult, RunStatus, TaskEvidence, TaskState,
     };
     use rusqlite::Connection;
     use tempfile::TempDir;
@@ -684,12 +694,12 @@ mod tests {
         let path = dir.path().join("test.db");
         let db = FactoryDb::open(&path).unwrap();
         let versions = schema_versions(&path);
-        assert_eq!(versions, vec![1, 2, 3]);
+        assert_eq!(versions, vec![1, 2, 3, 4]);
         db.create_run("objective", Some("codex")).unwrap();
         drop(db);
 
         let db = FactoryDb::open(&path).unwrap();
-        assert_eq!(schema_versions(&path), vec![1, 2, 3]);
+        assert_eq!(schema_versions(&path), vec![1, 2, 3, 4]);
         db.list_runs().unwrap();
     }
 
@@ -714,7 +724,7 @@ mod tests {
         drop(conn);
 
         let db = FactoryDb::open(&path).unwrap();
-        assert_eq!(schema_versions(&path), vec![1, 2, 3]);
+        assert_eq!(schema_versions(&path), vec![1, 2, 3, 4]);
         let run = db.get_run(1).unwrap().unwrap();
         assert_eq!(run.objective, "legacy");
         let tasks = db.list_tasks(1).unwrap();
@@ -873,6 +883,7 @@ mod tests {
             attempt_id: None,
             role: "planner".to_string(),
             agent: "codex".to_string(),
+            mode: AgentSessionMode::Automated,
             command: "codex exec".to_string(),
             status: "success".to_string(),
             started_at: "2026-01-01T00:00:00Z".to_string(),
@@ -1002,6 +1013,7 @@ mod tests {
                 attempt_id: Some(attempt.id),
                 role: "worker".into(),
                 agent: "worker".into(),
+                mode: AgentSessionMode::Automated,
                 command: "worker --task".into(),
                 status: "running".into(),
                 started_at: "2026-01-01T00:00:00Z".into(),

@@ -5,8 +5,12 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+factory-agent = { workspace = true }
 factory-core = { workspace = true }
+factory-db = { workspace = true }
 factory-types = { workspace = true }
+chrono = { workspace = true }
+portable-pty = "0.9"
 thiserror = { workspace = true }
 tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
 

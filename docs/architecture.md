@@ -14,12 +14,16 @@ flowchart TB
     API --> RUNTIME[Factory Runtime]
     API --> CORE[Factory Core]
     RUNTIME --> CORE
-    CORE --> P[Planner]
-    CORE --> W[Worker]
-    CORE --> R[Reviewer]
-    P --> S[AgentSessions]
+    CORE --> AUTO[Automated invocation profiles]
+    AUTO --> P[Planner]
+    AUTO --> W[Worker]
+    AUTO --> R[Reviewer]
+    P --> S[Automated AgentSessions]
     W --> S
     R --> S
+    RUNTIME --> PTY[PTY / ConPTY]
+    PTY --> IS[Interactive AgentSession]
+    IS --> CA[Configured coding agent]
     W --> WT[Git worktrees]
     R --> WT
     CORE --> DB[(SQLite)]
@@ -100,6 +104,28 @@ The Rust process owns background planning and execution. Browser reloads do not 
 workflow. This is an in-process runtime; it does not use an external queue or continue
 subprocesses across a Factory process restart.
 
+## Agent invocation modes
+
+Factory keeps automated work and user-driven terminals separate:
+
+```text
+Planner / Worker / Reviewer -> non-interactive process -> stdout / stderr -> exit
+Agent Console               -> PTY or ConPTY         <-> terminal WebSocket
+```
+
+An agent profile defines its executable, workflow arguments, prompt transport, and
+interactive arguments. Known profiles use argument transport (`codex exec`, `claude
+-p`, `opencode run`, `gemini -p`, and `qwen -p`). Legacy known configurations are
+inferred without rewriting their TOML; unknown legacy configurations remain custom
+stdin agents. Custom argument transport replaces one complete `{mission}` argument or
+appends the mission as one argument. No shell interpolation is used.
+
+`AgentSession.mode` distinguishes `automated` workflow invocations from `interactive`
+console invocations. Automated output remains split into stdout and stderr and streams
+through SSE. Interactive output is the PTY's combined terminal byte stream and uses a
+session-scoped WebSocket for input, output, and resize. Windows uses ConPTY; Linux and
+macOS use the platform PTY through `portable-pty`.
+
 ## API boundary
 
 | Method | Route                         | Purpose                                      |
@@ -111,14 +137,17 @@ subprocesses across a Factory process restart.
 | POST   | `/api/tasks/:id/retry`        | Retry an eligible task within the limit      |
 | GET    | `/api/graph`                  | Read Factory entities and semantic links     |
 | GET    | `/api/sessions/:id/stream`    | Stream one known session through SSE         |
+| POST   | `/api/agents/:agent/sessions` | Start that configured agent in a PTY          |
+| DELETE | `/api/sessions/:id`           | Stop one live interactive session             |
+| GET    | `/api/sessions/:id/terminal`  | Upgrade one live interactive session to WS    |
 | GET    | `/api/graph/workspace`        | Read visual workspace state                  |
 | PUT    | `/api/graph/workspace`        | Validate and atomically save visual state    |
 | GET    | `/api/config`                 | Read configured agents and role assignments  |
 | PUT    | `/api/config`                 | Validate and atomically save configuration   |
 
-Agent output uses session-scoped Server-Sent Events because current configured
-invocations are non-interactive. The stream reads only a known persisted session and
-closes at a terminal state. No stdin or WebSocket route is present.
+Automated output uses session-scoped Server-Sent Events. Interactive terminal traffic
+uses WebSocket only after the session ID resolves to a live Factory-owned PTY session.
+Both transports close at a terminal state.
 
 ## Agent Graph state ownership
 

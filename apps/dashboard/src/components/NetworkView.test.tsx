@@ -135,7 +135,7 @@ describe("Agent Graph interactions", () => {
     fireEvent.click(await screen.findByRole("button", { name: "select agent:codex" }));
 
     expect(await screen.findByLabelText("codex Agent Console")).toBeTruthy();
-    expect(screen.getByText("No active session.")).toBeTruthy();
+    expect(screen.getByText("No active interactive session.")).toBeTruthy();
   });
 
   it("opens the compact node creation menu from the toolbar", async () => {

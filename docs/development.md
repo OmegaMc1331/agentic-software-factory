@@ -64,6 +64,13 @@ execution also creates a durable `TaskAttempt` containing status, worktree, exit
 evidence, and structured review. Process exit code 0 doesn't complete a task without
 Reviewer approval. The centralized retry limit is `MAX_TASK_ATTEMPTS`.
 
+Agent entries have a small invocation profile: kind, workflow arguments, prompt
+transport, environment, and optional interactive arguments. Automated execution uses
+either a stdin payload or one process argument and never shell interpolation. Treat
+missing executables, disabled automated transport, invalid placeholders, and detected
+TTY requirements as configuration failures; they must not consume the normal retry
+loop.
+
 Opening the API state reconciles records left `running` by a previous process. Add
 migrations for schema changes; don't rewrite existing migrations.
 
@@ -85,9 +92,15 @@ Workflow nodes come from real Runs. Task nodes and dependency edges come from SQ
 Role assignments update `.factory/config.toml`; custom links, groups, notes, and
 memberships remain visual-only.
 
-The Agent Console consumes persisted session data and a session-scoped SSE route. SSE
-is sufficient while sessions are output-only. Add a bidirectional transport only when
-the runtime owns a specific interactive session; never expose an arbitrary shell.
+The Agent Console consumes persisted session data. Automated sessions use the
+session-scoped SSE route. Interactive sessions are started for a configured agent,
+owned by `factory-runtime`, and connected through a session-scoped WebSocket to a
+`portable-pty` terminal. Propagate xterm dimensions to `MasterPty::resize`; never add a
+generic shell or executable endpoint.
+
+Invocation tests construct commands without authenticated external agents. The runtime
+PTY probe runs the test executable inside ConPTY/PTY and asserts that stdin is a
+terminal. Keep Windows coverage enabled where ConPTY is available.
 
 Frontend tests cover workflow creation, plan inspection, start errors, graph dragging,
 custom edge deletion, and Agent Console states:
