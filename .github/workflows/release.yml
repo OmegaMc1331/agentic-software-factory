@@ -101,6 +101,37 @@ jobs:
           curl -fsS http://127.0.0.1:4321/ | grep -q 'id="root"'
           echo "OK: standalone binary serves the embedded dashboard"
 
+      - name: Smoke test a standalone copy of the binary (Windows)
+        if: matrix.is_windows == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dir = Join-Path $env:RUNNER_TEMP "factory-smoke-${{ matrix.name }}"
+          Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.binary }}" (Join-Path $dir "${{ matrix.binary }}")
+          $exe = Join-Path $dir "${{ matrix.binary }}"
+          $proc = $null
+          try {
+              & $exe --version | Out-Null
+              & $exe init | Out-Null
+              $proc = Start-Process -FilePath $exe -ArgumentList 'start','--no-browser' -PassThru
+              $content = $null
+              $ok = $false
+              for ($i = 0; $i -lt 50; $i++) {
+                  try {
+                      $resp = Invoke-WebRequest -Uri 'http://127.0.0.1:4321/' -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop
+                      if ($resp.StatusCode -eq 200) { $content = $resp.Content; $ok = $true; break }
+                  } catch { Start-Sleep -Milliseconds 200 }
+              }
+              if (-not $ok) { throw 'dashboard did not respond on 127.0.0.1:4321' }
+              if ($content -notmatch 'id="root"') { throw 'embedded dashboard marker not found' }
+              Write-Output 'OK: standalone binary serves the embedded dashboard'
+          } finally {
+              if ($null -ne $proc) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
+              Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue
+          }
+
       - name: Package the archive
         shell: bash
         run: |
@@ -112,19 +143,43 @@ jobs:
             tar -czf "release/${{ matrix.archive }}" -C "target/${{ matrix.target }}/release" "${{ matrix.binary }}" -C "$GITHUB_WORKSPACE" LICENSE
           fi
 
-      - name: Verify the archive and generate its SHA-256 checksum
+      - name: Verify the Windows archive contents
+        if: matrix.is_windows == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $check = Join-Path $env:RUNNER_TEMP "factory-release-check"
+          Remove-Item $check -Recurse -Force -ErrorAction SilentlyContinue
+          Expand-Archive -Path "release/${{ matrix.archive }}" -DestinationPath $check -Force
+
+          if (-not (Test-Path (Join-Path $check "${{ matrix.binary }}"))) {
+              throw "${{ matrix.binary }} missing from Windows archive"
+          }
+          if (-not (Test-Path (Join-Path $check "LICENSE"))) {
+              throw "LICENSE missing from Windows archive"
+          }
+
+          Remove-Item $check -Recurse -Force -ErrorAction SilentlyContinue
+          echo "OK: Windows archive contents verified"
+
+      - name: Verify the tar.gz archive contents
+        if: matrix.is_windows == 'false'
         shell: bash
         run: |
           set -euo pipefail
-          if [ "${{ matrix.is_windows }}" = "true" ]; then
-            tar -tf "release/${{ matrix.archive }}" | grep -q "${{ matrix.binary }}"
-            tar -tf "release/${{ matrix.archive }}" | grep -q 'LICENSE'
-          else
-            tar -tzf "release/${{ matrix.archive }}" | grep -q "${{ matrix.binary }}"
-            tar -tzf "release/${{ matrix.archive }}" | grep -q 'LICENSE'
-          fi
+          contents="$(mktemp)"
+          tar -tzf "release/${{ matrix.archive }}" > "$contents"
+          grep -q "${{ matrix.binary }}" -x "$contents"
+          grep -q "LICENSE" -x "$contents"
+          rm -f "$contents"
+          echo "OK: archive contents verified"
+
+      - name: Generate the SHA-256 checksum
+        shell: bash
+        run: |
+          set -euo pipefail
           ( sha256sum "release/${{ matrix.archive }}" || shasum -a 256 "release/${{ matrix.archive }}" ) > "release/${{ matrix.archive }}.sha256"
-          echo "OK: archive contents verified, checksum written"
+          echo "OK: checksum written"
           ls -la release
 
       - name: Upload the release artifacts
@@ -159,10 +214,30 @@ jobs:
             [ -f "$f" ] || { echo "missing artifact: $f"; exit 1; }
             [ -f "$f.sha256" ] || { echo "missing checksum: $f.sha256"; exit 1; }
           done
-          tar -tf factory-windows-x86_64.zip | grep -q factory.exe
-          tar -tzf factory-linux-x86_64.tar.gz | grep -qx factory
-          tar -tzf factory-macos-aarch64.tar.gz | grep -qx factory
-          tar -tzf factory-macos-x86_64.tar.gz | grep -qx factory
+          windows_list="$(mktemp)"
+          unzip -Z1 factory-windows-x86_64.zip > "$windows_list"
+          grep -qx factory.exe "$windows_list"
+          grep -qx LICENSE "$windows_list"
+          rm -f "$windows_list"
+
+          linux_list="$(mktemp)"
+          tar -tzf factory-linux-x86_64.tar.gz > "$linux_list"
+          grep -qx factory "$linux_list"
+          grep -qx LICENSE "$linux_list"
+          rm -f "$linux_list"
+
+          macos_aarch64_list="$(mktemp)"
+          tar -tzf factory-macos-aarch64.tar.gz > "$macos_aarch64_list"
+          grep -qx factory "$macos_aarch64_list"
+          grep -qx LICENSE "$macos_aarch64_list"
+          rm -f "$macos_aarch64_list"
+
+          macos_x86_64_list="$(mktemp)"
+          tar -tzf factory-macos-x86_64.tar.gz > "$macos_x86_64_list"
+          grep -qx factory "$macos_x86_64_list"
+          grep -qx LICENSE "$macos_x86_64_list"
+          rm -f "$macos_x86_64_list"
+
           echo "OK: all archives, binaries, and checksums present"
 
       - name: Combine the checksums
