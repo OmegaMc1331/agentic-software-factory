@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use axum::extract::{Path as UrlPath, State};
@@ -10,8 +10,8 @@ use axum::{Json, Router};
 use factory_core::{Agents, Config, ConfigError};
 use factory_db::FactoryDb;
 use serde_json::json;
-use tower_http::services::{ServeDir, ServeFile};
 
+use crate::dashboard;
 use crate::types::{GraphEdge, GraphNode, GraphResponse, RunDetail, RunSummary, TaskCounts};
 
 pub struct ApiState {
@@ -71,7 +71,7 @@ pub fn router(state: SharedState) -> Router {
         .route("/api/agents", get(get_agents))
         .route("/api/config", get(get_config).put(put_config))
         .route("/api/*rest", get(api_not_found))
-        .fallback_service(dashboard_service(&state.root))
+        .fallback_service(dashboard::router(&state.root))
         .with_state(state)
 }
 
@@ -79,57 +79,21 @@ async fn api_not_found() -> ApiError {
     ApiError::new(StatusCode::NOT_FOUND, "unknown endpoint")
 }
 
-pub async fn run_app(state: SharedState, port: u16) -> std::io::Result<()> {
-    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+/// Bind the listener first so the caller can advertise the URL before
+/// accepting connections.
+pub fn bind(port: u16) -> std::io::Result<std::net::TcpListener> {
+    let addr = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port));
+    std::net::TcpListener::bind(addr)
+}
+
+/// Serve the API and dashboard on an already-bound listener.
+pub async fn serve(state: SharedState, listener: std::net::TcpListener) -> std::io::Result<()> {
+    let listener = tokio::net::TcpListener::from_std(listener)?;
     axum::serve(listener, router(state)).await
 }
 
-fn dashboard_service(root: &Path) -> Router {
-    let dir = find_dashboard_dir(root).unwrap_or_else(dashboard_stub_dir);
-    Router::new().fallback_service(
-        ServeDir::new(&dir).not_found_service(ServeFile::new(dir.join("index.html"))),
-    )
-}
-
-fn dashboard_stub_dir() -> PathBuf {
-    let dir = std::env::temp_dir().join("factory-dashboard-stub");
-    let _ = std::fs::create_dir_all(&dir);
-    std::fs::write(
-        dir.join("index.html"),
-        "<!doctype html><meta charset=\"utf-8\"><title>Agentic Software Factory</title>\
-         <style>body{font-family:system-ui,sans-serif;background:#0f1115;color:#d7dce3;margin:48px auto;max-width:560px;line-height:1.6}</style>\
-         <h1>Dashboard not built</h1>\
-         <p>The dashboard has not been built yet. From the project root run:</p>\
-         <pre>cd apps/dashboard\nnpm install\nnpm run build</pre>\
-         <p>Then restart <code>factory start</code>.</p>",
-    )
-    .ok();
-    dir
-}
-
-fn find_dashboard_dir(start: &Path) -> Option<PathBuf> {
-    let mut cursor = Some(start.to_path_buf());
-    while let Some(dir) = cursor {
-        let candidate = dir.join("apps").join("dashboard").join("dist");
-        if candidate.join("index.html").is_file() {
-            return Some(candidate);
-        }
-        cursor = dir.parent().map(Path::to_path_buf);
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            let mut cursor = Some(parent.to_path_buf());
-            while let Some(dir) = cursor {
-                let candidate = dir.join("apps").join("dashboard").join("dist");
-                if candidate.join("index.html").is_file() {
-                    return Some(candidate);
-                }
-                cursor = dir.parent().map(Path::to_path_buf);
-            }
-        }
-    }
-    None
+pub async fn run_app(state: SharedState, port: u16) -> std::io::Result<()> {
+    serve(state, bind(port)?).await
 }
 
 async fn health() -> Json<serde_json::Value> {

@@ -4,6 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# Release builds embed apps/dashboard/dist into the binary, so `factory start`
+# serves the dashboard without a source checkout. The folder must exist at
+# compile time: `cd apps/dashboard && npm run build` first.
+embedded-dashboard = ["dep:rust-embed"]
+
 [dependencies]
 factory-types = { workspace = true }
 factory-db = { workspace = true }
@@ -13,6 +19,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs"] }
 tower-http = { version = "0.5", features = ["fs"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+rust-embed = { version = "8", features = ["mime-guess"], optional = true }
 
 [dev-dependencies]
 tempfile = "3"

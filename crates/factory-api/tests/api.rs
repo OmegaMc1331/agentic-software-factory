@@ -10,7 +10,7 @@ use tempfile::TempDir;
 use tower::ServiceExt;
 
 fn init_root(root: &Path) {
-    factory_core::Factory::init(root, false).unwrap();
+    factory_core::Factory::init(root).unwrap();
 }
 
 fn make_state(root: &Path) -> Arc<factory_api::ApiState> {
@@ -130,6 +130,47 @@ async fn lists_agents_with_availability() {
     assert!(value.as_array().unwrap()[0]["available"].is_boolean());
 }
 
+#[cfg(feature = "embedded-dashboard")]
+#[tokio::test]
+async fn serves_the_embedded_dashboard_and_spa_fallback() {
+    let dir = TempDir::new().unwrap();
+    init_root(dir.path());
+    let app = factory_api::router(make_state(dir.path()));
+
+    let response = app
+        .clone()
+        .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(body_text(response).await.contains("id=\"root\""));
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/settings")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(body_text(response).await.contains("id=\"root\""));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/not-a-route")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[cfg(not(feature = "embedded-dashboard"))]
 #[tokio::test]
 async fn serves_the_dashboard_index_from_dist() {
     let dir = TempDir::new().unwrap();

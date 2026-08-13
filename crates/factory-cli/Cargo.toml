@@ -8,6 +8,9 @@ license.workspace = true
 name = "factory"
 path = "src/main.rs"
 
+[features]
+embedded-dashboard = ["factory-api/embedded-dashboard"]
+
 [dependencies]
 factory-core = { workspace = true }
 factory-db = { workspace = true }
