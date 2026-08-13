@@ -255,6 +255,7 @@ jobs:
           fi
           gh release create "$GITHUB_REF_NAME" \
             release/* SHA256SUMS.txt \
+            --repo "$GITHUB_REPOSITORY" \
             --title "Agentic Software Factory $GITHUB_REF_NAME" \
             --notes "Prebuilt binaries for Windows (x86_64), Linux (x86_64), macOS Apple Silicon and macOS Intel." \
             $prerelease
