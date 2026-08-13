@@ -10,6 +10,7 @@ flowchart LR
     CLI[factory binary] --> CORE[factory-core]
     DASH[Dashboard: Vite + React] --> API[factory-api]
     API --> CORE
+    EMBED["dashboard assets (rust-embed)"] -. release only .-> API
     CORE --> DB[factory-db / SQLite]
     CORE --> GIT[factory-git / worktrees]
     CORE --> AGENT[factory-agent / subprocess]
@@ -105,17 +106,30 @@ An axum application serving the dashboard and the API from one process. Routes:
 | GET    | `/api/config`    | Agent/role configuration                  |
 | PUT    | `/api/config`    | Write a validated configuration, atomically |
 
-The dashboard build (`apps/dashboard/dist`), resolved from the working directory or the
-binary location, is served for every non-API path. When it is missing, a stub page
-explains how to build it. Unknown `/api/*` paths return 404. The server binds
-`127.0.0.1`.
+The dashboard is served for every non-API path; unknown `/api/*` paths return 404. How
+the dashboard assets are provided depends on the build:
+
+- **Release builds** (`--features embedded-dashboard`): the compiled dashboard is
+  embedded into the binary with `rust-embed`. The binary alone is a complete
+  installation; there is no dependency on a `dist` directory beside it. The feature
+  fails at compile time if `apps/dashboard/dist` is missing.
+- **Development builds** (no feature): the server looks for `apps/dashboard/dist`
+  relative to the working directory or the binary, and shows a stub page explaining how
+  to build the dashboard when it is missing.
+
+The server binds `127.0.0.1`.
 
 ### factory-cli
 
 The `factory` binary. Public commands are `init`, `start` (one process for API and
-dashboard; opens the browser), `run`, and `status`. Everything else — `agents`,
-`config list`, `tasks`, `inspect`, `mark`, `worktree`, and `serve` — sits under
-`factory dev` for debugging and development.
+dashboard), `run`, and `status`. Everything else — `agents`, `config list`, `tasks`,
+`inspect`, `mark`, `worktree`, and `serve` — sits under `factory dev` for debugging and
+development.
+
+`init` is idempotent: running it inside an already initialized project prints "Factory
+already initialized." and does not touch existing state. `start` binds the listener
+first, prints the URL, and only then opens the browser (`--no-browser` skips the
+browser), so the browser never races an unready server.
 
 ## Task state machine
 

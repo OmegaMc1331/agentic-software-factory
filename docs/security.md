@@ -46,3 +46,12 @@ rename). There is no endpoint that executes shell commands.
 
 SQLite lives at `.factory/db.sqlite3` with the process default permissions. All SQL is
 parameterized; schema changes come only from versioned migrations applied at open.
+
+## Installers
+
+`install.ps1` and `install.sh` download prebuilt binaries from GitHub Releases over
+HTTPS. They never run the downloaded binary during installation. Each archive ships
+with a published SHA-256 checksum; the installer verifies the download against it and
+aborts on any mismatch, so the served binary is trusted only as far as GitHub itself is.
+Installation is user-local (under `%LOCALAPPDATA%` or `$HOME/.local/bin`) and requires
+no administrator rights. The installers do not store credentials.

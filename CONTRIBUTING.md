@@ -26,6 +26,9 @@ cargo test
 cd apps/dashboard && npm install
 ```
 
+To build a release binary with the dashboard embedded (as shipped), build the dashboard
+first, then `cargo build --release --features embedded-dashboard -p factory-cli`.
+
 ## Making changes
 
 - Run `cargo fmt --all` and `cargo clippy --workspace --all-targets` before committing;
