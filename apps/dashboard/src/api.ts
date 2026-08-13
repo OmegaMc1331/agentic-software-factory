@@ -1,8 +1,13 @@
 import type { AgentStatusInfo, ConfigData, GraphData, RunDetail, RunSummary } from "./types";
 
 const API_BASE = "/api";
+const REQUEST_TIMEOUT_MS = 5000;
 
-async function fail(response: Response, path: string): Promise<never> {
+function timeoutError(): Error {
+  return new Error("Factory API did not respond. Check that `factory start` is still running.");
+}
+
+async function fail(response: Response): Promise<never> {
   let detail = "";
   try {
     const text = await response.text();
@@ -14,28 +19,55 @@ async function fail(response: Response, path: string): Promise<never> {
   } catch {
     detail = "";
   }
-  throw new Error(detail || `request to ${path} failed with ${response.status}`);
+  const suffix = detail ? `: ${detail}` : "";
+  throw new Error(`Factory API request failed (HTTP ${response.status})${suffix}`);
+}
+
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+
+  try {
+    let response: Response;
+    try {
+      response = await fetch(`${API_BASE}${path}`, { ...init, signal: controller.signal });
+    } catch {
+      if (controller.signal.aborted) throw timeoutError();
+      throw new Error(
+        "Could not connect to the Factory API. Check that `factory start` is running."
+      );
+    }
+
+    if (!response.ok) {
+      try {
+        return await fail(response);
+      } catch (error) {
+        if (controller.signal.aborted) throw timeoutError();
+        throw error;
+      }
+    }
+    if (response.status === 204) return undefined as T;
+    try {
+      return (await response.json()) as T;
+    } catch {
+      if (controller.signal.aborted) throw timeoutError();
+      throw new Error("Factory API returned an invalid response.");
+    }
+  } finally {
+    window.clearTimeout(timeout);
+  }
 }
 
 async function get<T>(path: string): Promise<T> {
-  const response = await fetch(`${API_BASE}${path}`);
-  if (!response.ok) {
-    return fail(response, path);
-  }
-  return response.json() as Promise<T>;
+  return request<T>(path);
 }
 
 async function put<T>(path: string, body: unknown): Promise<T> {
-  const response = await fetch(`${API_BASE}${path}`, {
+  return request<T>(path, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
-  if (!response.ok) {
-    return fail(response, path);
-  }
-  if (response.status === 204) return undefined as T;
-  return response.json() as Promise<T>;
 }
 
 export function fetchRuns(): Promise<RunSummary[]> {

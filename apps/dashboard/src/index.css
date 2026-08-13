@@ -125,6 +125,10 @@ code {
   margin: 0;
 }
 
+.empty-actions {
+  margin-top: 16px;
+}
+
 .table {
   width: 100%;
   border-collapse: collapse;

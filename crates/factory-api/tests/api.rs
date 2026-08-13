@@ -1,5 +1,8 @@
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -24,6 +27,104 @@ fn make_state(root: &Path) -> Arc<factory_api::ApiState> {
 async fn body_text(response: axum::response::Response) -> String {
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     String::from_utf8_lossy(&bytes).into_owned()
+}
+
+#[test]
+fn bind_returns_a_nonblocking_listener() {
+    let listener = factory_api::bind(0).unwrap();
+    let address = listener.local_addr().unwrap();
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+
+    let accept_thread = std::thread::spawn(move || {
+        let result = listener.accept().map(|_| ()).map_err(|error| error.kind());
+        result_tx.send(result).unwrap();
+    });
+
+    let result = match result_rx.recv_timeout(Duration::from_secs(1)) {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            // Unblock and join the worker before failing, so a regression cannot hang CI.
+            let _ = TcpStream::connect_timeout(&address, Duration::from_secs(1));
+            let _ = result_rx.recv_timeout(Duration::from_secs(1));
+            accept_thread.join().unwrap();
+            panic!("accept blocked; listener was not configured as non-blocking");
+        }
+        Err(error) => panic!("accept worker disconnected: {error}"),
+    };
+
+    accept_thread.join().unwrap();
+    assert_eq!(result.unwrap_err(), std::io::ErrorKind::WouldBlock);
+}
+
+async fn live_get(address: SocketAddr, path: &'static str) -> String {
+    tokio::task::spawn_blocking(move || {
+        let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(2)).unwrap();
+        stream.set_nodelay(true).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        write!(
+            stream,
+            "GET {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+        let mut response = Vec::new();
+        let mut chunk = [0; 1024];
+        while !http_response_is_complete(&response) {
+            let read = stream.read(&mut chunk).unwrap();
+            if read == 0 {
+                break;
+            }
+            response.extend_from_slice(&chunk[..read]);
+        }
+        String::from_utf8(response).unwrap()
+    })
+    .await
+    .unwrap()
+}
+
+fn http_response_is_complete(response: &[u8]) -> bool {
+    let Some(header_end) = response.windows(4).position(|window| window == b"\r\n\r\n") else {
+        return false;
+    };
+    let headers = String::from_utf8_lossy(&response[..header_end]);
+    let content_length = headers.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case("content-length")
+            .then(|| value.trim().parse::<usize>().ok())
+            .flatten()
+    });
+    content_length.is_some_and(|length| response.len() >= header_end + 4 + length)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_server_handles_sequential_api_requests() {
+    let dir = TempDir::new().unwrap();
+    init_root(dir.path());
+    let listener = factory_api::bind(0).unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(factory_api::serve(make_state(dir.path()), listener));
+
+    let health = live_get(address, "/api/health").await;
+    assert!(health.starts_with("HTTP/1.1 200 OK"));
+    assert!(health.contains(r#"{"status":"ok"}"#));
+
+    let runs = live_get(address, "/api/runs").await;
+    assert!(runs.starts_with("HTTP/1.1 200 OK"));
+    let runs_body = runs.split_once("\r\n\r\n").unwrap().1;
+    assert!(serde_json::from_str::<serde_json::Value>(runs_body)
+        .unwrap()
+        .is_array());
+
+    let health_again = live_get(address, "/api/health").await;
+    assert!(health_again.starts_with("HTTP/1.1 200 OK"));
+    assert!(health_again.contains(r#"{"status":"ok"}"#));
+
+    server.abort();
+    assert!(server.await.unwrap_err().is_cancelled());
 }
 
 #[tokio::test]

@@ -79,11 +79,11 @@ async fn api_not_found() -> ApiError {
     ApiError::new(StatusCode::NOT_FOUND, "unknown endpoint")
 }
 
-/// Bind the listener first so the caller can advertise the URL before
-/// accepting connections.
 pub fn bind(port: u16) -> std::io::Result<std::net::TcpListener> {
     let addr = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port));
-    std::net::TcpListener::bind(addr)
+    let listener = std::net::TcpListener::bind(addr)?;
+    listener.set_nonblocking(true)?;
+    Ok(listener)
 }
 
 /// Serve the API and dashboard on an already-bound listener.

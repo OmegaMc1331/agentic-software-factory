@@ -8,6 +8,7 @@ import type { RunDetail, RunSummary } from "./types";
 
 type View =
   { name: "runs" } | { name: "network" } | { name: "settings" } | { name: "run"; id: number };
+type LoadState = "loading" | "ready" | "error";
 
 function viewFromHash(): View {
   const runMatch = window.location.hash.match(/^#\/runs\/(\d+)$/);
@@ -28,6 +29,23 @@ function Loading() {
   return <p className="empty-title">Loading…</p>;
 }
 
+function RunsError({ message, onRetry }: { message: string; onRetry: () => void }) {
+  return (
+    <div className="empty" role="alert">
+      <p className="empty-title">Could not connect to the Factory API.</p>
+      <p className="empty-body">
+        Check that <code>factory start</code> is running.
+      </p>
+      <p className="error">{message}</p>
+      <div className="empty-actions">
+        <button className="button" onClick={onRetry}>
+          Retry
+        </button>
+      </div>
+    </div>
+  );
+}
+
 const NAV: { view: View["name"]; label: string }[] = [
   { view: "runs", label: "Runs" },
   { view: "network", label: "Agent Graph" },
@@ -36,23 +54,32 @@ const NAV: { view: View["name"]; label: string }[] = [
 
 export default function App() {
   const [runs, setRuns] = useState<RunSummary[] | null>(null);
+  const [runsState, setRunsState] = useState<LoadState>("loading");
+  const [runsError, setRunsError] = useState("");
   const [detail, setDetail] = useState<RunDetail | null>(null);
   const [view, setView] = useState<View>(viewFromHash);
-  const [error, setError] = useState<string | null>(null);
+  const [detailError, setDetailError] = useState<string | null>(null);
 
   const loadRun = useCallback((id: number) => {
     setDetail(null);
-    setError(null);
+    setDetailError(null);
     fetchRun(id)
       .then(setDetail)
-      .catch((err: Error) => setError(err.message));
+      .catch((err: Error) => setDetailError(err.message));
   }, []);
 
   const loadRuns = useCallback(() => {
-    setError(null);
+    setRunsState("loading");
+    setRunsError("");
     fetchRuns()
-      .then(setRuns)
-      .catch((err: Error) => setError(err.message));
+      .then((nextRuns) => {
+        setRuns(nextRuns);
+        setRunsState("ready");
+      })
+      .catch((err: Error) => {
+        setRunsError(err.message);
+        setRunsState("error");
+      });
   }, []);
 
   useEffect(() => {
@@ -75,7 +102,7 @@ export default function App() {
   }, [view, loadRun]);
 
   const navigate = (next: View) => {
-    setError(null);
+    setDetailError(null);
     window.location.hash = hashFor(next);
   };
 
@@ -114,13 +141,16 @@ export default function App() {
           <SettingsView />
         ) : (
           <>
-            {error && <p className="error">{error}</p>}
-            {view.name === "run" && !error && detail !== null && (
+            {view.name === "run" && detailError && <p className="error">{detailError}</p>}
+            {view.name === "run" && !detailError && detail !== null && (
               <RunDetailView detail={detail} onBack={() => navigate({ name: "runs" })} />
             )}
-            {view.name === "run" && !error && detail === null && <Loading />}
-            {view.name === "runs" && !error && runs === null && <Loading />}
-            {view.name === "runs" && !error && runs !== null && (
+            {view.name === "run" && !detailError && detail === null && <Loading />}
+            {view.name === "runs" && runsState === "loading" && <Loading />}
+            {view.name === "runs" && runsState === "error" && (
+              <RunsError message={runsError} onRetry={loadRuns} />
+            )}
+            {view.name === "runs" && runsState === "ready" && runs !== null && (
               <RunList runs={runs} onSelect={(id) => navigate({ name: "run", id })} />
             )}
           </>

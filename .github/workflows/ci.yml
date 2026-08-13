@@ -85,12 +85,14 @@ jobs:
           pid=$!
           trap 'kill $pid 2>/dev/null || true' EXIT
           for i in $(seq 1 50); do
-            curl -fsS http://127.0.0.1:4321/ >/dev/null 2>&1 && break
+            curl --max-time 2 -fsS http://127.0.0.1:4321/api/health >/tmp/factory-health.json 2>/dev/null && break
             sleep 0.2
           done
+          python3 -c 'import json; assert json.load(open("/tmp/factory-health.json"))["status"] == "ok"'
+          curl --max-time 2 -fsS http://127.0.0.1:4321/api/runs >/tmp/factory-runs.json
+          python3 -c 'import json; assert isinstance(json.load(open("/tmp/factory-runs.json")), list)'
           curl -fsS http://127.0.0.1:4321/ | grep -q 'id="root"'
-          curl -fsS http://127.0.0.1:4321/api/health | grep -q '"status":"ok"'
-          echo "OK: standalone binary serves the embedded dashboard"
+          echo "OK: standalone binary serves health, runs, and the embedded dashboard"
 
   installers:
     name: Installer end-to-end test

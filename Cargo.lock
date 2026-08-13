@@ -325,7 +325,7 @@ dependencies = [
 
 [[package]]
 name = "factory-agent"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "tempfile",
@@ -334,7 +334,7 @@ dependencies = [
 
 [[package]]
 name = "factory-api"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "axum",
  "factory-core",
@@ -352,7 +352,7 @@ dependencies = [
 
 [[package]]
 name = "factory-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -367,7 +367,7 @@ dependencies = [
 
 [[package]]
 name = "factory-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "factory-agent",
@@ -383,7 +383,7 @@ dependencies = [
 
 [[package]]
 name = "factory-db"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "factory-types",
@@ -395,7 +395,7 @@ dependencies = [
 
 [[package]]
 name = "factory-git"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "tempfile",
  "thiserror",
@@ -403,7 +403,7 @@ dependencies = [
 
 [[package]]
 name = "factory-types"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
 ]

@@ -1,12 +1,14 @@
 use std::path::Path;
 use std::process::Command as ProcessCommand;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use factory_core::{Agents, Config, Factory, FACTORY_DIR};
 use factory_db::FactoryDb;
 use factory_types::TaskState;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn main() -> Result<()> {
     dotenvy::dotenv().ok();
@@ -370,18 +372,63 @@ fn start(root: &Path, port: u16, no_browser: bool) -> Result<()> {
         db: Mutex::new(db),
         root: root.to_path_buf(),
     };
-    // Bind the listener before advertising the URL so the browser never opens
-    // against a server that is not ready.
     let listener = factory_api::bind(port)?;
-    let url = format!("http://127.0.0.1:{}", listener.local_addr()?.port());
-    println!("Agentic Software Factory running at {url}");
-    if !no_browser {
-        open_browser(&url);
-    }
+    let address = listener.local_addr()?;
+    let url = format!("http://127.0.0.1:{}", address.port());
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(factory_api::serve(Arc::new(state), listener))?;
+    runtime.block_on(async move {
+        let mut server = tokio::spawn(factory_api::serve(Arc::new(state), listener));
+        tokio::select! {
+            result = &mut server => {
+                result.context("Factory API task failed")??;
+                bail!("Factory API stopped before becoming ready");
+            }
+            result = wait_until_ready(address) => result?,
+        }
+
+        println!("Agentic Software Factory running at {url}");
+        if !no_browser {
+            open_browser(&url);
+        }
+
+        server.await.context("Factory API task failed")??;
+        Ok(())
+    })
+}
+
+async fn wait_until_ready(address: std::net::SocketAddr) -> Result<()> {
+    let response = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut stream = tokio::net::TcpStream::connect(address).await?;
+        stream.set_nodelay(true)?;
+        let request =
+            format!("GET /api/health HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n");
+        stream.write_all(request.as_bytes()).await?;
+        let mut response = Vec::new();
+        let mut chunk = [0; 1024];
+        loop {
+            let read = stream.read(&mut chunk).await?;
+            if read == 0 {
+                break;
+            }
+            response.extend_from_slice(&chunk[..read]);
+            if response
+                .windows(br#"{"status":"ok"}"#.len())
+                .any(|window| window == br#"{"status":"ok"}"#)
+            {
+                break;
+            }
+        }
+        Ok::<Vec<u8>, std::io::Error>(response)
+    })
+    .await
+    .context("Factory API did not become ready within 5 seconds")??;
+
+    let response = String::from_utf8_lossy(&response);
+    if !response.starts_with("HTTP/1.1 200 OK") || !response.contains(r#"{"status":"ok"}"#) {
+        bail!("Factory API health check did not report a healthy status");
+    }
     Ok(())
 }
 

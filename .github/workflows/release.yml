@@ -95,11 +95,14 @@ jobs:
           pid=$!
           trap 'kill $pid 2>/dev/null || true' EXIT
           for i in $(seq 1 50); do
-            curl -fsS http://127.0.0.1:4321/ >/dev/null 2>&1 && break
+            curl --max-time 2 -fsS http://127.0.0.1:4321/api/health >factory-health.json 2>/dev/null && break
             sleep 0.2
           done
+          python3 -c 'import json; assert json.load(open("factory-health.json"))["status"] == "ok"'
+          curl --max-time 2 -fsS http://127.0.0.1:4321/api/runs >factory-runs.json
+          python3 -c 'import json; assert isinstance(json.load(open("factory-runs.json")), list)'
           curl -fsS http://127.0.0.1:4321/ | grep -q 'id="root"'
-          echo "OK: standalone binary serves the embedded dashboard"
+          echo "OK: standalone binary serves health, runs, and the embedded dashboard"
 
       - name: Smoke test a standalone copy of the binary (Windows)
         if: matrix.is_windows == 'true'
@@ -116,17 +119,28 @@ jobs:
               & $exe --version | Out-Null
               & $exe init | Out-Null
               $proc = Start-Process -FilePath $exe -ArgumentList 'start','--no-browser' -PassThru
-              $content = $null
+              $health = $null
               $ok = $false
               for ($i = 0; $i -lt 50; $i++) {
                   try {
-                      $resp = Invoke-WebRequest -Uri 'http://127.0.0.1:4321/' -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop
-                      if ($resp.StatusCode -eq 200) { $content = $resp.Content; $ok = $true; break }
+                      $resp = Invoke-WebRequest -Uri 'http://127.0.0.1:4321/api/health' -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop
+                      $health = $resp.Content | ConvertFrom-Json
+                      if ($resp.StatusCode -eq 200 -and $health.status -eq 'ok') { $ok = $true; break }
                   } catch { Start-Sleep -Milliseconds 200 }
               }
-              if (-not $ok) { throw 'dashboard did not respond on 127.0.0.1:4321' }
-              if ($content -notmatch 'id="root"') { throw 'embedded dashboard marker not found' }
-              Write-Output 'OK: standalone binary serves the embedded dashboard'
+              if (-not $ok) { throw 'Factory API health endpoint did not become ready on 127.0.0.1:4321' }
+
+              $runsResponse = Invoke-WebRequest -Uri 'http://127.0.0.1:4321/api/runs' -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop
+              $runsResponse.Content | ConvertFrom-Json | Out-Null
+              if ($runsResponse.StatusCode -ne 200 -or $runsResponse.Content.TrimStart() -notmatch '^\[') {
+                  throw 'Factory API runs endpoint did not return a JSON array'
+              }
+
+              $dashboard = Invoke-WebRequest -Uri 'http://127.0.0.1:4321/' -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop
+              if ($dashboard.StatusCode -ne 200 -or $dashboard.Content -notmatch 'id="root"') {
+                  throw 'embedded dashboard marker not found'
+              }
+              Write-Output 'OK: standalone binary serves health, runs, and the embedded dashboard'
           } finally {
               if ($null -ne $proc) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
               Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue

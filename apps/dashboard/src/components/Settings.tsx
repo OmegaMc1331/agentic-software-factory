@@ -57,13 +57,11 @@ export function SettingsView() {
   const reload = useCallback(() => {
     setError(null);
     setSaved(null);
-    fetchConfig()
-      .then(setConfig)
-      .catch((err: Error) => setError(err.message));
-    fetchAgents()
-      .then((list) =>
-        setAvailable(Object.fromEntries(list.map((agent) => [agent.name, agent.available])))
-      )
+    Promise.all([fetchConfig(), fetchAgents()])
+      .then(([nextConfig, list]) => {
+        setConfig(nextConfig);
+        setAvailable(Object.fromEntries(list.map((agent) => [agent.name, agent.available])));
+      })
       .catch((err: Error) => setError(err.message));
   }, []);
 
@@ -144,8 +142,19 @@ export function SettingsView() {
   if (config === null) {
     return (
       <div className="settings">
-        {error && <p className="error">{error}</p>}
-        {!error && <p className="empty-title">Loading…</p>}
+        {error ? (
+          <div className="empty" role="alert">
+            <p className="empty-title">Could not load Settings.</p>
+            <p className="error">{error}</p>
+            <div className="empty-actions">
+              <button className="button" onClick={reload}>
+                Retry
+              </button>
+            </div>
+          </div>
+        ) : (
+          <p className="empty-title">Loading…</p>
+        )}
       </div>
     );
   }

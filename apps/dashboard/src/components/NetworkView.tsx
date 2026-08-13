@@ -23,6 +23,20 @@ function Loading() {
   return <p className="empty-title">Loading…</p>;
 }
 
+function LoadError({ message, onRetry }: { message: string; onRetry: () => void }) {
+  return (
+    <div className="empty net-empty" role="alert">
+      <p className="empty-title">Could not load the Agent Graph.</p>
+      <p className="error">{message}</p>
+      <div className="empty-actions">
+        <button className="button" onClick={onRetry}>
+          Retry
+        </button>
+      </div>
+    </div>
+  );
+}
+
 export function NetworkView() {
   const [data, setData] = useState<GraphData | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -37,7 +51,10 @@ export function NetworkView() {
 
   const reload = useCallback(() => {
     fetchGraph()
-      .then(setData)
+      .then((nextData) => {
+        setData(nextData);
+        setError(null);
+      })
       .catch((err: Error) => setError(err.message));
   }, []);
 
@@ -155,7 +172,7 @@ export function NetworkView() {
   );
 
   if (error) {
-    return <p className="error">{error}</p>;
+    return <LoadError message={error} onRetry={reload} />;
   }
 
   if (data === null) {
