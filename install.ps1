@@ -54,14 +54,18 @@ $exePath = Join-Path $installDir 'factory.exe'
 $asset = 'factory-windows-x86_64.zip'
 
 # 1. detect the architecture
-switch -Regex ($env:PROCESSOR_ARCHITECTURE) {
+# PROCESSOR_ARCHITECTURE is Windows-only; when it is unset (for example when
+# the script is run under pwsh on another platform), use the one published
+# architecture.
+$procArch = if ($env:PROCESSOR_ARCHITECTURE) { $env:PROCESSOR_ARCHITECTURE } else { 'AMD64' }
+switch -Regex ($procArch) {
   '^(AMD64|x86_64)$' { $arch = 'x86_64' }
   '^ARM64$' {
     $arch = 'x86_64'
     Write-Host 'Note: Windows on ARM — installing the x86_64 build (runs via emulation).'
   }
   default {
-    throw "Unsupported architecture: $env:PROCESSOR_ARCHITECTURE. Only x86_64 releases are published."
+    throw "Unsupported architecture: $procArch. Only x86_64 releases are published."
   }
 }
 
