@@ -28,11 +28,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Initialize the factory state in the current directory
-    Init {
-        /// Re-initialize, overwriting existing state
-        #[arg(long)]
-        force: bool,
-    },
+    Init,
     /// Start the local factory application (API + dashboard)
     Start {
         /// Port to bind (default: 4321)
@@ -123,8 +119,8 @@ impl Cli {
     fn run(&self) -> Result<()> {
         let root = std::env::current_dir().context("cannot resolve current directory")?;
         match &self.command {
-            Command::Init { force } => {
-                init(&root, *force)?;
+            Command::Init => {
+                init(&root)?;
             }
             Command::Start { port, no_browser } => {
                 start(&root, *port, *no_browser)?;
@@ -164,9 +160,14 @@ fn factory_root(root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn init(root: &Path, force: bool) -> Result<()> {
+fn init(root: &Path) -> Result<()> {
     let factory_dir = root.join(FACTORY_DIR);
-    Factory::init(root, force)?;
+    let already = factory_dir.join("db.sqlite3").exists();
+    Factory::init(root)?;
+    if already {
+        println!("Factory already initialized.");
+        return Ok(());
+    }
     println!("Initialized factory state at {}", factory_dir.display());
     println!("Database: {}", factory_dir.join("db.sqlite3").display());
     println!(
@@ -369,7 +370,10 @@ fn start(root: &Path, port: u16, no_browser: bool) -> Result<()> {
         db: Mutex::new(db),
         root: root.to_path_buf(),
     };
-    let url = format!("http://127.0.0.1:{port}");
+    // Bind the listener before advertising the URL so the browser never opens
+    // against a server that is not ready.
+    let listener = factory_api::bind(port)?;
+    let url = format!("http://127.0.0.1:{}", listener.local_addr()?.port());
     println!("Agentic Software Factory running at {url}");
     if !no_browser {
         open_browser(&url);
@@ -377,7 +381,7 @@ fn start(root: &Path, port: u16, no_browser: bool) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(factory_api::run_app(Arc::new(state), port))?;
+    runtime.block_on(factory_api::serve(Arc::new(state), listener))?;
     Ok(())
 }
 
@@ -388,11 +392,15 @@ fn serve(root: &Path, port: u16) -> Result<()> {
         db: Mutex::new(db),
         root: root.to_path_buf(),
     };
-    println!("Factory API listening on http://127.0.0.1:{port}");
+    let listener = factory_api::bind(port)?;
+    println!(
+        "Factory API listening on http://127.0.0.1:{}",
+        listener.local_addr()?.port()
+    );
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(factory_api::run_app(Arc::new(state), port))?;
+    runtime.block_on(factory_api::serve(Arc::new(state), listener))?;
     Ok(())
 }
 

@@ -169,7 +169,7 @@ fn default_config_is_valid_toml_with_all_roles() {
 #[test]
 fn init_does_not_require_agents_to_be_installed() {
     let dir = TempDir::new().unwrap();
-    factory_core::Factory::init(dir.path(), false).unwrap();
+    factory_core::Factory::init(dir.path()).unwrap();
     let config = Config::load(dir.path()).unwrap();
     assert!(config.agents.contains_key("codex"));
     assert!(config.roles.contains_key("planner"));

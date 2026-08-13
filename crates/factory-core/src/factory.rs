@@ -10,8 +10,6 @@ use crate::planner::{normalize_plan, PlanError, PlanOutcome, Planner};
 pub enum FactoryError {
     #[error("factory not initialized here; run `factory init` first")]
     NotInitialized,
-    #[error("a factory is already initialized at {0}")]
-    AlreadyInitialized(std::path::PathBuf),
     #[error("task {0} not found")]
     TaskNotFound(i64),
     #[error("invalid state transition: {0} -> {1}")]
@@ -56,14 +54,13 @@ pub struct Factory {
 }
 
 impl Factory {
-    pub fn init(root: &std::path::Path, force: bool) -> Result<Factory, FactoryError> {
+    /// Create the state directory, default config, and database, or open the
+    /// existing ones. Idempotent: never destroys existing state.
+    pub fn init(root: &std::path::Path) -> Result<Factory, FactoryError> {
         let factory_dir = root.join(FACTORY_DIR);
         std::fs::create_dir_all(&factory_dir).map_err(FactoryError::Io)?;
         crate::config::Config::ensure_default(root)?;
         let db_path = factory_dir.join("db.sqlite3");
-        if db_path.exists() && !force {
-            return Err(FactoryError::AlreadyInitialized(db_path));
-        }
         let db = FactoryDb::open(&db_path)?;
         Ok(Factory {
             db,

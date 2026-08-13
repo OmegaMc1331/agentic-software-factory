@@ -79,7 +79,7 @@ fn with_factory_and_plan(plan: &str) -> (TempDir, Factory) {
         fake_planner_config(&plan_path),
     )
     .unwrap();
-    let factory = Factory::init(dir.path(), false).unwrap();
+    let factory = Factory::init(dir.path()).unwrap();
     (dir, factory)
 }
 
@@ -261,20 +261,30 @@ fn refuses_to_remove_a_dirty_worktree() {
 }
 
 #[test]
-fn init_requires_force_to_overwrite_existing_state() {
+fn init_is_idempotent_and_never_destroys_existing_state() {
     let dir = TempDir::new().unwrap();
-    assert!(Factory::init(dir.path(), false).is_ok());
-    match Factory::init(dir.path(), false) {
-        Ok(_) => panic!("expected second init to fail"),
-        Err(e) => assert!(e.to_string().contains("already initialized")),
-    }
-    assert!(Factory::init(dir.path(), true).is_ok());
+    Factory::init(dir.path()).unwrap();
+    let db_path = dir.path().join(".factory").join("db.sqlite3");
+    let config_path = dir.path().join(".factory").join("config.toml");
+
+    // a second init is a successful no-op
+    assert!(Factory::init(dir.path()).is_ok());
+    assert!(db_path.exists());
+
+    // re-initializing does not overwrite a modified configuration
+    std::fs::write(&config_path, "[agents.custom]\ncommand = \"custom\"\n").unwrap();
+    Factory::init(dir.path()).unwrap();
+    let config = std::fs::read_to_string(&config_path).unwrap();
+    assert!(config.contains("[agents.custom]"));
+
+    // re-initializing leaves the database intact and openable
+    Factory::open(dir.path()).unwrap();
 }
 
 #[test]
 fn init_writes_a_default_agent_configuration() {
     let dir = TempDir::new().unwrap();
-    Factory::init(dir.path(), false).unwrap();
+    Factory::init(dir.path()).unwrap();
     let config = std::fs::read_to_string(dir.path().join(".factory").join("config.toml")).unwrap();
     assert!(config.contains("[agents.codex]"));
     assert!(config.contains("[roles.planner]"));
@@ -293,7 +303,7 @@ command = "codex"
 "#,
     )
     .unwrap();
-    let factory = Factory::init(dir.path(), false).unwrap();
+    let factory = Factory::init(dir.path()).unwrap();
     let err = factory.create_run("objective").unwrap_err();
     assert!(err
         .to_string()
@@ -315,7 +325,7 @@ agent = "ghost"
 "#,
     )
     .unwrap();
-    let factory = Factory::init(dir.path(), false).unwrap();
+    let factory = Factory::init(dir.path()).unwrap();
     let err = factory.create_run("build a calculator").unwrap_err();
     assert!(err
         .to_string()
