@@ -1,6 +1,12 @@
 import { useCallback, useEffect, useState } from "react";
 import { fetchAgents, fetchConfig, saveConfig } from "../api";
-import type { AgentKind, AgentStatusInfo, ConfigData, PromptTransport } from "../types";
+import {
+  agentResolutionStatusLabel,
+  type AgentKind,
+  type AgentStatusInfo,
+  type ConfigData,
+  type PromptTransport,
+} from "../types";
 
 const ROLES = ["planner", "worker", "reviewer"] as const;
 const PRESETS: Record<
@@ -291,8 +297,20 @@ export function SettingsView() {
                         <span className="muted">checking…</span>
                       ) : (
                         <span className="agent-capability-status">
-                          <span className={status.available ? "net-ok" : "net-bad"}>
-                            {status.available ? "Installed" : "Missing"}
+                          <span
+                            className={
+                              status.available
+                                ? "net-ok"
+                                : status.status === "broken"
+                                  ? "net-warn"
+                                  : "net-bad"
+                            }
+                          >
+                            {status.available
+                              ? "Installed"
+                              : status.status === "broken"
+                                ? "Broken installation"
+                                : "Missing"}
                           </span>
                           <small>
                             Workflow {status.workflowAvailable ? "available" : "unavailable"}
@@ -302,16 +320,33 @@ export function SettingsView() {
                           </small>
                           <details className="agent-resolution-details">
                             <summary>Resolution details</summary>
-                            {status.resolvedExecutable ? (
+                            <small>Status: {agentResolutionStatusLabel(status.status)}</small>
+                            {status.resolvedExecutable && (
                               <>
                                 <span>Executable resolved</span>
                                 <code>{status.resolvedExecutable}</code>
                               </>
-                            ) : (
-                              <span>
-                                {status.resolutionError ??
-                                  `${entry.command} was not found in Factory's PATH.`}
-                              </span>
+                            )}
+                            {!status.resolvedExecutable && status.resolutionError && (
+                              <span className="error">{status.resolutionError}</span>
+                            )}
+                            {!status.resolvedExecutable && !status.resolutionError && (
+                              <span>{entry.command} was not found in Factory&apos;s PATH.</span>
+                            )}
+                            {status.resolutionShim && (
+                              <small>
+                                Shim: <code>{status.resolutionShim}</code>
+                              </small>
+                            )}
+                            {status.resolutionTarget && (
+                              <small>
+                                Target: <code>{status.resolutionTarget}</code>
+                              </small>
+                            )}
+                            {status.resolutionKind && (
+                              <small>
+                                Resolver: <code>{status.resolutionKind}</code>
+                              </small>
                             )}
                             <small>
                               Command: <code>{entry.command}</code>

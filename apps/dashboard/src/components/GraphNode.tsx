@@ -41,13 +41,21 @@ export function GraphNode({ data, selected }: NodeProps<FactoryFlowNode>) {
         : `Task #${activity.taskId}`
       : meta.available
         ? "Available"
-        : "Missing";
+        : meta.status === "broken"
+          ? "Broken installation"
+          : "Missing";
     return (
       <div className={classes} aria-label={`${node.label} agent, ${status}`}>
         <Handles kind={node.kind} />
         <span className="graph-agent-orbit" aria-hidden="true" />
         <span
-          className={meta.available ? "graph-agent-status is-available" : "graph-agent-status"}
+          className={
+            meta.available
+              ? "graph-agent-status is-available"
+              : meta.status === "broken"
+                ? "graph-agent-status is-broken"
+                : "graph-agent-status"
+          }
           aria-hidden="true"
         />
         <strong>{node.label}</strong>

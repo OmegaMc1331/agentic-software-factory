@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use factory_agent::{
-    runtime_path_entries, AgentCapabilities, AgentConfig, AgentKind, AgentRequest, CommandAgent,
-    PromptTransport, MISSION_PLACEHOLDER,
+    runtime_path_entries, AgentCapabilities, AgentConfig, AgentError, AgentKind, AgentRequest,
+    AgentStatus, CommandAgent, PromptTransport, MISSION_PLACEHOLDER,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -62,6 +62,8 @@ pub enum AgentResolutionError {
     UnknownAgent(String, String),
     #[error("{0} agent `{1}` is not available. Check the agent configuration.")]
     NotAvailable(String, String),
+    #[error("{0} agent `{1}` cannot start because its executable installation is broken: {2}")]
+    Broken(String, String, String),
     #[error("Agent `{1}` cannot be used as {0} because it has no non-interactive invocation configured.")]
     AutomatedUnavailable(String, String),
 }
@@ -295,26 +297,45 @@ impl Agents {
                 },
             });
             let resolution = agent.resolve_executable();
-            let resolved_executable = resolution
-                .as_ref()
-                .ok()
-                .map(|resolved| resolved.path().to_string_lossy().into_owned());
-            let resolution_error = resolution.as_ref().err().map(ToString::to_string);
-            infos.push(AgentInfo {
+            let resolution_error = resolution.as_ref().err().map(|error| error.to_string());
+            let mut info = AgentInfo {
                 name: name.clone(),
                 command: format_command(&entry.command, &args),
                 args,
                 available: resolution.is_ok(),
+                status: AgentStatus::Missing,
                 kind,
                 workflow_available: agent.workflow_available(),
                 interactive_available: agent.interactive_available(),
-                resolved_executable,
+                resolved_executable: None,
                 resolution_error,
-                path_entries_checked: resolution
-                    .as_ref()
-                    .map(|resolved| resolved.path_entries_checked())
-                    .unwrap_or_else(|_| runtime_path_entries()),
-            });
+                resolution_shim: None,
+                resolution_target: None,
+                resolution_kind: None,
+                path_entries_checked: runtime_path_entries(),
+            };
+            match resolution {
+                Ok(resolved) => {
+                    info.status = AgentStatus::Available;
+                    info.resolved_executable = Some(resolved.path().to_string_lossy().into_owned());
+                    if resolved.kind() == factory_agent::ResolvedExecutableKind::NpmShim {
+                        info.resolution_shim = info.resolved_executable.clone();
+                    }
+                    info.resolution_target =
+                        Some(resolved.launch_program().to_string_lossy().into_owned());
+                    info.resolution_kind = Some(resolved.kind().as_str().to_string());
+                    info.path_entries_checked = resolved.path_entries_checked();
+                }
+                Err(AgentError::InvalidExecutable { path, shim, .. }) => {
+                    info.status = AgentStatus::Broken;
+                    info.resolution_shim = shim
+                        .as_ref()
+                        .map(|path| path.to_string_lossy().into_owned());
+                    info.resolution_target = Some(path.to_string_lossy().into_owned());
+                }
+                Err(_) => {}
+            }
+            infos.push(info);
         }
         infos.sort_by(|a, b| a.name.cmp(&b.name));
         infos
@@ -330,8 +351,18 @@ impl Agents {
             .agent_config(&name)
             .ok_or_else(|| AgentResolutionError::UnknownAgent(role.to_string(), name.clone()))?;
         let command = CommandAgent::new(agent);
-        if !command.available() {
-            return Err(AgentResolutionError::NotAvailable(capitalized(role), name));
+        match command.resolve_executable() {
+            Ok(_) => {}
+            Err(error @ AgentError::InvalidExecutable { .. }) => {
+                return Err(AgentResolutionError::Broken(
+                    capitalized(role),
+                    name,
+                    error.to_string(),
+                ));
+            }
+            Err(_) => {
+                return Err(AgentResolutionError::NotAvailable(capitalized(role), name));
+            }
         }
         if command
             .automated_invocation(&AgentRequest::new("validation", "."))
@@ -351,11 +382,21 @@ impl Agents {
             .agent_config(name)
             .ok_or_else(|| AgentResolutionError::UnknownAgent("console".into(), name.into()))?;
         let command = CommandAgent::new(agent);
-        if !command.available() {
-            return Err(AgentResolutionError::NotAvailable(
-                "Console".into(),
-                name.into(),
-            ));
+        match command.resolve_executable() {
+            Ok(_) => {}
+            Err(error @ AgentError::InvalidExecutable { .. }) => {
+                return Err(AgentResolutionError::Broken(
+                    "Console".into(),
+                    name.into(),
+                    error.to_string(),
+                ));
+            }
+            Err(_) => {
+                return Err(AgentResolutionError::NotAvailable(
+                    "Console".into(),
+                    name.into(),
+                ));
+            }
         }
         Ok(command)
     }
@@ -424,11 +465,15 @@ pub struct AgentInfo {
     pub command: String,
     pub args: Vec<String>,
     pub available: bool,
+    pub status: AgentStatus,
     pub kind: AgentKind,
     pub workflow_available: bool,
     pub interactive_available: bool,
     pub resolved_executable: Option<String>,
     pub resolution_error: Option<String>,
+    pub resolution_shim: Option<String>,
+    pub resolution_target: Option<String>,
+    pub resolution_kind: Option<String>,
     pub path_entries_checked: usize,
 }
 

@@ -54,6 +54,8 @@ export type AgentKind =
 
 export type PromptTransport = "stdin" | "argument" | "disabled";
 
+export type AgentResolutionStatus = "available" | "missing" | "broken";
+
 export interface AgentEntry {
   kind?: AgentKind;
   command: string;
@@ -74,11 +76,15 @@ export interface AgentStatusInfo {
   command: string;
   args: string[];
   available: boolean;
+  status?: AgentResolutionStatus;
   kind?: AgentKind;
   workflowAvailable?: boolean;
   interactiveAvailable?: boolean;
   resolvedExecutable?: string | null;
   resolutionError?: string | null;
+  resolutionShim?: string | null;
+  resolutionTarget?: string | null;
+  resolutionKind?: string | null;
   pathEntriesChecked?: number;
 }
 
@@ -89,13 +95,30 @@ export type GraphEdgeKind =
 export interface AgentMeta {
   command: string;
   available: boolean;
+  status?: AgentResolutionStatus;
   kind?: AgentKind;
   workflowAvailable?: boolean;
   interactiveAvailable?: boolean;
   resolvedExecutable?: string | null;
   resolutionError?: string | null;
+  resolutionShim?: string | null;
+  resolutionTarget?: string | null;
+  resolutionKind?: string | null;
   pathEntriesChecked?: number;
   roles: string[];
+}
+
+export function agentResolutionStatusLabel(status: AgentResolutionStatus | undefined): string {
+  switch (status) {
+    case "available":
+      return "Resolved";
+    case "broken":
+      return "Invalid Windows executable";
+    case "missing":
+      return "Not found in Factory PATH";
+    default:
+      return "Unknown";
+  }
 }
 
 export interface RoleMeta {

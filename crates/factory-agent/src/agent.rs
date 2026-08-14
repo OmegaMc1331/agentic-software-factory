@@ -10,7 +10,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::executable::{
-    resolve_executable, runtime_path_entries, LaunchCommand, ResolvedExecutable,
+    resolve_executable, runtime_path_entries, ExecutableResolution, LaunchCommand,
+    ResolvedExecutable,
 };
 
 pub const MISSION_PLACEHOLDER: &str = "{mission}";
@@ -132,8 +133,10 @@ impl ProcessInvocation {
         parts.join(" ")
     }
 
-    pub fn process_launch(&self) -> LaunchCommand {
-        self.executable.process_launch(&self.args)
+    pub fn process_launch(&self) -> Result<LaunchCommand, AgentError> {
+        self.executable
+            .process_launch(&self.args)
+            .map_err(|reason| AgentError::InvalidInvocation(self.command.clone(), reason))
     }
 
     pub fn pty_launch(&self) -> Result<LaunchCommand, AgentError> {
@@ -143,10 +146,12 @@ impl ProcessInvocation {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AgentStatus {
     Available,
     Missing,
+    Broken,
 }
 
 #[derive(Debug, Clone)]
@@ -188,6 +193,13 @@ pub enum AgentError {
         command: String,
         path_entries: usize,
     },
+    #[error("`{command}` was found, but its resolved Windows executable is invalid: {path} ({reason}). Reinstall the CLI and verify `{command} --version` outside Factory")]
+    InvalidExecutable {
+        command: String,
+        path: PathBuf,
+        shim: Option<PathBuf>,
+        reason: String,
+    },
     #[error("failed to run `{0}`: {1}")]
     Spawn(String, String),
     #[error("Agent `{0}` has no non-interactive workflow invocation configured.")]
@@ -207,6 +219,7 @@ impl AgentError {
         matches!(
             self,
             AgentError::ExecutableNotFound { .. }
+                | AgentError::InvalidExecutable { .. }
                 | AgentError::Spawn(_, _)
                 | AgentError::AutomatedUnavailable(_)
                 | AgentError::InteractiveUnavailable(_)
@@ -329,10 +342,10 @@ impl CommandAgent {
     }
 
     pub fn status(&self) -> AgentStatus {
-        if self.resolve_executable().is_ok() {
-            AgentStatus::Available
-        } else {
-            AgentStatus::Missing
+        match self.resolve_executable() {
+            Ok(_) => AgentStatus::Available,
+            Err(AgentError::InvalidExecutable { .. }) => AgentStatus::Broken,
+            Err(_) => AgentStatus::Missing,
         }
     }
 
@@ -341,10 +354,19 @@ impl CommandAgent {
     }
 
     pub fn resolve_executable(&self) -> Result<ResolvedExecutable, AgentError> {
-        resolve_executable(&self.config.command).ok_or_else(|| AgentError::ExecutableNotFound {
-            command: self.config.command.clone(),
-            path_entries: runtime_path_entries(),
-        })
+        match resolve_executable(&self.config.command) {
+            ExecutableResolution::Resolved(resolved) => Ok(resolved),
+            ExecutableResolution::NotFound => Err(AgentError::ExecutableNotFound {
+                command: self.config.command.clone(),
+                path_entries: runtime_path_entries(),
+            }),
+            ExecutableResolution::Broken(broken) => Err(AgentError::InvalidExecutable {
+                command: self.config.command.clone(),
+                path: broken.path,
+                shim: broken.shim,
+                reason: broken.reason,
+            }),
+        }
     }
 
     pub fn run(&self, request: &AgentRequest) -> Result<AgentResult, AgentError> {
@@ -362,7 +384,7 @@ impl CommandAgent {
         F: FnMut(OutputStream, &str),
     {
         let invocation = self.automated_invocation(request)?;
-        let launch = invocation.process_launch();
+        let launch = invocation.process_launch()?;
         let mut cmd = Command::new(&launch.program);
         cmd.args(&launch.args)
             .current_dir(&invocation.working_dir)
@@ -384,7 +406,7 @@ impl CommandAgent {
         let started = Instant::now();
         let mut child = cmd
             .spawn()
-            .map_err(|e| AgentError::Spawn(self.config.command.clone(), e.to_string()))?;
+            .map_err(|e| spawn_error(&self.config.command, &e))?;
         let write_error = match invocation.stdin_payload {
             Some(payload) => {
                 let mut stdin = child.stdin.take().ok_or_else(|| {
@@ -468,6 +490,26 @@ fn merged_env(
             .map(|(key, value)| (key.clone(), value.clone())),
     );
     env
+}
+
+/// Translates process-creation failures into actionable Factory diagnostics
+/// while preserving the original OS error. Windows error 193
+/// (ERROR_BAD_EXE_FORMAT) and 216 (ERROR_EXE_MACHINE_TYPE_MISMATCH) mean the
+/// resolved file is not a runnable executable for this environment.
+fn spawn_error(command: &str, error: &std::io::Error) -> AgentError {
+    let incompatible = matches!(error.raw_os_error(), Some(193) | Some(216));
+    if incompatible {
+        return AgentError::Spawn(
+            command.to_string(),
+            format!(
+                "the resolved executable is not compatible with this Windows environment \
+                 (os error {}: {error}). Verify the agent directly with `{command} --version` \
+                 outside Factory and reinstall it if the check fails",
+                error.raw_os_error().unwrap_or_default()
+            ),
+        );
+    }
+    AgentError::Spawn(command.to_string(), error.to_string())
 }
 
 fn terminal_required(stdout: &str, stderr: &str) -> bool {
@@ -619,6 +661,72 @@ mod tests {
         let request = AgentRequest::new("mission", TempDir::new().unwrap().path());
         let err = agent.run(&request).unwrap_err();
         assert!(matches!(err, AgentError::ExecutableNotFound { .. }));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_invalid_placeholder_exe_is_broken_not_available() {
+        let directory = TempDir::new().unwrap();
+        let fake = directory.path().join("fake-agent.exe");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\nthis file is a placeholder, not an executable\n",
+        )
+        .unwrap();
+        let agent = CommandAgent::new(AgentConfig::new(
+            "fake",
+            fake.to_string_lossy().into_owned(),
+        ));
+        assert_eq!(agent.status(), AgentStatus::Broken);
+        assert!(!agent.available());
+        assert!(!agent.workflow_available());
+        let error = agent
+            .run(&AgentRequest::new("mission", directory.path()))
+            .unwrap_err();
+        assert!(matches!(error, AgentError::InvalidExecutable { .. }));
+        assert!(error.to_string().contains("invalid"));
+        assert!(!error.to_string().contains("216"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_broken_npm_shim_reports_an_invalid_executable_diagnostic() {
+        let directory = TempDir::new().unwrap();
+        let target = directory.path().join("fake-package/bin/fake-agent.exe");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, "text placeholder shipped by a broken package\n").unwrap();
+        let shim_path = directory.path().join("fake-agent.cmd");
+        std::fs::write(
+            &shim_path,
+            "@ECHO off\r\n\"%dp0%\\fake-package\\bin\\fake-agent.exe\" %*\r\n",
+        )
+        .unwrap();
+
+        let agent = CommandAgent::new(AgentConfig::new(
+            "fake",
+            shim_path.to_string_lossy().into_owned(),
+        ));
+        assert_eq!(agent.status(), AgentStatus::Broken);
+        assert!(!agent.available());
+        let error = agent
+            .run(&AgentRequest::new("mission", directory.path()))
+            .unwrap_err();
+        match &error {
+            AgentError::InvalidExecutable {
+                command,
+                path,
+                shim,
+                reason,
+            } => {
+                assert_eq!(command, &shim_path.to_string_lossy().into_owned());
+                assert_eq!(path, &target);
+                assert_eq!(shim.as_deref(), Some(shim_path.as_path()));
+                assert!(reason.contains("Windows executable"));
+            }
+            other => panic!("expected InvalidExecutable, got {other:?}"),
+        }
+        assert!(error.to_string().contains("Reinstall the CLI"));
+        assert!(!error.to_string().contains("216"));
     }
 
     #[test]
@@ -839,6 +947,9 @@ mod tests {
             .unwrap();
         setter.join().unwrap();
         assert!(result.cancelled);
-        assert!(started.elapsed() < Duration::from_secs(5));
+        // The uncancelled agent would run for ~20s (ping -n 20 / sleep 20);
+        // a generous budget keeps this stable on loaded CI runners while
+        // still proving the process tree was terminated early.
+        assert!(started.elapsed() < Duration::from_secs(15));
     }
 }

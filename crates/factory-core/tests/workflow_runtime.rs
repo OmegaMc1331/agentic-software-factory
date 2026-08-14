@@ -269,6 +269,55 @@ fn terminal_configuration_errors_stop_after_one_attempt() {
     );
 }
 
+#[cfg(windows)]
+#[test]
+fn a_broken_worker_executable_blocks_the_workflow_without_consuming_retries() {
+    let (dir, factory) = fixture("approve");
+    let outcome = factory.create_run("blocked by a broken worker").unwrap();
+    drop(factory);
+
+    let target_dir = dir.path().join("broken-package").join("bin");
+    std::fs::create_dir_all(&target_dir).unwrap();
+    std::fs::write(
+        target_dir.join("worker-test.exe"),
+        "text placeholder shipped by a broken package\n",
+    )
+    .unwrap();
+    let shim = dir.path().join("worker-test.cmd");
+    std::fs::write(
+        &shim,
+        "@ECHO off\r\n\"%dp0%\\broken-package\\bin\\worker-test.exe\" %*\r\n",
+    )
+    .unwrap();
+    let mut config = Config::load(dir.path()).unwrap();
+    config.agents.insert(
+        "worker-test".into(),
+        AgentEntry {
+            kind: None,
+            command: shim.to_string_lossy().into_owned(),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            prompt_transport: None,
+            interactive_args: None,
+            capabilities: Vec::new(),
+        },
+    );
+    config.write_atomic(dir.path()).unwrap();
+    let factory = Factory::open(dir.path()).unwrap();
+
+    let error = factory.prepare_start(outcome.run.id).unwrap_err();
+    assert!(error.to_string().contains(
+        "Worker agent `worker-test` cannot start because its executable installation is broken"
+    ));
+    // Blocked before any attempt exists: no Worker retry is consumed.
+    let attempts = factory.list_task_attempts(outcome.run.id).unwrap();
+    assert_eq!(attempts.len(), 0);
+    assert_eq!(
+        factory.get_run(outcome.run.id).unwrap().unwrap().status,
+        RunStatus::Planned
+    );
+}
+
 #[test]
 fn start_requires_configured_worker_and_reviewer_roles() {
     let (dir, factory) = fixture("approve");

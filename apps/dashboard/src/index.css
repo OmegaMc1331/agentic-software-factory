@@ -766,6 +766,10 @@ code {
   color: #e5534b;
 }
 
+.net-warn {
+  color: #d08728;
+}
+
 .net-chip {
   display: inline-block;
   width: fit-content;
@@ -1161,6 +1165,11 @@ code {
 .graph-agent-status.is-available {
   border-color: #4eba7b;
   background: #4eba7b;
+}
+
+.graph-agent-status.is-broken {
+  border-color: #e0a962;
+  background: #e0a962;
 }
 
 .graph-node--role {

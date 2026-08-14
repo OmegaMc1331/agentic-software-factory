@@ -183,10 +183,10 @@ fn agents(root: &Path) -> Result<()> {
     }
     println!("{:<12} {:<20} {:<10}", "NAME", "COMMAND", "STATUS");
     for info in infos {
-        let status = if info.available {
-            "available"
-        } else {
-            "missing"
+        let status = match info.status {
+            factory_core::AgentStatus::Available => "available",
+            factory_core::AgentStatus::Missing => "missing",
+            factory_core::AgentStatus::Broken => "broken",
         };
         println!("{:<12} {:<20} {}", info.name, info.command, status);
     }

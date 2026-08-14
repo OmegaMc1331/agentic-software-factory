@@ -560,4 +560,68 @@ mod tests {
         assert_ne!(saved.status, "running");
         assert!(saved.stdout.unwrap_or_default().contains("TTY=true"));
     }
+
+    #[cfg(windows)]
+    #[test]
+    fn interactive_generic_batch_agent_runs_through_the_pty() {
+        let dir = TempDir::new().unwrap();
+        Factory::init(dir.path()).unwrap();
+        let bin = dir.path().join("agent-bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let batch = bin.join("fake-agent.cmd");
+        std::fs::write(&batch, "@echo off\r\necho BATCH_PTY_OK\r\n").unwrap();
+        let mut config = Config::default();
+        config.agents.insert(
+            "batch-test".into(),
+            AgentEntry {
+                kind: Some(AgentKind::Custom),
+                command: batch.to_string_lossy().into_owned(),
+                args: Vec::new(),
+                env: BTreeMap::new(),
+                prompt_transport: Some(PromptTransport::Disabled),
+                interactive_args: Some(Vec::new()),
+                capabilities: Vec::new(),
+            },
+        );
+        config.write_atomic(dir.path()).unwrap();
+
+        let runtime = Runtime::new(dir.path()).unwrap();
+        let session = runtime
+            .start_interactive_session("batch-test", 90, 24)
+            .unwrap();
+        let mut subscription = runtime.subscribe_terminal(session.id).unwrap();
+        let mut output = subscription.snapshot;
+        let mut answered_cursor_query = false;
+        for _ in 0..100 {
+            while let Ok(chunk) = subscription.receiver.try_recv() {
+                output.extend(chunk);
+            }
+            if !answered_cursor_query && output.windows(4).any(|window| window == b"\x1b[6n") {
+                runtime.write_terminal(session.id, b"\x1b[1;1R").unwrap();
+                answered_cursor_query = true;
+            }
+            if String::from_utf8_lossy(&output).contains("BATCH_PTY_OK") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let output = String::from_utf8_lossy(&output);
+        assert!(
+            output.contains("BATCH_PTY_OK"),
+            "PTY output was: {output:?}"
+        );
+        let _ = runtime.stop_interactive_session(session.id);
+
+        let db = FactoryDb::open(&dir.path().join(".factory").join("db.sqlite3")).unwrap();
+        let mut saved = db.get_agent_session(session.id).unwrap().unwrap();
+        for _ in 0..100 {
+            if saved.status != "running" {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            saved = db.get_agent_session(session.id).unwrap().unwrap();
+        }
+        assert_ne!(saved.status, "running");
+        assert!(saved.stdout.unwrap_or_default().contains("BATCH_PTY_OK"));
+    }
 }

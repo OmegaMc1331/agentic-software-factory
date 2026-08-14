@@ -185,6 +185,58 @@ agent = "ghost"
         .contains("Planner agent `ghost` is not available. Check the agent configuration."));
 }
 
+#[cfg(windows)]
+#[test]
+fn a_broken_executable_installation_is_reported_not_available() {
+    let dir = TempDir::new().unwrap();
+    let target_dir = dir.path().join("fake-package").join("bin");
+    std::fs::create_dir_all(&target_dir).unwrap();
+    let target = target_dir.join("fake-agent.exe");
+    std::fs::write(&target, "text placeholder shipped by a broken package\n").unwrap();
+    let shim = dir.path().join("fake-agent.cmd");
+    std::fs::write(
+        &shim,
+        "@ECHO off\r\n\"%dp0%\\fake-package\\bin\\fake-agent.exe\" %*\r\n",
+    )
+    .unwrap();
+    let command = shim.to_string_lossy().replace('\\', "\\\\");
+    write_config(
+        dir.path(),
+        &format!(
+            r#"
+[agents.broken]
+command = "{command}"
+[roles.worker]
+agent = "broken"
+"#
+        ),
+    );
+
+    let agents = Agents::load(dir.path()).unwrap();
+    let infos = agents.list();
+    let broken = infos.iter().find(|i| i.name == "broken").unwrap();
+    assert!(!broken.available);
+    assert_eq!(broken.status, factory_core::AgentStatus::Broken);
+    assert!(broken.resolution_shim.is_some());
+    assert!(broken
+        .resolution_target
+        .as_deref()
+        .unwrap()
+        .contains("fake-package"));
+    let error = broken
+        .resolution_error
+        .as_deref()
+        .expect("broken agent carries a resolution error");
+    assert!(error.contains("invalid"));
+    assert!(error.contains("Reinstall the CLI"));
+
+    let err = agents.command_agent("worker").unwrap_err();
+    assert!(matches!(err, AgentResolutionError::Broken(_, _, _)));
+    assert!(err.to_string().contains(
+        "Worker agent `broken` cannot start because its executable installation is broken"
+    ));
+}
+
 #[test]
 fn lists_configured_agents_with_availability() {
     let dir = TempDir::new().unwrap();

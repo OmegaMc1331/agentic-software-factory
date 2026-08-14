@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import type { GraphEdge, GraphNode } from "../types";
-import { roleMeta, runMeta, taskMeta } from "../types";
+import { agentMeta, agentResolutionStatusLabel, roleMeta, runMeta, taskMeta } from "../types";
 import { STATE_META } from "../state";
 import { connectionKind } from "../graphWorkspace";
 
@@ -99,6 +99,59 @@ export function NodeInspector({
   let details: React.ReactNode;
   if (node.kind === "role") {
     details = <Row label="Assigned agent">{roleMeta(node).agent}</Row>;
+  } else if (node.kind === "agent") {
+    const meta = agentMeta(node);
+    details = (
+      <>
+        <Row label="Command">
+          <code>{meta.command}</code>
+        </Row>
+        <Row label="Status">
+          {meta.available
+            ? "Available"
+            : meta.status === "broken"
+              ? "Broken installation"
+              : "Missing"}
+        </Row>
+        <Row label="Workflow">{meta.workflowAvailable ? "available" : "unavailable"}</Row>
+        <Row label="Interactive">{meta.interactiveAvailable ? "available" : "unavailable"}</Row>
+        <details className="agent-resolution-details">
+          <summary>Resolution details</summary>
+          <div className="inspector-row">
+            <span className="inspector-label">Status</span>
+            <span className="inspector-value">{agentResolutionStatusLabel(meta.status)}</span>
+          </div>
+          <div className="inspector-row">
+            <span className="inspector-label">Shim</span>
+            <span className="inspector-value">
+              {meta.resolutionShim ? <code>{meta.resolutionShim}</code> : "—"}
+            </span>
+          </div>
+          <div className="inspector-row">
+            <span className="inspector-label">Target</span>
+            <span className="inspector-value">
+              {meta.resolutionTarget ? <code>{meta.resolutionTarget}</code> : "—"}
+            </span>
+          </div>
+          <div className="inspector-row">
+            <span className="inspector-label">Resolver kind</span>
+            <span className="inspector-value">
+              {meta.resolutionKind ? <code>{meta.resolutionKind}</code> : "—"}
+            </span>
+          </div>
+          {meta.resolutionError && (
+            <div className="inspector-row">
+              <span className="inspector-label">Problem</span>
+              <span className="inspector-value">{meta.resolutionError}</span>
+            </div>
+          )}
+          <div className="inspector-row">
+            <span className="inspector-label">PATH entries</span>
+            <span className="inspector-value">{meta.pathEntriesChecked ?? 0} checked</span>
+          </div>
+        </details>
+      </>
+    );
   } else if (node.kind === "run") {
     const meta = runMeta(node);
     details = (
