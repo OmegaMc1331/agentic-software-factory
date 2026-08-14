@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use factory_agent::{
-    AgentCapabilities, AgentConfig, AgentKind, AgentRequest, CommandAgent, PromptTransport,
-    MISSION_PLACEHOLDER,
+    runtime_path_entries, AgentCapabilities, AgentConfig, AgentKind, AgentRequest, CommandAgent,
+    PromptTransport, MISSION_PLACEHOLDER,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -294,14 +294,26 @@ impl Agents {
                     roles: entry.capabilities.clone(),
                 },
             });
+            let resolution = agent.resolve_executable();
+            let resolved_executable = resolution
+                .as_ref()
+                .ok()
+                .map(|resolved| resolved.path().to_string_lossy().into_owned());
+            let resolution_error = resolution.as_ref().err().map(ToString::to_string);
             infos.push(AgentInfo {
                 name: name.clone(),
                 command: format_command(&entry.command, &args),
                 args,
-                available: agent.available(),
+                available: resolution.is_ok(),
                 kind,
                 workflow_available: agent.workflow_available(),
                 interactive_available: agent.interactive_available(),
+                resolved_executable,
+                resolution_error,
+                path_entries_checked: resolution
+                    .as_ref()
+                    .map(|resolved| resolved.path_entries_checked())
+                    .unwrap_or_else(|_| runtime_path_entries()),
             });
         }
         infos.sort_by(|a, b| a.name.cmp(&b.name));
@@ -415,6 +427,9 @@ pub struct AgentInfo {
     pub kind: AgentKind,
     pub workflow_available: bool,
     pub interactive_available: bool,
+    pub resolved_executable: Option<String>,
+    pub resolution_error: Option<String>,
+    pub path_entries_checked: usize,
 }
 
 fn format_command(command: &str, args: &[String]) -> String {

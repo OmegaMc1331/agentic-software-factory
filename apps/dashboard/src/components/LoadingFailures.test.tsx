@@ -55,12 +55,17 @@ describe("secondary view loading failures", () => {
         kind: "codex",
         workflowAvailable: true,
         interactiveAvailable: true,
+        resolvedExecutable: "C:\\tools\\codex.cmd",
+        resolutionError: null,
+        pathEntriesChecked: 14,
       },
     ]);
     render(<SettingsView />);
 
     expect(await screen.findByRole("heading", { name: "Settings" })).toBeTruthy();
     expect(screen.getByText("Installed")).toBeTruthy();
+    expect(screen.getByText("C:\\tools\\codex.cmd")).toBeTruthy();
+    expect(screen.getByText("Factory process PATH (14 entries checked)")).toBeTruthy();
   });
 
   it("stops loading the Agent Graph after an API failure", async () => {

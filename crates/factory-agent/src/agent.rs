@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc;
@@ -8,6 +8,10 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+use crate::executable::{
+    resolve_executable, runtime_path_entries, LaunchCommand, ResolvedExecutable,
+};
 
 pub const MISSION_PLACEHOLDER: &str = "{mission}";
 
@@ -114,6 +118,7 @@ impl AgentConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessInvocation {
     pub command: String,
+    pub executable: ResolvedExecutable,
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
     pub working_dir: PathBuf,
@@ -125,6 +130,16 @@ impl ProcessInvocation {
         let mut parts = vec![self.command.clone()];
         parts.extend(self.args.iter().cloned());
         parts.join(" ")
+    }
+
+    pub fn process_launch(&self) -> LaunchCommand {
+        self.executable.process_launch(&self.args)
+    }
+
+    pub fn pty_launch(&self) -> Result<LaunchCommand, AgentError> {
+        self.executable
+            .pty_launch(&self.args)
+            .map_err(|reason| AgentError::InvalidInvocation(self.command.clone(), reason))
     }
 }
 
@@ -168,8 +183,11 @@ pub enum OutputStream {
 
 #[derive(Debug, Error)]
 pub enum AgentError {
-    #[error("executable `{0}` not found; check that it is installed and on PATH")]
-    ExecutableNotFound(String),
+    #[error("executable `{command}` was not found in the PATH visible to Factory ({path_entries} entries checked)")]
+    ExecutableNotFound {
+        command: String,
+        path_entries: usize,
+    },
     #[error("failed to run `{0}`: {1}")]
     Spawn(String, String),
     #[error("Agent `{0}` has no non-interactive workflow invocation configured.")]
@@ -188,7 +206,7 @@ impl AgentError {
     pub fn is_configuration(&self) -> bool {
         matches!(
             self,
-            AgentError::ExecutableNotFound(_)
+            AgentError::ExecutableNotFound { .. }
                 | AgentError::Spawn(_, _)
                 | AgentError::AutomatedUnavailable(_)
                 | AgentError::InteractiveUnavailable(_)
@@ -264,8 +282,10 @@ impl CommandAgent {
             }
             PromptTransport::Disabled => unreachable!(),
         };
+        let executable = self.resolve_executable()?;
         Ok(ProcessInvocation {
             command: self.config.command.clone(),
+            executable,
             args,
             env: merged_env(&self.config.env, &request.env),
             working_dir: request.working_dir.clone(),
@@ -282,8 +302,10 @@ impl CommandAgent {
             .interactive_args
             .clone()
             .ok_or_else(|| AgentError::InteractiveUnavailable(self.config.name.clone()))?;
+        let executable = self.resolve_executable()?;
         Ok(ProcessInvocation {
             command: self.config.command.clone(),
+            executable,
             args,
             env: self.config.env.clone(),
             working_dir: working_dir.into(),
@@ -297,7 +319,9 @@ impl CommandAgent {
     }
 
     pub fn interactive_available(&self) -> bool {
-        self.interactive_invocation(".").is_ok()
+        self.interactive_invocation(".")
+            .and_then(|invocation| invocation.pty_launch().map(|_| invocation))
+            .is_ok()
     }
 
     pub fn config(&self) -> &AgentConfig {
@@ -305,7 +329,7 @@ impl CommandAgent {
     }
 
     pub fn status(&self) -> AgentStatus {
-        if executable_exists(&self.config.command) {
+        if self.resolve_executable().is_ok() {
             AgentStatus::Available
         } else {
             AgentStatus::Missing
@@ -314,6 +338,13 @@ impl CommandAgent {
 
     pub fn available(&self) -> bool {
         matches!(self.status(), AgentStatus::Available)
+    }
+
+    pub fn resolve_executable(&self) -> Result<ResolvedExecutable, AgentError> {
+        resolve_executable(&self.config.command).ok_or_else(|| AgentError::ExecutableNotFound {
+            command: self.config.command.clone(),
+            path_entries: runtime_path_entries(),
+        })
     }
 
     pub fn run(&self, request: &AgentRequest) -> Result<AgentResult, AgentError> {
@@ -330,12 +361,10 @@ impl CommandAgent {
     where
         F: FnMut(OutputStream, &str),
     {
-        if !executable_exists(&self.config.command) {
-            return Err(AgentError::ExecutableNotFound(self.config.command.clone()));
-        }
         let invocation = self.automated_invocation(request)?;
-        let mut cmd = Command::new(&invocation.command);
-        cmd.args(&invocation.args)
+        let launch = invocation.process_launch();
+        let mut cmd = Command::new(&launch.program);
+        cmd.args(&launch.args)
             .current_dir(&invocation.working_dir)
             .stdin(if invocation.stdin_payload.is_some() {
                 Stdio::piped()
@@ -498,34 +527,6 @@ fn output_reader<R: Read + Send + 'static>(
     })
 }
 
-fn executable_exists(command: &str) -> bool {
-    let path = Path::new(command);
-    if path.components().count() > 1 {
-        return path.is_file();
-    }
-    let path_value = std::env::var_os("PATH").unwrap_or_default();
-    for dir in std::env::split_paths(&path_value) {
-        let candidate = dir.join(command);
-        if candidate.is_file() {
-            return true;
-        }
-        #[cfg(windows)]
-        {
-            let pathext =
-                std::env::var("PATHEXT").unwrap_or_else(|_| ".EXE;.CMD;.BAT;.COM".to_string());
-            if candidate.extension().is_none() {
-                for ext in pathext.split(';').filter(|s| !s.is_empty()) {
-                    let ext = ext.trim_start_matches('.');
-                    if candidate.with_extension(ext).is_file() {
-                        return true;
-                    }
-                }
-            }
-        }
-    }
-    false
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -617,7 +618,7 @@ mod tests {
         assert!(!agent.available());
         let request = AgentRequest::new("mission", TempDir::new().unwrap().path());
         let err = agent.run(&request).unwrap_err();
-        assert!(matches!(err, AgentError::ExecutableNotFound(_)));
+        assert!(matches!(err, AgentError::ExecutableNotFound { .. }));
     }
 
     #[test]
@@ -709,7 +710,7 @@ mod tests {
     }
 
     #[test]
-    fn known_profiles_build_non_interactive_argument_invocations() {
+    fn known_profiles_define_non_interactive_argument_invocations() {
         for (kind, command, prefix) in [
             (AgentKind::Codex, "codex", vec!["exec"]),
             (AgentKind::ClaudeCode, "claude", vec!["-p"]),
@@ -727,16 +728,57 @@ mod tests {
                 interactive_args: Some(Vec::new()),
                 capabilities: AgentCapabilities::default(),
             };
-            let invocation = CommandAgent::new(config)
-                .automated_invocation(&AgentRequest::new("test mission", "."))
-                .unwrap();
-            assert_eq!(invocation.command, command);
-            assert_eq!(
-                invocation.args.last().map(String::as_str),
-                Some("test mission")
-            );
-            assert!(invocation.stdin_payload.is_none());
+            assert_eq!(config.command, command);
+            assert_eq!(config.args, prefix);
+            assert_eq!(config.prompt_transport, PromptTransport::Argument);
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_cmd_found_through_path_is_the_executable_that_runs() {
+        const CHILD: &str = "FACTORY_WINDOWS_CMD_RESOLUTION_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let mut config = AgentConfig::new("fake-agent", "fake-agent");
+            config.prompt_transport = PromptTransport::Argument;
+            let agent = CommandAgent::new(config);
+            assert_eq!(agent.status(), AgentStatus::Available);
+            let invocation = agent
+                .automated_invocation(&AgentRequest::new("mission-value", "."))
+                .unwrap();
+            assert!(invocation
+                .executable
+                .path()
+                .to_string_lossy()
+                .ends_with("fake-agent.cmd"));
+            let result = agent.run(&AgentRequest::new("mission-value", ".")).unwrap();
+            assert!(result.stdout.contains("ARG=mission-value"));
+            return;
+        }
+
+        let directory = TempDir::new().unwrap();
+        std::fs::write(
+            directory.path().join("fake-agent.cmd"),
+            "@echo off\r\necho ARG=%~1\r\n",
+        )
+        .unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "agent::tests::windows_cmd_found_through_path_is_the_executable_that_runs",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("PATH", directory.path())
+            .env("PATHEXT", ".CMD;.EXE")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]

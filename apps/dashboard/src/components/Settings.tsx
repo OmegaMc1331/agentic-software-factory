@@ -295,11 +295,32 @@ export function SettingsView() {
                             {status.available ? "Installed" : "Missing"}
                           </span>
                           <small>
-                            Workflow {status.workflowAvailable ? "configured" : "unavailable"}
+                            Workflow {status.workflowAvailable ? "available" : "unavailable"}
                           </small>
                           <small>
-                            Interactive {status.interactiveAvailable ? "configured" : "unavailable"}
+                            Interactive {status.interactiveAvailable ? "available" : "unavailable"}
                           </small>
+                          <details className="agent-resolution-details">
+                            <summary>Resolution details</summary>
+                            {status.resolvedExecutable ? (
+                              <>
+                                <span>Executable resolved</span>
+                                <code>{status.resolvedExecutable}</code>
+                              </>
+                            ) : (
+                              <span>
+                                {status.resolutionError ??
+                                  `${entry.command} was not found in Factory's PATH.`}
+                              </span>
+                            )}
+                            <small>
+                              Command: <code>{entry.command}</code>
+                            </small>
+                            <small>
+                              Factory process PATH ({status.pathEntriesChecked ?? 0} entries
+                              checked)
+                            </small>
+                          </details>
                         </span>
                       )}
                     </td>

@@ -77,6 +77,9 @@ export interface AgentStatusInfo {
   kind?: AgentKind;
   workflowAvailable?: boolean;
   interactiveAvailable?: boolean;
+  resolvedExecutable?: string | null;
+  resolutionError?: string | null;
+  pathEntriesChecked?: number;
 }
 
 export type GraphNodeKind = "agent" | "role" | "run" | "task" | "group" | "note";
@@ -89,6 +92,9 @@ export interface AgentMeta {
   kind?: AgentKind;
   workflowAvailable?: boolean;
   interactiveAvailable?: boolean;
+  resolvedExecutable?: string | null;
+  resolutionError?: string | null;
+  pathEntriesChecked?: number;
   roles: string[];
 }
 

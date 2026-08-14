@@ -610,6 +610,9 @@ fn build_graph(state: &SharedState) -> Result<GraphResponse, ApiError> {
                 "kind": agent.kind,
                 "workflowAvailable": agent.workflow_available,
                 "interactiveAvailable": agent.interactive_available,
+                "resolvedExecutable": agent.resolved_executable,
+                "resolutionError": agent.resolution_error,
+                "pathEntriesChecked": agent.path_entries_checked,
                 "roles": roles_for_agent.get(&agent.name).cloned().unwrap_or_default(),
             }),
         });

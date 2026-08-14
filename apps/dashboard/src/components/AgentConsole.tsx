@@ -241,12 +241,25 @@ export function AgentConsole({
               <dd>{meta.available ? "Available" : "Missing"}</dd>
             </div>
             <div>
+              <dt>Executable resolution</dt>
+              <dd>
+                {meta.resolvedExecutable ? (
+                  <code>{meta.resolvedExecutable}</code>
+                ) : (
+                  (meta.resolutionError ?? `Command ${meta.command} was not found.`)
+                )}
+                <small className="agent-resolution-source">
+                  Factory process PATH ({meta.pathEntriesChecked ?? 0} entries checked)
+                </small>
+              </dd>
+            </div>
+            <div>
               <dt>Workflow mode</dt>
-              <dd>{meta.workflowAvailable ? "Configured" : "Unavailable"}</dd>
+              <dd>{meta.workflowAvailable ? "Available" : "Unavailable"}</dd>
             </div>
             <div>
               <dt>Interactive mode</dt>
-              <dd>{meta.interactiveAvailable ? "Configured" : "Unavailable"}</dd>
+              <dd>{meta.interactiveAvailable ? "Available" : "Unavailable"}</dd>
             </div>
             <div>
               <dt>Assigned roles</dt>

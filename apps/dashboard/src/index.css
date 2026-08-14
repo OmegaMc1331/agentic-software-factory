@@ -872,6 +872,26 @@ code {
   color: var(--text-muted);
 }
 
+.agent-resolution-details {
+  margin-top: 0.35rem;
+  max-width: 28rem;
+  color: var(--text-muted);
+}
+
+.agent-resolution-details summary {
+  cursor: pointer;
+  color: var(--text-secondary);
+}
+
+.agent-resolution-details span,
+.agent-resolution-details code,
+.agent-resolution-details small,
+.agent-resolution-source {
+  display: block;
+  margin-top: 0.3rem;
+  overflow-wrap: anywhere;
+}
+
 .settings-field {
   display: flex;
   flex-direction: column;

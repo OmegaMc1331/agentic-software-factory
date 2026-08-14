@@ -71,6 +71,14 @@ missing executables, disabled automated transport, invalid placeholders, and det
 TTY requirements as configuration failures; they must not consume the normal retry
 loop.
 
+Executable discovery is centralized in `factory-agent`. It resolves explicit paths and
+the Factory process `PATH`; on Windows it also follows `PATHEXT` for native executables
+and `.cmd`/`.bat` shims. Automated and PTY invocations consume that same resolved
+target. npm shims are unwrapped to their packaged native executable or Node entry point
+when possible, without rewriting `.factory/config.toml` or interpolating mission text
+through a shell. Keep the controlled Windows shim execution and ConPTY regressions in
+the test suite.
+
 Opening the API state reconciles records left `running` by a previous process. Add
 migrations for schema changes; don't rewrite existing migrations.
 

@@ -95,12 +95,13 @@ impl Runtime {
         let invocation = agent
             .interactive_invocation(self.root.as_path())
             .map_err(FactoryError::from)?;
+        let launch = invocation.pty_launch().map_err(FactoryError::from)?;
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(terminal_size(cols, rows))
             .map_err(|error| RuntimeError::Terminal(error.to_string()))?;
-        let mut command = CommandBuilder::new(&invocation.command);
-        command.args(&invocation.args);
+        let mut command = CommandBuilder::new(&launch.program);
+        command.args(&launch.args);
         command.cwd(&invocation.working_dir);
         for (name, value) in &invocation.env {
             command.env(name, value);
@@ -475,10 +476,19 @@ mod tests {
     fn interactive_session_has_a_real_terminal_and_persists_its_mode() {
         let dir = TempDir::new().unwrap();
         Factory::init(dir.path()).unwrap();
-        let command = std::env::current_exe()
-            .unwrap()
-            .to_string_lossy()
-            .into_owned();
+        let test_executable = std::env::current_exe().unwrap();
+        #[cfg(windows)]
+        let command = {
+            let bin = dir.path().join("fake-npm-bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            let native = bin.join("fake-agent.exe");
+            std::fs::copy(&test_executable, &native).unwrap();
+            let shim = bin.join("fake-agent.cmd");
+            std::fs::write(&shim, "@ECHO off\r\n\"%dp0%\\fake-agent.exe\" %*\r\n").unwrap();
+            shim.to_string_lossy().into_owned()
+        };
+        #[cfg(not(windows))]
+        let command = test_executable.to_string_lossy().into_owned();
         let interactive_args = vec![
             "--exact".into(),
             "tests::pty_child_probe".into(),

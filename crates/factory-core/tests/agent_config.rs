@@ -205,8 +205,16 @@ command = "definitely-not-a-real-factory-test-binary"
     assert_eq!(infos.len(), 2);
     let codex = infos.iter().find(|i| i.name == "codex").unwrap();
     assert!(codex.available);
+    assert!(codex.resolved_executable.is_some());
+    assert!(codex.resolution_error.is_none());
     let ghost = infos.iter().find(|i| i.name == "ghost").unwrap();
     assert!(!ghost.available);
+    assert!(ghost.resolved_executable.is_none());
+    assert!(ghost
+        .resolution_error
+        .as_deref()
+        .unwrap()
+        .contains("PATH visible to Factory"));
 }
 
 #[test]

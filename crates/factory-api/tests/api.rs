@@ -424,6 +424,11 @@ async fn lists_agents_with_availability() {
         .collect();
     assert!(names.contains(&"codex"));
     assert!(value.as_array().unwrap()[0]["available"].is_boolean());
+    assert!(value.as_array().unwrap()[0]["pathEntriesChecked"].is_number());
+    assert!(value.as_array().unwrap()[0]
+        .as_object()
+        .unwrap()
+        .contains_key("resolvedExecutable"));
 }
 
 #[cfg(feature = "embedded-dashboard")]

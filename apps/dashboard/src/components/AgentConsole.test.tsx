@@ -42,6 +42,9 @@ const meta = {
   kind: "codex" as const,
   workflowAvailable: true,
   interactiveAvailable: true,
+  resolvedExecutable: "C:\\tools\\codex.cmd",
+  resolutionError: null,
+  pathEntriesChecked: 14,
   roles: ["worker"],
 };
 
@@ -247,6 +250,8 @@ describe("Agent Console", () => {
     );
 
     fireEvent.click(screen.getByRole("tab", { name: "Overview" }));
+    expect(screen.getByText("C:\\tools\\codex.cmd")).toBeTruthy();
+    expect(screen.getByText("Factory process PATH (14 entries checked)")).toBeTruthy();
     fireEvent.change(screen.getByLabelText("Add supported connection"), {
       target: { value: "agent:opencode" },
     });
