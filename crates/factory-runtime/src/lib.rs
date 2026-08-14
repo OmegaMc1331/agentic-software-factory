@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc as std_mpsc, Arc, Mutex};
 use std::time::Instant;
 
 use factory_core::{ExecutionRoles, Factory, FactoryError};
@@ -342,6 +342,7 @@ impl Runtime {
         let output_root = self.root.clone();
         let terminals = self.terminals.clone();
         let output_terminal = terminal.clone();
+        let (output_complete, output_drained) = std_mpsc::channel();
         std::thread::spawn(move || {
             let db = FactoryDb::open(&output_root.join(".factory").join("db.sqlite3")).ok();
             let mut buffer = [0u8; 8192];
@@ -375,13 +376,33 @@ impl Runtime {
                 .expect("terminal output poisoned")
                 .subscribers
                 .clear();
+            let _ = output_complete.send(());
         });
 
         let root = self.root.clone();
         std::thread::spawn(move || {
             let timer = Instant::now();
             let status = child.wait();
+            terminal
+                .writer
+                .lock()
+                .expect("terminal writer poisoned")
+                .take();
+            terminal
+                .master
+                .lock()
+                .expect("terminal master poisoned")
+                .take();
+            let _ = output_drained.recv();
             if let Ok(db) = FactoryDb::open(&root.join(".factory").join("db.sqlite3")) {
+                let stdout = terminal
+                    .output
+                    .lock()
+                    .expect("terminal output poisoned")
+                    .history
+                    .clone();
+                let stdout = String::from_utf8_lossy(&stdout);
+                let _ = db.set_agent_session_output(session_id, Some(&stdout), None);
                 match status {
                     Ok(status) => {
                         let session_status = if terminal.stopping.load(Ordering::Relaxed) {
@@ -413,16 +434,6 @@ impl Runtime {
                     }
                 }
             }
-            terminal
-                .writer
-                .lock()
-                .expect("terminal writer poisoned")
-                .take();
-            terminal
-                .master
-                .lock()
-                .expect("terminal master poisoned")
-                .take();
             terminals
                 .lock()
                 .expect("terminal mutex poisoned")

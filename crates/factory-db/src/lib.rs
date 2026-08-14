@@ -317,6 +317,19 @@ impl FactoryDb {
         Ok(())
     }
 
+    pub fn set_agent_session_output(
+        &self,
+        id: i64,
+        stdout: Option<&str>,
+        stderr: Option<&str>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE agent_sessions SET stdout = ?1, stderr = ?2 WHERE id = ?3",
+            params![stdout, stderr, id],
+        )?;
+        Ok(())
+    }
+
     pub fn finish_agent_session(
         &self,
         id: i64,
