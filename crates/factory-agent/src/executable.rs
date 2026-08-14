@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 const WINDOWS_DEFAULT_PATHEXT: &str = ".COM;.EXE;.BAT;.CMD";
 
 /// Guards shim -> node -> shim resolution chains against infinite recursion.
+#[cfg(windows)]
 const MAX_SHIM_RESOLUTION_DEPTH: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -194,34 +195,44 @@ fn resolve_candidate_set(
     depth: usize,
 ) -> ExecutableResolution {
     #[cfg(not(windows))]
-    let _ = (path_value, pathext_value);
-
-    let mut resolution = resolve_candidate(
-        candidate,
-        path_value,
-        pathext_value,
-        path_entries_checked,
-        depth,
-    );
-
-    #[cfg(windows)]
-    if resolution == ExecutableResolution::NotFound && candidate.extension().is_none() {
-        for extension in windows_extensions(pathext_value) {
-            let candidate = candidate.with_extension(extension.trim_start_matches('.'));
-            resolution = resolve_candidate(
-                &candidate,
-                path_value,
-                pathext_value,
-                path_entries_checked,
-                depth,
-            );
-            if resolution != ExecutableResolution::NotFound {
-                break;
-            }
-        }
+    {
+        resolve_candidate(
+            candidate,
+            path_value,
+            pathext_value,
+            path_entries_checked,
+            depth,
+        )
     }
 
-    resolution
+    #[cfg(windows)]
+    {
+        let mut resolution = resolve_candidate(
+            candidate,
+            path_value,
+            pathext_value,
+            path_entries_checked,
+            depth,
+        );
+
+        if resolution == ExecutableResolution::NotFound && candidate.extension().is_none() {
+            for extension in windows_extensions(pathext_value) {
+                let candidate = candidate.with_extension(extension.trim_start_matches('.'));
+                resolution = resolve_candidate(
+                    &candidate,
+                    path_value,
+                    pathext_value,
+                    path_entries_checked,
+                    depth,
+                );
+                if resolution != ExecutableResolution::NotFound {
+                    break;
+                }
+            }
+        }
+
+        resolution
+    }
 }
 
 fn resolve_candidate(
@@ -234,6 +245,11 @@ fn resolve_candidate(
     if !candidate.is_file() {
         return ExecutableResolution::NotFound;
     }
+
+    // The environment and shim depth are only consulted by the Windows
+    // resolution branches below.
+    #[cfg(not(windows))]
+    let _ = (path_value, pathext_value, depth);
 
     #[cfg(windows)]
     {
