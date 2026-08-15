@@ -97,8 +97,11 @@ viewport controls. Keep Factory entities from `GET /api/graph` separate from vis
 state in `.factory/graph.json`. Save positions on drag end, not during movement.
 
 Workflow nodes come from real Runs. Task nodes and dependency edges come from SQLite.
-Role assignments update `.factory/config.toml`; custom links, groups, notes, and
-memberships remain visual-only.
+Role definitions and assignments update `.factory/config.toml` through the `/api/roles`
+endpoints (or `PUT /api/config`); custom links, groups, notes, and memberships remain
+visual-only. Role routing tests live in
+`cargo test -p factory-core --test role_routing`; role API tests in
+`cargo test -p factory-api --test roles_api`.
 
 The Agent Console consumes persisted session data. Automated sessions use the
 session-scoped SSE route. Interactive sessions are started for a configured agent,

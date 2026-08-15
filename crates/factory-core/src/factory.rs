@@ -7,13 +7,16 @@ use factory_db::{FactoryDb, Reconciliation};
 use factory_git::{Repo, WorktreeInfo};
 use factory_types::{
     AgentSession, AgentSessionMode, AttemptStatus, ReviewDecision, ReviewResult, Run, RunStatus,
-    Task, TaskAttempt, TaskEvidence, TaskState,
+    Task, TaskAttempt, TaskEvidence, TaskState, WorkflowTeam,
 };
 use serde::Deserialize;
 use thiserror::Error;
 
 use crate::config::{AgentResolutionError, Agents, ConfigError};
-use crate::planner::{mission as planner_mission, normalize_plan, parse_plan, PlanError};
+use crate::planner::{
+    mission as planner_mission, normalize_plan, parse_plan, validate_plan_roles, PlanError,
+};
+use crate::roles::{self, RoleDefinition};
 
 pub const FACTORY_DIR: &str = ".factory";
 pub const MAX_TASK_ATTEMPTS: u32 = 3;
@@ -34,6 +37,10 @@ pub enum FactoryError {
     EmptyPlan(i64),
     #[error("workflow #{0} has an invalid task dependency graph: {1}")]
     InvalidDag(i64, String),
+    #[error("task #{0} requires role '{1}' which has no agents in this workflow's team")]
+    TaskRoleUnavailable(i64, String),
+    #[error("invalid workflow team: {0}")]
+    InvalidTeam(String),
     #[error("task #{0} reached the retry limit of {MAX_TASK_ATTEMPTS} attempts")]
     RetryLimit(i64),
     #[error("planning failed: {0}")]
@@ -76,12 +83,6 @@ pub struct MarkOutcome {
     pub task: Task,
     pub from: TaskState,
     pub updated: Vec<i64>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExecutionRoles {
-    pub worker: String,
-    pub reviewer: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -139,23 +140,63 @@ impl Factory {
         &self.agents
     }
 
-    pub fn planner_agent(&self) -> Result<String, FactoryError> {
-        Ok(self.agents.command_agent("planner")?.name().to_string())
-    }
-
-    pub fn begin_run(&self, objective: &str) -> Result<Run, FactoryError> {
+    pub fn begin_run(
+        &self,
+        objective: &str,
+        team: Option<WorkflowTeam>,
+    ) -> Result<Run, FactoryError> {
         let objective = objective.trim();
         if objective.is_empty() {
             return Err(FactoryError::EmptyObjective);
         }
-        let planner = self.agents.command_agent("planner")?;
-        Ok(self
-            .db
-            .create_run_with_status(objective, Some(planner.name()), RunStatus::Planning)?)
+        let team = self.resolve_new_team(team)?;
+        let planner = self.agents.command_agent_for("planner", &team.planner)?;
+        let run =
+            self.db
+                .create_run_with_status(objective, Some(planner.name()), RunStatus::Planning)?;
+        self.db.set_run_team(run.id, &team)?;
+        self.db
+            .get_run(run.id)?
+            .ok_or(FactoryError::RunNotFound(run.id))
+    }
+
+    fn resolve_new_team(&self, team: Option<WorkflowTeam>) -> Result<WorkflowTeam, FactoryError> {
+        let (team, complete) = match team {
+            Some(team) => (team, true),
+            None => (
+                self.agents
+                    .config()
+                    .initial_team()
+                    .map_err(FactoryError::InvalidTeam)?,
+                false,
+            ),
+        };
+        let validation = if complete {
+            self.agents.config().validate_team(&team)
+        } else {
+            self.agents.config().validate_partial_team(&team)
+        };
+        validation.map_err(FactoryError::InvalidTeam)?;
+        Ok(team)
+    }
+
+    /// The team recorded on the run, or the current default team persisted as
+    /// a snapshot for runs created before teams existed.
+    fn resolve_team(&self, run: &Run) -> Result<WorkflowTeam, FactoryError> {
+        if let Some(team) = &run.team {
+            return Ok(team.clone());
+        }
+        let team = self
+            .agents
+            .config()
+            .default_team()
+            .map_err(FactoryError::InvalidTeam)?;
+        self.db.set_run_team(run.id, &team)?;
+        Ok(team)
     }
 
     pub fn create_run(&self, objective: &str) -> Result<RunOutcome, FactoryError> {
-        let run = self.begin_run(objective)?;
+        let run = self.begin_run(objective, None)?;
         self.plan_run(run.id, &AtomicBool::new(false))
     }
 
@@ -183,10 +224,34 @@ impl Factory {
                 run.status.as_str().to_string(),
             ));
         }
+        let team = self.resolve_team(&run)?;
+        let planner = self.agents.command_agent_for("planner", &team.planner)?;
+        let catalog = self.agents.config().catalog();
+        let available_roles: Vec<(String, String)> = team
+            .task_roles()
+            .into_iter()
+            .map(|role| {
+                let description = catalog
+                    .get(&role)
+                    .map(|definition| definition.description.clone())
+                    .unwrap_or_default();
+                (role, description)
+            })
+            .collect();
+        let allowed_roles: std::collections::HashSet<String> = available_roles
+            .iter()
+            .map(|(role, _)| role.clone())
+            .collect();
+        let available_roles: Vec<(&str, &str)> = available_roles
+            .iter()
+            .map(|(role, description)| (role.as_str(), description.as_str()))
+            .collect();
         let mut rejection: Option<String> = None;
         for attempt in 0..crate::planner::MAX_ATTEMPTS {
-            let instruction = planner_mission(&run.objective, rejection.as_deref());
-            let invocation = self.invoke(
+            let instruction =
+                planner_mission(&run.objective, &available_roles, rejection.as_deref());
+            let invocation = self.invoke_with_agent(
+                planner.clone(),
                 InvocationScope {
                     run_id: Some(run_id),
                     task_id: None,
@@ -210,9 +275,13 @@ impl Factory {
                 ))
                 .into());
             }
-            match parse_plan(&invocation.result.stdout) {
+            let parsed = parse_plan(&invocation.result.stdout).and_then(|plan| {
+                let plan = normalize_plan(plan);
+                validate_plan_roles(&plan, &allowed_roles)?;
+                Ok(plan)
+            });
+            match parsed {
                 Ok(plan) => {
-                    let plan = normalize_plan(plan);
                     let tasks = self.db.persist_plan(run_id, &plan)?;
                     let run = self
                         .db
@@ -233,14 +302,7 @@ impl Factory {
         unreachable!("planner attempt loop returns")
     }
 
-    pub fn execution_roles(&self) -> Result<ExecutionRoles, FactoryError> {
-        Ok(ExecutionRoles {
-            worker: self.agents.command_agent("worker")?.name().to_string(),
-            reviewer: self.agents.command_agent("reviewer")?.name().to_string(),
-        })
-    }
-
-    pub fn prepare_start(&self, run_id: i64) -> Result<ExecutionRoles, FactoryError> {
+    pub fn prepare_start(&self, run_id: i64) -> Result<WorkflowTeam, FactoryError> {
         let run = self
             .db
             .get_run(run_id)?
@@ -256,10 +318,71 @@ impl Factory {
             return Err(FactoryError::EmptyPlan(run_id));
         }
         validate_task_dag(&tasks).map_err(|reason| FactoryError::InvalidDag(run_id, reason))?;
-        let roles = self.execution_roles()?;
+        let mut team = self.resolve_team(&run)?;
+        if team.workers.is_empty() || team.reviewers.is_empty() {
+            let defaults = self
+                .agents
+                .config()
+                .default_team()
+                .map_err(FactoryError::InvalidTeam)?;
+            if team.workers.is_empty() {
+                team.workers = defaults.workers;
+            }
+            if team.reviewers.is_empty() {
+                team.reviewers = defaults.reviewers;
+            }
+            self.db.set_run_team(run_id, &team)?;
+        }
+        self.agents
+            .config()
+            .validate_team(&team)
+            .map_err(FactoryError::InvalidTeam)?;
+        for task in &tasks {
+            if let Some(role) = &task.role {
+                if team.agents_for_role(role).is_empty() {
+                    return Err(FactoryError::TaskRoleUnavailable(task.id, role.clone()));
+                }
+            }
+        }
+        for role in team.roles() {
+            for agent in team.agents_for_role(&role) {
+                self.agents.command_agent_for(&role, agent)?;
+            }
+        }
         Repo::detect_bounded(&self.root, &self.root)?;
         self.db.set_run_status(run_id, RunStatus::Active)?;
-        Ok(roles)
+        Ok(team)
+    }
+
+    /// Replaces the team of a workflow that has not started yet.
+    pub fn update_run_team(
+        &self,
+        run_id: i64,
+        team: WorkflowTeam,
+    ) -> Result<WorkflowTeam, FactoryError> {
+        let run = self
+            .db
+            .get_run(run_id)?
+            .ok_or(FactoryError::RunNotFound(run_id))?;
+        if !matches!(
+            run.status,
+            RunStatus::Planning | RunStatus::Planned | RunStatus::Blocked
+        ) {
+            return Err(FactoryError::InvalidRunState(
+                run_id,
+                run.status.as_str().to_string(),
+            ));
+        }
+        self.agents
+            .config()
+            .validate_team(&team)
+            .map_err(FactoryError::InvalidTeam)?;
+        let planner = self.agents.command_agent_for("planner", &team.planner)?;
+        self.db.set_run_team(run_id, &team)?;
+        if run.status == RunStatus::Planning {
+            self.db.set_run_planner_agent(run_id, planner.name())?;
+        }
+        Ok(team)
     }
 
     pub fn execute_active_run(
@@ -337,7 +460,15 @@ impl Factory {
         {
             return Err(FactoryError::RetryLimit(task_id));
         }
-        self.execution_roles()?;
+        let run = self
+            .db
+            .get_run(task.run_id)?
+            .ok_or(FactoryError::RunNotFound(task.run_id))?;
+        let team = self.resolve_team(&run)?;
+        self.agents
+            .config()
+            .validate_team(&team)
+            .map_err(FactoryError::InvalidTeam)?;
         self.mark_task(task_id, TaskState::Ready)?;
         self.db.set_run_status(task.run_id, RunStatus::Active)?;
         Ok(task.run_id)
@@ -368,20 +499,44 @@ impl Factory {
             };
             let repo = Repo::detect_bounded(&worktree, &self.root)?;
             let base_sha = repo.head_sha(&worktree)?;
-            let worker = self.agents.command_agent("worker")?;
-            let attempt =
-                self.db
-                    .create_task_attempt(task_id, worker.name(), &worktree.to_string_lossy())?;
+            let run = self
+                .db
+                .get_run(task.run_id)?
+                .ok_or(FactoryError::RunNotFound(task.run_id))?;
+            let team = self.resolve_team(&run)?;
+            let role = task
+                .role
+                .clone()
+                .unwrap_or_else(|| roles::WORKER.to_string());
+            let catalog = self.agents.config().catalog();
+            let role_definition = catalog
+                .get(&role)
+                .cloned()
+                .or_else(|| roles::core_role(roles::WORKER))
+                .ok_or_else(|| FactoryError::TaskRoleUnavailable(task.id, role.clone()))?;
+            let worker_pool = team.agents_for_role(&role).to_vec();
+            let worker_index = self.db.count_task_attempts(task.run_id)?;
+            let worker_name = roles::select_agent(&worker_pool, worker_index)
+                .ok_or_else(|| FactoryError::TaskRoleUnavailable(task.id, role.clone()))?
+                .clone();
+            let worker = self.agents.command_agent_for(&role, &worker_name)?;
+            let attempt = self.db.create_task_attempt(
+                task_id,
+                &role,
+                worker.name(),
+                &worktree.to_string_lossy(),
+            )?;
             self.mark_task(task_id, TaskState::Running)?;
 
-            let worker_instruction = worker_mission(&task, previous_feedback.as_ref());
+            let worker_instruction =
+                worker_mission(&task, &role_definition, previous_feedback.as_ref());
             let worker_run = self.invoke_with_agent(
                 worker,
                 InvocationScope {
                     run_id: Some(task.run_id),
                     task_id: Some(task.id),
                     attempt_id: Some(attempt.id),
-                    role: "worker",
+                    role: &role,
                     working_dir: &worktree,
                 },
                 &worker_instruction,
@@ -455,8 +610,19 @@ impl Factory {
 
             self.db
                 .set_task_attempt_status(attempt.id, AttemptStatus::Reviewing)?;
-            let reviewer = self.agents.command_agent("reviewer")?;
-            let review_instruction = reviewer_mission(&task, &evidence, &worker_run.result.stdout);
+            let reviewer_name = roles::select_agent(
+                &team.reviewers,
+                attempt.attempt_number.saturating_sub(1) as usize,
+            )
+            .ok_or_else(|| FactoryError::TaskRoleUnavailable(task.id, "reviewer".into()))?
+            .clone();
+            let reviewer = self.agents.command_agent_for("reviewer", &reviewer_name)?;
+            let review_instruction = reviewer_mission(
+                &task,
+                &role_definition,
+                &evidence,
+                &worker_run.result.stdout,
+            );
             let review_run = self.invoke_with_agent(
                 reviewer,
                 InvocationScope {
@@ -559,16 +725,6 @@ impl Factory {
             }
             self.mark_task(task_id, TaskState::Ready)?;
         }
-    }
-
-    fn invoke(
-        &self,
-        scope: InvocationScope<'_>,
-        mission: &str,
-        cancel: &AtomicBool,
-    ) -> Result<Invocation, FactoryError> {
-        let agent = self.agents.command_agent(scope.role)?;
-        self.invoke_with_agent(agent, scope, mission, cancel)
     }
 
     fn invoke_with_agent(
@@ -849,32 +1005,61 @@ fn validate_task_dag(tasks: &[Task]) -> Result<(), String> {
     Ok(())
 }
 
-fn worker_mission(task: &Task, previous_review: Option<&ReviewResult>) -> String {
+fn worker_mission(
+    task: &Task,
+    role: &RoleDefinition,
+    previous_review: Option<&ReviewResult>,
+) -> String {
     let criteria = task
         .acceptance_criteria
         .iter()
         .map(|criterion| format!("- {criterion}"))
         .collect::<Vec<_>>()
         .join("\n");
-    let feedback = previous_review.map_or_else(String::new, |review| {
-        format!(
-            "\n\nPrevious review requested changes:\n{}\n{}",
-            review.reason,
-            review
-                .feedback
-                .iter()
-                .map(|item| format!("- {item}"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        )
-    });
-    format!(
-        "You are the Worker for one task in Agentic Software Factory. Work only in the current git worktree. Implement the task, run focused verification, and preserve all useful changes. Do not modify Factory orchestration state.\n\nTask: {}\nObjective: {}\nAcceptance criteria:\n{}{}\n\nAt the end, report a concise JSON object with keys `summary` and `commands` (an array of commands/tests you ran).",
-        task.title, task.objective, criteria, feedback
-    )
+    let mut mission = format!(
+        "ROLE\n{} — {}\n\n{}\n\nOBJECTIVE\n{}\n\nTASK\n{}\n",
+        role.name,
+        role.description,
+        role.instructions.trim(),
+        task.objective.trim(),
+        task.title.trim()
+    );
+    mission.push_str(
+        "\nCONSTRAINTS\n\
+- Work only in the current git worktree.\n\
+- Do not modify Factory orchestration state (.factory).\n\
+- These constraints take precedence over any role instruction.",
+    );
+    if let Some(review) = previous_review {
+        mission.push_str("\n\nCONTEXT\nPrevious review requested changes:\n");
+        mission.push_str(&review.reason);
+        if !review.feedback.is_empty() {
+            mission.push('\n');
+            mission.push_str(
+                &review
+                    .feedback
+                    .iter()
+                    .map(|item| format!("- {item}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
+        }
+    }
+    mission.push_str(&format!("\n\nACCEPTANCE CRITERIA\n{criteria}"));
+    mission.push_str(
+        "\n\nOUTPUT CONTRACT\n\
+At the end, report a concise JSON object with keys `summary` and `commands` \
+(an array of the commands or tests you ran).",
+    );
+    mission
 }
 
-fn reviewer_mission(task: &Task, evidence: &TaskEvidence, worker_output: &str) -> String {
+fn reviewer_mission(
+    task: &Task,
+    worker_role: &RoleDefinition,
+    evidence: &TaskEvidence,
+    worker_output: &str,
+) -> String {
     let worker_output = tail(worker_output, 20_000);
     let criteria = task
         .acceptance_criteria
@@ -883,9 +1068,16 @@ fn reviewer_mission(task: &Task, evidence: &TaskEvidence, worker_output: &str) -
         .collect::<Vec<_>>()
         .join("\n");
     format!(
-        "You are the Reviewer for one task in Agentic Software Factory. Review the actual worktree and the evidence below against the task and acceptance criteria. Do not modify files. Return one JSON object only: {{\"decision\":\"approve\"|\"request_changes\",\"reason\":string,\"feedback\":[string]}}. Approve only when the evidence and repository changes satisfy the task.\n\nTask: {}\nObjective: {}\nAcceptance criteria:\n{}\nChanged files: {}\nDiff summary:\n{}\nCommit: {}\nWorker-reported commands: {}\nWorker output:\n{}",
-        task.title,
-        task.objective,
+        "ROLE\nReviewer — Independently evaluates task output against acceptance criteria.\n\
+The {} produced the change below.\n\nOBJECTIVE\n{}\n\nTASK\n{}\n\nACCEPTANCE CRITERIA\n{}\n\n\
+EVIDENCE\nChanged files: {}\nDiff summary:\n{}\nCommit: {}\nWorker-reported commands: {}\n\n\
+WORKER OUTPUT\n{}\n\n\
+OUTPUT CONTRACT\n\
+Return one JSON object only: {{\"decision\":\"approve\"|\"request_changes\",\"reason\":string,\"feedback\":[string]}}.\n\
+Approve only when the evidence and repository changes satisfy the task. Do not modify files.",
+        worker_role.name,
+        task.objective.trim(),
+        task.title.trim(),
         criteria,
         evidence.changed_files.join(", "),
         evidence.diff_summary,
@@ -998,9 +1190,77 @@ mod tests {
             position: id as i32,
             dependencies,
             worktree_path: None,
+            role: None,
             created_at: String::new(),
             updated_at: String::new(),
         };
         assert!(validate_task_dag(&[task(1, vec![2]), task(2, vec![1])]).is_err());
+    }
+
+    #[test]
+    fn worker_mission_keeps_role_instructions_and_factory_constraints_separate() {
+        let task = Task {
+            id: 7,
+            run_id: 1,
+            title: "Add index".into(),
+            objective: "Speed up the query.".into(),
+            acceptance_criteria: vec!["query plan uses the index".into()],
+            state: TaskState::Ready,
+            position: 0,
+            dependencies: Vec::new(),
+            worktree_path: None,
+            role: Some("database_engineer".into()),
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        let role = crate::roles::core_role(crate::roles::WORKER).unwrap();
+        let mission = worker_mission(&task, &role, None);
+        assert!(mission.contains("ROLE\nWorker — "));
+        assert!(mission.contains("OBJECTIVE\nSpeed up the query."));
+        assert!(mission.contains("TASK\nAdd index"));
+        assert!(mission.contains("CONSTRAINTS"));
+        assert!(mission.contains("Do not modify Factory orchestration state"));
+        assert!(mission.contains("take precedence over any role instruction"));
+        assert!(mission.contains("ACCEPTANCE CRITERIA\n- query plan uses the index"));
+        assert!(mission.contains("OUTPUT CONTRACT"));
+        let review = ReviewResult {
+            decision: ReviewDecision::RequestChanges,
+            reason: "missing test".into(),
+            feedback: vec!["add a regression test".into()],
+        };
+        let retry = worker_mission(&task, &role, Some(&review));
+        assert!(retry.contains("CONTEXT\nPrevious review requested changes:\nmissing test"));
+        assert!(retry.contains("- add a regression test"));
+    }
+
+    #[test]
+    fn reviewer_mission_names_the_worker_role() {
+        let task = Task {
+            id: 7,
+            run_id: 1,
+            title: "Add index".into(),
+            objective: "Speed up the query.".into(),
+            acceptance_criteria: vec!["query plan uses the index".into()],
+            state: TaskState::Running,
+            position: 0,
+            dependencies: Vec::new(),
+            worktree_path: None,
+            role: Some("database_engineer".into()),
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        let evidence = TaskEvidence {
+            changed_files: vec!["migrations/1.sql".into()],
+            diff_summary: "1 file changed".into(),
+            commit_sha: Some("abc".into()),
+            commands: vec!["cargo test".into()],
+            acceptance_criteria: Vec::new(),
+            worker_exit_code: Some(0),
+        };
+        let role = crate::roles::core_role(crate::roles::TEST_ENGINEER).unwrap();
+        let mission = reviewer_mission(&task, &role, &evidence, "worker said hi");
+        assert!(mission.contains("The Test Engineer produced the change below."));
+        assert!(mission.contains("OUTPUT CONTRACT"));
+        assert!(mission.contains("approve"));
     }
 }

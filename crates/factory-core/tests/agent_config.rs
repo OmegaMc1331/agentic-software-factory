@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use factory_agent::{AgentKind, PromptTransport};
-use factory_core::{AgentEntry, AgentResolutionError, Agents, Config};
+use factory_core::{AgentEntry, AgentResolutionError, Agents, Config, RoleAssignment};
 use tempfile::TempDir;
 
 fn write_config(dir: &Path, content: &str) {
@@ -56,6 +56,7 @@ fn legacy_custom_configuration_keeps_stdin_transport() {
     let config = Config {
         agents: BTreeMap::from([("custom".into(), entry)]),
         roles: BTreeMap::new(),
+        role_assignments: Vec::new(),
     };
     let agent = config.agent_config("custom").unwrap();
     assert_eq!(agent.kind, AgentKind::Custom);
@@ -297,7 +298,7 @@ fn init_does_not_require_agents_to_be_installed() {
     factory_core::Factory::init(dir.path()).unwrap();
     let config = Config::load(dir.path()).unwrap();
     assert!(config.agents.contains_key("codex"));
-    assert!(config.roles.contains_key("planner"));
+    assert_eq!(config.agent_for_role("planner"), Some("codex".to_string()));
 }
 
 #[test]
@@ -308,12 +309,12 @@ fn write_atomic_round_trips_configuration() {
             "codex".to_string(),
             build_entry("codex", vec!["exec".to_string()]),
         )]),
-        roles: BTreeMap::from([(
-            "planner".to_string(),
-            factory_core::config::RoleEntry {
-                agent: "codex".to_string(),
-            },
-        )]),
+        roles: BTreeMap::new(),
+        role_assignments: vec![RoleAssignment {
+            role: "planner".to_string(),
+            agent: "codex".to_string(),
+            preferred: true,
+        }],
     };
     let path = config.write_atomic(dir.path()).unwrap();
     assert!(path.ends_with("config.toml"));
@@ -333,12 +334,12 @@ fn write_atomic_round_trips_configuration() {
 fn validation_rejects_unknown_role_agent() {
     let config = Config {
         agents: BTreeMap::from([("codex".into(), build_entry("codex", vec![]))]),
-        roles: BTreeMap::from([(
-            "planner".into(),
-            factory_core::config::RoleEntry {
-                agent: "ghost".into(),
-            },
-        )]),
+        roles: BTreeMap::new(),
+        role_assignments: vec![RoleAssignment {
+            role: "planner".into(),
+            agent: "ghost".into(),
+            preferred: false,
+        }],
     };
     let err = config.validate().unwrap_err();
     assert!(err.contains("unknown agent 'ghost'"));
@@ -349,6 +350,7 @@ fn validation_rejects_empty_commands_and_invalid_names() {
     let config = Config {
         agents: BTreeMap::from([("bad name".into(), build_entry("", vec![]))]),
         roles: BTreeMap::new(),
+        role_assignments: Vec::new(),
     };
     let err = config.validate().unwrap_err();
     assert!(err.contains("invalid agent name"));
@@ -356,7 +358,77 @@ fn validation_rejects_empty_commands_and_invalid_names() {
     let config = Config {
         agents: BTreeMap::from([("codex".into(), build_entry("", vec![]))]),
         roles: BTreeMap::new(),
+        role_assignments: Vec::new(),
     };
     let err = config.validate().unwrap_err();
     assert!(err.contains("empty command"));
+}
+
+#[test]
+fn legacy_config_file_migrates_on_disk_with_a_backup() {
+    let dir = TempDir::new().unwrap();
+    write_config(
+        dir.path(),
+        r#"
+[agents.codex]
+command = "codex"
+args = ["exec"]
+
+[agents.opencode]
+command = "opencode"
+args = ["run"]
+
+[agents.claude]
+command = "claude"
+args = ["-p"]
+
+[roles.planner]
+agent = "codex"
+
+[roles.worker]
+agent = "opencode"
+
+[roles.reviewer]
+agent = "claude"
+"#,
+    );
+    let config = Config::load_and_migrate(dir.path()).unwrap();
+    assert_eq!(config.agent_for_role("planner"), Some("codex".to_string()));
+    assert_eq!(
+        config.agent_for_role("worker"),
+        Some("opencode".to_string())
+    );
+    assert_eq!(
+        config.agent_for_role("reviewer"),
+        Some("claude".to_string())
+    );
+
+    let written = std::fs::read_to_string(dir.path().join(".factory").join("config.toml")).unwrap();
+    assert!(written.contains("[[role_assignments]]"), "got:\n{written}");
+    assert!(written.contains("role = \"planner\""));
+    assert!(written.contains("preferred = true"));
+    assert!(!written.contains("[roles.planner]"));
+
+    let backup =
+        std::fs::read_to_string(dir.path().join(".factory").join("config.toml.bak")).unwrap();
+    assert!(backup.contains("[roles.planner]\nagent = \"codex\""));
+
+    let reloaded = Config::load_and_migrate(dir.path()).unwrap();
+    assert_eq!(reloaded, config);
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join(".factory").join("config.toml")).unwrap(),
+        written,
+        "second load must not rewrite the file"
+    );
+}
+
+#[test]
+fn current_config_files_load_without_migration_writes() {
+    let dir = TempDir::new().unwrap();
+    write_config(dir.path(), &factory_core::default_config_text());
+    let before = std::fs::read_to_string(dir.path().join(".factory").join("config.toml")).unwrap();
+    Config::load_and_migrate(dir.path()).unwrap();
+    let after = std::fs::read_to_string(dir.path().join(".factory").join("config.toml")).unwrap();
+    assert_eq!(before, after);
+    assert!(!dir.path().join(".factory").join("config.toml.bak").exists());
 }

@@ -1,6 +1,6 @@
 import { Handle, Position, type Node, type NodeProps } from "@xyflow/react";
 import type { AgentActivity, GraphNode as GraphNodeData } from "../types";
-import { agentMeta, runMeta, taskMeta } from "../types";
+import { agentMeta, roleMeta, runMeta, taskMeta } from "../types";
 import { STATE_META } from "../state";
 import { truncate } from "../layout";
 
@@ -66,11 +66,15 @@ export function GraphNode({ data, selected }: NodeProps<FactoryFlowNode>) {
   }
 
   if (node.kind === "role") {
+    const meta = roleMeta(node);
     return (
       <div className={classes} aria-label={`${node.label} role`}>
         <Handles kind={node.kind} />
-        <span className="graph-node-kicker">Role</span>
-        <strong>{node.label}</strong>
+        <span className="graph-node-kicker">
+          {meta.kind === "core" ? "Core role" : "Custom role"}
+        </span>
+        <strong>{truncate(node.label, 18)}</strong>
+        {meta.assignments.length > 1 && <small>{meta.assignments.length} agents</small>}
       </div>
     );
   }
@@ -92,6 +96,7 @@ export function GraphNode({ data, selected }: NodeProps<FactoryFlowNode>) {
 
   if (node.kind === "task") {
     const meta = taskMeta(node);
+    const showRole = meta.role !== null && meta.role !== "worker";
     return (
       <div
         className={`${classes} graph-node--state-${meta.state}`}
@@ -101,7 +106,10 @@ export function GraphNode({ data, selected }: NodeProps<FactoryFlowNode>) {
         <Handles kind={node.kind} />
         <strong>#{meta.taskId}</strong>
         <span>{truncate(node.label, 24)}</span>
-        <small>{meta.currentAttempt?.status === "reviewing" ? "review" : meta.state}</small>
+        <small>
+          {meta.currentAttempt?.status === "reviewing" ? "review" : meta.state}
+          {showRole ? ` · ${meta.role}` : ""}
+        </small>
       </div>
     );
   }

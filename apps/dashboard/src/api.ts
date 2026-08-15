@@ -2,11 +2,14 @@ import type {
   AgentSession,
   AgentStatusInfo,
   ConfigData,
+  ExecutionClass,
   GraphData,
   GraphWorkspace,
+  RoleInfo,
   Run,
   RunDetail,
   RunSummary,
+  WorkflowTeam,
 } from "./types";
 
 const API_BASE = "/api";
@@ -87,8 +90,8 @@ async function post<T>(path: string, body?: unknown): Promise<T> {
   });
 }
 
-async function remove(path: string): Promise<void> {
-  return request<void>(path, { method: "DELETE" });
+async function remove<T = void>(path: string): Promise<T> {
+  return request<T>(path, { method: "DELETE" });
 }
 
 export function fetchRuns(): Promise<RunSummary[]> {
@@ -99,12 +102,16 @@ export function fetchRun(id: number): Promise<RunDetail> {
   return get<RunDetail>(`/runs/${id}`);
 }
 
-export function createWorkflow(objective: string): Promise<Run> {
-  return post<Run>("/runs", { objective });
+export function createWorkflow(objective: string, team?: WorkflowTeam): Promise<Run> {
+  return post<Run>("/runs", team === undefined ? { objective } : { objective, team });
 }
 
-export function startWorkflow(id: number): Promise<{ worker: string; reviewer: string }> {
-  return post<{ worker: string; reviewer: string }>(`/runs/${id}/start`);
+export function updateWorkflowTeam(runId: number, team: WorkflowTeam): Promise<WorkflowTeam> {
+  return put<WorkflowTeam>(`/runs/${runId}/team`, team);
+}
+
+export function startWorkflow(id: number): Promise<WorkflowTeam> {
+  return post<WorkflowTeam>(`/runs/${id}/start`);
 }
 
 export function cancelWorkflow(id: number): Promise<void> {
@@ -143,6 +150,58 @@ export function saveConfig(config: ConfigData): Promise<void> {
 
 export function fetchAgents(): Promise<AgentStatusInfo[]> {
   return get<AgentStatusInfo[]>("/agents");
+}
+
+export function fetchRoles(): Promise<RoleInfo[]> {
+  return get<RoleInfo[]>("/roles");
+}
+
+export interface RoleCreateRequest {
+  id?: string;
+  name: string;
+  description: string;
+  executionClass: ExecutionClass;
+  instructions?: string;
+  agents?: string[];
+  preferredAgent?: string;
+}
+
+export function createRole(request: RoleCreateRequest): Promise<RoleInfo> {
+  return post<RoleInfo>("/roles", request);
+}
+
+export function updateRole(
+  id: string,
+  body: {
+    name: string;
+    description: string;
+    executionClass: ExecutionClass;
+    instructions?: string;
+  }
+): Promise<RoleInfo> {
+  return put<RoleInfo>(`/roles/${encodeURIComponent(id)}`, body);
+}
+
+export function deleteRole(id: string): Promise<void> {
+  return remove(`/roles/${encodeURIComponent(id)}`);
+}
+
+export function addRoleAssignment(
+  roleId: string,
+  agent: string,
+  preferred = false
+): Promise<RoleInfo> {
+  return post<RoleInfo>(`/roles/${encodeURIComponent(roleId)}/assignments`, { agent, preferred });
+}
+
+export function removeRoleAssignment(roleId: string, agent: string): Promise<RoleInfo> {
+  return remove<RoleInfo>(
+    `/roles/${encodeURIComponent(roleId)}/assignments/${encodeURIComponent(agent)}`
+  );
+}
+
+export function setPreferredAssignment(roleId: string, agent: string): Promise<RoleInfo> {
+  return put<RoleInfo>(`/roles/${encodeURIComponent(roleId)}/preferred`, { agent });
 }
 
 export function fetchAgentSessions(agent: string): Promise<AgentSession[]> {

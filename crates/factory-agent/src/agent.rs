@@ -229,7 +229,7 @@ impl AgentError {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CommandAgent {
     config: AgentConfig,
 }

@@ -65,23 +65,34 @@ planning → planned → active → completed
                     └────────→ cancelled
 ```
 
-Start validates the configured Worker and Reviewer, the Git repository, the task DAG,
-and the presence of planned tasks. The first runtime is sequential:
+Start validates the workflow team (planner, workers, reviewers, and any additional
+roles), the Git repository, the task DAG, and the presence of planned tasks. The first
+runtime is sequential:
 
 ```text
 lowest-position ready task
   → create or reuse its worktree
-  → Worker AgentSession
+  → Worker AgentSession (role = task role or worker)
   → capture Git and agent-reported evidence
   → Reviewer AgentSession
   → approve, retry, or fail
   → select the next ready task
 ```
 
-The Worker and Reviewer come only from `.factory/config.toml`. The Reviewer receives
+Teams come only from `.factory/config.toml` role assignments. Every workflow stores a
+team snapshot: which planner, workers, reviewers, and additional roles participate.
+Global assignments answer which agents *may* act as Worker; the team decides which
+ones *do* for that workflow. Tasks may name a role (assigned by the Planner from the
+team's role catalog); a task without a role defaults to Worker. See [Roles](roles.md)
+for the full model.
+
+The Reviewer receives
 the task objective, acceptance criteria, diff evidence, and Worker output. Its JSON
 decision must be `approve` or `request_changes`. Change requests and Worker failures
-are limited to three total `TaskAttempt` records per task.
+are limited to three total `TaskAttempt` records per task. Within a team of several
+workers, execution attempts route round-robin; review attempts rotate across the
+selected reviewers. Selection is a deterministic function of persisted state and
+survives restarts.
 
 Cancellation sets a run-scoped signal, stops scheduling, terminates the current
 configured agent process tree, and preserves the worktree and recorded evidence. A
@@ -89,11 +100,51 @@ Factory restart marks formerly running sessions and attempts as `interrupted`, r
 tasks as `failed`, and active/planning workflows as `failed`; the graph can then expose
 the failure and eligible retry.
 
+## Role model
+
+Role definitions are independent from agents. Core roles (Planner, Worker, Reviewer,
+Architect, Researcher, Test Engineer, Security Auditor, Documentation Writer) are
+built in; custom roles are `[roles.<slug>]` tables in `.factory/config.toml`. A role
+definition says what the role does; a `[[role_assignments]]` entry permits one agent
+to perform it. One role may have several agents, one agent may hold several roles,
+and at most one assignment per role is preferred.
+
+```text
+RoleDefinition
+      │
+      ├── Core (built-in ids)
+      └── Custom ([roles.<slug>] in config.toml)
+             │
+             ▼
+      RoleAssignments  ── many-to-many ──  Agents
+             │
+             ▼
+         Workflow team snapshot (runs.team)
+             │
+             ▼
+           Tasks (tasks.role, default worker)
+```
+
+Runtime resolution for one execution attempt:
+
+```text
+task role → workflow team assignment set → routing policy → selected agent
+→ AgentSession(role = actual role id) → TaskAttempt(role, agent)
+```
+
+Routing is deterministic: the preferred assignment is the default team selection,
+execution attempts cycle the selected worker pool by persisted attempt count, and
+review attempts rotate by attempt number. There is no heuristic or model-based
+routing. Execution stays sequential; the pool topology is parallel-ready.
+
 ## Persistence and concurrency
 
 SQLite tables include `runs`, `tasks`, `task_dependencies`, `task_attempts`, and
-`agent_sessions`. `TaskAttempt` stores the attempt number, agent, status, timestamps,
-worktree, commit, exit code, error, evidence, and structured review.
+`agent_sessions`. `TaskAttempt` stores the attempt number, agent, role, status,
+timestamps, worktree, commit, exit code, error, evidence, and structured review.
+`runs.team` stores each workflow's team snapshot, `tasks.role` and
+`task_attempts.role` preserve the role that actually executed, and
+`agent_sessions.role` records the same per session.
 
 SQLite uses WAL mode and a bounded busy timeout. API handlers hold their shared
 connection only for short reads or writes. Runtime jobs open separate Factory/database
@@ -130,11 +181,19 @@ macOS use the platform PTY through `portable-pty`.
 
 | Method | Route                         | Purpose                                      |
 | ------ | ----------------------------- | -------------------------------------------- |
-| POST   | `/api/runs`                   | Persist and begin planning a workflow        |
+| POST   | `/api/runs`                   | Persist and begin planning a workflow (optional team) |
 | GET    | `/api/runs/:id`               | Read tasks, attempts, and sessions           |
-| POST   | `/api/runs/:id/start`         | Validate and schedule a planned workflow     |
+| POST   | `/api/runs/:id/start`         | Validate and schedule a planned workflow; returns its team |
 | POST   | `/api/runs/:id/cancel`        | Cancel that run's live operation             |
+| PUT    | `/api/runs/:id/team`          | Replace the team before the workflow starts  |
 | POST   | `/api/tasks/:id/retry`        | Retry an eligible task within the limit      |
+| GET    | `/api/roles`                  | Read role definitions and assignments        |
+| POST   | `/api/roles`                  | Create a custom role definition              |
+| PUT    | `/api/roles/:id`              | Update a custom role definition              |
+| DELETE | `/api/roles/:id`              | Delete an unused custom role                 |
+| POST   | `/api/roles/:id/assignments`  | Assign an agent to a role                    |
+| DELETE | `/api/roles/:id/assignments/:agent` | Remove one role assignment            |
+| PUT    | `/api/roles/:id/preferred`    | Mark one assignment as preferred             |
 | GET    | `/api/graph`                  | Read Factory entities and semantic links     |
 | GET    | `/api/sessions/:id/stream`    | Stream one known session through SSE         |
 | POST   | `/api/agents/:agent/sessions` | Start that configured agent in a PTY          |
@@ -142,7 +201,7 @@ macOS use the platform PTY through `portable-pty`.
 | GET    | `/api/sessions/:id/terminal`  | Upgrade one live interactive session to WS    |
 | GET    | `/api/graph/workspace`        | Read visual workspace state                  |
 | PUT    | `/api/graph/workspace`        | Validate and atomically save visual state    |
-| GET    | `/api/config`                 | Read configured agents and role assignments  |
+| GET    | `/api/config`                 | Read agents, custom role definitions, and role assignments |
 | PUT    | `/api/config`                 | Validate and atomically save configuration   |
 
 Automated output uses session-scoped Server-Sent Events. Interactive terminal traffic

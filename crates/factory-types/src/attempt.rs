@@ -77,6 +77,8 @@ pub struct TaskAttempt {
     pub task_id: i64,
     pub attempt_number: u32,
     pub agent: String,
+    #[serde(default)]
+    pub role: Option<String>,
     pub status: AttemptStatus,
     pub started_at: String,
     pub finished_at: Option<String>,

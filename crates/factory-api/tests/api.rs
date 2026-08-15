@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use factory_core::{AgentEntry, Config, RoleEntry};
+use factory_core::{AgentEntry, Config, RoleAssignment};
 use factory_types::{AgentSession, AgentSessionMode, RunStatus};
 use http_body_util::BodyExt;
 use serde_json::json;
@@ -104,12 +104,11 @@ fn configure_test_agents(root: &Path, slow_planner: bool) {
         ("worker", "worker-test"),
         ("reviewer", "reviewer-test"),
     ] {
-        config.roles.insert(
-            role.into(),
-            RoleEntry {
-                agent: agent.into(),
-            },
-        );
+        config.role_assignments.push(RoleAssignment {
+            role: role.into(),
+            agent: agent.into(),
+            preferred: true,
+        });
     }
     config.write_atomic(root).unwrap();
 }
@@ -278,7 +277,10 @@ async fn config_round_trips_through_put_and_get() {
         "agents": {
             "codex": { "command": "codex", "args": ["exec"], "env": { "TEST": "1" } }
         },
-        "roles": { "planner": { "agent": "codex" } }
+        "roles": {},
+        "role_assignments": [
+            { "role": "planner", "agent": "codex", "preferred": true }
+        ]
     });
     let response = app
         .clone()
@@ -311,7 +313,9 @@ async fn config_round_trips_through_put_and_get() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let value: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
-    assert_eq!(value["roles"]["planner"]["agent"], "codex");
+    assert_eq!(value["role_assignments"][0]["role"], "planner");
+    assert_eq!(value["role_assignments"][0]["agent"], "codex");
+    assert_eq!(value["role_assignments"][0]["preferred"], true);
     assert_eq!(value["agents"]["codex"]["args"][0], "exec");
 }
 
@@ -326,7 +330,10 @@ async fn role_assignment_can_be_reassigned_to_another_configured_agent() {
             "codex": { "command": "codex" },
             "opencode": { "command": "opencode" }
         },
-        "roles": { "planner": { "agent": "codex" } }
+        "roles": {},
+        "role_assignments": [
+            { "role": "planner", "agent": "codex", "preferred": true }
+        ]
     });
     let response = app
         .clone()
@@ -347,7 +354,10 @@ async fn role_assignment_can_be_reassigned_to_another_configured_agent() {
             "codex": { "command": "codex" },
             "opencode": { "command": "opencode" }
         },
-        "roles": { "planner": { "agent": "opencode" } }
+        "roles": {},
+        "role_assignments": [
+            { "role": "planner", "agent": "opencode", "preferred": true }
+        ]
     });
     let response = app
         .oneshot(
@@ -377,7 +387,8 @@ async fn rejects_invalid_configuration_writes() {
 
     let config = json!({
         "agents": {},
-        "roles": { "planner": { "agent": "ghost" } }
+        "roles": {},
+        "role_assignments": [ { "role": "planner", "agent": "ghost" } ]
     });
     let response = app
         .clone()
@@ -846,9 +857,10 @@ async fn workflow_api_plans_and_executes_through_factory_core() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::ACCEPTED);
-    let roles: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
-    assert_eq!(roles["worker"], "worker-test");
-    assert_eq!(roles["reviewer"], "reviewer-test");
+    let team: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+    assert_eq!(team["planner"], "planner-test");
+    assert_eq!(team["workers"][0], "worker-test");
+    assert_eq!(team["reviewers"][0], "reviewer-test");
     wait_for_run(dir.path(), run_id, RunStatus::Completed).await;
 
     let response = app

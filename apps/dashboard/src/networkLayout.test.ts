@@ -14,7 +14,19 @@ function node(id: string, kind: GraphNode["kind"], label = id): GraphNode {
     return { ...base, meta: { command: "codex exec", available: true, roles: [] } };
   }
   if (kind === "role") {
-    return { ...base, meta: { agent: "codex" } };
+    return {
+      ...base,
+      meta: {
+        id,
+        name: label,
+        kind: "core",
+        description: "",
+        instructions: "",
+        executionClass: "execution" as const,
+        assignments: [{ agent: "codex", preferred: true }],
+        available: true,
+      },
+    };
   }
   if (kind === "run") {
     return {
@@ -24,8 +36,7 @@ function node(id: string, kind: GraphNode["kind"], label = id): GraphNode {
         objective: "",
         status: "planned",
         plannerAgent: "codex",
-        workerAgent: "opencode",
-        reviewerAgent: "claude",
+        team: null,
         createdAt: "2026-01-01T00:00:00Z",
         counts: {
           pending: 0,
@@ -50,6 +61,7 @@ function node(id: string, kind: GraphNode["kind"], label = id): GraphNode {
       dependencies: [],
       acceptanceCriteria: [],
       worktreePath: null,
+      role: null,
       currentAttempt: null,
     },
   };

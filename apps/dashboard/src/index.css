@@ -1889,3 +1889,309 @@ code {
     grid-template-columns: 1fr;
   }
 }
+
+/* ---- Roles and workflow teams ---- */
+
+.workflow-team {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+
+.workflow-team-title {
+  color: var(--text-muted);
+  font-size: 10.5px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.workflow-team-group {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin: 0;
+  padding: 8px 10px 10px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+}
+
+.workflow-team-group legend {
+  color: var(--text-muted);
+  font-size: 10px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.workflow-team-check {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12px;
+}
+
+.workflow-team-summary ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.workflow-team-summary li {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 3px 0;
+}
+
+.workflow-team-summary li span {
+  color: var(--text-muted);
+  font-size: 10px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.workflow-team-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  margin-top: 10px;
+}
+
+.workflow-team-editor label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.workflow-team-editor label > span {
+  color: var(--text-muted);
+  font-size: 10px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.workflow-team-editor select {
+  width: 100%;
+  padding: 7px 8px;
+  color: var(--text);
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  background: var(--bg-inset);
+  font: inherit;
+}
+
+.role-form-agents {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0;
+  padding: 8px 10px 10px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+}
+
+.role-form-agents legend {
+  color: var(--text-muted);
+  font-size: 10px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.role-form-agent {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.role-form-agent-check,
+.role-form-agent-preferred {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+}
+
+.role-form-agent-preferred {
+  margin-left: auto;
+  color: var(--text-muted);
+  font-size: 10.5px;
+}
+
+.role-form-hint {
+  color: var(--text-muted);
+  font-family: var(--mono);
+  font-size: 9.5px;
+}
+
+.role-inspector .role-description {
+  margin: 10px 0 0;
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.role-instructions {
+  margin-top: 10px;
+}
+
+.role-instructions summary {
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 10px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.role-instructions pre {
+  margin: 7px 0 0;
+  padding: 9px 10px;
+  overflow-x: auto;
+  color: #aeb6c4;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-inset);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+
+.role-agents {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  margin-top: 12px;
+}
+
+.role-agent-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.role-agent-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-inset);
+}
+
+.role-agent-row + .role-agent-row {
+  margin-top: 5px;
+}
+
+.role-preferred {
+  color: #d6a85f;
+  font-size: 10px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.role-agent-action {
+  min-height: 24px;
+  padding: 2px 8px;
+  font-size: 10.5px;
+}
+
+.role-agent-remove {
+  margin-left: auto;
+  min-width: 24px;
+  min-height: 24px;
+  padding: 0;
+  color: #ef8178;
+  font-size: 14px;
+}
+
+.role-add-agent {
+  display: flex;
+  gap: 7px;
+}
+
+.role-definition-actions {
+  display: flex;
+  gap: 7px;
+  margin-top: 12px;
+}
+
+.settings-roles {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.settings-role {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 11px 13px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-raised);
+}
+
+.settings-role-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.settings-role-head .muted {
+  font-size: 10.5px;
+}
+
+.settings-role-agents {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.settings-role-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 6px 3px 8px;
+  color: #dce8ff;
+  border: 1px solid #4569a8;
+  border-radius: 999px;
+  background: #16233a;
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.settings-role-chip > span {
+  color: #d6a85f;
+}
+
+.settings-role-chip-remove {
+  padding: 0 3px;
+  color: #ef8178;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.settings-role-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.settings-role-preferred {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-left: 4px;
+}
+
+.settings-role-preferred label {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--text-muted);
+  font-size: 11px;
+}

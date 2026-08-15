@@ -68,13 +68,6 @@ pub struct RunDetail {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ExecutionRolesResponse {
-    pub worker: String,
-    pub reviewer: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct RetryResponse {
     pub run_id: i64,
 }

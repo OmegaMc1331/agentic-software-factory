@@ -11,6 +11,8 @@ export function GraphToolbar({
   onShowTasks,
   showDependencies,
   onShowDependencies,
+  showRoles,
+  onShowRoles,
   live,
   onLive,
   onAdd,
@@ -28,6 +30,8 @@ export function GraphToolbar({
   onShowTasks: (value: boolean) => void;
   showDependencies: boolean;
   onShowDependencies: (value: boolean) => void;
+  showRoles: boolean;
+  onShowRoles: (value: boolean) => void;
   live: boolean;
   onLive: (value: boolean) => void;
   onAdd: () => void;
@@ -103,6 +107,14 @@ export function GraphToolbar({
             onChange={(event) => onShowDependencies(event.target.checked)}
           />
           Dependencies
+        </label>
+        <label className="net-toggle">
+          <input
+            type="checkbox"
+            checked={showRoles}
+            onChange={(event) => onShowRoles(event.target.checked)}
+          />
+          Roles
         </label>
         <button
           className={live ? "net-btn net-btn-live" : "net-btn"}

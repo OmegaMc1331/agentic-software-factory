@@ -3,7 +3,9 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::AtomicBool;
 
-use factory_core::{AgentEntry, Config, Factory, RoleEntry, WorkflowResult, MAX_TASK_ATTEMPTS};
+use factory_core::{
+    AgentEntry, Config, Factory, RoleAssignment, WorkflowResult, MAX_TASK_ATTEMPTS,
+};
 use factory_types::{AttemptStatus, RunStatus, TaskState};
 use tempfile::TempDir;
 
@@ -110,12 +112,11 @@ fn fixture(review_decision: &str) -> (TempDir, Factory) {
         ("worker", "worker-test"),
         ("reviewer", "reviewer-test"),
     ] {
-        config.roles.insert(
-            role.into(),
-            RoleEntry {
-                agent: agent.into(),
-            },
-        );
+        config.role_assignments.push(RoleAssignment {
+            role: role.into(),
+            agent: agent.into(),
+            preferred: true,
+        });
     }
     config.write_atomic(dir.path()).unwrap();
     let factory = Factory::open(dir.path()).unwrap();
@@ -125,7 +126,7 @@ fn fixture(review_decision: &str) -> (TempDir, Factory) {
 #[test]
 fn planner_success_persists_a_planned_workflow_and_session() {
     let (_dir, factory) = fixture("approve");
-    let run = factory.begin_run("ship the workflow").unwrap();
+    let run = factory.begin_run("ship the workflow", None).unwrap();
     assert_eq!(run.status, RunStatus::Planning);
 
     let outcome = factory.plan_run(run.id, &AtomicBool::new(false)).unwrap();
@@ -150,7 +151,7 @@ fn planner_process_failure_marks_the_persisted_workflow_failed() {
     );
     config.write_atomic(dir.path()).unwrap();
     let factory = Factory::open(dir.path()).unwrap();
-    let run = factory.begin_run("fail while planning").unwrap();
+    let run = factory.begin_run("fail while planning", None).unwrap();
 
     assert!(factory.plan_run(run.id, &AtomicBool::new(false)).is_err());
     assert_eq!(
@@ -166,9 +167,10 @@ fn planner_process_failure_marks_the_persisted_workflow_failed() {
 fn sequential_scheduler_records_evidence_reviews_and_completion() {
     let (_dir, factory) = fixture("approve");
     let outcome = factory.create_run("execute in order").unwrap();
-    let roles = factory.prepare_start(outcome.run.id).unwrap();
-    assert_eq!(roles.worker, "worker-test");
-    assert_eq!(roles.reviewer, "reviewer-test");
+    let team = factory.prepare_start(outcome.run.id).unwrap();
+    assert_eq!(team.planner, "planner-test");
+    assert_eq!(team.workers, ["worker-test"]);
+    assert_eq!(team.reviewers, ["reviewer-test"]);
 
     let result = factory
         .execute_active_run(outcome.run.id, &AtomicBool::new(false))
@@ -324,12 +326,16 @@ fn start_requires_configured_worker_and_reviewer_roles() {
     let outcome = factory.create_run("check start eligibility").unwrap();
     drop(factory);
     let mut config = Config::load(dir.path()).unwrap();
-    config.roles.remove("worker");
+    config
+        .role_assignments
+        .retain(|assignment| assignment.role != "worker");
     config.write_atomic(dir.path()).unwrap();
     let factory = Factory::open(dir.path()).unwrap();
 
     let error = factory.prepare_start(outcome.run.id).unwrap_err();
-    assert!(error.to_string().contains("worker role"));
+    assert!(error
+        .to_string()
+        .contains("is not assigned to the 'worker' role"));
     assert_eq!(
         factory.get_run(outcome.run.id).unwrap().unwrap().status,
         RunStatus::Planned

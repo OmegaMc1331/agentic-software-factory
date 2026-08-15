@@ -1,14 +1,25 @@
 import { useCallback, useEffect, useState } from "react";
-import { fetchAgents, fetchConfig, saveConfig } from "../api";
+import {
+  addRoleAssignment,
+  deleteRole,
+  fetchAgents,
+  fetchConfig,
+  fetchRoles,
+  removeRoleAssignment,
+  saveConfig,
+  setPreferredAssignment,
+  updateRole,
+} from "../api";
 import {
   agentResolutionStatusLabel,
   type AgentKind,
   type AgentStatusInfo,
   type ConfigData,
   type PromptTransport,
+  type RoleInfo,
 } from "../types";
+import { RoleForm } from "./RoleForm";
 
-const ROLES = ["planner", "worker", "reviewer"] as const;
 const PRESETS: Record<
   Exclude<AgentKind, "custom">,
   { label: string; command: string; args: string[] }
@@ -97,17 +108,24 @@ function parseEnv(text: string): Record<string, string> {
 export function SettingsView() {
   const [config, setConfig] = useState<ConfigData | null>(null);
   const [available, setAvailable] = useState<Record<string, AgentStatusInfo>>({});
+  const [roles, setRoles] = useState<RoleInfo[]>([]);
   const [draft, setDraft] = useState<Draft | null>(null);
+  const [editingRole, setEditingRole] = useState<RoleInfo | null>(null);
+  const [roleSelection, setRoleSelection] = useState<Record<string, string>>({});
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState<string | null>(null);
 
   const reload = useCallback(() => {
     setError(null);
     setSaved(null);
-    Promise.all([fetchConfig(), fetchAgents()])
-      .then(([nextConfig, list]) => {
+    Promise.all([fetchConfig(), fetchAgents(), fetchRoles()])
+      .then(([nextConfig, list, nextRoles]) => {
         setConfig(nextConfig);
         setAvailable(Object.fromEntries(list.map((agent) => [agent.name, agent])));
+        setRoles(nextRoles);
+        setEditingRole((current) =>
+          current ? (nextRoles.find((role) => role.id === current.id) ?? null) : null
+        );
       })
       .catch((err: Error) => setError(err.message));
   }, []);
@@ -115,6 +133,20 @@ export function SettingsView() {
   useEffect(() => {
     reload();
   }, [reload]);
+
+  const runRoleOperation = useCallback(
+    (operation: () => Promise<unknown>, note: string) => {
+      setError(null);
+      setSaved(null);
+      operation()
+        .then(() => {
+          setSaved(note);
+          reload();
+        })
+        .catch((err: Error) => setError(err.message));
+    },
+    [reload]
+  );
 
   const apply = useCallback(
     (next: ConfigData, note: string) => {
@@ -166,22 +198,9 @@ export function SettingsView() {
     if (!config) return;
     const agents = { ...config.agents };
     delete agents[name];
-    const roles = Object.fromEntries(
-      Object.entries(config.roles).filter(([, role]) => role.agent !== name)
-    );
+    const role_assignments = config.role_assignments.filter((entry) => entry.agent !== name);
     setDraft(null);
-    apply({ agents, roles }, `Removed agent ${name}.`);
-  };
-
-  const setRole = (role: string, agent: string) => {
-    if (!config) return;
-    const roles = { ...config.roles };
-    if (agent === "") {
-      delete roles[role];
-    } else {
-      roles[role] = { agent };
-    }
-    apply({ ...config, roles }, `Saved the ${role} role.`);
+    apply({ ...config, agents, role_assignments }, `Removed agent ${name}.`);
   };
 
   const refreshAvailability = () => {
@@ -223,36 +242,163 @@ export function SettingsView() {
       <section className="section">
         <h3 className="section-title">Roles</h3>
         <p className="settings-note">
-          Assign a configured coding agent to each role. The config is written to{" "}
-          <code>.factory/config.toml</code>.
+          Assign configured agents to each role. Core roles are built in; custom roles can be edited
+          or deleted. The config is written to <code>.factory/config.toml</code>.
         </p>
-        <table className="table">
-          <tbody>
-            {ROLES.map((role) => (
-              <tr key={role}>
-                <td className="settings-role-name">{role}</td>
-                <td>
-                  <select
-                    className="net-select"
-                    value={config.roles[role]?.agent ?? ""}
-                    onChange={(event) => setRole(role, event.target.value)}
-                  >
-                    <option value="">— none —</option>
-                    {agentNames.map((name) => (
-                      <option key={name} value={name}>
-                        {name}
-                      </option>
-                    ))}
-                  </select>
-                </td>
-                <td className="muted">
-                  {config.roles[role] ? config.roles[role].agent : "not assigned"}
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+        <div className="settings-roles">
+          {roles.map((role) => {
+            const assigned = new Set(role.assignments.map((assignment) => assignment.agent));
+            const candidates = agentNames.filter((name) => !assigned.has(name));
+            const selection = roleSelection[role.id] ?? "";
+            return (
+              <article key={role.id} className="settings-role">
+                <div className="settings-role-head">
+                  <strong>{role.name}</strong>
+                  <span className="muted">
+                    {role.kind === "core" ? "Core role" : "Custom role"} ·{" "}
+                    {role.executionClass.replaceAll("_", " ")}
+                  </span>
+                </div>
+                <div className="settings-role-agents">
+                  {role.assignments.length === 0 ? (
+                    <span className="muted">No agent assigned</span>
+                  ) : (
+                    role.assignments.map((assignment) => (
+                      <span key={assignment.agent} className="settings-role-chip">
+                        {assignment.preferred ? <span aria-label="preferred">★</span> : null}
+                        {assignment.agent}
+                        <button
+                          className="settings-role-chip-remove"
+                          aria-label={`Remove ${assignment.agent} from ${role.name}`}
+                          onClick={() =>
+                            runRoleOperation(
+                              () => removeRoleAssignment(role.id, assignment.agent),
+                              `Removed ${assignment.agent} from ${role.name}.`
+                            )
+                          }
+                        >
+                          ×
+                        </button>
+                      </span>
+                    ))
+                  )}
+                </div>
+                <div className="settings-role-actions">
+                  {candidates.length > 0 ? (
+                    <>
+                      <select
+                        className="net-select"
+                        aria-label={`Add agent to ${role.name}`}
+                        value={selection}
+                        onChange={(event) =>
+                          setRoleSelection({ ...roleSelection, [role.id]: event.target.value })
+                        }
+                      >
+                        <option value="">Add agent</option>
+                        {candidates.map((name) => (
+                          <option key={name} value={name}>
+                            {name}
+                          </option>
+                        ))}
+                      </select>
+                      <button
+                        className="button"
+                        aria-label={`Assign agent to ${role.name}`}
+                        disabled={!selection}
+                        onClick={() => {
+                          if (!selection) return;
+                          const agent = selection;
+                          setRoleSelection({ ...roleSelection, [role.id]: "" });
+                          runRoleOperation(
+                            () => addRoleAssignment(role.id, agent),
+                            `Assigned ${agent} to ${role.name}.`
+                          );
+                        }}
+                      >
+                        Assign
+                      </button>
+                    </>
+                  ) : (
+                    <span className="muted">Every configured agent is assigned.</span>
+                  )}
+                  {role.assignments.length > 1 && (
+                    <span className="settings-role-preferred">
+                      {role.assignments.map((assignment) => (
+                        <label key={assignment.agent}>
+                          <input
+                            type="radio"
+                            name={`preferred-${role.id}`}
+                            checked={assignment.preferred}
+                            onChange={() =>
+                              runRoleOperation(
+                                () => setPreferredAssignment(role.id, assignment.agent),
+                                `${assignment.agent} is the preferred ${role.name}.`
+                              )
+                            }
+                          />
+                          {assignment.agent}
+                        </label>
+                      ))}
+                    </span>
+                  )}
+                  {role.kind === "custom" && (
+                    <span className="settings-actions">
+                      <button
+                        className="button"
+                        aria-label={`Edit ${role.name} role`}
+                        onClick={() => setEditingRole(role)}
+                      >
+                        Edit
+                      </button>
+                      <button
+                        className="button"
+                        onClick={() => {
+                          if (!window.confirm(`Delete the ${role.name} custom role?`)) return;
+                          runRoleOperation(
+                            () => deleteRole(role.id),
+                            `Deleted the ${role.name} role.`
+                          );
+                        }}
+                      >
+                        Delete
+                      </button>
+                    </span>
+                  )}
+                </div>
+              </article>
+            );
+          })}
+        </div>
       </section>
+
+      {editingRole && (
+        <section className="section settings-form">
+          <h3 className="section-title">Edit {editingRole.name}</h3>
+          <RoleForm
+            mode="edit"
+            agents={agentNames}
+            initial={editingRole}
+            error={error}
+            submitLabel="Save role"
+            onSubmit={(value) => {
+              setError(null);
+              updateRole(editingRole.id, {
+                name: value.name,
+                description: value.description,
+                executionClass: value.executionClass,
+                instructions: value.instructions,
+              })
+                .then(() => {
+                  setEditingRole(null);
+                  setSaved(`Saved the ${editingRole.name} role.`);
+                  reload();
+                })
+                .catch((err: Error) => setError(err.message));
+            }}
+            onCancel={() => setEditingRole(null)}
+          />
+        </section>
+      )}
 
       <section className="section">
         <div className="settings-section-head">

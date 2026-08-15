@@ -1,8 +1,17 @@
 import { useEffect, useRef, useState } from "react";
-import type { AgentEntry, AgentKind, ConfigData, PromptTransport } from "../types";
+import type {
+  AgentEntry,
+  AgentKind,
+  ConfigData,
+  PromptTransport,
+  RoleInfo,
+  WorkflowTeam,
+} from "../types";
+import { PIPELINE_ROLE_IDS, preferredRoleAgents, roleAgents } from "../types";
+import { RoleForm, type RoleFormValue } from "./RoleForm";
 
 type AddKind = "workflow" | "agent" | "role" | "group" | "note";
-const CORE_ROLES = ["planner", "worker", "reviewer"] as const;
+type RoleMode = "core" | "custom";
 const AGENT_PRESETS: Record<
   Exclude<AgentKind, "custom">,
   { label: string; name: string; command: string; args: string[] }
@@ -45,22 +54,26 @@ function parseEnvironment(text: string): {
 export function AddNodeMenu({
   open,
   config,
+  roles,
   error,
   initialKind,
   onClose,
   onCreateWorkflow,
   onCreateAgent,
   onCreateRole,
+  onAssignCoreRole,
   onCreateVisual,
 }: {
   open: boolean;
   config: ConfigData;
+  roles: RoleInfo[];
   error: string | null;
   initialKind?: AddKind | null;
   onClose: () => void;
-  onCreateWorkflow: (objective: string) => void;
+  onCreateWorkflow: (objective: string, team: WorkflowTeam) => void;
   onCreateAgent: (name: string, entry: AgentEntry) => void;
-  onCreateRole: (role: string, agent: string) => void;
+  onCreateRole: (value: RoleFormValue) => void;
+  onAssignCoreRole: (roleId: string, agent: string) => void;
   onCreateVisual: (kind: "group" | "note", label: string, text: string) => void;
 }) {
   const [kind, setKind] = useState<AddKind | null>(null);
@@ -72,10 +85,15 @@ export function AddNodeMenu({
   const [promptTransport, setPromptTransport] = useState<PromptTransport>("stdin");
   const [interactive, setInteractive] = useState(false);
   const [interactiveArgumentsText, setInteractiveArgumentsText] = useState("");
-  const [role, setRole] = useState("");
-  const [agent, setAgent] = useState("");
+  const [roleMode, setRoleMode] = useState<RoleMode | null>(null);
+  const [coreRoleDraft, setCoreRoleDraft] = useState<RoleInfo | null>(null);
+  const [coreRoleAgent, setCoreRoleAgent] = useState("");
   const [text, setText] = useState("");
   const [objective, setObjective] = useState("");
+  const [teamPlanner, setTeamPlanner] = useState("");
+  const [teamWorkers, setTeamWorkers] = useState<string[]>([]);
+  const [teamReviewers, setTeamReviewers] = useState<string[]>([]);
+  const [teamAdditional, setTeamAdditional] = useState<Record<string, string[]>>({});
   const [validationError, setValidationError] = useState<string | null>(null);
   const firstButton = useRef<HTMLButtonElement>(null);
 
@@ -85,6 +103,8 @@ export function AddNodeMenu({
       window.requestAnimationFrame(() => firstButton.current?.focus());
     } else {
       setKind(null);
+      setRoleMode(null);
+      setCoreRoleDraft(null);
       setValidationError(null);
     }
   }, [initialKind, open]);
@@ -98,10 +118,53 @@ export function AddNodeMenu({
     return () => window.removeEventListener("keydown", closeOnEscape);
   }, [onClose, open]);
 
+  useEffect(() => {
+    if (!open || kind !== "workflow") return;
+    const byId = new Map(roles.map((role) => [role.id, role]));
+    setTeamPlanner(preferredRoleAgents(byId.get("planner"))[0] ?? "");
+    setTeamWorkers(preferredRoleAgents(byId.get("worker")));
+    setTeamReviewers(preferredRoleAgents(byId.get("reviewer")));
+    setTeamAdditional({});
+  }, [kind, open, roles]);
+
   if (!open) return null;
-  const availableRoles = CORE_ROLES.filter((candidate) => !config.roles[candidate]);
   const agents = Object.keys(config.agents).sort();
-  const planner = config.roles.planner?.agent ?? null;
+  const roleById = new Map(roles.map((role) => [role.id, role]));
+  const plannerRole = roleById.get("planner");
+  const plannerAgents = plannerRole ? roleAgents(plannerRole) : [];
+  const workerRole = roleById.get("worker");
+  const workerAgents = workerRole ? roleAgents(workerRole) : [];
+  const reviewerRole = roleById.get("reviewer");
+  const reviewerAgents = reviewerRole ? roleAgents(reviewerRole) : [];
+  const optionalRoles = roles.filter(
+    (role) =>
+      !PIPELINE_ROLE_IDS.includes(role.id as (typeof PIPELINE_ROLE_IDS)[number]) &&
+      (role.kind === "custom" || role.available)
+  );
+  const dormantCoreRoles = roles.filter(
+    (role) =>
+      role.kind === "core" &&
+      !PIPELINE_ROLE_IDS.includes(role.id as (typeof PIPELINE_ROLE_IDS)[number]) &&
+      !role.available
+  );
+  const workflowReady = teamPlanner !== "" && teamWorkers.length > 0 && teamReviewers.length > 0;
+
+  const toggleTeamAgent = (
+    selection: string[],
+    setSelection: (next: string[]) => void,
+    agent: string,
+    checked: boolean
+  ) => {
+    setSelection(
+      checked ? [...selection, agent] : selection.filter((candidate) => candidate !== agent)
+    );
+  };
+
+  const toggleAdditionalAgent = (roleId: string, agent: string, checked: boolean) => {
+    const current = teamAdditional[roleId] ?? [];
+    const next = checked ? [...current, agent] : current.filter((candidate) => candidate !== agent);
+    setTeamAdditional({ ...teamAdditional, [roleId]: next });
+  };
 
   const submit = (event: React.FormEvent) => {
     event.preventDefault();
@@ -110,8 +173,20 @@ export function AddNodeMenu({
         setValidationError("Describe what the Factory should build.");
         return;
       }
+      if (!workflowReady) {
+        setValidationError("Pick a planner, at least one worker and at least one reviewer.");
+        return;
+      }
       setValidationError(null);
-      onCreateWorkflow(objective.trim());
+      const additional = Object.fromEntries(
+        Object.entries(teamAdditional).filter(([, selected]) => selected.length > 0)
+      );
+      onCreateWorkflow(objective.trim(), {
+        planner: teamPlanner,
+        workers: teamWorkers,
+        reviewers: teamReviewers,
+        additional,
+      });
     } else if (kind === "agent") {
       const parsedEnvironment = parseEnvironment(environmentText);
       if (parsedEnvironment.error) {
@@ -132,16 +207,21 @@ export function AddNodeMenu({
       }
       onCreateAgent(name.trim(), entry);
     } else if (kind === "role") {
-      onCreateRole(role, agent);
+      if (coreRoleDraft && coreRoleAgent) onAssignCoreRole(coreRoleDraft.id, coreRoleAgent);
     } else if (kind) {
       onCreateVisual(kind, name.trim(), text.trim());
     }
   };
 
+  const submitLabel = coreRoleDraft ? "Assign" : kind === "workflow" ? "Plan" : "Create";
+
   return (
     <div className="add-node-menu" role="dialog" aria-label="Add graph node">
       <div className="add-node-menu-head">
-        <strong>{kind ? `New ${kind}` : "Add node"}</strong>
+        <strong>
+          {kind ? `New ${kind}` : "Add node"}
+          {kind === "role" && roleMode ? ` — ${roleMode}` : ""}
+        </strong>
         <button className="inspector-close" onClick={onClose} aria-label="Close add node menu">
           x
         </button>
@@ -160,9 +240,9 @@ export function AddNodeMenu({
                 {option === "agent"
                   ? "Configured external process"
                   : option === "workflow"
-                    ? "Plan work with the configured Planner"
+                    ? "Plan work with a Factory team"
                     : option === "role"
-                      ? "Core Factory assignment"
+                      ? "Core assignment or custom role"
                       : option === "group"
                         ? "Visual organization"
                         : "Workspace context"}
@@ -170,45 +250,145 @@ export function AddNodeMenu({
             </button>
           ))}
         </div>
+      ) : kind === "role" && roleMode === "custom" ? (
+        <RoleForm
+          mode="create"
+          agents={agents}
+          error={error}
+          submitLabel="Create role"
+          onSubmit={onCreateRole}
+          onCancel={() => setRoleMode(null)}
+        />
       ) : (
         <form className="add-node-form" onSubmit={submit}>
           {kind === "workflow" && (
             <>
-              {planner ? (
-                <>
-                  <label>
-                    <span>What should the Factory build?</span>
-                    <textarea
-                      rows={5}
-                      value={objective}
-                      onChange={(event) => {
-                        setObjective(event.target.value);
-                        setValidationError(null);
-                      }}
-                      placeholder="Implement authentication with email login and password reset."
-                      required
-                      autoFocus
-                    />
-                  </label>
-                  <div className="workflow-planner-field">
-                    <span>Planner</span>
-                    <strong>{planner}</strong>
-                    <small>From the Planner role in Factory configuration</small>
-                  </div>
-                </>
-              ) : (
-                <div className="workflow-missing-role">
-                  <strong>No planner configured.</strong>
-                  <p>Assign an agent to the Planner role before creating a workflow.</p>
-                  <button
-                    className="button"
-                    type="button"
-                    onClick={() => setKind(agents.length > 0 ? "role" : "agent")}
+              <label>
+                <span>What should the Factory build?</span>
+                <textarea
+                  rows={5}
+                  value={objective}
+                  onChange={(event) => {
+                    setObjective(event.target.value);
+                    setValidationError(null);
+                  }}
+                  placeholder="Implement authentication with email login and password reset."
+                  required
+                  autoFocus
+                />
+              </label>
+              <div className="workflow-team">
+                <span className="workflow-team-title">Team</span>
+                <label>
+                  <span>Planner</span>
+                  <select
+                    value={teamPlanner}
+                    onChange={(event) => setTeamPlanner(event.target.value)}
                   >
-                    Configure agents
-                  </button>
-                </div>
-              )}
+                    <option value="">Select a planner</option>
+                    {plannerAgents.map((agent) => (
+                      <option key={agent} value={agent}>
+                        {agent}
+                        {plannerRole?.assignments.some(
+                          (assignment) => assignment.agent === agent && assignment.preferred
+                        )
+                          ? " (preferred)"
+                          : ""}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                {plannerAgents.length === 0 && (
+                  <p className="inline-note">
+                    No planner configured. Assign an agent to the planner role before creating a
+                    workflow.
+                  </p>
+                )}
+                <fieldset className="workflow-team-group">
+                  <legend>Workers</legend>
+                  {workerAgents.length === 0 ? (
+                    <p className="inline-note">No worker configured.</p>
+                  ) : (
+                    workerAgents.map((agent) => (
+                      <label key={agent} className="workflow-team-check">
+                        <input
+                          type="checkbox"
+                          checked={teamWorkers.includes(agent)}
+                          onChange={(event) =>
+                            toggleTeamAgent(
+                              teamWorkers,
+                              setTeamWorkers,
+                              agent,
+                              event.target.checked
+                            )
+                          }
+                        />
+                        <span>{agent}</span>
+                      </label>
+                    ))
+                  )}
+                </fieldset>
+                <fieldset className="workflow-team-group">
+                  <legend>Reviewers</legend>
+                  {reviewerAgents.length === 0 ? (
+                    <p className="inline-note">No reviewer configured.</p>
+                  ) : (
+                    reviewerAgents.map((agent) => (
+                      <label key={agent} className="workflow-team-check">
+                        <input
+                          type="checkbox"
+                          checked={teamReviewers.includes(agent)}
+                          onChange={(event) =>
+                            toggleTeamAgent(
+                              teamReviewers,
+                              setTeamReviewers,
+                              agent,
+                              event.target.checked
+                            )
+                          }
+                        />
+                        <span>{agent}</span>
+                      </label>
+                    ))
+                  )}
+                </fieldset>
+                <details className="agent-advanced">
+                  <summary>Advanced team</summary>
+                  {optionalRoles.length === 0 ? (
+                    <p className="inline-note">
+                      No optional roles available. Assign agents to optional core roles or create a
+                      custom role.
+                    </p>
+                  ) : (
+                    optionalRoles.map((role) => (
+                      <fieldset key={role.id} className="workflow-team-group">
+                        <legend>{role.name}</legend>
+                        {(teamAdditional[role.id] ?? []).length === 0 && (
+                          <p className="inline-note">
+                            Optional — skipped unless an agent is picked.
+                          </p>
+                        )}
+                        {role.assignments.map((assignment) => (
+                          <label key={assignment.agent} className="workflow-team-check">
+                            <input
+                              type="checkbox"
+                              checked={(teamAdditional[role.id] ?? []).includes(assignment.agent)}
+                              onChange={(event) =>
+                                toggleAdditionalAgent(
+                                  role.id,
+                                  assignment.agent,
+                                  event.target.checked
+                                )
+                              }
+                            />
+                            <span>{assignment.agent}</span>
+                          </label>
+                        ))}
+                      </fieldset>
+                    ))
+                  )}
+                </details>
+              </div>
             </>
           )}
           {kind === "agent" && (
@@ -319,39 +499,58 @@ export function AddNodeMenu({
               </details>
             </>
           )}
-          {kind === "role" && (
+          {kind === "role" && roleMode === null && (
+            <div className="add-node-types">
+              <button
+                ref={firstButton}
+                className="add-node-type"
+                onClick={() => setRoleMode("core")}
+              >
+                <strong>Core role</strong>
+                <span>Assign an agent to a built-in optional role</span>
+              </button>
+              <button className="add-node-type" onClick={() => setRoleMode("custom")}>
+                <strong>Custom role</strong>
+                <span>Define a new role for your factory</span>
+              </button>
+            </div>
+          )}
+          {kind === "role" && roleMode === "core" && (
             <>
-              {availableRoles.length === 0 ? (
-                <p className="inline-note">All supported core roles are already configured.</p>
+              {coreRoleDraft ? (
+                <label>
+                  <span>Agent for {coreRoleDraft.name}</span>
+                  <select
+                    value={coreRoleAgent}
+                    onChange={(event) => setCoreRoleAgent(event.target.value)}
+                    required
+                    autoFocus
+                  >
+                    <option value="">Select an agent</option>
+                    {agents.map((option) => (
+                      <option key={option} value={option}>
+                        {option}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              ) : dormantCoreRoles.length === 0 ? (
+                <p className="inline-note">
+                  Every optional core role already has an agent assigned.
+                </p>
               ) : (
-                <>
-                  <label>
-                    <span>Role</span>
-                    <select value={role} onChange={(event) => setRole(event.target.value)} required>
-                      <option value="">Select a core role</option>
-                      {availableRoles.map((option) => (
-                        <option key={option} value={option}>
-                          {option}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                  <label>
-                    <span>Agent</span>
-                    <select
-                      value={agent}
-                      onChange={(event) => setAgent(event.target.value)}
-                      required
+                <div className="add-node-types">
+                  {dormantCoreRoles.map((role) => (
+                    <button
+                      key={role.id}
+                      className="add-node-type"
+                      onClick={() => setCoreRoleDraft(role)}
                     >
-                      <option value="">Select an agent</option>
-                      {agents.map((option) => (
-                        <option key={option} value={option}>
-                          {option}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                </>
+                      <strong>{role.name}</strong>
+                      <span>{role.description}</span>
+                    </button>
+                  ))}
+                </div>
               )}
             </>
           )}
@@ -373,19 +572,31 @@ export function AddNodeMenu({
               )}
             </>
           )}
-          {(validationError ?? error) && <p className="inline-error">{validationError ?? error}</p>}
+          {(validationError ?? error) && !(kind === "role" && roleMode === "custom") && (
+            <p className="inline-error">{validationError ?? error}</p>
+          )}
           <div className="add-node-actions">
+            {!(kind === "role" && roleMode === null) && (
+              <button
+                className="button"
+                type="submit"
+                disabled={
+                  (kind === "workflow" && !workflowReady) ||
+                  (kind === "role" && (!coreRoleDraft || !coreRoleAgent))
+                }
+              >
+                {submitLabel}
+              </button>
+            )}
             <button
               className="button"
-              type="submit"
-              disabled={
-                (kind === "role" && availableRoles.length === 0) ||
-                (kind === "workflow" && !planner)
-              }
+              type="button"
+              onClick={() => {
+                if (kind === "role" && roleMode !== null && !coreRoleDraft) setRoleMode(null);
+                else if (coreRoleDraft) setCoreRoleDraft(null);
+                else setKind(null);
+              }}
             >
-              {kind === "workflow" ? "Plan" : "Create"}
-            </button>
-            <button className="button" type="button" onClick={() => setKind(null)}>
               Back
             </button>
           </div>

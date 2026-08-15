@@ -58,6 +58,8 @@ pub struct Task {
     pub position: i32,
     pub dependencies: Vec<i64>,
     pub worktree_path: Option<String>,
+    #[serde(default)]
+    pub role: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }

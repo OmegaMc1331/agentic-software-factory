@@ -1,16 +1,22 @@
 pub mod config;
 pub mod factory;
 pub mod planner;
+pub mod roles;
 pub mod workflow;
 
 pub use config::{
     default_config_text, AgentEntry, AgentInfo, AgentResolutionError, Agents, Config, ConfigError,
-    RoleEntry,
+    RoleAssignment, RoleAssignmentInfo, RoleDefinitionEntry, RoleInfo,
 };
 pub use factory::{
-    ExecutionRoles, Factory, FactoryError, MarkOutcome, RunOutcome, WorkflowResult, FACTORY_DIR,
-    MAX_TASK_ATTEMPTS,
+    Factory, FactoryError, MarkOutcome, RunOutcome, WorkflowResult, FACTORY_DIR, MAX_TASK_ATTEMPTS,
 };
 pub use factory_agent::AgentStatus;
+pub use factory_types::WorkflowTeam;
 pub use planner::{parse_plan, validate_plan, PlanError, PlanOutcome, Planner};
+pub use roles::{
+    core_role, core_roles, is_core_role, is_pipeline_role, slugify, ExecutionClass, RoleCatalog,
+    RoleDefinition, RoleKind, CORE_ROLE_IDS, PIPELINE_ROLE_IDS, PLANNER, REVIEWER,
+    SECURITY_AUDITOR, TEST_ENGINEER, WORKER,
+};
 pub use workflow::Workflow;

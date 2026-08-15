@@ -9,12 +9,12 @@ use axum::extract::{Path as UrlPath, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
-use factory_core::{Agents, Config, ConfigError};
+use factory_core::{Agents, Config, ConfigError, RoleAssignment};
 use factory_db::FactoryDb;
 use factory_runtime::{Runtime, RuntimeError, TerminalSubscription};
-use factory_types::AgentSessionMode;
+use factory_types::{AgentSessionMode, WorkflowTeam};
 use serde::Deserialize;
 use serde_json::json;
 use tokio_stream::wrappers::ReceiverStream;
@@ -22,8 +22,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::dashboard;
 use crate::graph_workspace::{GraphWorkspace, GraphWorkspaceError, GraphWorkspaceResponse};
 use crate::types::{
-    AgentSessionResponse, ExecutionRolesResponse, GraphEdge, GraphNode, GraphResponse,
-    RetryResponse, RunDetail, RunSummary, TaskCounts,
+    AgentSessionResponse, GraphEdge, GraphNode, GraphResponse, RetryResponse, RunDetail,
+    RunSummary, TaskCounts,
 };
 
 pub struct ApiState {
@@ -110,6 +110,8 @@ impl From<RuntimeError> for ApiError {
                 | factory_core::FactoryError::InvalidRunState(_, _)
                 | factory_core::FactoryError::EmptyPlan(_)
                 | factory_core::FactoryError::InvalidDag(_, _)
+                | factory_core::FactoryError::TaskRoleUnavailable(_, _)
+                | factory_core::FactoryError::InvalidTeam(_)
                 | factory_core::FactoryError::RetryLimit(_)
                 | factory_core::FactoryError::InvalidTransition(_, _)
                 | factory_core::FactoryError::NotReady(_)
@@ -131,6 +133,15 @@ pub fn router(state: SharedState) -> Router {
         .route("/api/runs/:id/start", post(start_run))
         .route("/api/runs/:id/cancel", post(cancel_run))
         .route("/api/tasks/:id/retry", post(retry_task))
+        .route("/api/runs/:id/team", put(put_run_team))
+        .route("/api/roles", get(list_roles).post(create_role))
+        .route("/api/roles/:id", put(update_role).delete(delete_role))
+        .route("/api/roles/:id/assignments", post(add_role_assignment))
+        .route(
+            "/api/roles/:id/assignments/:agent",
+            delete(remove_role_assignment),
+        )
+        .route("/api/roles/:id/preferred", put(set_preferred_assignment))
         .route("/api/graph", get(get_graph))
         .route(
             "/api/graph/workspace",
@@ -200,6 +211,8 @@ async fn list_runs(State(state): State<SharedState>) -> Result<Json<Vec<RunSumma
 #[serde(rename_all = "camelCase")]
 struct CreateRunRequest {
     objective: String,
+    #[serde(default)]
+    team: Option<WorkflowTeam>,
 }
 
 async fn create_run(
@@ -209,22 +222,30 @@ async fn create_run(
     let request = body
         .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "invalid JSON body"))?
         .0;
-    let run = state.runtime.create_workflow(&request.objective)?;
+    let run = state
+        .runtime
+        .create_workflow(&request.objective, request.team)?;
     Ok((StatusCode::ACCEPTED, Json(run)))
 }
 
 async fn start_run(
     State(state): State<SharedState>,
     UrlPath(id): UrlPath<i64>,
-) -> Result<(StatusCode, Json<ExecutionRolesResponse>), ApiError> {
-    let roles = state.runtime.start_workflow(id)?;
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(ExecutionRolesResponse {
-            worker: roles.worker,
-            reviewer: roles.reviewer,
-        }),
-    ))
+) -> Result<(StatusCode, Json<WorkflowTeam>), ApiError> {
+    let team = state.runtime.start_workflow(id)?;
+    Ok((StatusCode::ACCEPTED, Json(team)))
+}
+
+async fn put_run_team(
+    State(state): State<SharedState>,
+    UrlPath(id): UrlPath<i64>,
+    body: Result<Json<WorkflowTeam>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<WorkflowTeam>, ApiError> {
+    let team = body
+        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "invalid JSON body"))?
+        .0;
+    let team = state.runtime.update_workflow_team(id, team)?;
+    Ok(Json(team))
 }
 
 async fn cancel_run(
@@ -279,14 +300,326 @@ async fn put_config(
     State(state): State<SharedState>,
     body: Result<Json<Config>, axum::extract::rejection::JsonRejection>,
 ) -> Result<StatusCode, ApiError> {
-    let config = body
+    let mut config = body
         .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "invalid JSON body"))?
         .0;
+    config.normalize();
+    save_config(&state, &config)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn load_config(state: &SharedState) -> Result<Config, ApiError> {
+    Ok(Config::load(&state.root)?)
+}
+
+fn save_config(state: &SharedState, config: &Config) -> Result<(), ApiError> {
     config
         .validate()
         .map_err(|reason| ApiError::new(StatusCode::BAD_REQUEST, reason))?;
     config.write_atomic(&state.root).map_err(ApiError::from)?;
+    Ok(())
+}
+
+fn role_info(config: &Config, id: &str) -> Result<factory_core::RoleInfo, ApiError> {
+    config
+        .role_infos()
+        .into_iter()
+        .find(|role| role.id == id)
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, format!("role '{id}' not found")))
+}
+
+fn role_in_use(db: &FactoryDb, role: &str) -> Result<bool, factory_db::DbError> {
+    for run in db.list_runs()? {
+        if !matches!(
+            run.status,
+            factory_types::RunStatus::Planning
+                | factory_types::RunStatus::Planned
+                | factory_types::RunStatus::Active
+                | factory_types::RunStatus::Blocked
+        ) {
+            continue;
+        }
+        if run
+            .team
+            .as_ref()
+            .is_some_and(|team| team.additional.contains_key(role))
+        {
+            return Ok(true);
+        }
+        for task in db.list_tasks(run.id)? {
+            if task.role.as_deref() == Some(role) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+async fn list_roles(
+    State(state): State<SharedState>,
+) -> Result<Json<Vec<factory_core::RoleInfo>>, ApiError> {
+    let config = load_config(&state)?;
+    Ok(Json(config.role_infos()))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateRoleRequest {
+    #[serde(default)]
+    id: Option<String>,
+    name: String,
+    description: String,
+    execution_class: factory_core::ExecutionClass,
+    #[serde(default)]
+    instructions: String,
+    #[serde(default)]
+    agents: Vec<String>,
+    #[serde(default)]
+    preferred_agent: Option<String>,
+}
+
+async fn create_role(
+    State(state): State<SharedState>,
+    body: Result<Json<CreateRoleRequest>, axum::extract::rejection::JsonRejection>,
+) -> Result<(StatusCode, Json<factory_core::RoleInfo>), ApiError> {
+    let request = body
+        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "invalid JSON body"))?
+        .0;
+    let mut config = load_config(&state)?;
+    let id = request
+        .id
+        .clone()
+        .unwrap_or_else(|| factory_core::slugify(&request.name));
+    if id.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "the role needs a name or id",
+        ));
+    }
+    if factory_core::is_core_role(&id) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!("role '{id}' is a built-in core role and cannot be redefined"),
+        ));
+    }
+    if config.roles.contains_key(&id) {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            format!("role '{id}' already exists"),
+        ));
+    }
+    config.roles.insert(
+        id.clone(),
+        factory_core::RoleDefinitionEntry {
+            name: Some(request.name.trim().to_string()),
+            description: Some(request.description.trim().to_string()),
+            execution_class: Some(request.execution_class),
+            instructions: request.instructions.trim().to_string(),
+            agent: None,
+        },
+    );
+    let preferred_agent = request.preferred_agent.as_deref();
+    if preferred_agent.is_some() {
+        config
+            .role_assignments
+            .retain(|assignment| !(assignment.role == id && assignment.preferred));
+    }
+    for agent in &request.agents {
+        config.role_assignments.push(RoleAssignment {
+            role: id.clone(),
+            agent: agent.clone(),
+            preferred: preferred_agent == Some(agent.as_str()),
+        });
+    }
+    save_config(&state, &config)?;
+    Ok((StatusCode::CREATED, Json(role_info(&config, &id)?)))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateRoleRequest {
+    name: String,
+    description: String,
+    execution_class: factory_core::ExecutionClass,
+    #[serde(default)]
+    instructions: String,
+}
+
+async fn update_role(
+    State(state): State<SharedState>,
+    UrlPath(id): UrlPath<String>,
+    body: Result<Json<UpdateRoleRequest>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<factory_core::RoleInfo>, ApiError> {
+    let request = body
+        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "invalid JSON body"))?
+        .0;
+    let mut config = load_config(&state)?;
+    if factory_core::is_core_role(&id) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "built-in core roles cannot be redefined; manage their assignments instead",
+        ));
+    }
+    let Some(entry) = config.roles.get_mut(&id) else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            format!("role '{id}' not found"),
+        ));
+    };
+    *entry = factory_core::RoleDefinitionEntry {
+        name: Some(request.name.trim().to_string()),
+        description: Some(request.description.trim().to_string()),
+        execution_class: Some(request.execution_class),
+        instructions: request.instructions.trim().to_string(),
+        agent: None,
+    };
+    save_config(&state, &config)?;
+    Ok(Json(role_info(&config, &id)?))
+}
+
+async fn delete_role(
+    State(state): State<SharedState>,
+    UrlPath(id): UrlPath<String>,
+) -> Result<StatusCode, ApiError> {
+    let mut config = load_config(&state)?;
+    if factory_core::is_core_role(&id) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "built-in core roles cannot be deleted; remove their assignments instead",
+        ));
+    }
+    if config.roles.remove(&id).is_none() {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            format!("role '{id}' not found"),
+        ));
+    }
+    {
+        let db = state.db.lock().expect("db mutex poisoned");
+        if role_in_use(&db, &id)? {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                format!("role '{id}' is used by an active workflow and cannot be deleted"),
+            ));
+        }
+    }
+    config
+        .role_assignments
+        .retain(|assignment| assignment.role != id);
+    save_config(&state, &config)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AddAssignmentRequest {
+    agent: String,
+    #[serde(default)]
+    preferred: bool,
+}
+
+async fn add_role_assignment(
+    State(state): State<SharedState>,
+    UrlPath(id): UrlPath<String>,
+    body: Result<Json<AddAssignmentRequest>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<factory_core::RoleInfo>, ApiError> {
+    let request = body
+        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "invalid JSON body"))?
+        .0;
+    let mut config = load_config(&state)?;
+    if config.role_infos().iter().all(|role| role.id != id) {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            format!("role '{id}' not found"),
+        ));
+    }
+    if !config.agents.contains_key(&request.agent) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!("unknown agent '{}'", request.agent),
+        ));
+    }
+    if config
+        .role_assignments
+        .iter()
+        .any(|assignment| assignment.role == id && assignment.agent == request.agent)
+    {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            format!(
+                "agent '{}' is already assigned to role '{id}'",
+                request.agent
+            ),
+        ));
+    }
+    if request.preferred {
+        config.role_assignments.iter_mut().for_each(|assignment| {
+            if assignment.role == id {
+                assignment.preferred = false;
+            }
+        });
+    }
+    config.role_assignments.push(RoleAssignment {
+        role: id.clone(),
+        agent: request.agent,
+        preferred: request.preferred,
+    });
+    save_config(&state, &config)?;
+    Ok(Json(role_info(&config, &id)?))
+}
+
+async fn remove_role_assignment(
+    State(state): State<SharedState>,
+    UrlPath((id, agent)): UrlPath<(String, String)>,
+) -> Result<Json<factory_core::RoleInfo>, ApiError> {
+    let mut config = load_config(&state)?;
+    let before = config.role_assignments.len();
+    config
+        .role_assignments
+        .retain(|assignment| !(assignment.role == id && assignment.agent == agent));
+    if config.role_assignments.len() == before {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            format!("agent '{agent}' is not assigned to role '{id}'"),
+        ));
+    }
+    save_config(&state, &config)?;
+    Ok(Json(role_info(&config, &id)?))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PreferredAssignmentRequest {
+    agent: String,
+}
+
+async fn set_preferred_assignment(
+    State(state): State<SharedState>,
+    UrlPath(id): UrlPath<String>,
+    body: Result<Json<PreferredAssignmentRequest>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<factory_core::RoleInfo>, ApiError> {
+    let request = body
+        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "invalid JSON body"))?
+        .0;
+    let mut config = load_config(&state)?;
+    let mut found = false;
+    for assignment in &mut config.role_assignments {
+        if assignment.role != id {
+            continue;
+        }
+        assignment.preferred = assignment.agent == request.agent;
+        if assignment.preferred {
+            found = true;
+        }
+    }
+    if !found {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            format!("agent '{}' is not assigned to role '{id}'", request.agent),
+        ));
+    }
+    save_config(&state, &config)?;
+    Ok(Json(role_info(&config, &id)?))
 }
 
 async fn get_graph_workspace(
@@ -584,15 +917,17 @@ fn build_graph(state: &SharedState) -> Result<GraphResponse, ApiError> {
         .map(|a| a.list())
         .unwrap_or_default();
 
-    let mut role_to_agent: BTreeMap<String, String> = BTreeMap::new();
     let mut roles_for_agent: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut planner_bound = false;
     if let Some(config) = &config {
-        for (role, entry) in &config.roles {
-            role_to_agent.insert(role.clone(), entry.agent.clone());
+        for assignment in &config.role_assignments {
             roles_for_agent
-                .entry(entry.agent.clone())
+                .entry(assignment.agent.clone())
                 .or_default()
-                .push(role.clone());
+                .push(assignment.role.clone());
+            if assignment.role == "planner" {
+                planner_bound = true;
+            }
         }
     }
 
@@ -622,21 +957,42 @@ fn build_graph(state: &SharedState) -> Result<GraphResponse, ApiError> {
         });
     }
 
-    for (role, agent) in &role_to_agent {
+    let role_infos = config
+        .as_ref()
+        .map(|config| config.role_infos())
+        .unwrap_or_default();
+    let visible_roles = role_infos
+        .iter()
+        .filter(|role| {
+            factory_core::is_pipeline_role(&role.id) || role.kind == "custom" || role.available
+        })
+        .collect::<Vec<_>>();
+    for role in &visible_roles {
         nodes.push(GraphNode {
-            id: format!("role:{role}"),
+            id: format!("role:{}", role.id),
             kind: "role".into(),
-            label: role.clone(),
-            meta: json!({ "agent": agent }),
+            label: role.name.clone(),
+            meta: json!({
+                "id": role.id,
+                "name": role.name,
+                "kind": role.kind,
+                "description": role.description,
+                "instructions": role.instructions,
+                "executionClass": role.execution_class,
+                "assignments": role.assignments,
+                "available": role.available,
+            }),
         });
-        edges.push(GraphEdge {
-            id: format!("assignment:{role}"),
-            source: format!("role:{role}"),
-            target: format!("agent:{agent}"),
-            kind: "binds".into(),
-            editable: true,
-            semantic: "configuration".into(),
-        });
+        for assignment in &role.assignments {
+            edges.push(GraphEdge {
+                id: format!("assignment:{}:{}", role.id, assignment.agent),
+                source: format!("role:{}", role.id),
+                target: format!("agent:{}", assignment.agent),
+                kind: "binds".into(),
+                editable: true,
+                semantic: "configuration".into(),
+            });
+        }
     }
 
     let runs = db.list_runs()?;
@@ -664,15 +1020,20 @@ fn build_graph(state: &SharedState) -> Result<GraphResponse, ApiError> {
                 "objective": run.objective,
                 "status": run.status.as_str(),
                 "plannerAgent": run.planner_agent,
-                "workerAgent": role_to_agent.get("worker"),
-                "reviewerAgent": role_to_agent.get("reviewer"),
+                "team": run.team,
                 "createdAt": run.created_at,
                 "counts": TaskCounts::from_tasks(&tasks),
             }),
         });
 
         if let Some(planner) = &run.planner_agent {
-            let target = if role_to_agent.get("planner") == Some(planner) {
+            let planner_assigned = config.as_ref().is_some_and(|config| {
+                config
+                    .role_assignments
+                    .iter()
+                    .any(|assignment| assignment.role == "planner" && &assignment.agent == planner)
+            });
+            let target = if planner_bound && planner_assigned {
                 "role:planner".to_string()
             } else {
                 format!("agent:{planner}")
@@ -701,6 +1062,7 @@ fn build_graph(state: &SharedState) -> Result<GraphResponse, ApiError> {
                     "dependencies": task.dependencies,
                     "acceptanceCriteria": task.acceptance_criteria,
                     "worktreePath": task.worktree_path,
+                    "role": task.role,
                     "currentAttempt": latest_attempts.get(&task.id),
                 }),
             });
@@ -722,14 +1084,17 @@ fn build_graph(state: &SharedState) -> Result<GraphResponse, ApiError> {
             let Some(task_id) = session.task_id else {
                 continue;
             };
-            let (kind, source) = match session.role.as_str() {
-                "worker" => ("works", format!("agent:{}", session.agent)),
-                "reviewer" => ("reviews", format!("agent:{}", session.agent)),
-                _ => continue,
+            if session.role == "planner" {
+                continue;
+            }
+            let kind = if session.role == "reviewer" {
+                "reviews"
+            } else {
+                "works"
             };
             edges.push(GraphEdge {
                 id: format!("activity:{}", session.id),
-                source,
+                source: format!("agent:{}", session.agent),
                 target: format!("task:{task_id}"),
                 kind: kind.into(),
                 editable: false,
@@ -756,7 +1121,7 @@ fn build_graph(state: &SharedState) -> Result<GraphResponse, ApiError> {
         "tasks": total_tasks,
         "agents": agents.len(),
         "missingAgents": agents.iter().filter(|a| !a.available).count(),
-        "roles": role_to_agent.len(),
+        "roles": visible_roles.len(),
     });
 
     Ok(GraphResponse {

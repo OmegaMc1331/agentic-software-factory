@@ -287,7 +287,7 @@ fn init_writes_a_default_agent_configuration() {
     Factory::init(dir.path()).unwrap();
     let config = std::fs::read_to_string(dir.path().join(".factory").join("config.toml")).unwrap();
     assert!(config.contains("[agents.codex]"));
-    assert!(config.contains("[roles.planner]"));
+    assert!(config.contains("[[role_assignments]]"));
 }
 
 #[test]

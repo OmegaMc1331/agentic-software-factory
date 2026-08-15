@@ -5,9 +5,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc as std_mpsc, Arc, Mutex};
 use std::time::Instant;
 
-use factory_core::{ExecutionRoles, Factory, FactoryError};
+use factory_core::{Factory, FactoryError};
 use factory_db::FactoryDb;
-use factory_types::{AgentSession, AgentSessionMode, Run};
+use factory_types::{AgentSession, AgentSessionMode, Run, WorkflowTeam};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -215,9 +215,13 @@ impl Runtime {
             .map_err(|error| RuntimeError::Terminal(error.to_string()))
     }
 
-    pub fn create_workflow(&self, objective: &str) -> Result<Run, RuntimeError> {
+    pub fn create_workflow(
+        &self,
+        objective: &str,
+        team: Option<WorkflowTeam>,
+    ) -> Result<Run, RuntimeError> {
         let factory = Factory::open(&self.root)?;
-        let run = factory.begin_run(objective)?;
+        let run = factory.begin_run(objective, team)?;
         let cancel = self.reserve(run.id, OperationKind::Planning)?;
         let runtime = self.clone();
         let root = self.root.clone();
@@ -230,18 +234,27 @@ impl Runtime {
         Ok(run)
     }
 
-    pub fn start_workflow(&self, run_id: i64) -> Result<ExecutionRoles, RuntimeError> {
+    pub fn start_workflow(&self, run_id: i64) -> Result<WorkflowTeam, RuntimeError> {
         let factory = Factory::open(&self.root)?;
         let cancel = self.reserve(run_id, OperationKind::Executing)?;
-        let roles = match factory.prepare_start(run_id) {
-            Ok(roles) => roles,
+        let team = match factory.prepare_start(run_id) {
+            Ok(team) => team,
             Err(error) => {
                 self.release(run_id);
                 return Err(error.into());
             }
         };
         self.spawn_execution(run_id, cancel);
-        Ok(roles)
+        Ok(team)
+    }
+
+    pub fn update_workflow_team(
+        &self,
+        run_id: i64,
+        team: WorkflowTeam,
+    ) -> Result<WorkflowTeam, RuntimeError> {
+        let factory = Factory::open(&self.root)?;
+        Ok(factory.update_run_team(run_id, team)?)
     }
 
     pub fn retry_task(&self, task_id: i64) -> Result<i64, RuntimeError> {

@@ -1,6 +1,6 @@
 import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { fetchAgents, fetchConfig, fetchGraph, fetchGraphWorkspace } from "../api";
+import { fetchAgents, fetchConfig, fetchGraph, fetchGraphWorkspace, fetchRoles } from "../api";
 import { NetworkView } from "./NetworkView";
 import { SettingsView } from "./Settings";
 
@@ -9,6 +9,7 @@ vi.mock("../api", () => ({
   fetchConfig: vi.fn(),
   fetchGraph: vi.fn(),
   fetchGraphWorkspace: vi.fn(),
+  fetchRoles: vi.fn(),
   saveConfig: vi.fn(),
   saveGraphWorkspace: vi.fn(),
 }));
@@ -18,13 +19,19 @@ beforeEach(() => {
   vi.mocked(fetchConfig).mockReset();
   vi.mocked(fetchGraph).mockReset();
   vi.mocked(fetchGraphWorkspace).mockReset();
+  vi.mocked(fetchRoles).mockReset();
   vi.mocked(fetchGraphWorkspace).mockResolvedValue({
     version: 1,
     nodes: {},
     customNodes: [],
     edges: [],
   });
-  vi.mocked(fetchConfig).mockResolvedValue({ agents: {}, roles: {} });
+  vi.mocked(fetchConfig).mockResolvedValue({
+    agents: {},
+    roles: {},
+    role_assignments: [],
+  });
+  vi.mocked(fetchRoles).mockResolvedValue([]);
 });
 
 afterEach(cleanup);
@@ -44,7 +51,8 @@ describe("secondary view loading failures", () => {
   it("renders Settings after config and agent availability load", async () => {
     vi.mocked(fetchConfig).mockResolvedValue({
       agents: { codex: { command: "codex", args: ["exec"], env: {} } },
-      roles: { planner: { agent: "codex" } },
+      roles: {},
+      role_assignments: [],
     });
     vi.mocked(fetchAgents).mockResolvedValue([
       {

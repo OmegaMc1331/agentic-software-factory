@@ -195,12 +195,28 @@ fn agents(root: &Path) -> Result<()> {
 
 fn config_list(root: &Path) -> Result<()> {
     let config = Config::load(root).context("run `factory init` to create config.toml first")?;
-    if config.roles.is_empty() {
-        println!("no roles configured");
+    if config.role_assignments.is_empty() {
+        println!("no role assignments configured");
         return Ok(());
     }
-    for (role, entry) in &config.roles {
-        println!("{:<12} {}", role, entry.agent);
+    println!("{:<22} AGENTS", "ROLE");
+    for info in config.role_infos() {
+        if info.assignments.is_empty() {
+            continue;
+        }
+        let agents = info
+            .assignments
+            .iter()
+            .map(|assignment| {
+                if assignment.preferred {
+                    format!("{} (preferred)", assignment.agent)
+                } else {
+                    assignment.agent.clone()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("{:<22} {}", info.id, agents);
     }
     Ok(())
 }
@@ -292,6 +308,10 @@ fn inspect(root: &Path, task_id: i64) -> Result<()> {
     let deps = deps_label(&task.dependencies);
     println!("Task #{} (run {})", task.id, task.run_id);
     println!("State:         {}", task.state.as_str());
+    println!(
+        "Role:          {}",
+        task.role.as_deref().unwrap_or("worker")
+    );
     println!("Position:      {}", task.position);
     println!("Title:         {}", task.title);
     println!("Objective:     {}", task.objective);

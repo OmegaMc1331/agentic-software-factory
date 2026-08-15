@@ -42,7 +42,16 @@ const graph: GraphData = {
       id: "role:planner",
       kind: "role",
       label: "planner",
-      meta: { agent: "codex" },
+      meta: {
+        id: "planner",
+        name: "Planner",
+        kind: "core",
+        description: "Transforms the objective into tasks.",
+        instructions: "",
+        executionClass: "planning",
+        assignments: [{ agent: "codex", preferred: true }],
+        available: true,
+      },
     },
   ],
   edges: [

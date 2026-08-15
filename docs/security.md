@@ -7,13 +7,29 @@ machine.
 ## Workflow operations
 
 Agent Graph can request only explicit Factory operations: create a workflow, start or
-cancel it, and retry an eligible task. The backend resolves Planner, Worker, and
-Reviewer processes from validated `.factory/config.toml` entries. Workflow endpoints
-cannot provide an executable, select an arbitrary process, or submit a shell command.
+cancel it, and retry an eligible task. The backend resolves every role from validated
+`.factory/config.toml` role assignments; workflow execution only invokes agents
+assigned to a role on that workflow's team. Workflow endpoints cannot provide an
+executable, select an arbitrary process, or submit a shell command.
 
-The configuration API can change agent definitions, so access to the local dashboard
-is equivalent to access to this project's agent configuration. Only configured agents
-are invoked by workflow operations.
+The configuration and role APIs can change agent definitions and role assignments, so
+access to the local dashboard is equivalent to access to this project's agent
+configuration. Only configured agents are invoked by workflow operations.
+
+## Role instructions
+
+Custom role instructions are project-controlled text that Factory incorporates into
+the mission sent to a coding agent. They change what the agent is asked to do; they
+do not change what it is allowed to do:
+
+- role instructions do not change OS permissions — agents still run as the invoking
+  user;
+- roles cannot bypass Factory's API boundary or its execution constraints
+  (worktree isolation, `.factory` state protection), which always take precedence;
+- creating a role does not create a new executable capability — roles select among
+  already-configured agents and only alter mission text;
+- custom role text is not a security sandbox; treat it like any other prompt to an
+  agent you trust.
 
 ## Agent Console
 

@@ -501,6 +501,7 @@ name = "factory-types"
 version = "0.3.3"
 dependencies = [
  "serde",
+ "serde_json",
 ]
 
 [[package]]

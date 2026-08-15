@@ -3,9 +3,11 @@ pub mod plan;
 pub mod run;
 pub mod session;
 pub mod task;
+pub mod team;
 
 pub use attempt::{AttemptStatus, ReviewDecision, ReviewResult, TaskAttempt, TaskEvidence};
 pub use plan::{Plan, PlannedTask};
 pub use run::{Run, RunStatus};
 pub use session::{AgentSession, AgentSessionMode};
 pub use task::{Task, TaskState};
+pub use team::WorkflowTeam;

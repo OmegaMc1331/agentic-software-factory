@@ -82,6 +82,8 @@ pub struct Run {
     pub objective: String,
     pub status: RunStatus,
     pub planner_agent: Option<String>,
+    #[serde(default)]
+    pub team: Option<crate::team::WorkflowTeam>,
     pub created_at: String,
     pub updated_at: String,
 }

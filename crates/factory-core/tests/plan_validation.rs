@@ -106,3 +106,47 @@ fn accepts_backticks_fences_around_the_json() {
     let plan = parse_plan(content).unwrap();
     assert_eq!(plan.tasks.len(), 1);
 }
+
+#[test]
+fn parses_an_optional_task_role() {
+    let plan = parse_plan(
+        r#"{"objective":"o","tasks":[{"id":"T1","title":"t","objective":"o","dependencies":[],"acceptanceCriteria":["c"],"role":"database_engineer"}]}"#,
+    )
+    .unwrap();
+    assert_eq!(plan.tasks[0].role.as_deref(), Some("database_engineer"));
+    let plan = parse_plan(
+        r#"{"objective":"o","tasks":[{"id":"T1","title":"t","objective":"o","dependencies":[],"acceptanceCriteria":["c"]}]}"#,
+    )
+    .unwrap();
+    assert_eq!(plan.tasks[0].role, None);
+}
+
+#[test]
+fn empty_task_roles_normalize_to_none() {
+    let mut plan = parse_plan(
+        r#"{"objective":"o","tasks":[{"id":"T1","title":"t","objective":"o","dependencies":[],"acceptanceCriteria":["c"],"role":""}]}"#,
+    )
+    .unwrap();
+    plan = factory_core::planner::normalize_plan(plan);
+    assert_eq!(plan.tasks[0].role, None);
+}
+
+#[test]
+fn task_roles_must_be_enabled_for_the_workflow() {
+    use factory_core::planner::validate_plan_roles;
+    use std::collections::HashSet;
+    let plan = parse_plan(
+        r#"{"objective":"o","tasks":[{"id":"T1","title":"t","objective":"o","dependencies":[],"acceptanceCriteria":["c"],"role":"database_engineer"}]}"#,
+    )
+    .unwrap();
+    let allowed: HashSet<String> = ["worker".to_string(), "database_engineer".to_string()]
+        .into_iter()
+        .collect();
+    assert!(validate_plan_roles(&plan, &allowed).is_ok());
+    let worker_only: HashSet<String> = ["worker".to_string()].into_iter().collect();
+    let error = validate_plan_roles(&plan, &worker_only).unwrap_err();
+    assert!(
+        error.contains("not enabled for this workflow"),
+        "got: {error}"
+    );
+}

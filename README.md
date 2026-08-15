@@ -65,9 +65,9 @@ closing the browser doesn't stop active work.
 
 ## Configure agents
 
-Use Agent Graph or **Settings → Agents** to add installed coding agents and assign the
-**planner**, **worker**, and **reviewer** roles. Configuration lives in
-`.factory/config.toml`; the dashboard writes it for you, and you can edit it directly:
+Use Agent Graph or **Settings → Agents** to add installed coding agents and assign
+roles. Configuration lives in `.factory/config.toml`; the dashboard writes it for you,
+and you can edit it directly:
 
 ```toml
 [agents.codex]
@@ -75,8 +75,14 @@ kind = "codex"
 command = "codex"
 args = ["exec"]
 
-[roles.planner]
+[[role_assignments]]
+role = "planner"
 agent = "codex"
+preferred = true
+
+[[role_assignments]]
+role = "worker"
+agent = "opencode"
 ```
 
 Known coding agents are configured with their standard non-interactive workflow
@@ -86,6 +92,16 @@ as one process argument; `{mission}` can set that argument's exact position.
 The Factory never talks to model providers. If a required role is missing or its
 executable or workflow invocation is unavailable, the operation fails instead of
 selecting a fallback agent.
+
+## Roles
+
+Roles describe responsibilities; agents are the CLIs that perform them. Eight core
+roles are built in (Planner, Worker, Reviewer, Architect, Researcher, Test Engineer,
+Security Auditor, Documentation Writer), a role can be filled by several agents at
+once, and one agent can hold several roles — no `worker2`-style duplicates. You can
+create custom roles with their own instructions from Agent Graph, and each workflow
+selects the team of roles and agents that may participate. See
+[docs/roles.md](docs/roles.md) for the full guide.
 
 ## Dashboard
 
@@ -112,7 +128,13 @@ The local API is bound to `127.0.0.1`:
 | GET    | `/api/runs/:id`               | Workflow, tasks, attempts, and sessions           |
 | POST   | `/api/runs/:id/start`         | Validate and start a planned workflow             |
 | POST   | `/api/runs/:id/cancel`        | Cancel a live workflow operation                  |
+| PUT    | `/api/runs/:id/team`          | Replace the workflow team before it starts        |
 | POST   | `/api/tasks/:id/retry`        | Retry an eligible failed task                     |
+| GET    | `/api/roles`                  | Role definitions and assignments                  |
+| POST   | `/api/roles`                  | Create a custom role                              |
+| PUT    | `/api/roles/:id`              | Update a custom role definition                   |
+| DELETE | `/api/roles/:id`              | Delete an unused custom role                      |
+| POST   | `/api/roles/:id/assignments`  | Assign an agent to a role                         |
 | GET    | `/api/graph`                  | Agents, workflows, tasks, and semantic links     |
 | GET    | `/api/graph/workspace`        | Saved visual layout and custom topology          |
 | PUT    | `/api/graph/workspace`        | Validate and atomically save the graph workspace |
@@ -131,11 +153,13 @@ Agent Graph → local API → Factory Core → Planner → task DAG
                                       → Reviewer → approve or retry
 ```
 
-**Plan** asks the configured Planner for structured tasks and dependencies without
-changing the repository. **Start** validates the roles, Git repository, and DAG, then
+**Plan** asks the selected Planner for structured tasks and dependencies without
+changing the repository; tasks may target specific roles from the workflow's team.
+**Start** validates the team, Git repository, and DAG, then
 runs ready tasks sequentially. A task completes only after structured Reviewer
 approval; process exit alone is not completion. Worker failures and change requests
-retry up to three total attempts. Every invocation is an `AgentSession`.
+retry up to three total attempts. Every invocation is an `AgentSession` that records
+the role and agent that ran.
 
 All state lives in `.factory/`:
 

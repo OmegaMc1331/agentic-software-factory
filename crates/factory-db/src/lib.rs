@@ -54,7 +54,7 @@ impl FactoryDb {
         let row = self
             .conn
             .query_row(
-                "SELECT id, objective, status, planner_agent, created_at, updated_at
+                "SELECT id, objective, status, planner_agent, created_at, updated_at, team
                  FROM runs WHERE id = ?1",
                 params![id],
                 build_run,
@@ -65,7 +65,7 @@ impl FactoryDb {
 
     pub fn list_runs(&self) -> Result<Vec<Run>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, objective, status, planner_agent, created_at, updated_at
+            "SELECT id, objective, status, planner_agent, created_at, updated_at, team
              FROM runs ORDER BY id DESC",
         )?;
         let rows = stmt
@@ -85,6 +85,29 @@ impl FactoryDb {
         Ok(())
     }
 
+    pub fn set_run_team(&self, id: i64, team: &factory_types::WorkflowTeam) -> Result<()> {
+        let team = serde_json::to_string(team)?;
+        let changed = self.conn.execute(
+            "UPDATE runs SET team = ?1, updated_at = ?2 WHERE id = ?3",
+            params![team, now(), id],
+        )?;
+        if changed == 0 {
+            return Err(DbError::NotFound("run"));
+        }
+        Ok(())
+    }
+
+    pub fn set_run_planner_agent(&self, id: i64, planner_agent: &str) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE runs SET planner_agent = ?1, updated_at = ?2 WHERE id = ?3",
+            params![planner_agent, now(), id],
+        )?;
+        if changed == 0 {
+            return Err(DbError::NotFound("run"));
+        }
+        Ok(())
+    }
+
     pub fn persist_plan(&self, run_id: i64, plan: &Plan) -> Result<Vec<Task>> {
         let tx = self.conn.unchecked_transaction()?;
         let mut ids = std::collections::HashMap::new();
@@ -92,9 +115,18 @@ impl FactoryDb {
         for (position, task) in plan.tasks.iter().enumerate() {
             let criteria = serde_json::to_string(&task.acceptance_criteria)?;
             tx.execute(
-                "INSERT INTO tasks (run_id, title, objective, acceptance_criteria, state, position, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?7)",
-                params![run_id, task.title, task.objective, criteria, position as i32, ts, ts],
+                "INSERT INTO tasks (run_id, title, objective, acceptance_criteria, state, position, role, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?7, ?8)",
+                params![
+                    run_id,
+                    task.title,
+                    task.objective,
+                    criteria,
+                    position as i32,
+                    task.role,
+                    ts,
+                    ts
+                ],
             )?;
             ids.insert(task.id.clone(), tx.last_insert_rowid());
         }
@@ -124,6 +156,7 @@ impl FactoryDb {
         self.list_tasks(run_id)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn create_task(
         &self,
         run_id: i64,
@@ -132,13 +165,24 @@ impl FactoryDb {
         acceptance_criteria: &[String],
         state: TaskState,
         position: i32,
+        role: Option<&str>,
     ) -> Result<i64> {
         let ts = now();
         let criteria = serde_json::to_string(acceptance_criteria)?;
         self.conn.execute(
-            "INSERT INTO tasks (run_id, title, objective, acceptance_criteria, state, position, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![run_id, title, objective, criteria, state.as_str(), position, ts, ts],
+            "INSERT INTO tasks (run_id, title, objective, acceptance_criteria, state, position, role, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                run_id,
+                title,
+                objective,
+                criteria,
+                state.as_str(),
+                position,
+                role,
+                ts,
+                ts
+            ],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
@@ -155,7 +199,7 @@ impl FactoryDb {
         let row = self
             .conn
             .query_row(
-                "SELECT t.id, t.run_id, t.title, t.objective, t.acceptance_criteria, t.state, t.position, t.worktree_path, t.created_at, t.updated_at
+                "SELECT t.id, t.run_id, t.title, t.objective, t.acceptance_criteria, t.state, t.position, t.worktree_path, t.created_at, t.updated_at, t.role
                  FROM tasks t WHERE t.id = ?1",
                 params![id],
                 build_task,
@@ -170,7 +214,7 @@ impl FactoryDb {
 
     pub fn list_tasks(&self, run_id: i64) -> Result<Vec<Task>> {
         let mut stmt = self.conn.prepare(
-            "SELECT t.id, t.run_id, t.title, t.objective, t.acceptance_criteria, t.state, t.position, t.worktree_path, t.created_at, t.updated_at
+            "SELECT t.id, t.run_id, t.title, t.objective, t.acceptance_criteria, t.state, t.position, t.worktree_path, t.created_at, t.updated_at, t.role
              FROM tasks t WHERE t.run_id = ?1 ORDER BY t.position",
         )?;
         let mut tasks = Vec::new();
@@ -357,6 +401,7 @@ impl FactoryDb {
     pub fn create_task_attempt(
         &self,
         task_id: i64,
+        role: &str,
         agent: &str,
         worktree_path: &str,
     ) -> Result<TaskAttempt> {
@@ -367,19 +412,29 @@ impl FactoryDb {
         )?;
         self.conn.execute(
             "INSERT INTO task_attempts
-             (task_id, attempt_number, agent, status, started_at, worktree_path)
-             VALUES (?1, ?2, ?3, 'running', ?4, ?5)",
-            params![task_id, attempt_number, agent, now(), worktree_path],
+             (task_id, attempt_number, agent, role, status, started_at, worktree_path)
+             VALUES (?1, ?2, ?3, ?4, 'running', ?5, ?6)",
+            params![task_id, attempt_number, agent, role, now(), worktree_path],
         )?;
         self.get_task_attempt(self.conn.last_insert_rowid())?
             .ok_or(DbError::NotFound("task attempt"))
+    }
+
+    pub fn count_task_attempts(&self, run_id: i64) -> Result<usize> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM task_attempts a JOIN tasks t ON t.id = a.task_id
+             WHERE t.run_id = ?1",
+            params![run_id],
+            |row| row.get(0),
+        )?;
+        Ok(count as usize)
     }
 
     pub fn get_task_attempt(&self, id: i64) -> Result<Option<TaskAttempt>> {
         self.conn
             .query_row(
                 "SELECT id, task_id, attempt_number, agent, status, started_at, finished_at,
-                        worktree_path, commit_sha, exit_code, error, evidence, review
+                        worktree_path, commit_sha, exit_code, error, evidence, review, role
                  FROM task_attempts WHERE id = ?1",
                 params![id],
                 build_attempt,
@@ -392,7 +447,7 @@ impl FactoryDb {
         let mut statement = self.conn.prepare(
             "SELECT a.id, a.task_id, a.attempt_number, a.agent, a.status, a.started_at,
                     a.finished_at, a.worktree_path, a.commit_sha, a.exit_code, a.error,
-                    a.evidence, a.review
+                    a.evidence, a.review, a.role
              FROM task_attempts a
              JOIN tasks t ON t.id = a.task_id
              WHERE t.run_id = ?1
@@ -408,7 +463,7 @@ impl FactoryDb {
         self.conn
             .query_row(
                 "SELECT id, task_id, attempt_number, agent, status, started_at, finished_at,
-                        worktree_path, commit_sha, exit_code, error, evidence, review
+                        worktree_path, commit_sha, exit_code, error, evidence, review, role
                  FROM task_attempts WHERE task_id = ?1 ORDER BY attempt_number DESC LIMIT 1",
                 params![task_id],
                 build_attempt,
@@ -499,11 +554,13 @@ pub struct Reconciliation {
 }
 
 fn build_run(r: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
+    let team: Option<String> = r.get(6)?;
     Ok(Run {
         id: r.get(0)?,
         objective: r.get(1)?,
         status: run_status(r.get::<_, String>(2)?),
         planner_agent: r.get(3)?,
+        team: team.and_then(|value| serde_json::from_str(&value).ok()),
         created_at: r.get(4)?,
         updated_at: r.get(5)?,
     })
@@ -522,6 +579,7 @@ fn build_task(r: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         position: r.get(6)?,
         dependencies: Vec::new(),
         worktree_path: r.get(7)?,
+        role: r.get(10)?,
         created_at: r.get(8)?,
         updated_at: r.get(9)?,
     })
@@ -558,6 +616,7 @@ fn build_attempt(r: &rusqlite::Row<'_>) -> rusqlite::Result<TaskAttempt> {
         task_id: r.get(1)?,
         attempt_number: r.get(2)?,
         agent: r.get(3)?,
+        role: r.get(13)?,
         status: r
             .get::<_, String>(4)?
             .parse()
@@ -657,7 +716,13 @@ ALTER TABLE agent_sessions ADD COLUMN mode TEXT NOT NULL DEFAULT 'automated';
 CREATE INDEX idx_sessions_mode_status ON agent_sessions(mode, status);
 ";
 
-const MIGRATIONS: &[&str] = &[V1_SCHEMA, V2_SCHEMA, V3_SCHEMA, V4_SCHEMA];
+const V5_SCHEMA: &str = "
+ALTER TABLE tasks ADD COLUMN role TEXT;
+ALTER TABLE task_attempts ADD COLUMN role TEXT;
+ALTER TABLE runs ADD COLUMN team TEXT;
+";
+
+const MIGRATIONS: &[&str] = &[V1_SCHEMA, V2_SCHEMA, V3_SCHEMA, V4_SCHEMA, V5_SCHEMA];
 
 fn migrate(conn: &mut Connection) -> Result<()> {
     migrate_schemas(conn, MIGRATIONS)
@@ -707,12 +772,12 @@ mod tests {
         let path = dir.path().join("test.db");
         let db = FactoryDb::open(&path).unwrap();
         let versions = schema_versions(&path);
-        assert_eq!(versions, vec![1, 2, 3, 4]);
+        assert_eq!(versions, vec![1, 2, 3, 4, 5]);
         db.create_run("objective", Some("codex")).unwrap();
         drop(db);
 
         let db = FactoryDb::open(&path).unwrap();
-        assert_eq!(schema_versions(&path), vec![1, 2, 3, 4]);
+        assert_eq!(schema_versions(&path), vec![1, 2, 3, 4, 5]);
         db.list_runs().unwrap();
     }
 
@@ -737,7 +802,7 @@ mod tests {
         drop(conn);
 
         let db = FactoryDb::open(&path).unwrap();
-        assert_eq!(schema_versions(&path), vec![1, 2, 3, 4]);
+        assert_eq!(schema_versions(&path), vec![1, 2, 3, 4, 5]);
         let run = db.get_run(1).unwrap().unwrap();
         assert_eq!(run.objective, "legacy");
         let tasks = db.list_tasks(1).unwrap();
@@ -764,10 +829,10 @@ mod tests {
         let db = FactoryDb::open(&dir.path().join("test.db")).unwrap();
         let run = db.create_run("objective", Some("codex")).unwrap();
         let a = db
-            .create_task(run.id, "A", "a", &[], TaskState::Ready, 0)
+            .create_task(run.id, "A", "a", &[], TaskState::Ready, 0, None)
             .unwrap();
         let b = db
-            .create_task(run.id, "B", "b", &[], TaskState::Ready, 1)
+            .create_task(run.id, "B", "b", &[], TaskState::Ready, 1, None)
             .unwrap();
         assert_eq!(
             db.get_run(run.id).unwrap().unwrap().status,
@@ -835,6 +900,7 @@ mod tests {
                 &["a works".into()],
                 TaskState::Ready,
                 0,
+                None,
             )
             .unwrap();
         let b = db
@@ -845,6 +911,7 @@ mod tests {
                 &["b works".into()],
                 TaskState::Pending,
                 1,
+                Some("database_engineer"),
             )
             .unwrap();
         db.add_dependency(b, a).unwrap();
@@ -866,7 +933,7 @@ mod tests {
         let db = FactoryDb::open(&dir.path().join("test.db")).unwrap();
         let run = db.create_run("objective", Some("codex")).unwrap();
         let task = db
-            .create_task(run.id, "T", "objective", &[], TaskState::Ready, 0)
+            .create_task(run.id, "T", "objective", &[], TaskState::Ready, 0, None)
             .unwrap();
 
         db.set_task_state(task, TaskState::Running).unwrap();
@@ -947,6 +1014,7 @@ mod tests {
                             objective: "first".into(),
                             dependencies: Vec::new(),
                             acceptance_criteria: vec!["done".into()],
+                            role: None,
                         },
                         PlannedTask {
                             id: "B".into(),
@@ -954,6 +1022,7 @@ mod tests {
                             objective: "second".into(),
                             dependencies: vec!["A".into()],
                             acceptance_criteria: vec!["reviewed".into()],
+                            role: Some("database_engineer".into()),
                         },
                     ],
                 },
@@ -962,6 +1031,8 @@ mod tests {
         assert_eq!(tasks[0].state, TaskState::Ready);
         assert_eq!(tasks[1].state, TaskState::Pending);
         assert_eq!(tasks[1].dependencies, vec![tasks[0].id]);
+        assert_eq!(tasks[0].role, None);
+        assert_eq!(tasks[1].role.as_deref(), Some("database_engineer"));
         let loaded = db.get_run(run.id).unwrap().unwrap();
         assert_eq!(loaded.status, RunStatus::Planned);
         assert_eq!(loaded.objective, "normalized objective");
@@ -973,9 +1044,11 @@ mod tests {
         let db = FactoryDb::open(&dir.path().join("test.db")).unwrap();
         let run = db.create_run("objective", Some("planner")).unwrap();
         let task = db
-            .create_task(run.id, "Task", "objective", &[], TaskState::Ready, 0)
+            .create_task(run.id, "Task", "objective", &[], TaskState::Ready, 0, None)
             .unwrap();
-        let attempt = db.create_task_attempt(task, "worker", "worktree").unwrap();
+        let attempt = db
+            .create_task_attempt(task, "worker", "opencode", "worktree")
+            .unwrap();
         let evidence = TaskEvidence {
             changed_files: vec!["src/lib.rs".into()],
             diff_summary: "1 file changed".into(),
@@ -1002,9 +1075,67 @@ mod tests {
 
         let loaded = db.latest_task_attempt(task).unwrap().unwrap();
         assert_eq!(loaded.status, AttemptStatus::Approved);
+        assert_eq!(loaded.agent, "opencode");
+        assert_eq!(loaded.role.as_deref(), Some("worker"));
         assert_eq!(loaded.evidence, Some(evidence));
         assert_eq!(loaded.review, Some(review));
         assert!(loaded.finished_at.is_some());
+    }
+
+    #[test]
+    fn persists_run_team_snapshot() {
+        let dir = TempDir::new().unwrap();
+        let db = FactoryDb::open(&dir.path().join("test.db")).unwrap();
+        let run = db.create_run("objective", Some("codex")).unwrap();
+        assert!(db.get_run(run.id).unwrap().unwrap().team.is_none());
+
+        let team = factory_types::WorkflowTeam {
+            planner: "codex".into(),
+            workers: vec!["opencode".into(), "qwen".into()],
+            reviewers: vec!["claude".into()],
+            additional: std::collections::BTreeMap::from([(
+                "database_engineer".to_string(),
+                vec!["opencode".to_string()],
+            )]),
+        };
+        db.set_run_team(run.id, &team).unwrap();
+        assert_eq!(db.get_run(run.id).unwrap().unwrap().team, Some(team));
+        assert!(db
+            .list_runs()
+            .unwrap()
+            .iter()
+            .any(|listed| listed.team.is_some()));
+    }
+
+    #[test]
+    fn counts_attempts_per_run_for_routing() {
+        let dir = TempDir::new().unwrap();
+        let db = FactoryDb::open(&dir.path().join("test.db")).unwrap();
+        let run = db.create_run("objective", Some("codex")).unwrap();
+        let other = db.create_run("other", Some("codex")).unwrap();
+        let task = db
+            .create_task(run.id, "Task", "objective", &[], TaskState::Ready, 0, None)
+            .unwrap();
+        let other_task = db
+            .create_task(
+                other.id,
+                "Other",
+                "objective",
+                &[],
+                TaskState::Ready,
+                0,
+                None,
+            )
+            .unwrap();
+        assert_eq!(db.count_task_attempts(run.id).unwrap(), 0);
+        db.create_task_attempt(task, "worker", "opencode", "worktree")
+            .unwrap();
+        db.create_task_attempt(task, "worker", "qwen", "worktree")
+            .unwrap();
+        db.create_task_attempt(other_task, "worker", "claude", "worktree")
+            .unwrap();
+        assert_eq!(db.count_task_attempts(run.id).unwrap(), 2);
+        assert_eq!(db.count_task_attempts(other.id).unwrap(), 1);
     }
 
     #[test]
@@ -1015,9 +1146,19 @@ mod tests {
             .create_run_with_status("objective", Some("planner"), RunStatus::Active)
             .unwrap();
         let task = db
-            .create_task(run.id, "Task", "objective", &[], TaskState::Running, 0)
+            .create_task(
+                run.id,
+                "Task",
+                "objective",
+                &[],
+                TaskState::Running,
+                0,
+                None,
+            )
             .unwrap();
-        let attempt = db.create_task_attempt(task, "worker", "worktree").unwrap();
+        let attempt = db
+            .create_task_attempt(task, "worker", "opencode", "worktree")
+            .unwrap();
         let session = db
             .insert_agent_session(&AgentSession {
                 id: 0,

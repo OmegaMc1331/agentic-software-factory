@@ -1,28 +1,39 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  addRoleAssignment,
   createWorkflow,
   fetchAgentSessions,
   fetchConfig,
   fetchGraph,
   fetchGraphWorkspace,
+  fetchRoles,
+  removeRoleAssignment,
+  saveConfig,
   saveGraphWorkspace,
 } from "../api";
-import type { GraphData, GraphWorkspace } from "../types";
+import type { GraphData, GraphWorkspace, RoleInfo } from "../types";
 import { NetworkView } from "./NetworkView";
 
 vi.mock("../api", () => ({
+  addRoleAssignment: vi.fn(),
   agentSessionStreamUrl: (id: number) => `/api/sessions/${id}/stream`,
   cancelWorkflow: vi.fn(),
+  createRole: vi.fn(),
   createWorkflow: vi.fn(),
+  deleteRole: vi.fn(),
   fetchAgentSessions: vi.fn(),
   fetchConfig: vi.fn(),
   fetchGraph: vi.fn(),
   fetchGraphWorkspace: vi.fn(),
+  fetchRoles: vi.fn(),
+  removeRoleAssignment: vi.fn(),
+  retryTask: vi.fn(),
   saveConfig: vi.fn(),
   saveGraphWorkspace: vi.fn(),
+  setPreferredAssignment: vi.fn(),
   startWorkflow: vi.fn(),
-  retryTask: vi.fn(),
+  updateWorkflowTeam: vi.fn(),
 }));
 
 vi.mock("./AgentGraph", async () => {
@@ -54,7 +65,7 @@ vi.mock("./AgentGraph", async () => {
           drag codex
         </button>
         {props.edges
-          .filter((edge) => edge.kind === "custom")
+          .filter((edge) => edge.kind === "custom" || edge.kind === "binds")
           .map((edge) => (
             <button key={edge.id} onClick={() => props.onEdgeSelect(edge.id)}>
               select {edge.id}
@@ -73,7 +84,7 @@ const graph: GraphData = {
       id: "agent:codex",
       kind: "agent",
       label: "Codex",
-      meta: { command: "codex exec", available: true, roles: ["planner"] },
+      meta: { command: "codex exec", available: true, roles: ["planner", "worker"] },
     },
     {
       id: "agent:opencode",
@@ -81,9 +92,33 @@ const graph: GraphData = {
       label: "OpenCode",
       meta: { command: "opencode run", available: true, roles: ["worker"] },
     },
+    {
+      id: "role:worker",
+      kind: "role",
+      label: "Worker",
+      meta: {
+        id: "worker",
+        name: "Worker",
+        kind: "core",
+        description: "Implements a planned task in an isolated worktree.",
+        instructions: "",
+        executionClass: "execution",
+        assignments: [{ agent: "opencode", preferred: true }],
+        available: true,
+      },
+    },
   ],
-  edges: [],
-  metadata: { runs: 0, tasks: 0, agents: 2, missingAgents: 0, roles: 0 },
+  edges: [
+    {
+      id: "assignment:worker:opencode",
+      source: "role:worker",
+      target: "agent:opencode",
+      kind: "binds",
+      editable: true,
+      semantic: "configuration",
+    },
+  ],
+  metadata: { runs: 0, tasks: 0, agents: 2, missingAgents: 0, roles: 1 },
 };
 
 const workspace: GraphWorkspace = {
@@ -103,9 +138,43 @@ const workspace: GraphWorkspace = {
   ],
 };
 
+const roles: RoleInfo[] = [
+  {
+    id: "planner",
+    name: "Planner",
+    kind: "core",
+    description: "",
+    instructions: "",
+    executionClass: "planning",
+    assignments: [{ agent: "codex", preferred: true }],
+    available: true,
+  },
+  {
+    id: "worker",
+    name: "Worker",
+    kind: "core",
+    description: "Implements a planned task in an isolated worktree.",
+    instructions: "",
+    executionClass: "execution",
+    assignments: [{ agent: "opencode", preferred: true }],
+    available: true,
+  },
+  {
+    id: "reviewer",
+    name: "Reviewer",
+    kind: "core",
+    description: "",
+    instructions: "",
+    executionClass: "review",
+    assignments: [{ agent: "codex", preferred: true }],
+    available: true,
+  },
+];
+
 beforeEach(() => {
   vi.mocked(fetchGraph).mockReset().mockResolvedValue(graph);
   vi.mocked(fetchGraphWorkspace).mockReset().mockResolvedValue(workspace);
+  vi.mocked(fetchRoles).mockReset().mockResolvedValue(roles);
   vi.mocked(fetchConfig)
     .mockReset()
     .mockResolvedValue({
@@ -113,21 +182,29 @@ beforeEach(() => {
         codex: { command: "codex", args: ["exec"], env: {} },
         opencode: { command: "opencode", args: ["run"], env: {} },
       },
-      roles: { planner: { agent: "codex" } },
+      roles: {},
+      role_assignments: [{ role: "planner", agent: "codex", preferred: true }],
     });
   vi.mocked(fetchAgentSessions).mockReset().mockResolvedValue([]);
   vi.mocked(saveGraphWorkspace).mockReset().mockResolvedValue();
+  vi.mocked(addRoleAssignment).mockReset().mockResolvedValue(roles[1]);
+  vi.mocked(removeRoleAssignment).mockReset().mockResolvedValue(roles[1]);
   vi.mocked(createWorkflow).mockReset().mockResolvedValue({
     id: 12,
     objective: "Implement authentication",
     status: "planning",
     plannerAgent: "codex",
+    team: null,
     createdAt: "2026-08-13T18:00:00Z",
     updatedAt: "2026-08-13T18:00:00Z",
   });
+  vi.spyOn(window, "confirm").mockReturnValue(true);
 });
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+});
 
 describe("Agent Graph interactions", () => {
   it("opens the Agent Console when an agent is selected", async () => {
@@ -150,7 +227,7 @@ describe("Agent Graph interactions", () => {
     expect(screen.getByRole("button", { name: /Note/ })).toBeTruthy();
   });
 
-  it("creates a workflow from the canvas and persists its viewport-centered position", async () => {
+  it("creates a workflow with the default team and persists its viewport-centered position", async () => {
     render(<NetworkView />);
     fireEvent.click(await screen.findByRole("button", { name: "Add graph node" }));
     fireEvent.click(screen.getByRole("button", { name: /Workflow/ }));
@@ -159,7 +236,14 @@ describe("Agent Graph interactions", () => {
     });
     fireEvent.click(screen.getByRole("button", { name: "Plan" }));
 
-    await waitFor(() => expect(createWorkflow).toHaveBeenCalledWith("Implement authentication"));
+    await waitFor(() =>
+      expect(createWorkflow).toHaveBeenCalledWith("Implement authentication", {
+        planner: "codex",
+        workers: ["opencode"],
+        reviewers: ["codex"],
+        additional: {},
+      })
+    );
     expect(saveGraphWorkspace).toHaveBeenCalledWith(
       expect.objectContaining({
         nodes: expect.objectContaining({ "run:12": expect.any(Object) }),
@@ -190,5 +274,39 @@ describe("Agent Graph interactions", () => {
     await waitFor(() =>
       expect(saveGraphWorkspace).toHaveBeenCalledWith(expect.objectContaining({ edges: [] }))
     );
+  });
+
+  it("removes a binds edge through the role assignment API", async () => {
+    render(<NetworkView />);
+    fireEvent.click(
+      await screen.findByRole("button", { name: "select assignment:worker:opencode" })
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Delete connection" }));
+
+    await waitFor(() => expect(removeRoleAssignment).toHaveBeenCalledWith("worker", "opencode"));
+    await waitFor(() => expect(vi.mocked(fetchGraph).mock.calls.length).toBeGreaterThan(1));
+    expect(saveConfig).not.toHaveBeenCalled();
+  });
+
+  it("opens the Role inspector for a selected role node", async () => {
+    render(<NetworkView />);
+    fireEvent.click(await screen.findByRole("button", { name: "select role:worker" }));
+
+    expect(await screen.findByText("Core role")).toBeTruthy();
+    expect(screen.getByText("Implements a planned task in an isolated worktree.")).toBeTruthy();
+    expect(screen.getByText("opencode")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Edit" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Delete" })).toBeNull();
+  });
+
+  it("hides role nodes and binds edges when the Roles toggle is off", async () => {
+    render(<NetworkView />);
+    fireEvent.click(await screen.findByRole("button", { name: "select role:worker" }));
+    fireEvent.click(screen.getByLabelText("Roles"));
+
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: "select role:worker" })).toBeNull()
+    );
+    expect(screen.queryByRole("button", { name: "select assignment:worker:opencode" })).toBeNull();
   });
 });

@@ -1,11 +1,16 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { Connection, XYPosition } from "@xyflow/react";
 import {
+  addRoleAssignment,
   cancelWorkflow,
+  createRole,
   createWorkflow,
+  deleteRole,
   fetchConfig,
   fetchGraph,
   fetchGraphWorkspace,
+  fetchRoles,
+  removeRoleAssignment,
   retryTask,
   saveConfig,
   saveGraphWorkspace,
@@ -25,7 +30,9 @@ import type {
   GraphEdge,
   GraphNode,
   GraphWorkspace,
+  RoleInfo,
   TaskState,
+  WorkflowTeam,
 } from "../types";
 import { agentActivity, agentMeta, taskMeta, type AgentActivity } from "../types";
 import { computeNetworkLayout, neighborsOf, type NetworkLayout } from "../networkLayout";
@@ -35,7 +42,9 @@ import { AgentConsole } from "./AgentConsole";
 import { AgentGraph, type AgentGraphHandle } from "./AgentGraph";
 import { GraphToolbar, type RunOption } from "./GraphToolbar";
 import { NodeInspector } from "./NodeInspector";
+import { RoleInspector } from "./RoleInspector";
 import { WorkflowInspector } from "./WorkflowInspector";
+import type { RoleFormValue } from "./RoleForm";
 
 const POLL_MS = 3000;
 const STATE_ORDER: TaskState[] = ["pending", "ready", "running", "blocked", "failed", "completed"];
@@ -69,6 +78,7 @@ export function NetworkView() {
   const [data, setData] = useState<GraphData | null>(null);
   const [workspace, setWorkspace] = useState<GraphWorkspace | null>(null);
   const [config, setConfig] = useState<ConfigData | null>(null);
+  const [roles, setRoles] = useState<RoleInfo[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [operationError, setOperationError] = useState<string | null>(null);
   const [pollError, setPollError] = useState<string | null>(null);
@@ -78,6 +88,7 @@ export function NetworkView() {
   const [runFilter, setRunFilter] = useState<number | null>(null);
   const [showTasks, setShowTasks] = useState<boolean | null>(null);
   const [showDependencies, setShowDependencies] = useState(true);
+  const [showRoles, setShowRoles] = useState(true);
   const [addOpen, setAddOpen] = useState(false);
   const [initialAddKind, setInitialAddKind] = useState<"workflow" | null>(null);
   const [zoom, setZoom] = useState(1);
@@ -86,11 +97,12 @@ export function NetworkView() {
   const layoutCache = useRef<{ key: string; layout: NetworkLayout } | null>(null);
 
   const reload = useCallback(() => {
-    Promise.all([fetchGraph(), fetchGraphWorkspace(), fetchConfig()])
-      .then(([nextData, nextWorkspace, nextConfig]) => {
+    Promise.all([fetchGraph(), fetchGraphWorkspace(), fetchConfig(), fetchRoles()])
+      .then(([nextData, nextWorkspace, nextConfig, nextRoles]) => {
         setData(nextData);
         setWorkspace(nextWorkspace);
         setConfig(nextConfig);
+        setRoles(nextRoles);
         setError(null);
         if (nextWorkspace.warning) setOperationError(nextWorkspace.warning);
       })
@@ -103,6 +115,12 @@ export function NetworkView() {
         setData(next);
         setPollError(null);
       })
+      .catch((reason: Error) => setPollError(reason.message));
+  }, []);
+
+  const reloadRoles = useCallback(() => {
+    fetchRoles()
+      .then((next) => setRoles(next))
       .catch((reason: Error) => setPollError(reason.message));
   }, []);
 
@@ -150,9 +168,12 @@ export function NetworkView() {
         if (node.kind === "run") {
           return runFilter === null || Number(node.id.slice(4)) === runFilter;
         }
+        if (node.kind === "role") {
+          return showRoles;
+        }
         return true;
       }),
-    [effectiveShowTasks, merged, runFilter]
+    [effectiveShowTasks, merged, runFilter, showRoles]
   );
   const visibleIds = useMemo(() => new Set(filteredNodes.map((node) => node.id)), [filteredNodes]);
   const filteredEdges = useMemo(
@@ -256,11 +277,11 @@ export function NetworkView() {
   );
 
   const createWorkflowNode = useCallback(
-    async (objective: string) => {
+    async (objective: string, team: WorkflowTeam) => {
       if (!workspace) return;
       setOperationError(null);
       try {
-        const run = await createWorkflow(objective);
+        const run = await createWorkflow(objective, team);
         const nodeId = `run:${run.id}`;
         const nextWorkspace = {
           ...workspace,
@@ -303,28 +324,57 @@ export function NetworkView() {
     [reloadGraph]
   );
 
-  const createRole = useCallback(
-    (role: string, agent: string) => {
-      if (!config || !workspace || !role || !agent) {
-        setOperationError("Choose a supported role and configured agent.");
+  const createRoleNode = useCallback(
+    async (value: RoleFormValue) => {
+      if (!workspace) return;
+      setOperationError(null);
+      try {
+        const role = await createRole({
+          id: value.id,
+          name: value.name,
+          description: value.description,
+          executionClass: value.executionClass,
+          instructions: value.instructions,
+          agents: value.agents,
+          preferredAgent: value.preferredAgent ?? undefined,
+        });
+        const nodeId = `role:${role.id}`;
+        const nextWorkspace = {
+          ...workspace,
+          nodes: { ...workspace.nodes, [nodeId]: freePosition() },
+        };
+        await persistWorkspace(nextWorkspace);
+        setAddOpen(false);
+        setInitialAddKind(null);
+        setSelectedNodeId(nodeId);
+        setPositionRevision((revision) => revision + 1);
+        reloadGraph();
+        reloadRoles();
+      } catch (reason) {
+        setOperationError((reason as Error).message);
+      }
+    },
+    [freePosition, persistWorkspace, reloadGraph, reloadRoles, workspace]
+  );
+
+  const assignCoreRole = useCallback(
+    async (roleId: string, agent: string) => {
+      if (!roleId || !agent) {
+        setOperationError("Choose a role and a configured agent.");
         return;
       }
-      const nextConfig = {
-        ...config,
-        roles: { ...config.roles, [role]: { agent } },
-      };
-      const nextWorkspace = {
-        ...workspace,
-        nodes: { ...workspace.nodes, [`role:${role}`]: freePosition() },
-      };
-      void saveConfiguration(nextConfig, nextWorkspace).then((saved) => {
-        if (!saved) return;
+      setOperationError(null);
+      try {
+        await addRoleAssignment(roleId, agent);
         setAddOpen(false);
-        setSelectedNodeId(`role:${role}`);
-        setPositionRevision((value) => value + 1);
-      });
+        setInitialAddKind(null);
+        reloadGraph();
+        reloadRoles();
+      } catch (reason) {
+        setOperationError((reason as Error).message);
+      }
     },
-    [config, freePosition, saveConfiguration, workspace]
+    [reloadGraph, reloadRoles]
   );
 
   const createVisual = useCallback(
@@ -351,7 +401,7 @@ export function NetworkView() {
 
   const connect = useCallback(
     (connection: Connection) => {
-      if (!merged || !workspace || !config || !connection.source || !connection.target) return;
+      if (!merged || !workspace || !connection.source || !connection.target) return;
       const invalid = validateConnection(connection, allNodesById, merged.edges);
       if (invalid) {
         setOperationError(invalid);
@@ -364,10 +414,13 @@ export function NetworkView() {
       if (kind === "assignment") {
         const role = connection.source.slice("role:".length);
         const agent = connection.target.slice("agent:".length);
-        void saveConfiguration({
-          ...config,
-          roles: { ...config.roles, [role]: { agent } },
-        });
+        setOperationError(null);
+        void addRoleAssignment(role, agent)
+          .then(() => {
+            reloadGraph();
+            reloadRoles();
+          })
+          .catch((reason: Error) => setOperationError(reason.message));
         return;
       }
       if (!kind) return;
@@ -380,11 +433,11 @@ export function NetworkView() {
         ],
       });
     },
-    [allNodesById, config, merged, persistWorkspace, saveConfiguration, workspace]
+    [allNodesById, merged, persistWorkspace, reloadGraph, reloadRoles, workspace]
   );
 
   const deleteSelection = useCallback(() => {
-    if (!workspace || !config || !merged) return;
+    if (!workspace || !config || !merged || !roles) return;
     if (selectedEdge) {
       if (!selectedEdge.editable) {
         setOperationError("This Factory-generated connection is read-only.");
@@ -392,20 +445,15 @@ export function NetworkView() {
       }
       if (selectedEdge.kind === "binds") {
         const role = selectedEdge.source.slice("role:".length);
-        if (!window.confirm(`Remove the ${role} role assignment from Factory configuration?`))
-          return;
-        const roles = { ...config.roles };
-        delete roles[role];
-        const nodes = { ...workspace.nodes };
-        delete nodes[`role:${role}`];
-        const nextWorkspace = {
-          ...workspace,
-          nodes,
-          edges: workspace.edges.filter(
-            (edge) => edge.source !== `role:${role}` && edge.target !== `role:${role}`
-          ),
-        };
-        void saveConfiguration({ ...config, roles }, nextWorkspace);
+        const agent = selectedEdge.target.slice("agent:".length);
+        if (!window.confirm(`Remove the ${agent} assignment from the ${role} role?`)) return;
+        setOperationError(null);
+        void removeRoleAssignment(role, agent)
+          .then(() => {
+            reloadGraph();
+            reloadRoles();
+          })
+          .catch((reason: Error) => setOperationError(reason.message));
       } else {
         void persistWorkspace({
           ...workspace,
@@ -431,37 +479,38 @@ export function NetworkView() {
       return;
     }
     if (selectedNode.kind === "role") {
-      const role = selectedNode.id.slice("role:".length);
-      if (!window.confirm(`Unassign the ${role} role from Factory configuration?`)) return;
-      const roles = { ...config.roles };
-      delete roles[role];
-      const nodes = { ...workspace.nodes };
-      delete nodes[selectedNode.id];
-      const nextWorkspace = {
-        ...workspace,
-        nodes,
-        edges: workspace.edges.filter(
-          (edge) => edge.source !== selectedNode.id && edge.target !== selectedNode.id
-        ),
-      };
-      void saveConfiguration({ ...config, roles }, nextWorkspace);
-      setSelectedNodeId(null);
+      const roleId = selectedNode.id.slice("role:".length);
+      const role = roles.find((candidate) => candidate.id === roleId);
+      if (!role) return;
+      if (role.kind === "core") {
+        setOperationError(
+          "Built-in core roles cannot be deleted; remove their assignments instead."
+        );
+        return;
+      }
+      if (!window.confirm(`Delete the ${role.name} custom role and its assignments?`)) return;
+      setOperationError(null);
+      void deleteRole(role.id)
+        .then(() => {
+          setSelectedNodeId(null);
+          reloadGraph();
+          reloadRoles();
+        })
+        .catch((reason: Error) => setOperationError(reason.message));
       return;
     }
     if (selectedNode.kind === "agent") {
       const name = selectedNode.id.slice("agent:".length);
-      const affected = Object.entries(config.roles)
-        .filter(([, entry]) => entry.agent === name)
-        .map(([role]) => role);
+      const affected = config.role_assignments
+        .filter((entry) => entry.agent === name)
+        .map((entry) => entry.role);
       const detail = affected.length
-        ? ` Assigned roles will also be removed: ${affected.join(", ")}.`
+        ? ` Role assignments will also be removed: ${affected.join(", ")}.`
         : "";
       if (!window.confirm(`Remove agent '${name}' from Factory configuration?${detail}`)) return;
       const agents = { ...config.agents };
       delete agents[name];
-      const roles = Object.fromEntries(
-        Object.entries(config.roles).filter(([, entry]) => entry.agent !== name)
-      );
+      const role_assignments = config.role_assignments.filter((entry) => entry.agent !== name);
       const nodes = { ...workspace.nodes };
       delete nodes[selectedNode.id];
       const nextWorkspace = {
@@ -471,12 +520,23 @@ export function NetworkView() {
           (edge) => edge.source !== selectedNode.id && edge.target !== selectedNode.id
         ),
       };
-      void saveConfiguration({ agents, roles }, nextWorkspace);
+      void saveConfiguration({ ...config, agents, role_assignments }, nextWorkspace);
       setSelectedNodeId(null);
       return;
     }
     setOperationError("Run and task nodes are read-only Factory state.");
-  }, [config, merged, persistWorkspace, saveConfiguration, selectedEdge, selectedNode, workspace]);
+  }, [
+    config,
+    merged,
+    persistWorkspace,
+    reloadGraph,
+    reloadRoles,
+    roles,
+    saveConfiguration,
+    selectedEdge,
+    selectedNode,
+    workspace,
+  ]);
 
   const resetLayout = useCallback(() => {
     if (!workspace) return;
@@ -517,10 +577,14 @@ export function NetworkView() {
   }, [deleteSelection]);
 
   if (error) return <LoadError message={error} onRetry={reload} />;
-  if (!data || !workspace || !config || !merged) return <Loading />;
+  if (!data || !workspace || !config || !roles || !merged) return <Loading />;
 
   const empty = data.metadata.agents === 0;
   const visibleError = operationError ?? pollError;
+  const selectedRole =
+    selectedNode?.kind === "role"
+      ? (roles.find((role) => role.id === selectedNode.id.slice("role:".length)) ?? null)
+      : null;
 
   return (
     <div className="network-view">
@@ -532,6 +596,8 @@ export function NetworkView() {
         onShowTasks={setShowTasks}
         showDependencies={showDependencies}
         onShowDependencies={setShowDependencies}
+        showRoles={showRoles}
+        onShowRoles={setShowRoles}
         live={live}
         onLive={(value) => {
           setLive(value);
@@ -552,15 +618,17 @@ export function NetworkView() {
         <AddNodeMenu
           open={addOpen}
           config={config}
+          roles={roles}
           error={operationError}
           initialKind={initialAddKind}
           onClose={() => {
             setAddOpen(false);
             setInitialAddKind(null);
           }}
-          onCreateWorkflow={(objective) => void createWorkflowNode(objective)}
+          onCreateWorkflow={(objective, team) => void createWorkflowNode(objective, team)}
           onCreateAgent={createAgent}
-          onCreateRole={createRole}
+          onCreateRole={(value) => void createRoleNode(value)}
+          onAssignCoreRole={(roleId, agent) => void assignCoreRole(roleId, agent)}
           onCreateVisual={createVisual}
         />
         {visibleError && !addOpen && (
@@ -656,6 +724,18 @@ export function NetworkView() {
                 onStart={startRun}
                 onCancel={cancelRun}
                 onRetry={retryFailedTask}
+                onTeamUpdated={reloadGraph}
+              />
+            ) : selectedRole ? (
+              <RoleInspector
+                role={selectedRole}
+                agents={Object.keys(config.agents).sort()}
+                onClose={() => setSelectedNodeId(null)}
+                onChanged={() => {
+                  reloadGraph();
+                  reloadRoles();
+                }}
+                onDelete={deleteSelection}
               />
             ) : (
               <NodeInspector

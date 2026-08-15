@@ -125,13 +125,18 @@ export function findFreePosition(
   );
 }
 
-export function nextWorkspaceId(kind: "group" | "note", label: string): string {
-  const slug =
+export function slugify(label: string): string {
+  return (
     label
       .trim()
       .toLowerCase()
       .replace(/[^a-z0-9_-]+/g, "-")
       .replace(/^-+|-+$/g, "")
-      .slice(0, 48) || kind;
+      .slice(0, 48) || ""
+  );
+}
+
+export function nextWorkspaceId(kind: "group" | "note", label: string): string {
+  const slug = slugify(label) || kind;
   return `${kind}:${slug}-${Date.now().toString(36)}`;
 }

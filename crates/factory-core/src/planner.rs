@@ -38,7 +38,7 @@ impl Planner {
     }
 
     pub fn plan(&self, objective: &str, working_dir: &Path) -> Result<PlanOutcome, PlanError> {
-        let mut instruction = mission(objective, None);
+        let mut instruction = mission(objective, &[], None);
         for attempt in 0..MAX_ATTEMPTS {
             let request = AgentRequest::new(&instruction, working_dir);
             let result = self.agent.run(&request)?;
@@ -61,7 +61,7 @@ impl Planner {
                     if attempt + 1 >= MAX_ATTEMPTS {
                         return Err(PlanError::Invalid(reason));
                     }
-                    instruction = mission(objective, Some(&reason));
+                    instruction = mission(objective, &[], Some(&reason));
                 }
             }
         }
@@ -79,7 +79,8 @@ const SYSTEM_PROMPT: &str = "You are the planner of a software factory. Convert 
       \"title\": string,
       \"objective\": string,
       \"dependencies\": [string],
-      \"acceptanceCriteria\": [string]
+      \"acceptanceCriteria\": [string],
+      \"role\": string
     }
   ]
 }
@@ -89,16 +90,46 @@ Rules:
 - \"dependencies\" lists ids of other tasks in the same plan that must finish first.
 - the first tasks have empty dependency lists.
 - every task has a distinct responsibility and at least one acceptance criterion.
+- \"role\" is optional; it must be the id of one of the available roles listed below. Omit it when the task needs general implementation.
 - do not include any text outside the JSON object.";
 
-pub(crate) fn mission(objective: &str, rejection: Option<&str>) -> String {
+pub(crate) fn mission(
+    objective: &str,
+    available_roles: &[(&str, &str)],
+    rejection: Option<&str>,
+) -> String {
     let mut text = format!("{SYSTEM_PROMPT}\n\nObjective: {objective}");
+    if available_roles.is_empty() {
+        text.push_str("\n\nAvailable roles:\n- worker: General implementation.");
+    } else {
+        text.push_str("\n\nAvailable roles:");
+        for (id, description) in available_roles {
+            text.push_str(&format!("\n- {id}: {description}"));
+        }
+    }
     if let Some(reason) = rejection {
         text.push_str("\n\nYour previous output was rejected because: ");
         text.push_str(reason);
         text.push_str("\nReturn a corrected plan that matches the schema.");
     }
     text
+}
+
+pub fn validate_plan_roles(
+    plan: &Plan,
+    allowed: &std::collections::HashSet<String>,
+) -> Result<(), String> {
+    for task in &plan.tasks {
+        if let Some(role) = &task.role {
+            if !allowed.contains(role) {
+                return Err(format!(
+                    "task {} uses role '{}' which is not enabled for this workflow",
+                    task.id, role
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn parse_plan(content: &str) -> std::result::Result<Plan, String> {
@@ -200,6 +231,9 @@ pub fn normalize_plan(mut plan: Plan) -> Plan {
         task.objective = task.objective.trim().to_string();
         task.dependencies.sort();
         task.dependencies.dedup();
+        if task.role.as_deref().is_some_and(str::is_empty) {
+            task.role = None;
+        }
     }
     plan
 }

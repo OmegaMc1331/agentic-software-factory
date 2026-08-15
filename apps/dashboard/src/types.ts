@@ -19,11 +19,19 @@ export interface RunSummary {
   counts: TaskCounts;
 }
 
+export interface WorkflowTeam {
+  planner: string;
+  workers: string[];
+  reviewers: string[];
+  additional: Record<string, string[]>;
+}
+
 export interface Run {
   id: number;
   objective: string;
   status: string;
   plannerAgent: string | null;
+  team: WorkflowTeam | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -38,6 +46,7 @@ export interface Task {
   position: number;
   dependencies: number[];
   worktreePath: string | null;
+  role: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -66,9 +75,55 @@ export interface AgentEntry {
   capabilities?: string[];
 }
 
+export interface RoleDefinitionEntry {
+  name?: string;
+  description?: string;
+  execution_class?: ExecutionClass;
+  instructions?: string;
+}
+
+export interface RoleAssignmentEntry {
+  role: string;
+  agent: string;
+  preferred?: boolean;
+}
+
 export interface ConfigData {
   agents: Record<string, AgentEntry>;
-  roles: Record<string, { agent: string }>;
+  roles: Record<string, RoleDefinitionEntry>;
+  role_assignments: RoleAssignmentEntry[];
+}
+
+export type ExecutionClass = "planning" | "execution" | "review" | "advisory" | "post_process";
+
+export interface RoleAssignmentInfo {
+  agent: string;
+  preferred: boolean;
+}
+
+export interface RoleInfo {
+  id: string;
+  name: string;
+  kind: "core" | "custom";
+  description: string;
+  instructions: string;
+  executionClass: ExecutionClass;
+  assignments: RoleAssignmentInfo[];
+  available: boolean;
+}
+
+export const PIPELINE_ROLE_IDS = ["planner", "worker", "reviewer"] as const;
+
+export function roleAgents(role: RoleInfo): string[] {
+  return role.assignments.map((assignment) => assignment.agent);
+}
+
+export function preferredRoleAgents(role: RoleInfo | undefined): string[] {
+  if (!role) return [];
+  const preferred = role.assignments.filter((assignment) => assignment.preferred);
+  return (preferred.length > 0 ? preferred : role.assignments).map(
+    (assignment) => assignment.agent
+  );
 }
 
 export interface AgentStatusInfo {
@@ -122,7 +177,14 @@ export function agentResolutionStatusLabel(status: AgentResolutionStatus | undef
 }
 
 export interface RoleMeta {
-  agent: string;
+  id: string;
+  name: string;
+  kind: "core" | "custom";
+  description: string;
+  instructions: string;
+  executionClass: ExecutionClass;
+  assignments: RoleAssignmentInfo[];
+  available: boolean;
 }
 
 export interface RunMeta {
@@ -130,8 +192,7 @@ export interface RunMeta {
   objective: string;
   status: string;
   plannerAgent: string | null;
-  workerAgent: string | null;
-  reviewerAgent: string | null;
+  team: WorkflowTeam | null;
   createdAt: string;
   counts: TaskCounts;
 }
@@ -165,6 +226,7 @@ export interface TaskAttempt {
   taskId: number;
   attemptNumber: number;
   agent: string;
+  role: string | null;
   status: AttemptStatus;
   startedAt: string;
   finishedAt: string | null;
@@ -185,6 +247,7 @@ export interface TaskMeta {
   dependencies: number[];
   acceptanceCriteria: string[];
   worktreePath: string | null;
+  role: string | null;
   currentAttempt: TaskAttempt | null;
 }
 

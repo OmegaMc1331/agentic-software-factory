@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import type { GraphEdge, GraphNode } from "../types";
-import { agentMeta, agentResolutionStatusLabel, roleMeta, runMeta, taskMeta } from "../types";
+import { agentMeta, agentResolutionStatusLabel, runMeta, taskMeta } from "../types";
 import { STATE_META } from "../state";
 import { connectionKind } from "../graphWorkspace";
 
@@ -97,9 +97,7 @@ export function NodeInspector({
   }
 
   let details: React.ReactNode;
-  if (node.kind === "role") {
-    details = <Row label="Assigned agent">{roleMeta(node).agent}</Row>;
-  } else if (node.kind === "agent") {
+  if (node.kind === "agent") {
     const meta = agentMeta(node);
     details = (
       <>
@@ -170,6 +168,7 @@ export function NodeInspector({
           <span style={{ color: STATE_META[meta.state].color }}>{meta.state}</span>
         </Row>
         <Row label="Run">#{meta.runId}</Row>
+        {meta.role && <Row label="Role">{meta.role}</Row>}
         <Row label="Depends on">
           {meta.dependencies.length ? meta.dependencies.map((id) => `#${id}`).join(", ") : "None"}
         </Row>
@@ -223,7 +222,7 @@ export function NodeInspector({
     details = null;
   }
 
-  const removable = node.kind === "role" || node.kind === "group" || node.kind === "note";
+  const removable = node.kind === "group" || node.kind === "note";
 
   return (
     <Frame title={node.label} kind={node.kind} onClose={onClose}>
@@ -259,7 +258,7 @@ export function NodeInspector({
       )}
       {removable && (
         <button className="button inspector-delete" onClick={onDelete}>
-          {node.kind === "role" ? "Unassign role" : `Delete ${node.kind}`}
+          {`Delete ${node.kind}`}
         </button>
       )}
     </Frame>

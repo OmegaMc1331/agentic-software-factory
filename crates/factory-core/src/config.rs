@@ -5,8 +5,14 @@ use factory_agent::{
     runtime_path_entries, AgentCapabilities, AgentConfig, AgentError, AgentKind, AgentRequest,
     AgentStatus, CommandAgent, PromptTransport, MISSION_PLACEHOLDER,
 };
+use factory_types::WorkflowTeam;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+use crate::roles::{
+    self, is_core_role, is_pipeline_role, RoleCatalog, RoleDefinition, RoleKind,
+    MAX_ROLE_INSTRUCTIONS_CHARS, MAX_ROLE_NAME_CHARS,
+};
 
 pub const CONFIG_FILE: &str = "config.toml";
 
@@ -15,7 +21,9 @@ pub struct Config {
     #[serde(default)]
     pub agents: BTreeMap<String, AgentEntry>,
     #[serde(default)]
-    pub roles: BTreeMap<String, RoleEntry>,
+    pub roles: BTreeMap<String, RoleDefinitionEntry>,
+    #[serde(default)]
+    pub role_assignments: Vec<RoleAssignment>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -35,9 +43,64 @@ pub struct AgentEntry {
     pub capabilities: Vec<String>,
 }
 
+/// A custom role definition stored under `[roles.<slug>]`.
+///
+/// The `agent` field only captures the legacy single-agent form
+/// (`[roles.planner] agent = "codex"`); `Config::normalize` converts it into a
+/// `[[role_assignments]]` entry and never writes it back.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleDefinitionEntry {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_class: Option<roles::ExecutionClass>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub instructions: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+}
+
+impl RoleDefinitionEntry {
+    pub fn is_empty(&self) -> bool {
+        self.name.is_none()
+            && self.description.is_none()
+            && self.execution_class.is_none()
+            && self.instructions.trim().is_empty()
+            && self.agent.is_none()
+    }
+
+    pub fn is_definition(&self) -> bool {
+        self.name.is_some()
+            || self.description.is_some()
+            || self.execution_class.is_some()
+            || !self.instructions.trim().is_empty()
+    }
+
+    pub fn to_definition(&self, id: &str) -> Option<RoleDefinition> {
+        if !self.is_definition() {
+            return None;
+        }
+        Some(RoleDefinition {
+            id: id.to_string(),
+            name: self.name.clone().unwrap_or_else(|| id.to_string()),
+            description: self.description.clone().unwrap_or_default(),
+            instructions: self.instructions.trim().to_string(),
+            execution_class: self
+                .execution_class
+                .unwrap_or(roles::ExecutionClass::Execution),
+            kind: RoleKind::Custom,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RoleEntry {
+pub struct RoleAssignment {
+    pub role: String,
     pub agent: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub preferred: bool,
 }
 
 #[derive(Debug, Error)]
@@ -60,6 +123,8 @@ pub enum AgentResolutionError {
     NoRole(String),
     #[error("role `{0}` refers to unknown agent `{1}`; add an [agents.{1}] section")]
     UnknownAgent(String, String),
+    #[error("Agent `{1}` is not assigned to the {0} role.")]
+    NotAssigned(String, String),
     #[error("{0} agent `{1}` is not available. Check the agent configuration.")]
     NotAvailable(String, String),
     #[error("{0} agent `{1}` cannot start because its executable installation is broken: {2}")]
@@ -73,8 +138,33 @@ impl Config {
         let path = root.join(".factory").join(CONFIG_FILE);
         let text =
             std::fs::read_to_string(&path).map_err(|e| ConfigError::Read(path.clone(), e))?;
-        let config: Config =
+        let mut config: Config =
             toml::from_str(&text).map_err(|e| ConfigError::Parse(path, Box::new(e)))?;
+        config.normalize();
+        Ok(config)
+    }
+
+    /// Loads the configuration and, when the file still uses the legacy
+    /// single-agent role form, rewrites it in place. The original file is
+    /// preserved next to it as `config.toml.bak` before the atomic rewrite.
+    /// When the migrated configuration fails validation, the normalized form is
+    /// returned without writing so the fault surfaces at role resolution
+    /// instead of blocking startup.
+    pub fn load_and_migrate(root: &Path) -> Result<Config, ConfigError> {
+        let path = Self::path(root);
+        let original =
+            std::fs::read_to_string(&path).map_err(|e| ConfigError::Read(path.clone(), e))?;
+        let mut config: Config =
+            toml::from_str(&original).map_err(|e| ConfigError::Parse(path.clone(), Box::new(e)))?;
+        if !config.normalize() {
+            return Ok(config);
+        }
+        if config.validate().is_err() {
+            return Ok(config);
+        }
+        let backup = path.with_extension("toml.bak");
+        std::fs::write(&backup, &original).map_err(|e| ConfigError::Write(backup.clone(), e))?;
+        config.write_atomic(root)?;
         Ok(config)
     }
 
@@ -90,6 +180,70 @@ impl Config {
         }
         let _ = Config::load(root)?;
         Ok(path)
+    }
+
+    /// Converts legacy `[roles.<role>] agent = "..."` entries into
+    /// `[[role_assignments]]` entries and drops empty role tables. Returns
+    /// whether anything changed.
+    pub fn normalize(&mut self) -> bool {
+        let mut changed = false;
+        let legacy: Vec<(String, String)> = self
+            .roles
+            .iter()
+            .filter_map(|(id, entry)| {
+                entry
+                    .agent
+                    .as_ref()
+                    .map(|agent| (id.clone(), agent.clone()))
+            })
+            .collect();
+        for (role, agent) in legacy {
+            changed = true;
+            if agent.is_empty() {
+                continue;
+            }
+            if self
+                .role_assignments
+                .iter()
+                .any(|assignment| assignment.role == role && assignment.agent == agent)
+            {
+                continue;
+            }
+            let preferred = !self
+                .role_assignments
+                .iter()
+                .any(|assignment| assignment.role == role && assignment.preferred);
+            self.role_assignments.push(RoleAssignment {
+                role,
+                agent,
+                preferred,
+            });
+        }
+        for entry in self.roles.values_mut() {
+            if entry.agent.take().is_some() {
+                changed = true;
+            }
+        }
+        let empty_roles: Vec<String> = self
+            .roles
+            .iter()
+            .filter(|(_, entry)| entry.is_empty())
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in empty_roles {
+            changed = true;
+            self.roles.remove(&id);
+        }
+        let before = self.role_assignments.len();
+        let mut seen = std::collections::HashSet::new();
+        self.role_assignments
+            .retain(|assignment| seen.insert((assignment.role.clone(), assignment.agent.clone())));
+        if self.role_assignments.len() != before {
+            changed = true;
+        }
+        self.role_assignments
+            .sort_by(|a, b| (&a.role, &a.agent).cmp(&(&b.role, &b.agent)));
+        changed
     }
 
     pub fn agent_config(&self, name: &str) -> Option<AgentConfig> {
@@ -115,25 +269,130 @@ impl Config {
         })
     }
 
+    pub fn catalog(&self) -> RoleCatalog {
+        RoleCatalog::build(&self.roles)
+    }
+
+    pub fn assignments_for(&self, role: &str) -> Vec<&RoleAssignment> {
+        self.role_assignments
+            .iter()
+            .filter(|assignment| assignment.role == role)
+            .collect()
+    }
+
+    /// The preferred assignment for a role, or the first declared one.
+    pub fn preferred_assignment(&self, role: &str) -> Option<&RoleAssignment> {
+        let mut assignments = self.assignments_for(role);
+        assignments.sort_by_key(|assignment| !assignment.preferred);
+        assignments.into_iter().next()
+    }
+
     pub fn agent_for_role(&self, role: &str) -> Option<String> {
-        self.roles.get(role).map(|r| r.agent.clone())
+        self.preferred_assignment(role)
+            .map(|assignment| assignment.agent.clone())
+    }
+
+    pub fn role_infos(&self) -> Vec<RoleInfo> {
+        let catalog = self.catalog();
+        let mut infos = Vec::new();
+        for definition in catalog.list() {
+            let assignments = self.assignments_for(&definition.id);
+            let available = !assignments.is_empty();
+            infos.push(RoleInfo {
+                id: definition.id.clone(),
+                name: definition.name.clone(),
+                kind: definition.kind.as_str().to_string(),
+                description: definition.description.clone(),
+                instructions: definition.instructions.clone(),
+                execution_class: definition.execution_class.as_str().to_string(),
+                assignments: assignments
+                    .into_iter()
+                    .map(|assignment| RoleAssignmentInfo {
+                        agent: assignment.agent.clone(),
+                        preferred: assignment.preferred,
+                    })
+                    .collect(),
+                available,
+            });
+        }
+        infos
+    }
+
+    fn known_role(&self, role: &str) -> bool {
+        is_core_role(role) || self.roles.contains_key(role)
     }
 
     pub fn validate(&self) -> std::result::Result<(), String> {
-        for role in self.roles.keys() {
-            if !valid_name(role) {
-                return Err(format!("invalid role name '{role}'"));
+        for (id, entry) in &self.roles {
+            if !valid_name(id) {
+                return Err(format!("invalid role id '{id}'"));
             }
-            let agent = self
-                .roles
-                .get(role)
-                .map(|r| r.agent.as_str())
-                .unwrap_or_default();
-            if agent.is_empty() {
-                return Err(format!("role '{role}' has no agent assigned"));
+            if is_core_role(id) {
+                return Err(format!(
+                    "role '{id}' is a built-in core role and cannot be redefined"
+                ));
             }
-            if !self.agents.contains_key(agent) {
-                return Err(format!("role '{role}' refers to unknown agent '{agent}'"));
+            if entry.agent.is_some() {
+                return Err(format!(
+                    "role '{id}' uses the legacy single-agent form; assignments belong in [[role_assignments]]"
+                ));
+            }
+            if entry.is_definition() {
+                let name = entry.name.as_deref().unwrap_or("").trim();
+                if name.is_empty() {
+                    return Err(format!("role '{id}' has no name"));
+                }
+                if name.chars().count() > MAX_ROLE_NAME_CHARS {
+                    return Err(format!(
+                        "role '{id}' name exceeds {MAX_ROLE_NAME_CHARS} characters"
+                    ));
+                }
+                let description = entry.description.as_deref().unwrap_or("").trim();
+                if description.is_empty() {
+                    return Err(format!("role '{id}' has no description"));
+                }
+                if entry.execution_class.is_none() {
+                    return Err(format!("role '{id}' has no execution class"));
+                }
+                if entry.instructions.chars().count() > MAX_ROLE_INSTRUCTIONS_CHARS {
+                    return Err(format!(
+                        "role '{id}' instructions exceed {MAX_ROLE_INSTRUCTIONS_CHARS} characters"
+                    ));
+                }
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut preferred_counts: BTreeMap<&str, usize> = BTreeMap::new();
+        for assignment in &self.role_assignments {
+            if !self.known_role(&assignment.role) {
+                return Err(format!(
+                    "assignment refers to unknown role '{}'",
+                    assignment.role
+                ));
+            }
+            if !self.agents.contains_key(&assignment.agent) {
+                return Err(format!(
+                    "role '{}' refers to unknown agent '{}'",
+                    assignment.role, assignment.agent
+                ));
+            }
+            if !seen.insert((assignment.role.clone(), assignment.agent.clone())) {
+                return Err(format!(
+                    "role '{}' assigns agent '{}' more than once",
+                    assignment.role, assignment.agent
+                ));
+            }
+            if assignment.preferred {
+                *preferred_counts
+                    .entry(assignment.role.as_str())
+                    .or_default() += 1;
+            }
+        }
+        for (role, count) in preferred_counts {
+            if count > 1 {
+                return Err(format!(
+                    "role '{role}' has {count} preferred assignments; at most one is allowed"
+                ));
             }
         }
         for (name, entry) in &self.agents {
@@ -205,6 +464,134 @@ impl Config {
         Ok(())
     }
 
+    /// Validates a workflow team against this configuration. Every selected
+    /// agent must be assigned to the role it is selected for.
+    pub fn validate_team(&self, team: &WorkflowTeam) -> std::result::Result<(), String> {
+        self.validate_team_inner(team, true)
+    }
+
+    /// Same as `validate_team`, but an empty worker or reviewer selection is
+    /// allowed; used for teams captured before every role is configured.
+    pub fn validate_partial_team(&self, team: &WorkflowTeam) -> std::result::Result<(), String> {
+        self.validate_team_inner(team, false)
+    }
+
+    fn validate_team_inner(
+        &self,
+        team: &WorkflowTeam,
+        require_complete: bool,
+    ) -> std::result::Result<(), String> {
+        let member_of = |role: &str, agent: &str| -> std::result::Result<(), String> {
+            if self
+                .role_assignments
+                .iter()
+                .any(|assignment| assignment.role == role && assignment.agent == agent)
+            {
+                Ok(())
+            } else {
+                Err(format!(
+                    "agent '{agent}' is not assigned to the '{role}' role"
+                ))
+            }
+        };
+        let unique = |agents: &[String], role: &str| -> std::result::Result<(), String> {
+            let mut seen = std::collections::HashSet::new();
+            for agent in agents {
+                if !seen.insert(agent.as_str()) {
+                    return Err(format!(
+                        "agent '{agent}' appears twice in the {role} selection"
+                    ));
+                }
+            }
+            Ok(())
+        };
+        if team.planner.trim().is_empty() {
+            return Err("the team has no planner".into());
+        }
+        member_of("planner", &team.planner)?;
+        if team.workers.is_empty() {
+            if require_complete {
+                return Err("the team has no workers".into());
+            }
+        } else {
+            unique(&team.workers, "worker selection")?;
+            for worker in &team.workers {
+                member_of("worker", worker)?;
+            }
+        }
+        if team.reviewers.is_empty() {
+            if require_complete {
+                return Err("the team has no reviewers".into());
+            }
+        } else {
+            unique(&team.reviewers, "reviewer selection")?;
+            for reviewer in &team.reviewers {
+                member_of("reviewer", reviewer)?;
+            }
+        }
+        for (role, agents) in &team.additional {
+            if is_pipeline_role(role) {
+                return Err(format!(
+                    "role '{role}' is composed directly on the team and cannot appear as an additional role"
+                ));
+            }
+            if !self.known_role(role) {
+                return Err(format!("the team uses unknown role '{role}'"));
+            }
+            if agents.is_empty() {
+                return Err(format!("role '{role}' has no selected agents"));
+            }
+            unique(agents, &format!("{role} selection"))?;
+            for agent in agents {
+                member_of(role, agent)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The team captured when a workflow is created: the planner must be
+    /// assigned; workers and reviewers are captured when they are configured
+    /// and are required before the workflow starts.
+    pub fn initial_team(&self) -> std::result::Result<WorkflowTeam, String> {
+        let planner = self
+            .preferred_assignment("planner")
+            .map(|assignment| assignment.agent.clone())
+            .ok_or_else(|| {
+                "No agent is assigned to the planner role. Configure one from the dashboard."
+                    .to_string()
+            })?;
+        Ok(WorkflowTeam {
+            planner,
+            workers: self
+                .preferred_assignment("worker")
+                .map(|assignment| vec![assignment.agent.clone()])
+                .unwrap_or_default(),
+            reviewers: self
+                .preferred_assignment("reviewer")
+                .map(|assignment| vec![assignment.agent.clone()])
+                .unwrap_or_default(),
+            additional: BTreeMap::new(),
+        })
+    }
+
+    /// The default team for a new workflow: the preferred assignment of each
+    /// pipeline role. Optional roles are never added automatically.
+    pub fn default_team(&self) -> std::result::Result<WorkflowTeam, String> {
+        let pick = |role: &str| -> std::result::Result<String, String> {
+            self.preferred_assignment(role)
+                .map(|assignment| assignment.agent.clone())
+                .ok_or_else(|| {
+                    format!("No agent is assigned to the {role} role. Configure one from the dashboard.")
+                })
+        };
+        Ok(WorkflowTeam {
+            planner: pick("planner")?,
+            workers: vec![pick("worker")?],
+            reviewers: vec![pick("reviewer")?],
+            additional: BTreeMap::new(),
+        })
+    }
+
     pub fn write_atomic(&self, root: &Path) -> Result<PathBuf, ConfigError> {
         self.validate().map_err(|reason| {
             ConfigError::Write(Self::path(root), std::io::Error::other(reason))
@@ -230,7 +617,10 @@ pub fn default_config_text() -> String {
 # CLIs that you install and authenticate yourself (Codex, Claude Code,
 # OpenCode, Gemini CLI, ...). The Factory only orchestrates them.
 #
-# A role points to an agent by name; the same agent may fill several roles.
+# Roles describe responsibilities; assignments connect a role to one or
+# more agents. The same agent may fill several roles. Custom roles are
+# defined under [roles.<slug>] with name, description, execution_class
+# and instructions.
 
 [agents.codex]
 kind = \"codex\"
@@ -247,14 +637,20 @@ kind = \"claude_code\"
 command = \"claude\"
 args = [\"-p\"]
 
-[roles.planner]
+[[role_assignments]]
+role = \"planner\"
 agent = \"codex\"
+preferred = true
 
-[roles.worker]
+[[role_assignments]]
+role = \"worker\"
 agent = \"opencode\"
+preferred = true
 
-[roles.reviewer]
+[[role_assignments]]
+role = \"reviewer\"
 agent = \"claude\"
+preferred = true
 "
     .to_string()
 }
@@ -266,7 +662,7 @@ pub struct Agents {
 impl Agents {
     pub fn load(root: &Path) -> Result<Agents, ConfigError> {
         Ok(Agents {
-            config: Config::load(root)?,
+            config: Config::load_and_migrate(root)?,
         })
     }
 
@@ -346,22 +742,45 @@ impl Agents {
             .config
             .agent_for_role(role)
             .ok_or_else(|| AgentResolutionError::NoRole(role.to_string()))?;
-        let agent = self
+        self.command_agent_for(role, &name)
+    }
+
+    /// Resolves a specific agent that must be assigned to the given role.
+    pub fn command_agent_for(
+        &self,
+        role: &str,
+        agent: &str,
+    ) -> Result<CommandAgent, AgentResolutionError> {
+        let assigned = self
             .config
-            .agent_config(&name)
-            .ok_or_else(|| AgentResolutionError::UnknownAgent(role.to_string(), name.clone()))?;
-        let command = CommandAgent::new(agent);
+            .role_assignments
+            .iter()
+            .any(|assignment| assignment.role == role && assignment.agent == agent);
+        if !assigned {
+            return Err(AgentResolutionError::NotAssigned(
+                role.to_string(),
+                agent.to_string(),
+            ));
+        }
+        let config = self
+            .config
+            .agent_config(agent)
+            .ok_or_else(|| AgentResolutionError::UnknownAgent(role.to_string(), agent.into()))?;
+        let command = CommandAgent::new(config);
         match command.resolve_executable() {
             Ok(_) => {}
             Err(error @ AgentError::InvalidExecutable { .. }) => {
                 return Err(AgentResolutionError::Broken(
                     capitalized(role),
-                    name,
+                    agent.to_string(),
                     error.to_string(),
                 ));
             }
             Err(_) => {
-                return Err(AgentResolutionError::NotAvailable(capitalized(role), name));
+                return Err(AgentResolutionError::NotAvailable(
+                    capitalized(role),
+                    agent.to_string(),
+                ));
             }
         }
         if command
@@ -370,7 +789,7 @@ impl Agents {
         {
             return Err(AgentResolutionError::AutomatedUnavailable(
                 capitalized(role),
-                name,
+                agent.to_string(),
             ));
         }
         Ok(command)
@@ -477,8 +896,295 @@ pub struct AgentInfo {
     pub path_entries_checked: usize,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RoleAssignmentInfo {
+    pub agent: String,
+    pub preferred: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RoleInfo {
+    pub id: String,
+    pub name: String,
+    pub kind: String,
+    pub description: String,
+    pub instructions: String,
+    pub execution_class: String,
+    pub assignments: Vec<RoleAssignmentInfo>,
+    pub available: bool,
+}
+
 fn format_command(command: &str, args: &[String]) -> String {
     let mut parts = vec![command.to_string()];
     parts.extend(args.iter().cloned());
     parts.join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn agent_entry() -> AgentEntry {
+        AgentEntry {
+            kind: None,
+            command: "codex".into(),
+            args: vec!["exec".into()],
+            env: BTreeMap::new(),
+            prompt_transport: None,
+            interactive_args: None,
+            capabilities: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn legacy_single_agent_roles_migrate_to_assignments() {
+        let mut config = Config::default();
+        config.agents.insert("codex".into(), agent_entry());
+        config.agents.insert("claude".into(), agent_entry());
+        config.roles.insert(
+            "planner".into(),
+            RoleDefinitionEntry {
+                agent: Some("codex".into()),
+                ..RoleDefinitionEntry::default()
+            },
+        );
+        config.roles.insert(
+            "reviewer".into(),
+            RoleDefinitionEntry {
+                agent: Some("claude".into()),
+                ..RoleDefinitionEntry::default()
+            },
+        );
+        assert!(config.normalize());
+        assert!(config.roles.is_empty());
+        assert_eq!(config.role_assignments.len(), 2);
+        let planner = config
+            .role_assignments
+            .iter()
+            .find(|assignment| assignment.role == "planner")
+            .unwrap();
+        assert_eq!(planner.agent, "codex");
+        assert!(planner.preferred);
+        assert!(config.validate().is_ok());
+        assert!(!config.normalize(), "second normalize is a no-op");
+    }
+
+    #[test]
+    fn empty_role_tables_are_dropped() {
+        let mut config = Config::default();
+        config
+            .roles
+            .insert("architect".into(), RoleDefinitionEntry::default());
+        assert!(config.normalize());
+        assert!(config.roles.is_empty());
+    }
+
+    #[test]
+    fn duplicate_assignments_are_rejected() {
+        let mut config = Config::default();
+        config.agents.insert("codex".into(), agent_entry());
+        config.role_assignments = vec![
+            RoleAssignment {
+                role: "worker".into(),
+                agent: "codex".into(),
+                preferred: false,
+            },
+            RoleAssignment {
+                role: "worker".into(),
+                agent: "codex".into(),
+                preferred: false,
+            },
+        ];
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn multiple_preferred_assignments_are_rejected() {
+        let mut config = Config::default();
+        config.agents.insert("codex".into(), agent_entry());
+        config.agents.insert("claude".into(), agent_entry());
+        config.role_assignments = vec![
+            RoleAssignment {
+                role: "worker".into(),
+                agent: "codex".into(),
+                preferred: true,
+            },
+            RoleAssignment {
+                role: "worker".into(),
+                agent: "claude".into(),
+                preferred: true,
+            },
+        ];
+        let error = config.validate().unwrap_err();
+        assert!(error.contains("preferred"), "unexpected: {error}");
+    }
+
+    #[test]
+    fn assignment_to_unknown_agent_or_role_is_rejected() {
+        let mut config = Config::default();
+        config.agents.insert("codex".into(), agent_entry());
+        config.role_assignments = vec![RoleAssignment {
+            role: "worker".into(),
+            agent: "ghost".into(),
+            preferred: false,
+        }];
+        assert!(config.validate().is_err());
+        config.role_assignments = vec![RoleAssignment {
+            role: "ghost_role".into(),
+            agent: "codex".into(),
+            preferred: false,
+        }];
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn core_roles_cannot_be_redefined() {
+        let mut config = Config::default();
+        config.roles.insert(
+            "worker".into(),
+            RoleDefinitionEntry {
+                name: Some("Worker".into()),
+                description: Some("Override".into()),
+                execution_class: Some(roles::ExecutionClass::Execution),
+                instructions: String::new(),
+                agent: None,
+            },
+        );
+        let error = config.validate().unwrap_err();
+        assert!(error.contains("built-in core role"), "unexpected: {error}");
+    }
+
+    #[test]
+    fn custom_roles_validate_and_join_the_catalog() {
+        let mut config = Config::default();
+        config.agents.insert("codex".into(), agent_entry());
+        config.roles.insert(
+            "database_engineer".into(),
+            RoleDefinitionEntry {
+                name: Some("Database Engineer".into()),
+                description: Some("Designs and modifies relational database schemas.".into()),
+                execution_class: Some(roles::ExecutionClass::Execution),
+                instructions: "Focus on schema design and migrations.".into(),
+                agent: None,
+            },
+        );
+        config.role_assignments = vec![RoleAssignment {
+            role: "database_engineer".into(),
+            agent: "codex".into(),
+            preferred: true,
+        }];
+        assert!(config.validate().is_ok());
+        let catalog = config.catalog();
+        let role = catalog.get("database_engineer").unwrap();
+        assert_eq!(role.name, "Database Engineer");
+        assert_eq!(role.kind, RoleKind::Custom);
+        assert!(catalog.get("planner").is_some());
+        let infos = config.role_infos();
+        assert!(infos.len() >= 9);
+        let info = infos
+            .iter()
+            .find(|info| info.id == "database_engineer")
+            .unwrap();
+        assert!(info.available);
+        assert_eq!(info.assignments.len(), 1);
+        assert!(info.assignments[0].preferred);
+        let architect = infos.iter().find(|info| info.id == "architect").unwrap();
+        assert!(!architect.available);
+    }
+
+    #[test]
+    fn incomplete_custom_role_definitions_are_rejected() {
+        let mut config = Config::default();
+        config.roles.insert(
+            "half_role".into(),
+            RoleDefinitionEntry {
+                name: Some("Half".into()),
+                description: None,
+                execution_class: None,
+                instructions: String::new(),
+                agent: None,
+            },
+        );
+        let error = config.validate().unwrap_err();
+        assert!(error.contains("no description"), "unexpected: {error}");
+    }
+
+    #[test]
+    fn default_team_picks_the_preferred_assignment() {
+        let mut config = Config::default();
+        config.agents.insert("codex".into(), agent_entry());
+        config.agents.insert("claude".into(), agent_entry());
+        config.role_assignments = vec![
+            RoleAssignment {
+                role: "planner".into(),
+                agent: "codex".into(),
+                preferred: true,
+            },
+            RoleAssignment {
+                role: "worker".into(),
+                agent: "codex".into(),
+                preferred: false,
+            },
+            RoleAssignment {
+                role: "worker".into(),
+                agent: "claude".into(),
+                preferred: true,
+            },
+            RoleAssignment {
+                role: "reviewer".into(),
+                agent: "claude".into(),
+                preferred: true,
+            },
+        ];
+        let team = config.default_team().unwrap();
+        assert_eq!(team.planner, "codex");
+        assert_eq!(team.workers, ["claude"]);
+        assert_eq!(team.reviewers, ["claude"]);
+        assert!(config.validate_team(&team).is_ok());
+    }
+
+    #[test]
+    fn team_validation_rejects_unassigned_agents() {
+        let mut config = Config::default();
+        config.agents.insert("codex".into(), agent_entry());
+        config.agents.insert("claude".into(), agent_entry());
+        config.role_assignments = vec![
+            RoleAssignment {
+                role: "planner".into(),
+                agent: "codex".into(),
+                preferred: true,
+            },
+            RoleAssignment {
+                role: "worker".into(),
+                agent: "codex".into(),
+                preferred: true,
+            },
+            RoleAssignment {
+                role: "reviewer".into(),
+                agent: "claude".into(),
+                preferred: true,
+            },
+        ];
+        let team = WorkflowTeam {
+            planner: "codex".into(),
+            workers: vec!["claude".into()],
+            reviewers: vec!["claude".into()],
+            additional: BTreeMap::new(),
+        };
+        let error = config.validate_team(&team).unwrap_err();
+        assert!(error.contains("not assigned"), "unexpected: {error}");
+    }
+
+    #[test]
+    fn default_config_text_parses_and_validates() {
+        let mut config: Config = toml::from_str(&default_config_text()).unwrap();
+        assert!(config.validate().is_ok());
+        assert!(!config.normalize());
+        let team = config.default_team().unwrap();
+        assert_eq!(team.planner, "codex");
+        assert_eq!(team.workers, ["opencode"]);
+        assert_eq!(team.reviewers, ["claude"]);
+    }
 }
