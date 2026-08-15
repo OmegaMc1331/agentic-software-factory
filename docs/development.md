@@ -148,8 +148,8 @@ builds all supported platform archives, verifies installers, and creates a GitHu
 Release. Do not tag routine changes automatically.
 
 ```bash
-git tag v0.3.3
-git push origin v0.3.3
+git tag v0.3.4
+git push origin v0.3.4
 ```
 
 [CI](../.github/workflows/ci.yml) runs Rust checks on Ubuntu and Windows, dashboard
