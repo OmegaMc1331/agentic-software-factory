@@ -906,29 +906,35 @@ async fn role_aware_artifacts_and_stages_are_exposed() {
     let insert_agent = |config: &mut Config, name: &str, script: String| {
         config.agents.insert(name.into(), command_entry(&script));
     };
-    insert_agent(
-        &mut config,
-        "planner-api",
-        format!("type {}", plan_path.display()),
-    );
+    // The fake agents print fixture files the same way on every platform:
+    // `cat` on unix, `type` on Windows. Producers also touch a marker file so
+    // implementation tasks produce real repository evidence.
+    let cat = |path: &Path| -> String {
+        if cfg!(windows) {
+            format!("type {}", path.display())
+        } else {
+            format!("cat '{}'", path.display())
+        }
+    };
+    let producer = |marker: &str, file: &str, path: &Path| -> String {
+        if cfg!(windows) {
+            format!("echo {marker}>{file} & type {}", path.display())
+        } else {
+            format!("printf '{marker}\\n' > {file}; cat '{}'", path.display())
+        }
+    };
+    insert_agent(&mut config, "planner-api", cat(&plan_path));
     insert_agent(
         &mut config,
         "researcher-api",
-        format!("echo found>research.txt & type {}", research_path.display()),
+        producer("found", "research.txt", &research_path),
     );
     insert_agent(
         &mut config,
         "worker-api",
-        format!(
-            "echo done>worker-output.txt & type {}",
-            worker_output.display()
-        ),
+        producer("done", "worker-output.txt", &worker_output),
     );
-    insert_agent(
-        &mut config,
-        "reviewer-api",
-        format!("type {}", reviewer_output.display()),
-    );
+    insert_agent(&mut config, "reviewer-api", cat(&reviewer_output));
     for (role, agent, preferred) in [
         ("planner", "planner-api", true),
         ("worker", "worker-api", true),
