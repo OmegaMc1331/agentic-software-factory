@@ -1185,18 +1185,18 @@ impl Factory {
             let review = review_result_from(&decision.findings);
 
             if decision.decision == ReviewDecision::Approve {
-self.db.finish_task_attempt(
-                        attempt.id,
-                        AttemptStatus::Approved,
-                        review_exit_code,
-                        evidence.commit_sha.as_deref(),
-                        None,
-                        Some(&evidence),
-                        Some(&review),
-                    )?;
-                    self.mark_task(task_id, TaskState::Completed)?;
-                    self.prune_inert_worktree(task_id)?;
-                    return Ok(true);
+                self.db.finish_task_attempt(
+                    attempt.id,
+                    AttemptStatus::Approved,
+                    review_exit_code,
+                    evidence.commit_sha.as_deref(),
+                    None,
+                    Some(&evidence),
+                    Some(&review),
+                )?;
+                self.mark_task(task_id, TaskState::Completed)?;
+                self.prune_inert_worktree(task_id)?;
+                return Ok(true);
             }
 
             self.db.finish_task_attempt(
@@ -1590,7 +1590,12 @@ self.db.finish_task_attempt(
     /// integration head, evidence is measured against it (stable across rework
     /// and independent of where the worktree started); otherwise the worktree
     /// head at attempt start is used.
-    fn attempt_base_sha(&self, task: &Task, repo: &Repo, worktree: &Path) -> Result<String, FactoryError> {
+    fn attempt_base_sha(
+        &self,
+        task: &Task,
+        repo: &Repo,
+        worktree: &Path,
+    ) -> Result<String, FactoryError> {
         if let Some(sha) = self.db.get_run_integration(task.run_id)? {
             return Ok(sha);
         }
@@ -1630,7 +1635,10 @@ self.db.finish_task_attempt(
             repo.commit_changes(
                 worktree,
                 &message,
-                (&format!("{agent_name} via Factory {}", run.id), "factory@local"),
+                (
+                    &format!("{agent_name} via Factory {}", run.id),
+                    "factory@local",
+                ),
             )?;
         }
         let head = repo.head_sha(worktree)?;

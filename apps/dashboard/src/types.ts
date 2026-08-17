@@ -132,9 +132,7 @@ export interface RunIntegration {
   integratedTasks: number[];
 }
 
-export function isImplementationOperation(
-  operation: TaskOperation | null | undefined
-): boolean {
+export function isImplementationOperation(operation: TaskOperation | null | undefined): boolean {
   return operation === "implement" || operation === "verify" || operation === "post_process";
 }
 
@@ -153,8 +151,7 @@ export function isTaskIntegratedIds(
   integration: RunIntegration | null | undefined
 ): boolean {
   return (
-    isImplementationOperation(operation) &&
-    (integration?.integratedTasks ?? []).includes(taskId)
+    isImplementationOperation(operation) && (integration?.integratedTasks ?? []).includes(taskId)
   );
 }
 

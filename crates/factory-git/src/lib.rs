@@ -229,9 +229,7 @@ impl Repo {
             .status()
             .map_err(GitError::Io)?;
         if !add.success() {
-            return Err(GitError::CommandFailed(
-                "git add -A failed".to_string(),
-            ));
+            return Err(GitError::CommandFailed("git add -A failed".to_string()));
         }
         let staged = Command::new("git")
             .arg("-C")
@@ -554,7 +552,10 @@ mod tests {
         let worktree = dir.path().join("wt");
         repo.add_worktree(&worktree, "factory/t1", Some("factory/run-1"))
             .unwrap();
-        assert_eq!(repo.head_sha(&worktree).unwrap(), repo.head_sha(dir.path()).unwrap());
+        assert_eq!(
+            repo.head_sha(&worktree).unwrap(),
+            repo.head_sha(dir.path()).unwrap()
+        );
         assert!(worktree.join("more.txt").exists());
     }
 
@@ -578,7 +579,12 @@ mod tests {
         assert_eq!(repo.head_sha(&worktree).unwrap(), sha);
         assert!(!repo.has_uncommitted_changes(&worktree).unwrap());
 
-        let author = git(&worktree, &["show", "-s", "--format=%an <%ae>", "HEAD"], None).unwrap();
+        let author = git(
+            &worktree,
+            &["show", "-s", "--format=%an <%ae>", "HEAD"],
+            None,
+        )
+        .unwrap();
         assert_eq!(author.trim(), "Builder Agent <factory@local>");
     }
 
@@ -619,10 +625,14 @@ mod tests {
             .unwrap();
         let task_head = repo.head_sha(&worktree).unwrap();
 
-        assert!(repo.is_ancestor(&repo.resolve_ref("factory/run-1").unwrap(), &task_head).unwrap());
+        assert!(repo
+            .is_ancestor(&repo.resolve_ref("factory/run-1").unwrap(), &task_head)
+            .unwrap());
         repo.update_ref("factory/run-1", &task_head).unwrap();
         assert_eq!(repo.resolve_ref("factory/run-1").unwrap(), task_head);
-        assert!(repo.is_ancestor("main", &repo.resolve_ref("factory/run-1").unwrap()).unwrap());
+        assert!(repo
+            .is_ancestor("main", &repo.resolve_ref("factory/run-1").unwrap())
+            .unwrap());
     }
 
     #[test]
@@ -657,11 +667,15 @@ mod tests {
             .unwrap();
 
         let task_head = repo.head_sha(&worktree).unwrap();
-        assert!(!repo.is_ancestor(&repo.resolve_ref("factory/run-1").unwrap(), &task_head).unwrap());
+        assert!(!repo
+            .is_ancestor(&repo.resolve_ref("factory/run-1").unwrap(), &task_head)
+            .unwrap());
 
         repo.rebase_onto_in(&worktree, "factory/run-1").unwrap();
         let rebased = repo.head_sha(&worktree).unwrap();
-        assert!(repo.is_ancestor(&repo.resolve_ref("factory/run-1").unwrap(), &rebased).unwrap());
+        assert!(repo
+            .is_ancestor(&repo.resolve_ref("factory/run-1").unwrap(), &rebased)
+            .unwrap());
     }
 
     #[test]

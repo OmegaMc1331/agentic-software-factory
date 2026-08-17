@@ -75,23 +75,25 @@ const taskNode: GraphNode = {
 
 beforeEach(() => {
   vi.mocked(fetchRunArtifacts).mockReset();
-  vi.mocked(fetchRun).mockReset().mockResolvedValue({
-    run: {
-      id: 9,
-      objective: "",
-      status: "active",
-      plannerAgent: null,
-      team: null,
-      createdAt: "",
-      updatedAt: "",
-    },
-    tasks: [],
-    attempts: [],
-    sessions: [],
-    stages: [],
-    artifacts: [],
-    integration: { branch: "factory/run-9", head: null, integratedTasks: [] },
-  });
+  vi.mocked(fetchRun)
+    .mockReset()
+    .mockResolvedValue({
+      run: {
+        id: 9,
+        objective: "",
+        status: "active",
+        plannerAgent: null,
+        team: null,
+        createdAt: "",
+        updatedAt: "",
+      },
+      tasks: [],
+      attempts: [],
+      sessions: [],
+      stages: [],
+      artifacts: [],
+      integration: { branch: "factory/run-9", head: null, integratedTasks: [] },
+    });
 });
 
 afterEach(() => {
