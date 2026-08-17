@@ -68,6 +68,20 @@ pub struct RunDetail {
     pub stages: Vec<StageStatus>,
     /// Artifacts persisted by the workflow's advisory/verification/review tasks.
     pub artifacts: Vec<RoleArtifact>,
+    /// Per-run integration branch state: where approved implementation-family
+    /// work is merged and which tasks contributed commits to it.
+    pub integration: RunIntegration,
+}
+
+/// The run's `factory/run-<id>` integration branch: its current head and the
+/// implementation-family tasks whose latest attempt was approved and integrated
+/// into it. `head` is `None` until the first implementation task is approved.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunIntegration {
+    pub branch: String,
+    pub head: Option<String>,
+    pub integrated_tasks: Vec<i64>,
 }
 
 /// One derived workflow stage ("what kind of work is happening") with its

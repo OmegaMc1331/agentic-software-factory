@@ -188,10 +188,25 @@ fn sequential_scheduler_records_evidence_reviews_and_completion() {
     assert!(attempts
         .iter()
         .all(|attempt| attempt.status == AttemptStatus::Approved));
-    assert!(attempts.iter().all(|attempt| attempt
-        .evidence
-        .as_ref()
-        .is_some_and(|evidence| evidence.changed_files == vec!["worker-output.txt"])));
+    for attempt in &attempts {
+        let expected: Vec<String> = if attempt.task_id == outcome.tasks[0].id {
+            vec!["worker-output.txt".to_string()]
+        } else {
+            // The second task's worktree starts from the already-integrated run
+            // branch, so re-writing the identical file introduces no diff.
+            Vec::new()
+        };
+        assert_eq!(
+            attempt
+                .evidence
+                .as_ref()
+                .map(|evidence| evidence.changed_files.clone()),
+            Some(expected),
+            "attempt {} for task {}",
+            attempt.id,
+            attempt.task_id,
+        );
+    }
     assert!(attempts.iter().all(|attempt| attempt
         .review
         .as_ref()

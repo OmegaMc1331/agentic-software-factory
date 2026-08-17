@@ -1,9 +1,11 @@
 import { useEffect, useMemo, useState } from "react";
-import { fetchRunArtifacts } from "../api";
-import type { GraphEdge, GraphNode, RoleArtifact, RoleMeta } from "../types";
+import { fetchRun, fetchRunArtifacts } from "../api";
+import type { GraphEdge, GraphNode, RoleArtifact, RoleMeta, RunIntegration } from "../types";
 import {
   agentMeta,
   agentResolutionStatusLabel,
+  isImplementationOperation,
+  isTaskIntegratedIds,
   operationStage,
   roleMeta,
   runMeta,
@@ -83,10 +85,12 @@ export function NodeInspector({
   const [target, setTarget] = useState("");
   useEffect(() => setTarget(""), [node?.id]);
   const [runArtifacts, setRunArtifacts] = useState<RoleArtifact[]>([]);
+  const [runIntegration, setRunIntegration] = useState<RunIntegration | null>(null);
   useEffect(() => {
     if (node?.kind !== "task") return;
     let active = true;
     setRunArtifacts([]);
+    setRunIntegration(null);
     const runId = taskMeta(node).runId;
     fetchRunArtifacts(runId)
       .then((artifacts) => {
@@ -94,6 +98,13 @@ export function NodeInspector({
       })
       .catch(() => {
         if (active) setRunArtifacts([]);
+      });
+    fetchRun(runId)
+      .then((detail) => {
+        if (active) setRunIntegration(detail.integration);
+      })
+      .catch(() => {
+        if (active) setRunIntegration(null);
       });
     return () => {
       active = false;
@@ -236,6 +247,18 @@ export function NodeInspector({
         {executionClass && <Row label="Execution class">{executionClass}</Row>}
         {meta.role ? <Row label="Role">{meta.role}</Row> : <Row label="Role">worker (default)</Row>}
         {attempt && <Row label="Agent">{attempt.agent}</Row>}
+        {isTaskIntegratedIds(meta.operation, meta.taskId, runIntegration) ? (
+          <Row label="Integration">
+            <span className="integrated-tag">✓ merged into {runIntegration?.branch}</span>
+          </Row>
+        ) : (
+          isImplementationOperation(meta.operation) &&
+          runIntegration && (
+            <Row label="Integration">
+              <span className="integrated-tag is-out">not integrated</span>
+            </Row>
+          )
+        )}
         <Row label="Depends on">
           {meta.dependencies.length ? meta.dependencies.map((id) => `#${id}`).join(", ") : "None"}
         </Row>

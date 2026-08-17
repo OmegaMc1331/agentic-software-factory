@@ -1949,6 +1949,52 @@ code {
   text-transform: uppercase;
 }
 
+.workflow-integration-summary {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.workflow-integration-summary li {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 3px 0;
+}
+
+.workflow-integration-summary li span {
+  color: var(--text-muted);
+  font-size: 10px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.workflow-integration-summary strong {
+  font-family: var(--font-mono, monospace);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.integrated-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 1px 7px;
+  border-radius: 9px;
+  background: rgba(22, 163, 74, 0.15);
+  color: #16a34a;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  white-space: nowrap;
+}
+
+.integrated-tag.is-out {
+  background: rgba(148, 163, 184, 0.14);
+  color: var(--text-muted);
+  font-weight: 500;
+}
+
 .workflow-team-editor {
   display: flex;
   flex-direction: column;

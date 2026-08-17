@@ -122,6 +122,40 @@ export interface RunDetail {
   sessions: AgentSession[];
   stages: StageStatus[];
   artifacts: RoleArtifact[];
+  integration: RunIntegration;
+}
+
+/** Per-run integration branch (`factory/run-<id>`): head + integrated tasks. */
+export interface RunIntegration {
+  branch: string;
+  head: string | null;
+  integratedTasks: number[];
+}
+
+export function isImplementationOperation(
+  operation: TaskOperation | null | undefined
+): boolean {
+  return operation === "implement" || operation === "verify" || operation === "post_process";
+}
+
+/** Whether a task's approved work was merged into the run integration branch. */
+export function isTaskIntegrated(
+  task: Task,
+  integration: RunIntegration | null | undefined
+): boolean {
+  return isTaskIntegratedIds(task.operation, task.id, integration);
+}
+
+/** Task-node variant of `isTaskIntegrated` for `TaskMeta` (graph) sources. */
+export function isTaskIntegratedIds(
+  operation: TaskOperation | null | undefined,
+  taskId: number,
+  integration: RunIntegration | null | undefined
+): boolean {
+  return (
+    isImplementationOperation(operation) &&
+    (integration?.integratedTasks ?? []).includes(taskId)
+  );
 }
 
 export type AgentKind =

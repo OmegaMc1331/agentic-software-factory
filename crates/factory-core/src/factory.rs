@@ -541,7 +541,7 @@ impl Factory {
                 self.create_worktree(task_id)?
             };
             let repo = Repo::detect_bounded(&worktree, &self.root)?;
-            let base_sha = repo.head_sha(&worktree)?;
+            let base_sha = self.attempt_base_sha(&task, &repo, &worktree)?;
             let run = self
                 .db
                 .get_run(task.run_id)?
@@ -782,16 +782,20 @@ impl Factory {
             };
 
             if review.decision == ReviewDecision::Approve {
+                let integrated_sha =
+                    self.integrate_approved_task(&run, &task, &worker_name, &worktree)?;
+                let commit_sha = integrated_sha.or_else(|| evidence.commit_sha.clone());
                 self.db.finish_task_attempt(
                     attempt.id,
                     AttemptStatus::Approved,
                     worker_run.result.exit_code,
-                    evidence.commit_sha.as_deref(),
+                    commit_sha.as_deref(),
                     None,
                     Some(&evidence),
                     Some(&review),
                 )?;
                 self.mark_task(task_id, TaskState::Completed)?;
+                self.remove_worktree(task_id, false)?;
                 return Ok(true);
             }
 
@@ -841,7 +845,7 @@ impl Factory {
                 self.create_worktree(task_id)?
             };
             let repo = Repo::detect_bounded(&worktree, &self.root)?;
-            let base_sha = repo.head_sha(&worktree)?;
+            let base_sha = self.attempt_base_sha(&task, &repo, &worktree)?;
             let run = self
                 .db
                 .get_run(task.run_id)?
@@ -934,6 +938,7 @@ impl Factory {
                         None,
                     )?;
                     self.mark_task(task_id, TaskState::Completed)?;
+                    self.prune_inert_worktree(task_id)?;
                     return Ok(true);
                 }
                 Ok(run) => {
@@ -1035,7 +1040,7 @@ impl Factory {
                 self.create_worktree(task_id)?
             };
             let repo = Repo::detect_bounded(&worktree, &self.root)?;
-            let base_sha = repo.head_sha(&worktree)?;
+            let base_sha = self.attempt_base_sha(&task, &repo, &worktree)?;
             let attempt = self.db.create_task_attempt(
                 task_id,
                 &role,
@@ -1180,17 +1185,18 @@ impl Factory {
             let review = review_result_from(&decision.findings);
 
             if decision.decision == ReviewDecision::Approve {
-                self.db.finish_task_attempt(
-                    attempt.id,
-                    AttemptStatus::Approved,
-                    review_exit_code,
-                    evidence.commit_sha.as_deref(),
-                    None,
-                    Some(&evidence),
-                    Some(&review),
-                )?;
-                self.mark_task(task_id, TaskState::Completed)?;
-                return Ok(true);
+self.db.finish_task_attempt(
+                        attempt.id,
+                        AttemptStatus::Approved,
+                        review_exit_code,
+                        evidence.commit_sha.as_deref(),
+                        None,
+                        Some(&evidence),
+                        Some(&review),
+                    )?;
+                    self.mark_task(task_id, TaskState::Completed)?;
+                    self.prune_inert_worktree(task_id)?;
+                    return Ok(true);
             }
 
             self.db.finish_task_attempt(
@@ -1466,7 +1472,11 @@ impl Factory {
     }
 
     pub fn reconcile_interrupted(&self) -> Result<Reconciliation, FactoryError> {
-        Ok(self.db.reconcile_interrupted()?)
+        let result = self.db.reconcile_interrupted()?;
+        // Clean task worktrees from a previous session are reclaimed; dirty
+        // ones (work-in-progress) are kept for inspection.
+        let _ = self.prune_clean_worktrees();
+        Ok(result)
     }
 
     pub fn mark_task(&self, task_id: i64, target: TaskState) -> Result<MarkOutcome, FactoryError> {
@@ -1570,6 +1580,126 @@ impl Factory {
             .join(format!("t{task_id}"))
     }
 
+    /// The integration branch name for a run. Approved implementation-family
+    /// work is integrated onto this branch; `main` is never touched.
+    fn run_branch(&self, run_id: i64) -> String {
+        format!("factory/run-{run_id}")
+    }
+
+    /// The diff base used for an attempt's evidence. Once the run has an
+    /// integration head, evidence is measured against it (stable across rework
+    /// and independent of where the worktree started); otherwise the worktree
+    /// head at attempt start is used.
+    fn attempt_base_sha(&self, task: &Task, repo: &Repo, worktree: &Path) -> Result<String, FactoryError> {
+        if let Some(sha) = self.db.get_run_integration(task.run_id)? {
+            return Ok(sha);
+        }
+        Ok(repo.head_sha(worktree)?)
+    }
+
+    /// Integrates an approved implementation-family task's worktree into the
+    /// run's `factory/run-<id>` branch:
+    ///
+    /// 1. The run branch is created at the main repository head the first time.
+    /// 2. Any uncommitted agent output is committed under the agent's identity
+    ///    (authorship attribution) without relying on local git configuration.
+    /// 3. The run branch is fast-forwarded to the worktree head; if it has
+    ///    diverged, the task worktree is rebased onto it first.
+    /// 4. The new head is recorded as the run's integration sha.
+    ///
+    /// Returns the new integration head, or `None` when the task introduced no
+    /// commits (nothing was integrated).
+    fn integrate_approved_task(
+        &self,
+        run: &Run,
+        task: &Task,
+        agent_name: &str,
+        worktree: &Path,
+    ) -> Result<Option<String>, FactoryError> {
+        let repo = Repo::detect_bounded(&self.root, &self.root)?;
+        let run_branch = self.run_branch(run.id);
+        if !repo.branch_exists(&run_branch)? {
+            let main_head = repo.head_sha(repo.root())?;
+            repo.update_ref(&run_branch, &main_head)?;
+        }
+        if repo.has_uncommitted_changes(worktree)? {
+            let message = format!(
+                "factory: integrate run-{} task-{} ({agent_name})",
+                run.id, task.id
+            );
+            repo.commit_changes(
+                worktree,
+                &message,
+                (&format!("{agent_name} via Factory {}", run.id), "factory@local"),
+            )?;
+        }
+        let head = repo.head_sha(worktree)?;
+        let run_head = repo.resolve_ref(&run_branch)?;
+        if head == run_head {
+            return Ok(None);
+        }
+        if !repo.is_ancestor(&run_head, &head)? {
+            repo.rebase_onto_in(worktree, &run_branch)?;
+            let rebased = repo.head_sha(worktree)?;
+            repo.update_ref(&run_branch, &rebased)?;
+            self.db.set_run_integration(run.id, Some(&rebased))?;
+            return Ok(Some(rebased));
+        }
+        repo.update_ref(&run_branch, &head)?;
+        self.db.set_run_integration(run.id, Some(&head))?;
+        Ok(Some(head))
+    }
+
+    /// Removes an advisory/specialized-review task's worktree once it no longer
+    /// holds changes (the product is a persisted artifact). While work-in-
+    /// progress remains, the worktree is left in place for inspection.
+    fn prune_inert_worktree(&self, task_id: i64) -> Result<(), FactoryError> {
+        let task = self
+            .db
+            .get_task(task_id)?
+            .ok_or(FactoryError::TaskNotFound(task_id))?;
+        let Some(path) = task.worktree_path.as_deref() else {
+            return Ok(());
+        };
+        let worktree = std::path::PathBuf::from(path);
+        let repo = Repo::detect_bounded(&self.root, &self.root)?;
+        if !repo.has_uncommitted_changes(&worktree)? {
+            self.remove_worktree(task_id, false)?;
+        }
+        Ok(())
+    }
+
+    /// Removes every clean Factory task worktree (`.factory/worktrees/t<N>`).
+    /// Worktrees with uncommitted changes are kept. Only task worktrees under
+    /// the Factory directory are ever touched; other worktrees the user created
+    /// are never removed.
+    fn prune_clean_worktrees(&self) -> Result<usize, FactoryError> {
+        let repo = Repo::detect_bounded(&self.root, &self.root)?;
+        let worktrees_root = self.root.join(FACTORY_DIR).join("worktrees");
+        let mut pruned = 0;
+        for info in repo.list_worktrees()? {
+            let path = &info.path;
+            if !path.starts_with(&worktrees_root) {
+                continue;
+            }
+            let Some(task_id) = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_prefix('t'))
+                .and_then(|rest| rest.parse::<i64>().ok())
+            else {
+                continue;
+            };
+            if repo.has_uncommitted_changes(path)? {
+                continue;
+            }
+            if self.remove_worktree(task_id, false).is_ok() {
+                pruned += 1;
+            }
+        }
+        Ok(pruned)
+    }
+
     pub fn create_worktree(&self, task_id: i64) -> Result<std::path::PathBuf, FactoryError> {
         let task = self
             .db
@@ -1580,7 +1710,13 @@ impl Factory {
         }
         let repo = Repo::detect_bounded(&self.root, &self.root)?;
         let directory = self.worktree_dir(task_id);
-        repo.add_worktree(&directory, &format!("factory/t{task_id}"))?;
+        let run_branch = self.run_branch(task.run_id);
+        let base = if repo.branch_exists(&run_branch)? {
+            Some(run_branch.as_str())
+        } else {
+            None
+        };
+        repo.add_worktree(&directory, &format!("factory/t{task_id}"), base)?;
         self.db.set_worktree_path(task_id, directory.to_str())?;
         Ok(directory)
     }

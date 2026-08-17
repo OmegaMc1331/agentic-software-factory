@@ -132,7 +132,9 @@ fn operation_guidance(operation: TaskOperation) -> &'static str {
              dependencies with the capabilities you already own, then report findings."
         }
         TaskOperation::Implement => {
-            "You make the repository changes the task requires in the current worktree."
+            "You make the repository changes the task requires in the current worktree. \
+             You may commit your work in this worktree; if you leave work uncommitted it is \
+             committed for you and integrated into the run branch automatically after approval."
         }
         TaskOperation::Verify => {
             "You add or run the tests and checks that make this task's requirements \

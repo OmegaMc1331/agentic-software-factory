@@ -108,6 +108,33 @@ impl FactoryDb {
         Ok(())
     }
 
+    /// Records the head of the run's integration branch after available work is
+    /// integrated. `None` clears it (run was never or is no longer integrated).
+    pub fn set_run_integration(&self, id: i64, integration_sha: Option<&str>) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE runs SET integration_sha = ?1, updated_at = ?2 WHERE id = ?3",
+            params![integration_sha, now(), id],
+        )?;
+        if changed == 0 {
+            return Err(DbError::NotFound("run"));
+        }
+        Ok(())
+    }
+
+    /// The latest integrated head of the run's `factory/run-<id>` branch, or
+    /// `None` when no implementation work has been integrated yet.
+    pub fn get_run_integration(&self, id: i64) -> Result<Option<String>> {
+        let sha: Option<Option<String>> = self
+            .conn
+            .query_row(
+                "SELECT integration_sha FROM runs WHERE id = ?1",
+                params![id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?;
+        Ok(sha.flatten())
+    }
+
     pub fn persist_plan(&self, run_id: i64, plan: &Plan) -> Result<Vec<Task>> {
         let tx = self.conn.unchecked_transaction()?;
         let mut ids = std::collections::HashMap::new();
@@ -901,8 +928,13 @@ UPDATE agent_sessions SET operation = CASE
 END WHERE operation IS NULL;
 ";
 
+/// Tracks the head of the per-run integration branch (`factory/run-<id>`):
+/// the latest commit sha integrated from approved implementation work.
+/// `NULL` until the first implementation task is approved.
+const V7_SCHEMA: &str = "ALTER TABLE runs ADD COLUMN integration_sha TEXT;";
+
 const MIGRATIONS: &[&str] = &[
-    V1_SCHEMA, V2_SCHEMA, V3_SCHEMA, V4_SCHEMA, V5_SCHEMA, V6_SCHEMA,
+    V1_SCHEMA, V2_SCHEMA, V3_SCHEMA, V4_SCHEMA, V5_SCHEMA, V6_SCHEMA, V7_SCHEMA,
 ];
 
 fn migrate(conn: &mut Connection) -> Result<()> {
@@ -953,12 +985,12 @@ mod tests {
         let path = dir.path().join("test.db");
         let db = FactoryDb::open(&path).unwrap();
         let versions = schema_versions(&path);
-        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7]);
         db.create_run("objective", Some("codex")).unwrap();
         drop(db);
 
         let db = FactoryDb::open(&path).unwrap();
-        assert_eq!(schema_versions(&path), vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(schema_versions(&path), vec![1, 2, 3, 4, 5, 6, 7]);
         db.list_runs().unwrap();
     }
 
@@ -983,7 +1015,7 @@ mod tests {
         drop(conn);
 
         let db = FactoryDb::open(&path).unwrap();
-        assert_eq!(schema_versions(&path), vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(schema_versions(&path), vec![1, 2, 3, 4, 5, 6, 7]);
         let run = db.get_run(1).unwrap().unwrap();
         assert_eq!(run.objective, "legacy");
         let tasks = db.list_tasks(1).unwrap();
@@ -1037,8 +1069,8 @@ mod tests {
         drop(conn);
 
         let db = FactoryDb::open(&path).unwrap();
-        // creation records version 6 exactly once
-        assert_eq!(schema_versions(&path), vec![1, 2, 3, 4, 5, 6]);
+        // opening records versions 6 and 7 exactly once
+        assert_eq!(schema_versions(&path), vec![1, 2, 3, 4, 5, 6, 7]);
         let tasks = db.list_tasks(1).unwrap();
         let operation_of = |title: &str| {
             tasks
@@ -1072,6 +1104,23 @@ mod tests {
         assert!(result.is_err());
         let versions = schema_versions_conn(&conn);
         assert_eq!(versions, vec![1]);
+    }
+
+    #[test]
+    fn records_and_reads_run_integration() {
+        let dir = TempDir::new().unwrap();
+        let db = FactoryDb::open(&dir.path().join("test.db")).unwrap();
+        let run = db.create_run("objective", Some("codex")).unwrap();
+        assert_eq!(db.get_run_integration(run.id).unwrap(), None);
+
+        db.set_run_integration(run.id, Some("abc123")).unwrap();
+        assert_eq!(
+            db.get_run_integration(run.id).unwrap(),
+            Some("abc123".to_string())
+        );
+
+        db.set_run_integration(run.id, None).unwrap();
+        assert_eq!(db.get_run_integration(run.id).unwrap(), None);
     }
 
     #[test]

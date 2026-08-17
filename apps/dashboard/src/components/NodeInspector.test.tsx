@@ -1,12 +1,13 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { fetchRunArtifacts } from "../api";
+import { fetchRun, fetchRunArtifacts } from "../api";
 import type { GraphEdge, GraphNode } from "../types";
 import { NodeInspector } from "./NodeInspector";
 
 vi.mock("../api", () => ({
   fetchRunArtifacts: vi.fn(),
   fetchTaskArtifacts: vi.fn(),
+  fetchRun: vi.fn(),
 }));
 
 const roleNode: GraphNode = {
@@ -74,6 +75,23 @@ const taskNode: GraphNode = {
 
 beforeEach(() => {
   vi.mocked(fetchRunArtifacts).mockReset();
+  vi.mocked(fetchRun).mockReset().mockResolvedValue({
+    run: {
+      id: 9,
+      objective: "",
+      status: "active",
+      plannerAgent: null,
+      team: null,
+      createdAt: "",
+      updatedAt: "",
+    },
+    tasks: [],
+    attempts: [],
+    sessions: [],
+    stages: [],
+    artifacts: [],
+    integration: { branch: "factory/run-9", head: null, integratedTasks: [] },
+  });
 });
 
 afterEach(() => {

@@ -280,6 +280,35 @@ async fn get_run(
     let sessions = db.list_agent_sessions(Some(id))?;
     let artifacts = db.list_role_artifacts(id)?;
     let stages = derive_stages(&tasks);
+    let head = db.get_run_integration(id)?;
+    let mut latest: HashMap<i64, &factory_types::TaskAttempt> = HashMap::new();
+    for attempt in &attempts {
+        match latest.get(&attempt.task_id) {
+            Some(current) if attempt.attempt_number > current.attempt_number => {
+                latest.insert(attempt.task_id, attempt);
+            }
+            None => {
+                latest.insert(attempt.task_id, attempt);
+            }
+            _ => {}
+        }
+    }
+    let integrated_tasks = tasks
+        .iter()
+        .filter(|task| {
+            matches!(
+                task.operation,
+                Some(
+                    factory_types::TaskOperation::Implement
+                        | factory_types::TaskOperation::Verify
+                        | factory_types::TaskOperation::PostProcess
+                )
+            ) && latest
+                .get(&task.id)
+                .is_some_and(|attempt| attempt.status == factory_types::AttemptStatus::Approved)
+        })
+        .map(|task| task.id)
+        .collect();
     Ok(Json(RunDetail {
         run,
         tasks,
@@ -287,6 +316,11 @@ async fn get_run(
         sessions,
         stages,
         artifacts,
+        integration: crate::types::RunIntegration {
+            branch: format!("factory/run-{id}"),
+            head,
+            integrated_tasks,
+        },
     }))
 }
 

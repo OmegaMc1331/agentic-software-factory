@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { fetchRoles, fetchRun, updateWorkflowTeam } from "../api";
 import type { GraphNode, RoleInfo, RunDetail, Task, WorkflowTeam } from "../types";
-import { PIPELINE_ROLE_IDS, roleAgents, runMeta } from "../types";
+import { isTaskIntegrated, PIPELINE_ROLE_IDS, roleAgents, runMeta } from "../types";
 import { ArtifactList } from "./ArtifactList";
 
 type WorkflowTab = "overview" | "tasks" | "activity";
@@ -276,6 +276,34 @@ export function WorkflowInspector({
               <dt>Progress</dt>
               <dd>{progressLabel(detail, meta)} tasks</dd>
             </div>
+            {detail && detail.integration && (
+              <div>
+                <dt>Integration</dt>
+                <dd>
+                  <ul className="workflow-integration-summary">
+                    <li>
+                      <span>Branch</span>
+                      <strong>{detail.integration.branch}</strong>
+                    </li>
+                    <li>
+                      <span>Head</span>
+                      <strong>
+                        {detail.integration.head
+                          ? detail.integration.head.slice(0, 12)
+                          : "No commits yet"}
+                      </strong>
+                    </li>
+                    <li>
+                      <span>Integrated</span>
+                      <strong>
+                        {detail.integration.integratedTasks.length} task
+                        {detail.integration.integratedTasks.length === 1 ? "" : "s"}
+                      </strong>
+                    </li>
+                  </ul>
+                </dd>
+              </div>
+            )}
             <div>
               <dt>Objective</dt>
               <dd>{meta.objective}</dd>
@@ -455,6 +483,14 @@ export function WorkflowInspector({
                 <p className="workflow-task-meta">
                   <span className="op-chip">{task.operation ?? "implement"}</span>
                   <span>{task.role ?? "worker"}</span>
+                  {isTaskIntegrated(task, detail.integration) && (
+                    <span
+                      className="integrated-tag"
+                      title="Approved work merged into the integration branch"
+                    >
+                      ✓ integrated
+                    </span>
+                  )}
                 </p>
                 <p>{task.objective}</p>
                 <ul>

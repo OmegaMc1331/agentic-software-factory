@@ -73,6 +73,11 @@ const detail: RunDetail = {
     },
   ],
   artifacts: [],
+  integration: {
+    branch: "factory/run-12",
+    head: null,
+    integratedTasks: [],
+  },
 };
 
 const roles: RoleInfo[] = [
