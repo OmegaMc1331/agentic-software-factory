@@ -1,6 +1,6 @@
 import { Handle, Position, type Node, type NodeProps } from "@xyflow/react";
 import type { AgentActivity, GraphNode as GraphNodeData } from "../types";
-import { agentMeta, roleMeta, runMeta, taskMeta } from "../types";
+import { agentMeta, operationStage, roleMeta, runMeta, STAGE_META, taskMeta } from "../types";
 import { STATE_META } from "../state";
 import { truncate } from "../layout";
 
@@ -97,6 +97,7 @@ export function GraphNode({ data, selected }: NodeProps<FactoryFlowNode>) {
   if (node.kind === "task") {
     const meta = taskMeta(node);
     const showRole = meta.role !== null && meta.role !== "worker";
+    const stage = meta.operation ? operationStage(meta.operation) : null;
     return (
       <div
         className={`${classes} graph-node--state-${meta.state}`}
@@ -109,6 +110,16 @@ export function GraphNode({ data, selected }: NodeProps<FactoryFlowNode>) {
         <small>
           {meta.currentAttempt?.status === "reviewing" ? "review" : meta.state}
           {showRole ? ` · ${meta.role}` : ""}
+          {stage && (
+            <span
+              className="graph-node-op"
+              style={{ color: STAGE_META[stage].color }}
+              aria-label={`operation ${meta.operation}`}
+            >
+              {" "}
+              ◦ {STAGE_META[stage].short}
+            </span>
+          )}
         </small>
       </div>
     );

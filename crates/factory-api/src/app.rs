@@ -23,7 +23,7 @@ use crate::dashboard;
 use crate::graph_workspace::{GraphWorkspace, GraphWorkspaceError, GraphWorkspaceResponse};
 use crate::types::{
     AgentSessionResponse, GraphEdge, GraphNode, GraphResponse, RetryResponse, RunDetail,
-    RunSummary, TaskCounts,
+    RunSummary, StageStatus, TaskCounts,
 };
 
 pub struct ApiState {
@@ -112,7 +112,7 @@ impl From<RuntimeError> for ApiError {
                 | factory_core::FactoryError::InvalidDag(_, _)
                 | factory_core::FactoryError::TaskRoleUnavailable(_, _)
                 | factory_core::FactoryError::InvalidTeam(_)
-                | factory_core::FactoryError::RetryLimit(_)
+                | factory_core::FactoryError::RetryLimit(_, _)
                 | factory_core::FactoryError::InvalidTransition(_, _)
                 | factory_core::FactoryError::NotReady(_)
                 | factory_core::FactoryError::Agent(_)
@@ -134,6 +134,8 @@ pub fn router(state: SharedState) -> Router {
         .route("/api/runs/:id/cancel", post(cancel_run))
         .route("/api/tasks/:id/retry", post(retry_task))
         .route("/api/runs/:id/team", put(put_run_team))
+        .route("/api/runs/:id/artifacts", get(run_artifacts))
+        .route("/api/tasks/:id/artifacts", get(task_artifacts))
         .route("/api/roles", get(list_roles).post(create_role))
         .route("/api/roles/:id", put(update_role).delete(delete_role))
         .route("/api/roles/:id/assignments", post(add_role_assignment))
@@ -276,12 +278,107 @@ async fn get_run(
     let tasks = db.list_tasks(id)?;
     let attempts = db.list_task_attempts(id)?;
     let sessions = db.list_agent_sessions(Some(id))?;
+    let artifacts = db.list_role_artifacts(id)?;
+    let stages = derive_stages(&tasks);
     Ok(Json(RunDetail {
         run,
         tasks,
         attempts,
         sessions,
+        stages,
+        artifacts,
     }))
+}
+
+async fn run_artifacts(
+    State(state): State<SharedState>,
+    UrlPath(id): UrlPath<i64>,
+) -> Result<Json<Vec<factory_types::RoleArtifact>>, ApiError> {
+    let db = state.db.lock().expect("db mutex poisoned");
+    if db.get_run(id)?.is_none() {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            format!("run {id} not found"),
+        ));
+    }
+    Ok(Json(db.list_role_artifacts(id)?))
+}
+
+async fn task_artifacts(
+    State(state): State<SharedState>,
+    UrlPath(id): UrlPath<i64>,
+) -> Result<Json<Vec<factory_types::RoleArtifact>>, ApiError> {
+    let db = state.db.lock().expect("db mutex poisoned");
+    if db.get_task(id)?.is_none() {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            format!("task {id} not found"),
+        ));
+    }
+    Ok(Json(db.list_artifacts_for_task(id)?))
+}
+
+/// The compact stage overview shown in the Workflow Inspector: one row per
+/// operation kind present in the plan, ordered by the role-aware pipeline.
+fn derive_stages(tasks: &[factory_types::Task]) -> Vec<StageStatus> {
+    use factory_types::TaskOperation as Op;
+    let order = [
+        (Op::Advisory, "analysis", "Analysis"),
+        (Op::Implement, "implementation", "Implementation"),
+        (Op::Verify, "verification", "Verification"),
+        (Op::Review, "review", "Review"),
+        (Op::PostProcess, "post_process", "Post-processing"),
+    ];
+    let mut stages = Vec::new();
+    for (operation, key, label) in order {
+        let members: Vec<&factory_types::Task> = tasks
+            .iter()
+            .filter(|task| task.operation == Some(operation))
+            .collect();
+        if members.is_empty() {
+            continue;
+        }
+        let completed = members
+            .iter()
+            .filter(|task| task.state == factory_types::TaskState::Completed)
+            .count();
+        let active = members.iter().any(|task| {
+            matches!(
+                task.state,
+                factory_types::TaskState::Ready | factory_types::TaskState::Running
+            )
+        });
+        let state = if members
+            .iter()
+            .all(|task| task.state == factory_types::TaskState::Completed)
+        {
+            "completed"
+        } else if active {
+            "active"
+        } else {
+            "pending"
+        };
+        stages.push(StageStatus {
+            key: key.to_string(),
+            label: label.to_string(),
+            total: members.len(),
+            completed,
+            state: state.to_string(),
+        });
+    }
+    if stages.is_empty() && !tasks.is_empty() {
+        stages.push(StageStatus {
+            key: "task".to_string(),
+            label: "Tasks".to_string(),
+            total: tasks.len(),
+            completed: tasks
+                .iter()
+                .filter(|task| task.state == factory_types::TaskState::Completed)
+                .count(),
+            state: "pending".to_string(),
+        });
+    }
+    stages
 }
 
 async fn get_agents(
@@ -1063,6 +1160,7 @@ fn build_graph(state: &SharedState) -> Result<GraphResponse, ApiError> {
                     "acceptanceCriteria": task.acceptance_criteria,
                     "worktreePath": task.worktree_path,
                     "role": task.role,
+                    "operation": task.operation,
                     "currentAttempt": latest_attempts.get(&task.id),
                 }),
             });

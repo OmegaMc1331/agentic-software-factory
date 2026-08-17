@@ -6,17 +6,23 @@ use factory_agent::{AgentError, AgentRequest, AgentResult, CommandAgent, OutputS
 use factory_db::{FactoryDb, Reconciliation};
 use factory_git::{Repo, WorktreeInfo};
 use factory_types::{
-    AgentSession, AgentSessionMode, AttemptStatus, ReviewDecision, ReviewResult, Run, RunStatus,
-    Task, TaskAttempt, TaskEvidence, TaskState, WorkflowTeam,
+    AgentSession, AgentSessionMode, AttemptStatus, ReviewDecision, ReviewResult, RoleArtifact, Run,
+    RunStatus, SpecializedReview, Task, TaskAttempt, TaskEvidence, TaskOperation, TaskState,
+    WorkflowTeam,
 };
-use serde::Deserialize;
 use thiserror::Error;
 
 use crate::config::{AgentResolutionError, Agents, ConfigError};
-use crate::planner::{
-    mission as planner_mission, normalize_plan, parse_plan, validate_plan_roles, PlanError,
+use crate::mission::{
+    build_mission, parse_advisory_report, parse_producer_report, parse_review,
+    parse_specialized_review, review_result_from, MissionContext, ReviewInput,
+    MAX_REVIEW_DIFF_CHARS,
 };
-use crate::roles::{self, RoleDefinition};
+use crate::planner::{
+    mission as planner_mission, normalize_plan, normalize_plan_with_operations, parse_plan,
+    validate_plan_roles, PlanError,
+};
+use crate::roles::{self, RoleCatalog, RoleDefinition};
 
 pub const FACTORY_DIR: &str = ".factory";
 pub const MAX_TASK_ATTEMPTS: u32 = 3;
@@ -41,8 +47,8 @@ pub enum FactoryError {
     TaskRoleUnavailable(i64, String),
     #[error("invalid workflow team: {0}")]
     InvalidTeam(String),
-    #[error("task #{0} reached the retry limit of {MAX_TASK_ATTEMPTS} attempts")]
-    RetryLimit(i64),
+    #[error("task #{0} reached the retry limit of {MAX_TASK_ATTEMPTS} attempts: {1}")]
+    RetryLimit(i64, String),
     #[error("planning failed: {0}")]
     Plan(#[from] PlanError),
     #[error("agent process failed: {0}")]
@@ -102,6 +108,7 @@ struct InvocationScope<'a> {
     task_id: Option<i64>,
     attempt_id: Option<i64>,
     role: &'a str,
+    operation: Option<TaskOperation>,
     working_dir: &'a Path,
 }
 
@@ -227,29 +234,13 @@ impl Factory {
         let team = self.resolve_team(&run)?;
         let planner = self.agents.command_agent_for("planner", &team.planner)?;
         let catalog = self.agents.config().catalog();
-        let available_roles: Vec<(String, String)> = team
-            .task_roles()
-            .into_iter()
-            .map(|role| {
-                let description = catalog
-                    .get(&role)
-                    .map(|definition| definition.description.clone())
-                    .unwrap_or_default();
-                (role, description)
-            })
-            .collect();
-        let allowed_roles: std::collections::HashSet<String> = available_roles
-            .iter()
-            .map(|(role, _)| role.clone())
-            .collect();
-        let available_roles: Vec<(&str, &str)> = available_roles
-            .iter()
-            .map(|(role, description)| (role.as_str(), description.as_str()))
-            .collect();
+        let available_roles = team.task_roles();
+        let allowed_roles: std::collections::HashSet<String> =
+            available_roles.iter().cloned().collect();
+        let planner_roles = crate::planner::planners_catalog(&catalog, &available_roles);
         let mut rejection: Option<String> = None;
         for attempt in 0..crate::planner::MAX_ATTEMPTS {
-            let instruction =
-                planner_mission(&run.objective, &available_roles, rejection.as_deref());
+            let instruction = planner_mission(&run.objective, &planner_roles, rejection.as_deref());
             let invocation = self.invoke_with_agent(
                 planner.clone(),
                 InvocationScope {
@@ -257,6 +248,7 @@ impl Factory {
                     task_id: None,
                     attempt_id: None,
                     role: "planner",
+                    operation: Some(TaskOperation::Planning),
                     working_dir: &self.root,
                 },
                 &instruction,
@@ -278,7 +270,8 @@ impl Factory {
             let parsed = parse_plan(&invocation.result.stdout).and_then(|plan| {
                 let plan = normalize_plan(plan);
                 validate_plan_roles(&plan, &allowed_roles)?;
-                Ok(plan)
+                // Reject role/operation mismatches and fill derived operations.
+                normalize_plan_with_operations(plan, &catalog)
             });
             match parsed {
                 Ok(plan) => {
@@ -458,7 +451,10 @@ impl Factory {
             .latest_task_attempt(task_id)?
             .is_some_and(|attempt| attempt.attempt_number >= MAX_TASK_ATTEMPTS)
         {
-            return Err(FactoryError::RetryLimit(task_id));
+            return Err(FactoryError::RetryLimit(
+                task_id,
+                "manual retry after the bounded attempt limit".into(),
+            ));
         }
         let run = self
             .db
@@ -474,7 +470,54 @@ impl Factory {
         Ok(task.run_id)
     }
 
+    /// Executes one task by its semantic operation. Returns `false` when the
+    /// workflow must stop (cancellation, retry limit, or a rejection without
+    /// anything to rework).
     fn execute_task(&self, task_id: i64, cancel: &AtomicBool) -> Result<bool, FactoryError> {
+        let task = self
+            .db
+            .get_task(task_id)?
+            .ok_or(FactoryError::TaskNotFound(task_id))?;
+        let catalog = self.agents.config().catalog();
+        let operation = roles::resolve_task_operation(&task, &catalog);
+        let role = task
+            .role
+            .clone()
+            .unwrap_or_else(|| roles::WORKER.to_string());
+        let role_definition = catalog
+            .get(&role)
+            .cloned()
+            .or_else(|| roles::core_role(roles::WORKER))
+            .ok_or_else(|| FactoryError::TaskRoleUnavailable(task.id, role.clone()))?;
+        match operation {
+            TaskOperation::Planning => Err(FactoryError::RetryLimit(
+                task.id,
+                "the planner role cannot be scheduled as a task".into(),
+            )),
+            TaskOperation::Advisory => {
+                self.execute_advisory(task_id, &role_definition, &catalog, cancel)
+            }
+            TaskOperation::Implement | TaskOperation::Verify | TaskOperation::PostProcess => {
+                self.execute_implementation(task_id, operation, &role_definition, &catalog, cancel)
+            }
+            TaskOperation::Review => {
+                self.execute_specialized_review(task_id, &role_definition, &catalog, cancel)
+            }
+        }
+    }
+
+    /// Implementation-family operations (implement, verify, post_process): the
+    /// agent runs in an isolated worktree, produces evidence, and is accepted
+    /// by the built-in final Reviewer. Verification and post-process work may
+    /// legitimately change only tests or documentation files.
+    fn execute_implementation(
+        &self,
+        task_id: i64,
+        operation: TaskOperation,
+        role_definition: &RoleDefinition,
+        catalog: &RoleCatalog,
+        cancel: &AtomicBool,
+    ) -> Result<bool, FactoryError> {
         loop {
             let task = self
                 .db
@@ -508,12 +551,6 @@ impl Factory {
                 .role
                 .clone()
                 .unwrap_or_else(|| roles::WORKER.to_string());
-            let catalog = self.agents.config().catalog();
-            let role_definition = catalog
-                .get(&role)
-                .cloned()
-                .or_else(|| roles::core_role(roles::WORKER))
-                .ok_or_else(|| FactoryError::TaskRoleUnavailable(task.id, role.clone()))?;
             let worker_pool = team.agents_for_role(&role).to_vec();
             let worker_index = self.db.count_task_attempts(task.run_id)?;
             let worker_name = roles::select_agent(&worker_pool, worker_index)
@@ -523,13 +560,23 @@ impl Factory {
             let attempt = self.db.create_task_attempt(
                 task_id,
                 &role,
+                Some(operation),
                 worker.name(),
                 &worktree.to_string_lossy(),
             )?;
             self.mark_task(task_id, TaskState::Running)?;
 
-            let worker_instruction =
-                worker_mission(&task, &role_definition, previous_feedback.as_ref());
+            let upstream = self.upstream_artifacts(&task)?;
+            let worker_instruction = build_mission(&MissionContext {
+                role: role_definition,
+                operation,
+                task: &task,
+                run_objective: &run.objective,
+                upstream_artifacts: &upstream,
+                previous_feedback: previous_feedback.as_ref(),
+                review_input: None,
+                final_review: false,
+            });
             let worker_run = self.invoke_with_agent(
                 worker,
                 InvocationScope {
@@ -537,18 +584,20 @@ impl Factory {
                     task_id: Some(task.id),
                     attempt_id: Some(attempt.id),
                     role: &role,
+                    operation: Some(operation),
                     working_dir: &worktree,
                 },
                 &worker_instruction,
                 cancel,
             );
-            let evidence = collect_evidence(
+            let mut evidence = collect_evidence(
                 &repo,
                 &worktree,
                 &base_sha,
                 &task,
                 worker_run.as_ref().ok().map(|run| &run.result),
             )?;
+
             let worker_run = match worker_run {
                 Ok(run) if run.result.cancelled => {
                     self.db.finish_task_attempt(
@@ -556,18 +605,39 @@ impl Factory {
                         AttemptStatus::Cancelled,
                         run.result.exit_code,
                         evidence.commit_sha.as_deref(),
-                        Some("Workflow cancelled while the Worker was running."),
+                        Some("Workflow cancelled while the agent was running."),
                         Some(&evidence),
                         None,
                     )?;
                     self.mark_task(task_id, TaskState::Failed)?;
                     return Ok(false);
                 }
-                Ok(run) if run.result.exit_code == Some(0) => run,
+                Ok(run) if run.result.exit_code == Some(0) => {
+                    if matches!(
+                        operation,
+                        TaskOperation::Verify | TaskOperation::PostProcess
+                    ) {
+                        self.persist_operation_artifact(
+                            task.run_id,
+                            task.id,
+                            attempt.id,
+                            &role,
+                            operation,
+                            &run.result.stdout,
+                            &mut evidence,
+                        )?;
+                    }
+                    run
+                }
                 Ok(run) => {
                     let error = run.result.exit_code.map_or_else(
-                        || "Worker process ended without an exit code.".to_string(),
-                        |code| format!("Worker process exited with code {code}."),
+                        || {
+                            format!(
+                                "{} process ended without an exit code.",
+                                role_definition.name
+                            )
+                        },
+                        |code| format!("{} process exited with code {code}.", role_definition.name),
                     );
                     self.db.finish_task_attempt(
                         attempt.id,
@@ -617,12 +687,26 @@ impl Factory {
             .ok_or_else(|| FactoryError::TaskRoleUnavailable(task.id, "reviewer".into()))?
             .clone();
             let reviewer = self.agents.command_agent_for("reviewer", &reviewer_name)?;
-            let review_instruction = reviewer_mission(
-                &task,
-                &role_definition,
-                &evidence,
-                &worker_run.result.stdout,
-            );
+            let reviewer_role = catalog
+                .get(roles::REVIEWER)
+                .cloned()
+                .unwrap_or_else(|| roles::core_role(roles::REVIEWER).expect("core reviewer"));
+            let review_instruction = build_mission(&MissionContext {
+                role: &reviewer_role,
+                operation: TaskOperation::Review,
+                task: &task,
+                run_objective: &run.objective,
+                upstream_artifacts: &upstream,
+                previous_feedback: None,
+                review_input: Some(&ReviewInput {
+                    producer_title: task.title.clone(),
+                    producer_role: role_definition.name.clone(),
+                    evidence: evidence.clone(),
+                    producer_output: worker_run.result.stdout.clone(),
+                    diff: evidence.diff_patch.clone().unwrap_or_default(),
+                }),
+                final_review: true,
+            });
             let review_run = self.invoke_with_agent(
                 reviewer,
                 InvocationScope {
@@ -630,6 +714,7 @@ impl Factory {
                     task_id: Some(task.id),
                     attempt_id: Some(attempt.id),
                     role: "reviewer",
+                    operation: Some(TaskOperation::Review),
                     working_dir: &worktree,
                 },
                 &review_instruction,
@@ -727,6 +812,559 @@ impl Factory {
         }
     }
 
+    /// Advisory operations (Researcher, Architect, custom analysts): the agent
+    /// produces context, a persisted artifact is created, and the task
+    /// succeeds even with zero repository changes. No implementation reviewer
+    /// runs for advisory work.
+    fn execute_advisory(
+        &self,
+        task_id: i64,
+        role_definition: &RoleDefinition,
+        _catalog: &RoleCatalog,
+        cancel: &AtomicBool,
+    ) -> Result<bool, FactoryError> {
+        loop {
+            let task = self
+                .db
+                .get_task(task_id)?
+                .ok_or(FactoryError::TaskNotFound(task_id))?;
+            let next_attempt = self
+                .db
+                .latest_task_attempt(task_id)?
+                .map_or(1, |attempt| attempt.attempt_number + 1);
+            if next_attempt > MAX_TASK_ATTEMPTS {
+                return Ok(false);
+            }
+            let worktree = if let Some(path) = &task.worktree_path {
+                std::path::PathBuf::from(path)
+            } else {
+                self.create_worktree(task_id)?
+            };
+            let repo = Repo::detect_bounded(&worktree, &self.root)?;
+            let base_sha = repo.head_sha(&worktree)?;
+            let run = self
+                .db
+                .get_run(task.run_id)?
+                .ok_or(FactoryError::RunNotFound(task.run_id))?;
+            let team = self.resolve_team(&run)?;
+            let role = task
+                .role
+                .clone()
+                .unwrap_or_else(|| roles::WORKER.to_string());
+            let pool = team.agents_for_role(&role).to_vec();
+            let index = self.db.count_task_attempts(task.run_id)?;
+            let agent_name = roles::select_agent(&pool, index)
+                .ok_or_else(|| FactoryError::TaskRoleUnavailable(task.id, role.clone()))?
+                .clone();
+            let agent = self.agents.command_agent_for(&role, &agent_name)?;
+            let attempt = self.db.create_task_attempt(
+                task_id,
+                &role,
+                Some(TaskOperation::Advisory),
+                agent.name(),
+                &worktree.to_string_lossy(),
+            )?;
+            self.mark_task(task_id, TaskState::Running)?;
+
+            let upstream = self.upstream_artifacts(&task)?;
+            let instruction = build_mission(&MissionContext {
+                role: role_definition,
+                operation: TaskOperation::Advisory,
+                task: &task,
+                run_objective: &run.objective,
+                upstream_artifacts: &upstream,
+                previous_feedback: None,
+                review_input: None,
+                final_review: false,
+            });
+            let agent_run = self.invoke_with_agent(
+                agent,
+                InvocationScope {
+                    run_id: Some(task.run_id),
+                    task_id: Some(task.id),
+                    attempt_id: Some(attempt.id),
+                    role: &role,
+                    operation: Some(TaskOperation::Advisory),
+                    working_dir: &worktree,
+                },
+                &instruction,
+                cancel,
+            );
+            let evidence = collect_evidence(
+                &repo,
+                &worktree,
+                &base_sha,
+                &task,
+                agent_run.as_ref().ok().map(|run| &run.result),
+            )?;
+
+            match agent_run {
+                Ok(run) if run.result.cancelled => {
+                    self.db.finish_task_attempt(
+                        attempt.id,
+                        AttemptStatus::Cancelled,
+                        run.result.exit_code,
+                        evidence.commit_sha.as_deref(),
+                        Some("Workflow cancelled while the advisory agent was running."),
+                        Some(&evidence),
+                        None,
+                    )?;
+                    self.mark_task(task_id, TaskState::Failed)?;
+                    return Ok(false);
+                }
+                Ok(run) if run.result.exit_code == Some(0) => {
+                    let output = run.result.stdout.clone();
+                    let mut evidence = evidence;
+                    self.persist_operation_artifact(
+                        task.run_id,
+                        task.id,
+                        attempt.id,
+                        &role,
+                        TaskOperation::Advisory,
+                        &output,
+                        &mut evidence,
+                    )?;
+                    self.db.finish_task_attempt(
+                        attempt.id,
+                        AttemptStatus::Approved,
+                        run.result.exit_code,
+                        evidence.commit_sha.as_deref(),
+                        None,
+                        Some(&evidence),
+                        None,
+                    )?;
+                    self.mark_task(task_id, TaskState::Completed)?;
+                    return Ok(true);
+                }
+                Ok(run) => {
+                    let error = run.result.exit_code.map_or_else(
+                        || {
+                            format!(
+                                "{} process ended without an exit code.",
+                                role_definition.name
+                            )
+                        },
+                        |code| format!("{} process exited with code {code}.", role_definition.name),
+                    );
+                    self.db.finish_task_attempt(
+                        attempt.id,
+                        AttemptStatus::Failed,
+                        run.result.exit_code,
+                        evidence.commit_sha.as_deref(),
+                        Some(&error),
+                        Some(&evidence),
+                        None,
+                    )?;
+                    self.mark_task(task_id, TaskState::Failed)?;
+                    if attempt.attempt_number >= MAX_TASK_ATTEMPTS {
+                        return Ok(false);
+                    }
+                    self.mark_task(task_id, TaskState::Ready)?;
+                }
+                Err(error) => {
+                    let message = error.to_string();
+                    self.db.finish_task_attempt(
+                        attempt.id,
+                        AttemptStatus::Failed,
+                        None,
+                        evidence.commit_sha.as_deref(),
+                        Some(&message),
+                        Some(&evidence),
+                        None,
+                    )?;
+                    self.mark_task(task_id, TaskState::Failed)?;
+                    if error.is_agent_configuration() {
+                        return Err(error);
+                    }
+                    if attempt.attempt_number >= MAX_TASK_ATTEMPTS {
+                        return Ok(false);
+                    }
+                    self.mark_task(task_id, TaskState::Ready)?;
+                }
+            }
+        }
+    }
+
+    /// Specialized review operations (Security Auditor, custom review roles,
+    /// an explicit final Reviewer): evaluate the evidence, diff, and upstream
+    /// artifacts of the implementation they depend on. `request_changes`
+    /// routes back to the implementation task (bounded rework) instead of
+    /// failing the workflow permanently.
+    fn execute_specialized_review(
+        &self,
+        task_id: i64,
+        role_definition: &RoleDefinition,
+        catalog: &RoleCatalog,
+        cancel: &AtomicBool,
+    ) -> Result<bool, FactoryError> {
+        let task = self
+            .db
+            .get_task(task_id)?
+            .ok_or(FactoryError::TaskNotFound(task_id))?;
+        let run = self
+            .db
+            .get_run(task.run_id)?
+            .ok_or(FactoryError::RunNotFound(task.run_id))?;
+        let team = self.resolve_team(&run)?;
+        let role = task
+            .role
+            .clone()
+            .unwrap_or_else(|| roles::REVIEWER.to_string());
+        let pool = team.agents_for_role(&role).to_vec();
+        let index = self.db.count_task_attempts(task.run_id)?;
+        let reviewer_name = roles::select_agent(&pool, index)
+            .ok_or_else(|| FactoryError::TaskRoleUnavailable(task.id, role.clone()))?
+            .clone();
+        let reviewer = self.agents.command_agent_for(&role, &reviewer_name)?;
+
+        loop {
+            let task = self
+                .db
+                .get_task(task_id)?
+                .ok_or(FactoryError::TaskNotFound(task_id))?;
+            let next_attempt = self
+                .db
+                .latest_task_attempt(task_id)?
+                .map_or(1, |attempt| attempt.attempt_number + 1);
+            if next_attempt > MAX_TASK_ATTEMPTS {
+                return Ok(false);
+            }
+            let worktree = if let Some(path) = &task.worktree_path {
+                std::path::PathBuf::from(path)
+            } else {
+                self.create_worktree(task_id)?
+            };
+            let repo = Repo::detect_bounded(&worktree, &self.root)?;
+            let base_sha = repo.head_sha(&worktree)?;
+            let attempt = self.db.create_task_attempt(
+                task_id,
+                &role,
+                Some(TaskOperation::Review),
+                reviewer.name(),
+                &worktree.to_string_lossy(),
+            )?;
+            self.mark_task(task_id, TaskState::Running)?;
+
+            let run_tasks = self.db.list_tasks(task.run_id)?;
+            let upstream = self.upstream_artifacts(&task)?;
+            let review_input = self.build_review_input(&task, &run_tasks, catalog)?;
+            let instruction = build_mission(&MissionContext {
+                role: role_definition,
+                operation: TaskOperation::Review,
+                task: &task,
+                run_objective: &run.objective,
+                upstream_artifacts: &upstream,
+                previous_feedback: None,
+                review_input: Some(&review_input),
+                final_review: false,
+            });
+            let review_run = self.invoke_with_agent(
+                reviewer.clone(),
+                InvocationScope {
+                    run_id: Some(task.run_id),
+                    task_id: Some(task.id),
+                    attempt_id: Some(attempt.id),
+                    role: &role,
+                    operation: Some(TaskOperation::Review),
+                    working_dir: &worktree,
+                },
+                &instruction,
+                cancel,
+            );
+            let evidence = collect_evidence(
+                &repo,
+                &worktree,
+                &base_sha,
+                &task,
+                review_run.as_ref().ok().map(|run| &run.result),
+            )?;
+            let review_exit_code = review_run
+                .as_ref()
+                .ok()
+                .and_then(|run| run.result.exit_code);
+
+            let decision = match review_run {
+                Ok(run) if run.result.cancelled => {
+                    self.db.finish_task_attempt(
+                        attempt.id,
+                        AttemptStatus::Cancelled,
+                        run.result.exit_code,
+                        evidence.commit_sha.as_deref(),
+                        Some("Workflow cancelled while the review agent was running."),
+                        Some(&evidence),
+                        None,
+                    )?;
+                    self.mark_task(task_id, TaskState::Failed)?;
+                    return Ok(false);
+                }
+                Ok(run) if run.result.exit_code == Some(0) => {
+                    match parse_specialized_review(&run.result.stdout) {
+                        Ok(decision) => decision,
+                        Err(_reason) => {
+                            self.db
+                                .set_agent_session_status(run.session_id, "rejected")?;
+                            SpecializedReview {
+                                decision: ReviewDecision::RequestChanges,
+                                findings: Vec::new(),
+                            }
+                        }
+                    }
+                }
+                Ok(run) => {
+                    let error = run.result.exit_code.map_or_else(
+                        || format!("{} ended without an exit code.", role_definition.name),
+                        |code| format!("{} exited with code {code}.", role_definition.name),
+                    );
+                    self.db.finish_task_attempt(
+                        attempt.id,
+                        AttemptStatus::Failed,
+                        run.result.exit_code,
+                        evidence.commit_sha.as_deref(),
+                        Some(&error),
+                        Some(&evidence),
+                        None,
+                    )?;
+                    self.mark_task(task_id, TaskState::Failed)?;
+                    if attempt.attempt_number >= MAX_TASK_ATTEMPTS {
+                        return Ok(false);
+                    }
+                    self.mark_task(task_id, TaskState::Ready)?;
+                    continue;
+                }
+                Err(error) if error.is_agent_configuration() => {
+                    let message = error.to_string();
+                    self.db.finish_task_attempt(
+                        attempt.id,
+                        AttemptStatus::Failed,
+                        None,
+                        evidence.commit_sha.as_deref(),
+                        Some(&message),
+                        Some(&evidence),
+                        None,
+                    )?;
+                    self.mark_task(task_id, TaskState::Failed)?;
+                    return Err(error);
+                }
+                Err(error) => {
+                    self.db.finish_task_attempt(
+                        attempt.id,
+                        AttemptStatus::Failed,
+                        None,
+                        evidence.commit_sha.as_deref(),
+                        Some(&error.to_string()),
+                        Some(&evidence),
+                        None,
+                    )?;
+                    self.mark_task(task_id, TaskState::Failed)?;
+                    if attempt.attempt_number >= MAX_TASK_ATTEMPTS {
+                        return Ok(false);
+                    }
+                    self.mark_task(task_id, TaskState::Ready)?;
+                    continue;
+                }
+            };
+
+            let content = serde_json::to_string(&decision)
+                .unwrap_or_else(|_| r#"{"decision":"request_changes","findings":[]}"#.to_string());
+            let artifact = self.db.insert_role_artifact(
+                task.run_id,
+                Some(task.id),
+                Some(attempt.id),
+                &role,
+                Some(TaskOperation::Review),
+                roles::artifact_kind_for(&role, TaskOperation::Review).as_str(),
+                &content,
+            )?;
+            let mut evidence = evidence;
+            evidence.artifacts.push(artifact.id);
+            let review = review_result_from(&decision.findings);
+
+            if decision.decision == ReviewDecision::Approve {
+                self.db.finish_task_attempt(
+                    attempt.id,
+                    AttemptStatus::Approved,
+                    review_exit_code,
+                    evidence.commit_sha.as_deref(),
+                    None,
+                    Some(&evidence),
+                    Some(&review),
+                )?;
+                self.mark_task(task_id, TaskState::Completed)?;
+                return Ok(true);
+            }
+
+            self.db.finish_task_attempt(
+                attempt.id,
+                AttemptStatus::ChangesRequested,
+                review_exit_code,
+                evidence.commit_sha.as_deref(),
+                Some(&review.reason),
+                Some(&evidence),
+                Some(&review),
+            )?;
+
+            match self.rework_after_review(&task, &run_tasks, catalog)? {
+                true => {
+                    // The implementation task is Ready again and the review
+                    // waits on it; hand control back to the scheduler, which
+                    // picks the reworked implementation next.
+                    return Ok(true);
+                }
+                false => {
+                    let reason = if find_evaluation_target(&task, &run_tasks, catalog).is_none() {
+                        "no implementation dependency is available to rework".to_string()
+                    } else {
+                        "the implementation reached the bounded retry limit".to_string()
+                    };
+                    self.mark_task(task_id, TaskState::Failed)?;
+                    return Err(FactoryError::RetryLimit(
+                        task_id,
+                        format!("{} requested changes but {reason}", role_definition.name),
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Resets the implementation task that a review evaluated to `Ready` so
+    /// the workflow reworks it. Completed tasks on the review's dependency
+    /// ancestry are unwound to `Pending` so the dependency cascade recomputes
+    /// them when the reworked implementation completes again.
+    fn rework_after_review(
+        &self,
+        review_task: &Task,
+        run_tasks: &[Task],
+        catalog: &RoleCatalog,
+    ) -> Result<bool, FactoryError> {
+        let Some(seed_id) = find_rework_seed(review_task, run_tasks, catalog) else {
+            return Ok(false);
+        };
+        let seed_attempts = self
+            .db
+            .latest_task_attempt(seed_id)?
+            .map_or(0, |attempt| attempt.attempt_number);
+        if seed_attempts >= MAX_TASK_ATTEMPTS {
+            return Ok(false);
+        }
+        for ancestor in transitive_ancestors(review_task, run_tasks)
+            .into_iter()
+            .filter(|id| *id != seed_id)
+        {
+            let ancestor_task = run_tasks
+                .iter()
+                .find(|task| task.id == ancestor)
+                .expect("ancestor is in the run tasks");
+            if ancestor_task.state == TaskState::Completed {
+                self.db.set_task_state(ancestor, TaskState::Pending)?;
+            }
+        }
+        // The review waits for the reworked dependency.
+        self.mark_task(review_task.id, TaskState::Blocked)?;
+        // Kick off the rework.
+        self.mark_task(seed_id, TaskState::Ready)?;
+        Ok(true)
+    }
+
+    fn build_review_input(
+        &self,
+        review_task: &Task,
+        run_tasks: &[Task],
+        catalog: &RoleCatalog,
+    ) -> Result<ReviewInput, FactoryError> {
+        let target_id = find_evaluation_target(review_task, run_tasks, catalog)
+            .or_else(|| review_task.dependencies.first().copied())
+            .ok_or_else(|| {
+                FactoryError::RetryLimit(
+                    review_task.id,
+                    "the review task has no dependency providing implementation evidence".into(),
+                )
+            })?;
+        let target = run_tasks
+            .iter()
+            .find(|task| task.id == target_id)
+            .ok_or_else(|| FactoryError::TaskNotFound(target_id))?;
+        let attempt = self
+            .db
+            .latest_task_attempt(target_id)?
+            .ok_or_else(|| FactoryError::TaskNotFound(target_id))?;
+        let producer_output = self
+            .db
+            .list_agent_sessions(Some(review_task.run_id))?
+            .into_iter()
+            .filter(|session| session.attempt_id == Some(attempt.id))
+            .filter(|session| session.role != "reviewer")
+            .find_map(|session| session.stdout)
+            .unwrap_or_default();
+        let evidence = attempt.evidence.unwrap_or_default();
+        let diff = evidence
+            .diff_patch
+            .clone()
+            .unwrap_or_else(|| evidence.diff_summary.clone());
+        Ok(ReviewInput {
+            producer_title: target.title.clone(),
+            producer_role: target
+                .role
+                .clone()
+                .unwrap_or_else(|| roles::WORKER.to_string()),
+            evidence,
+            producer_output,
+            diff: truncate_chars(&diff, MAX_REVIEW_DIFF_CHARS),
+        })
+    }
+
+    /// Artifacts produced by a task's direct dependencies. Only artifacts from
+    /// the task's own dependency ancestry reach a mission; unrelated branches
+    /// never leak context.
+    fn upstream_artifacts(&self, task: &Task) -> Result<Vec<RoleArtifact>, FactoryError> {
+        if task.dependencies.is_empty() {
+            return Ok(Vec::new());
+        }
+        let artifacts = self.db.list_artifacts_for_tasks(&task.dependencies)?;
+        Ok(artifacts)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn persist_operation_artifact(
+        &self,
+        run_id: i64,
+        task_id: i64,
+        attempt_id: i64,
+        role: &str,
+        operation: TaskOperation,
+        output: &str,
+        evidence: &mut TaskEvidence,
+    ) -> Result<(), FactoryError> {
+        let kind = roles::artifact_kind_for(role, operation)
+            .as_str()
+            .to_string();
+        let content = match operation {
+            TaskOperation::Advisory => {
+                let (report, _) = parse_advisory_report(output);
+                serde_json::to_string(&report).unwrap_or_else(|_| default_artifact_content(output))
+            }
+            _ => {
+                let report = parse_producer_report(output);
+                let value = serde_json::json!({
+                    "summary": report.summary,
+                    "commands": report.commands,
+                    "results": report.results,
+                });
+                serde_json::to_string(&value).unwrap_or_else(|_| default_artifact_content(output))
+            }
+        };
+        let artifact = self.db.insert_role_artifact(
+            run_id,
+            Some(task_id),
+            Some(attempt_id),
+            role,
+            Some(operation),
+            &kind,
+            &content,
+        )?;
+        evidence.artifacts.push(artifact.id);
+        Ok(())
+    }
+
     fn invoke_with_agent(
         &self,
         agent: CommandAgent,
@@ -741,6 +1379,7 @@ impl Factory {
             task_id: scope.task_id,
             attempt_id: scope.attempt_id,
             role: scope.role.to_string(),
+            operation: scope.operation,
             agent: agent.name().to_string(),
             mode: AgentSessionMode::Automated,
             command: agent.command_line(),
@@ -916,6 +1555,14 @@ impl Factory {
         Ok(self.db.list_agent_sessions(run_id)?)
     }
 
+    pub fn list_role_artifacts(&self, run_id: i64) -> Result<Vec<RoleArtifact>, FactoryError> {
+        Ok(self.db.list_role_artifacts(run_id)?)
+    }
+
+    pub fn list_artifacts_for_task(&self, task_id: i64) -> Result<Vec<RoleArtifact>, FactoryError> {
+        Ok(self.db.list_artifacts_for_task(task_id)?)
+    }
+
     pub fn worktree_dir(&self, task_id: i64) -> std::path::PathBuf {
         self.root
             .join(FACTORY_DIR)
@@ -963,6 +1610,84 @@ impl Factory {
     }
 }
 
+// --- Workflow stage --------------------------------------------------------
+
+/// Answers "what kind of work is currently happening?", distinct from the
+/// operational RunStatus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkflowStage {
+    Planning,
+    Analysis,
+    Implementation,
+    Verification,
+    Review,
+    PostProcessing,
+    Completed,
+}
+
+impl WorkflowStage {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WorkflowStage::Planning => "planning",
+            WorkflowStage::Analysis => "analysis",
+            WorkflowStage::Implementation => "implementation",
+            WorkflowStage::Verification => "verification",
+            WorkflowStage::Review => "review",
+            WorkflowStage::PostProcessing => "post_processing",
+            WorkflowStage::Completed => "completed",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            WorkflowStage::Planning => "Planning",
+            WorkflowStage::Analysis => "Analysis",
+            WorkflowStage::Implementation => "Implementation",
+            WorkflowStage::Verification => "Verification",
+            WorkflowStage::Review => "Review",
+            WorkflowStage::PostProcessing => "Post-processing",
+            WorkflowStage::Completed => "Completed",
+        }
+    }
+}
+
+/// Derives the current workflow stage from the run status and the operations
+/// of the incomplete tasks.
+pub fn derive_stage(run: &Run, tasks: &[Task], catalog: &RoleCatalog) -> WorkflowStage {
+    if run.status == RunStatus::Planning {
+        return WorkflowStage::Planning;
+    }
+    if run.status == RunStatus::Completed {
+        return WorkflowStage::Completed;
+    }
+    for operation in [
+        TaskOperation::PostProcess,
+        TaskOperation::Review,
+        TaskOperation::Verify,
+        TaskOperation::Implement,
+        TaskOperation::Advisory,
+    ] {
+        let stage = match operation {
+            TaskOperation::PostProcess => WorkflowStage::PostProcessing,
+            TaskOperation::Review => WorkflowStage::Review,
+            TaskOperation::Verify => WorkflowStage::Verification,
+            TaskOperation::Implement => WorkflowStage::Implementation,
+            TaskOperation::Advisory => WorkflowStage::Analysis,
+            TaskOperation::Planning => WorkflowStage::Planning,
+        };
+        if tasks
+            .iter()
+            .filter(|task| task.state != TaskState::Completed)
+            .any(|task| roles::resolve_task_operation(task, catalog) == operation)
+        {
+            return stage;
+        }
+    }
+    WorkflowStage::Completed
+}
+
+// --- Selection helpers -----------------------------------------------------
+
 fn validate_task_dag(tasks: &[Task]) -> Result<(), String> {
     let ids: std::collections::HashSet<i64> = tasks.iter().map(|task| task.id).collect();
     for task in tasks {
@@ -1005,87 +1730,77 @@ fn validate_task_dag(tasks: &[Task]) -> Result<(), String> {
     Ok(())
 }
 
-fn worker_mission(
-    task: &Task,
-    role: &RoleDefinition,
-    previous_review: Option<&ReviewResult>,
-) -> String {
-    let criteria = task
-        .acceptance_criteria
+/// The direct dependency whose operation a review task evaluates: an
+/// implementation task when present, otherwise a verification task, otherwise
+/// any direct dependency.
+fn find_evaluation_target(
+    review_task: &Task,
+    run_tasks: &[Task],
+    catalog: &RoleCatalog,
+) -> Option<i64> {
+    let deps: Vec<&Task> = run_tasks
         .iter()
-        .map(|criterion| format!("- {criterion}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let mut mission = format!(
-        "ROLE\n{} — {}\n\n{}\n\nOBJECTIVE\n{}\n\nTASK\n{}\n",
-        role.name,
-        role.description,
-        role.instructions.trim(),
-        task.objective.trim(),
-        task.title.trim()
-    );
-    mission.push_str(
-        "\nCONSTRAINTS\n\
-- Work only in the current git worktree.\n\
-- Do not modify Factory orchestration state (.factory).\n\
-- These constraints take precedence over any role instruction.",
-    );
-    if let Some(review) = previous_review {
-        mission.push_str("\n\nCONTEXT\nPrevious review requested changes:\n");
-        mission.push_str(&review.reason);
-        if !review.feedback.is_empty() {
-            mission.push('\n');
-            mission.push_str(
-                &review
-                    .feedback
-                    .iter()
-                    .map(|item| format!("- {item}"))
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            );
-        }
-    }
-    mission.push_str(&format!("\n\nACCEPTANCE CRITERIA\n{criteria}"));
-    mission.push_str(
-        "\n\nOUTPUT CONTRACT\n\
-At the end, report a concise JSON object with keys `summary` and `commands` \
-(an array of the commands or tests you ran).",
-    );
-    mission
+        .filter(|task| review_task.dependencies.contains(&task.id))
+        .collect();
+    let by_operation = |operation: TaskOperation| {
+        deps.iter()
+            .filter(|task| roles::resolve_task_operation(task, catalog) == operation)
+            .max_by_key(|task| task.position)
+            .map(|task| task.id)
+    };
+    by_operation(TaskOperation::Implement)
+        .or_else(|| by_operation(TaskOperation::Verify))
+        .or_else(|| {
+            deps.iter()
+                .max_by_key(|task| task.position)
+                .map(|task| task.id)
+        })
 }
 
-fn reviewer_mission(
-    task: &Task,
-    worker_role: &RoleDefinition,
-    evidence: &TaskEvidence,
-    worker_output: &str,
-) -> String {
-    let worker_output = tail(worker_output, 20_000);
-    let criteria = task
-        .acceptance_criteria
+/// The task to rework after a review requested changes: the deepest
+/// implementation task in the review's dependency ancestry (falling back to a
+/// verification task), so Worker → Test Engineer → Security Auditor reworks
+/// the Worker instead of bouncing the workflow.
+fn find_rework_seed(review_task: &Task, run_tasks: &[Task], catalog: &RoleCatalog) -> Option<i64> {
+    let ancestors = transitive_ancestors(review_task, run_tasks);
+    let mut candidates: Vec<&Task> = run_tasks
         .iter()
-        .map(|criterion| format!("- {criterion}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    format!(
-        "ROLE\nReviewer — Independently evaluates task output against acceptance criteria.\n\
-The {} produced the change below.\n\nOBJECTIVE\n{}\n\nTASK\n{}\n\nACCEPTANCE CRITERIA\n{}\n\n\
-EVIDENCE\nChanged files: {}\nDiff summary:\n{}\nCommit: {}\nWorker-reported commands: {}\n\n\
-WORKER OUTPUT\n{}\n\n\
-OUTPUT CONTRACT\n\
-Return one JSON object only: {{\"decision\":\"approve\"|\"request_changes\",\"reason\":string,\"feedback\":[string]}}.\n\
-Approve only when the evidence and repository changes satisfy the task. Do not modify files.",
-        worker_role.name,
-        task.objective.trim(),
-        task.title.trim(),
-        criteria,
-        evidence.changed_files.join(", "),
-        evidence.diff_summary,
-        evidence.commit_sha.as_deref().unwrap_or("not committed"),
-        evidence.commands.join(", "),
-        worker_output
-    )
+        .filter(|task| {
+            ancestors.contains(&task.id)
+                && roles::resolve_task_operation(task, catalog) == TaskOperation::Implement
+        })
+        .collect();
+    if candidates.is_empty() {
+        candidates = run_tasks
+            .iter()
+            .filter(|task| {
+                ancestors.contains(&task.id)
+                    && roles::resolve_task_operation(task, catalog) == TaskOperation::Verify
+            })
+            .collect();
+    }
+    candidates
+        .iter()
+        .max_by_key(|task| task.position)
+        .map(|task| task.id)
 }
+
+/// All task ids a task transitively depends on (its full ancestry).
+fn transitive_ancestors(task: &Task, run_tasks: &[Task]) -> std::collections::HashSet<i64> {
+    let mut ancestors = std::collections::HashSet::new();
+    let mut frontier = task.dependencies.clone();
+    while let Some(id) = frontier.pop() {
+        if !ancestors.insert(id) {
+            continue;
+        }
+        if let Some(ancestor) = run_tasks.iter().find(|candidate| candidate.id == id) {
+            frontier.extend(ancestor.dependencies.iter().copied());
+        }
+    }
+    ancestors
+}
+
+// --- Evidence helpers ------------------------------------------------------
 
 fn collect_evidence(
     repo: &Repo,
@@ -1095,51 +1810,37 @@ fn collect_evidence(
     result: Option<&AgentResult>,
 ) -> Result<TaskEvidence, FactoryError> {
     let git = repo.evidence_since(worktree, base_sha)?;
+    let runs = result
+        .map(|result| parse_producer_report(&result.stdout))
+        .unwrap_or_default();
+    let diff_patch = if git.is_change() {
+        repo.diff_patch(worktree, base_sha, MAX_REVIEW_DIFF_CHARS)
+            .ok()
+            .filter(|patch| !patch.trim().is_empty())
+    } else {
+        None
+    };
     Ok(TaskEvidence {
         changed_files: git.changed_files,
         diff_summary: git.diff_summary,
         commit_sha: git.commit_sha,
-        commands: result
-            .map(|result| parse_worker_commands(&result.stdout))
-            .unwrap_or_default(),
+        commands: runs.commands,
         acceptance_criteria: task.acceptance_criteria.clone(),
         worker_exit_code: result.and_then(|result| result.exit_code),
+        artifacts: Vec::new(),
+        diff_patch,
     })
 }
 
-#[derive(Deserialize)]
-struct WorkerReport {
-    #[serde(default)]
-    commands: Vec<String>,
+fn default_artifact_content(output: &str) -> String {
+    serde_json::json!({ "summary": tail(output, 4_000) }).to_string()
 }
 
-fn parse_worker_commands(output: &str) -> Vec<String> {
-    let trimmed = output.trim();
-    let candidate = trimmed
-        .strip_prefix("```json")
-        .or_else(|| trimmed.strip_prefix("```"))
-        .and_then(|value| value.strip_suffix("```"))
-        .unwrap_or(trimmed)
-        .trim();
-    serde_json::from_str::<WorkerReport>(candidate)
-        .map(|report| report.commands)
-        .unwrap_or_default()
-}
-
-fn parse_review(output: &str) -> Result<ReviewResult, String> {
-    let trimmed = output.trim();
-    let candidate = trimmed
-        .strip_prefix("```json")
-        .or_else(|| trimmed.strip_prefix("```"))
-        .and_then(|value| value.strip_suffix("```"))
-        .unwrap_or(trimmed)
-        .trim();
-    let review: ReviewResult =
-        serde_json::from_str(candidate).map_err(|error| format!("invalid JSON: {error}"))?;
-    if review.reason.trim().is_empty() {
-        return Err("reason must not be empty".into());
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
     }
-    Ok(review)
+    value.chars().take(max_chars).collect()
 }
 
 fn nonempty_lines(value: &str) -> Vec<String> {
@@ -1191,14 +1892,112 @@ mod tests {
             dependencies,
             worktree_path: None,
             role: None,
+            operation: None,
             created_at: String::new(),
             updated_at: String::new(),
         };
         assert!(validate_task_dag(&[task(1, vec![2]), task(2, vec![1])]).is_err());
     }
 
+    fn task_like(id: i64, deps: Vec<i64>, operation: TaskOperation) -> Task {
+        Task {
+            id,
+            run_id: 1,
+            title: id.to_string(),
+            objective: "o".into(),
+            acceptance_criteria: vec![],
+            state: TaskState::Completed,
+            position: id as i32,
+            dependencies: deps,
+            worktree_path: None,
+            role: None,
+            operation: Some(operation),
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    fn empty_catalog() -> RoleCatalog {
+        RoleCatalog::build(&std::collections::BTreeMap::new())
+    }
+
     #[test]
-    fn worker_mission_keeps_role_instructions_and_factory_constraints_separate() {
+    fn rework_seed_prefers_the_deepest_implementation_task() {
+        let tasks = vec![
+            task_like(1, vec![], TaskOperation::Advisory), // research
+            task_like(2, vec![1], TaskOperation::Implement), // worker
+            task_like(3, vec![2], TaskOperation::Verify),  // test engineer
+            task_like(4, vec![3], TaskOperation::Review),  // security auditor
+        ];
+        let review = &tasks[3];
+        let catalog = empty_catalog();
+        assert_eq!(
+            find_rework_seed(review, &tasks, &catalog),
+            Some(2),
+            "rework routes back to the Worker, not the validator or reviewer"
+        );
+        assert_eq!(
+            find_evaluation_target(review, &tasks, &catalog),
+            Some(3),
+            "the evaluated dependency is the verification task"
+        );
+    }
+
+    #[test]
+    fn stage_derivation_follows_operations() {
+        use crate::roles::resolve_task_operation;
+        let catalog = empty_catalog();
+        let mk = |state, operation| {
+            let mut task = task_like(1, vec![], operation);
+            task.state = state;
+            task
+        };
+        let run = |status| Run {
+            id: 1,
+            objective: "o".into(),
+            status,
+            planner_agent: None,
+            team: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        let _ = resolve_task_operation; // exercised through derive_stage
+        assert_eq!(
+            derive_stage(
+                &run(RunStatus::Active),
+                &[mk(TaskState::Running, TaskOperation::Advisory)],
+                &catalog
+            ),
+            WorkflowStage::Analysis
+        );
+        assert_eq!(
+            derive_stage(
+                &run(RunStatus::Active),
+                &[mk(TaskState::Running, TaskOperation::Verify)],
+                &catalog
+            ),
+            WorkflowStage::Verification
+        );
+        assert_eq!(
+            derive_stage(
+                &run(RunStatus::Active),
+                &[mk(TaskState::Running, TaskOperation::Review)],
+                &catalog
+            ),
+            WorkflowStage::Review
+        );
+        assert_eq!(
+            derive_stage(
+                &run(RunStatus::Active),
+                &[mk(TaskState::Ready, TaskOperation::Implement)],
+                &catalog
+            ),
+            WorkflowStage::Implementation
+        );
+    }
+
+    #[test]
+    fn implementation_mission_uses_the_role_aware_builder() {
         let task = Task {
             id: 7,
             run_id: 1,
@@ -1210,17 +2009,25 @@ mod tests {
             dependencies: Vec::new(),
             worktree_path: None,
             role: Some("database_engineer".into()),
+            operation: Some(TaskOperation::Implement),
             created_at: String::new(),
             updated_at: String::new(),
         };
         let role = crate::roles::core_role(crate::roles::WORKER).unwrap();
-        let mission = worker_mission(&task, &role, None);
+        let mission = build_mission(&MissionContext {
+            role: &role,
+            operation: TaskOperation::Implement,
+            task: &task,
+            run_objective: "objective",
+            upstream_artifacts: &[],
+            previous_feedback: None,
+            review_input: None,
+            final_review: false,
+        });
         assert!(mission.contains("ROLE\nWorker — "));
-        assert!(mission.contains("OBJECTIVE\nSpeed up the query."));
-        assert!(mission.contains("TASK\nAdd index"));
-        assert!(mission.contains("CONSTRAINTS"));
-        assert!(mission.contains("Do not modify Factory orchestration state"));
-        assert!(mission.contains("take precedence over any role instruction"));
+        assert!(mission.contains("WORKFLOW OBJECTIVE\nobjective"));
+        assert!(mission.contains("TASK\nAdd index — Speed up the query."));
+        assert!(mission.contains("OPERATION\nimplement"));
         assert!(mission.contains("ACCEPTANCE CRITERIA\n- query plan uses the index"));
         assert!(mission.contains("OUTPUT CONTRACT"));
         let review = ReviewResult {
@@ -1228,39 +2035,17 @@ mod tests {
             reason: "missing test".into(),
             feedback: vec!["add a regression test".into()],
         };
-        let retry = worker_mission(&task, &role, Some(&review));
+        let retry = build_mission(&MissionContext {
+            role: &role,
+            operation: TaskOperation::Implement,
+            task: &task,
+            run_objective: "objective",
+            upstream_artifacts: &[],
+            previous_feedback: Some(&review),
+            review_input: None,
+            final_review: false,
+        });
         assert!(retry.contains("CONTEXT\nPrevious review requested changes:\nmissing test"));
         assert!(retry.contains("- add a regression test"));
-    }
-
-    #[test]
-    fn reviewer_mission_names_the_worker_role() {
-        let task = Task {
-            id: 7,
-            run_id: 1,
-            title: "Add index".into(),
-            objective: "Speed up the query.".into(),
-            acceptance_criteria: vec!["query plan uses the index".into()],
-            state: TaskState::Running,
-            position: 0,
-            dependencies: Vec::new(),
-            worktree_path: None,
-            role: Some("database_engineer".into()),
-            created_at: String::new(),
-            updated_at: String::new(),
-        };
-        let evidence = TaskEvidence {
-            changed_files: vec!["migrations/1.sql".into()],
-            diff_summary: "1 file changed".into(),
-            commit_sha: Some("abc".into()),
-            commands: vec!["cargo test".into()],
-            acceptance_criteria: Vec::new(),
-            worker_exit_code: Some(0),
-        };
-        let role = crate::roles::core_role(crate::roles::TEST_ENGINEER).unwrap();
-        let mission = reviewer_mission(&task, &role, &evidence, "worker said hi");
-        assert!(mission.contains("The Test Engineer produced the change below."));
-        assert!(mission.contains("OUTPUT CONTRACT"));
-        assert!(mission.contains("approve"));
     }
 }

@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use factory_types::{ArtifactKind, TaskOperation};
 use serde::{Deserialize, Serialize};
 
 pub const PLANNER: &str = "planner";
@@ -61,6 +62,84 @@ impl std::str::FromStr for ExecutionClass {
             "post_process" => Ok(ExecutionClass::PostProcess),
             other => Err(format!("unknown execution class '{other}'")),
         }
+    }
+}
+
+/// The operations a role of this execution class may perform.
+///
+/// This matrix is Factory Core's invariant: a task's `operation` must belong
+/// to the class of its role. Planner output that violates it is rejected and
+/// repaired instead of being silently reinterpreted.
+///
+/// ```text
+/// planning     -> planning
+/// advisory     -> advisory
+/// execution    -> implement, verify
+/// review       -> review
+/// post_process -> post_process, implement (where explicitly allowed)
+/// ```
+pub fn compatible_operations(class: ExecutionClass) -> &'static [TaskOperation] {
+    match class {
+        ExecutionClass::Planning => &[TaskOperation::Planning],
+        ExecutionClass::Advisory => &[TaskOperation::Advisory],
+        ExecutionClass::Execution => &[TaskOperation::Implement, TaskOperation::Verify],
+        ExecutionClass::Review => &[TaskOperation::Review],
+        ExecutionClass::PostProcess => &[TaskOperation::PostProcess, TaskOperation::Implement],
+    }
+}
+
+/// Validates that a task operation is compatible with a role's execution
+/// class. Returns the mismatch as a human-readable message when invalid.
+pub fn validate_operation_compatibility(
+    role_id: &str,
+    class: ExecutionClass,
+    operation: TaskOperation,
+) -> Result<(), String> {
+    if compatible_operations(class).contains(&operation) {
+        Ok(())
+    } else {
+        let allowed = compatible_operations(class)
+            .iter()
+            .map(|operation| operation.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        Err(format!(
+            "role '{role_id}' (execution class {}) cannot perform operation '{}'; compatible operations: {allowed}",
+            class.as_str(),
+            operation.as_str()
+        ))
+    }
+}
+
+/// The operation a task defaults to when the plan does not specify one. Role
+/// ids win over classes only for the one core role whose natural operation
+/// differs from its class default (Test Engineer verifies, Workers implement).
+pub fn default_operation_for_role(id: &str, class: ExecutionClass) -> TaskOperation {
+    match id {
+        TEST_ENGINEER => TaskOperation::Verify,
+        _ => match class {
+            ExecutionClass::Planning => TaskOperation::Planning,
+            ExecutionClass::Advisory => TaskOperation::Advisory,
+            ExecutionClass::Execution => TaskOperation::Implement,
+            ExecutionClass::Review => TaskOperation::Review,
+            ExecutionClass::PostProcess => TaskOperation::PostProcess,
+        },
+    }
+}
+
+/// The artifact kind a task of this role and operation persists. Advisory
+/// roles map to their natural context kind; verification and review map to
+/// their report kinds; explicit production operations on otherwise-advisory
+/// roles persist `analysis`.
+pub fn artifact_kind_for(role_id: &str, operation: TaskOperation) -> ArtifactKind {
+    match (role_id, operation) {
+        (RESEARCHER, _) => ArtifactKind::Research,
+        (ARCHITECT, _) => ArtifactKind::Architecture,
+        (_, TaskOperation::Verify) => ArtifactKind::Verification,
+        (_, TaskOperation::Review) => ArtifactKind::Review,
+        (_, TaskOperation::PostProcess) => ArtifactKind::DocumentationContext,
+        (_, TaskOperation::Advisory) => ArtifactKind::Analysis,
+        (_, TaskOperation::Implement | TaskOperation::Planning) => ArtifactKind::Analysis,
     }
 }
 
@@ -268,6 +347,31 @@ impl RoleCatalog {
     pub fn list(&self) -> Vec<&RoleDefinition> {
         self.definitions.values().collect()
     }
+}
+
+/// The effective operation of a task: its declared operation, or a compatible
+/// default derived from the role's execution class. Tasks persisted by older
+/// releases carry no operation and fall back here. Unknown roles resolve as
+/// Worker (execution).
+pub fn resolve_task_operation(task: &factory_types::Task, catalog: &RoleCatalog) -> TaskOperation {
+    if let Some(operation) = task.operation {
+        return operation;
+    }
+    let role = task.role.as_deref().unwrap_or(WORKER);
+    let class = catalog
+        .get(role)
+        .map(|definition| definition.execution_class)
+        .unwrap_or(ExecutionClass::Execution);
+    default_operation_for_role(role, class)
+}
+
+/// Whether a task operation produces a persisted role artifact. Implementation
+/// produces evidence; the other operations persist their structured output.
+pub fn operation_persists_artifact(operation: TaskOperation) -> bool {
+    !matches!(
+        operation,
+        TaskOperation::Planning | TaskOperation::Implement
+    )
 }
 
 /// Deterministic assignment selection.

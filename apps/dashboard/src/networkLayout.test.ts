@@ -62,6 +62,7 @@ function node(id: string, kind: GraphNode["kind"], label = id): GraphNode {
       acceptanceCriteria: [],
       worktreePath: null,
       role: null,
+      operation: null,
       currentAttempt: null,
     },
   };

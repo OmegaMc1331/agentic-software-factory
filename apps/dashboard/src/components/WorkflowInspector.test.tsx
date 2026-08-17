@@ -56,12 +56,23 @@ const detail: RunDetail = {
       dependencies: [],
       worktreePath: null,
       role: null,
+      operation: "implement",
       createdAt: "2026-08-13T18:01:00Z",
       updatedAt: "2026-08-13T18:01:00Z",
     },
   ],
   attempts: [],
   sessions: [],
+  stages: [
+    {
+      key: "implementation",
+      label: "Implementation",
+      total: 1,
+      completed: 0,
+      state: "active",
+    },
+  ],
+  artifacts: [],
 };
 
 const roles: RoleInfo[] = [
@@ -116,6 +127,84 @@ afterEach(() => {
 });
 
 describe("Workflow inspector", () => {
+  it("shows derived stages and an artifact inspector from the run detail", async () => {
+    vi.mocked(fetchRun).mockResolvedValue({
+      ...detail,
+      stages: [
+        { key: "analysis", label: "Analysis", total: 1, completed: 0, state: "active" },
+        {
+          key: "implementation",
+          label: "Implementation",
+          total: 1,
+          completed: 1,
+          state: "completed",
+        },
+      ],
+      artifacts: [
+        {
+          id: 3,
+          runId: 12,
+          taskId: 40,
+          attemptId: 9,
+          role: "researcher",
+          operation: "advisory",
+          kind: "research",
+          content: '{"summary":"tokens in httpOnly cookies","findings":[]}',
+          createdAt: "2026-08-13T18:00:00Z",
+        },
+      ],
+    });
+    render(
+      <WorkflowInspector
+        node={node}
+        onClose={vi.fn()}
+        onStart={vi.fn()}
+        onCancel={vi.fn()}
+        onRetry={vi.fn()}
+      />
+    );
+
+    expect(await screen.findByText("Analysis")).toBeTruthy();
+    expect(screen.getByText("Implementation")).toBeTruthy();
+    expect(screen.getByText("✓")).toBeTruthy();
+    expect(screen.getByText("1/1")).toBeTruthy();
+
+    fireEvent.click(screen.getByText("Role artifacts (1)"));
+    expect(screen.getByText(/Research findings/)).toBeTruthy();
+    fireEvent.click(screen.getByText("Inspect content"));
+    expect(screen.getByText(/tokens in httpOnly cookies/)).toBeTruthy();
+  });
+
+  it("stays simple: workflows without stages show no empty stage list", async () => {
+    vi.mocked(fetchRun).mockResolvedValue({ ...detail, stages: [], artifacts: [] });
+    render(
+      <WorkflowInspector
+        node={node}
+        onClose={vi.fn()}
+        onStart={vi.fn()}
+        onCancel={vi.fn()}
+        onRetry={vi.fn()}
+      />
+    );
+    await screen.findByText("0 / 1 tasks");
+    expect(screen.queryByText("Stages")).toBeNull();
+  });
+
+  it("labels every task with its role operation in the tasks tab", async () => {
+    render(
+      <WorkflowInspector
+        node={node}
+        onClose={vi.fn()}
+        onStart={vi.fn()}
+        onCancel={vi.fn()}
+        onRetry={vi.fn()}
+      />
+    );
+    fireEvent.click(await screen.findByRole("tab", { name: "tasks" }));
+    expect(screen.getByText("implement")).toBeTruthy();
+    expect(screen.getByText("worker")).toBeTruthy();
+  });
+
   it("shows the persisted plan with its team and starts it after confirmation", async () => {
     const onStart = vi.fn().mockResolvedValue(undefined);
     render(

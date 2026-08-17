@@ -2,7 +2,8 @@
 
 This document explains the Factory role system: what roles are, how they differ from
 agents, which roles are built in, how multiple agents share a role, how workflows pick
-a team, and how to write good custom roles.
+a team, and — since the role-aware release — how **execution classes drive real
+runtime behavior** instead of only guiding the Planner and the UI.
 
 ![Role Inspector](assets/dashboard-roles.png)
 
@@ -102,10 +103,10 @@ Within a workflow's selected team, task execution routes deterministically:
 - **Planner**: exactly one per workflow. If several planners are assigned globally,
   the workflow still selects one; Factory does not run planner ensembles or merge
   plans.
-- **Workers**: round-robin across the selected worker pool, ordered by the number of
-  execution attempts already recorded for that workflow. The first task goes to the
-  first selected worker, the next attempt to the next one, and so on, wrapping
-  around. Retries rotate to the next worker.
+- **Execution attempts**: round-robin across the selected agent pool of the task's
+  role, ordered by the number of execution attempts already recorded for that
+  workflow. The first attempt goes to the first selected agent, the next to the next
+  one, and so on, wrapping around. Retries rotate to the next agent.
 - **Reviewers**: one reviewer per attempt, rotating by attempt number. Each review of
   the same task goes to the next selected reviewer.
 
@@ -144,6 +145,171 @@ active, the team is locked. The team is stored as a snapshot on the workflow, so
 changing global configuration later never rewrites what a running or historical
 workflow used.
 
+## Execution classes and operations
+
+Every role has one **execution class**. Since the role-aware release the class has
+real runtime meaning: it defines which **operations** a role may perform, how its
+agent is invoked, and what kind of output its task produces. The class is no longer a
+label the Planner and UI happen to read.
+
+![Role-aware workflow](assets/dashboard-workflow.png)
+
+The compatibility matrix lives in Factory Core and is enforced for every plan:
+
+```text
+planning     -> planning        (the Planner itself; never a scheduled task)
+advisory     -> advisory        (produce context for later tasks)
+execution    -> implement, verify
+review       -> review
+post_process -> post_process, implement (where explicitly allowed)
+```
+
+A task in a plan carries a small semantic **operation**. The Planner may write it
+explicitly; when it is missing Factory derives a compatible default from the role's
+class (`verify` for Test Engineer, `advisory` for Researcher/Architect, `review` for
+Security Auditor, `post_process` for Documentation Writer, `implement` everywhere
+else). A declared operation that does not match the role's class is **rejected and
+the plan is repaired** — for example `role: security_auditor, operation: implement`
+is invalid and is never silently reinterpreted.
+
+### What each operation does at runtime
+
+| Operation     | Agent behavior                                                     | Output                          |
+| ------------- | ------------------------------------------------------------------ | ------------------------------- |
+| `advisory`    | Inspects the repository and produces context. Does not need to change files. Succeeds with zero Git changes. | A persisted **role artifact** (research, architecture, analysis) |
+| `implement`   | Makes the repository changes the task requires in an isolated worktree. | `{summary, commands}` report + evidence |
+| `verify`      | Adds or runs tests; reports what ran and what passed, exactly as observed. | Verification artifact + `{summary, commands, results}` |
+| `review`      | Evaluates the diff, evidence, and upstream artifacts of the implementation it depends on. Decision is `approve` or `request_changes` with findings. | A persisted **review artifact** + decision |
+| `post_process`| Runs after the implementation it documents; may update README/docs/migration notes. | Documentation context artifact + evidence |
+
+The runtime dispatches on the operation, not on the role name. A custom review role
+and the built-in Security Auditor follow the same path; a custom execution role and
+the built-in Worker follow the same path.
+
+## Advisory roles
+
+Advisory roles (`researcher`, `architect`, and custom analyst roles) produce context
+that later tasks consume. Their output is persisted as a structured **role artifact**
+in SQLite (not just stdout), so the interface between roles is durable:
+
+```text
+Researcher  ->  research artifact
+Architect   ->  architecture artifact
+Worker      ->  consumes the architecture artifact of its dependency
+```
+
+Advisory tasks succeed even when the agent changes no files. They do not run the
+per-task implementation Reviewer; a failed advisory process retries up to the bounded
+limit.
+
+### Architect
+
+An Architect task normally produces an advisory artifact containing architecture
+decisions, affected components, interfaces, data flow, technical constraints, and
+migration considerations. It must not automatically modify production code; if a
+planned Architect task explicitly carries an implementation-compatible operation and
+the plan permits it, it may modify files. The artifact is shown in the Workflow
+Inspector and Task Inspector.
+
+### Researcher
+
+A Researcher inspects the repository, available project documentation, and relevant
+dependencies using whatever capabilities the external agent already owns, identifies
+constraints, and returns concise findings. Factory does not claim a web research
+capability the configured agent does not have. The Researcher does not modify
+production files by default.
+
+## Implementation and verification roles
+
+Execution-class roles (`worker`, `test_engineer`, and custom execution roles) run in
+isolated worktrees and produce normal `TaskEvidence`: changed files, diff summary,
+commands run, and — for verification — a persisted verification artifact with the
+reported results. Coverage figures are not invented: the artifact contains exactly
+what the agent reported.
+
+Test Engineer tasks (`operation: verify`) may add or extend tests and must report the
+test commands and their results as observed.
+
+The **built-in Reviewer remains the final acceptance authority** for implementation
+work. After an implement, verify, or post_process attempt finishes, a Reviewer
+session evaluates the evidence against the acceptance criteria and either approves or
+requests changes (bounded retries).
+
+## Specialized review roles
+
+Custom roles with `execution_class = "review"` — and the built-in
+`security_auditor` — behave as specialized reviewers:
+
+```text
+Worker
+    ↓
+Test Engineer
+    ↓
+Security Auditor
+    ↓
+Reviewer
+```
+
+A specialized review task:
+
+- receives the task/workflow objective, the relevant implementation **diff**,
+  acceptance criteria, the producer's evidence, and any relevant
+  architecture/research artifacts;
+- normally does not edit production files, and succeeds with zero file changes;
+- returns a structured decision:
+
+```json
+{ "decision": "approve", "findings": [] }
+```
+
+```json
+{
+  "decision": "request_changes",
+  "findings": [
+    { "severity": "high", "summary": "...", "evidence": "src/auth.rs:9" }
+  ]
+}
+```
+
+Severity stays simple: `low`, `medium`, `high`, `critical`. There is no automated
+CVSS scoring. `request_changes` with no findings is invalid and rejected.
+
+The final Reviewer, whether the built-in per-task reviewer or an explicit review
+task, receives the specialized review artifacts of its dependencies as upstream
+context.
+
+### Request changes → bounded implementation rework
+
+When a specialized review returns `request_changes`, Factory does not fail the
+workflow permanently and does not create a dependency cycle. Instead it **re-runs the
+implementation task the review evaluated** (its deepest implementation dependency) as
+a new attempt, and the review waits on it:
+
+```text
+Worker Task
+   ↓
+Security Review   → request_changes
+   ↓
+Worker retry
+   ↓
+Security Review retry
+   ↓
+Reviewer
+```
+
+The persisted DAG stays acyclic: the review task is `blocked` while its dependency is
+reworked, and the dependency `completed → ready` rework transition is represented as
+attempts/state transitions. Both the implementation task and the review task are
+bounded by the usual attempt limit, so rework cannot loop forever.
+
+## Post-processing
+
+`documentation_writer` and custom `post_process` roles run only when the Planner
+explicitly creates their work and their declared dependencies have completed — the
+normal DAG enforcement means a post-process task never becomes ready early. Their
+missions receive relevant implementation and review context, and they must not
+document behavior that was not actually implemented.
+
 ## Custom roles
 
 You can create arbitrary role definitions from Agent Graph (`+` → Role → Custom role)
@@ -154,7 +320,7 @@ or by editing `.factory/config.toml`. Custom roles are project-local definitions
 | `id` (slug)      | Stable identifier used by plans, tasks, and sessions           |
 | `name`           | Display name                                                   |
 | `description`    | One-line summary shown to the Planner and in inspectors        |
-| `execution_class`| Where Factory may use the role (see below)                     |
+| `execution_class`| Which operations the role may perform (see above)              |
 | `instructions`   | Reusable instruction text sent to the agent in its mission     |
 
 Custom roles do not own model settings. Temperature, model choice, provider, and
@@ -165,28 +331,60 @@ editable until first save. After a role has been used by persisted workflows, ke
 its id stable: renaming the display name is safe; changing the slug orphans historical
 references. Deleting a custom role used by an active workflow is rejected.
 
-### Execution classes
+Custom roles run through the generic operation semantics — no `if role == ...`
+branching. For example a `performance_analyst` with `execution_class = "review"`
+announces itself to the Planner as a review role; a plan may assign it
+`operation: review`, and it executes with the same review flow as Security Auditor.
 
-Every role has one execution class. The class determines **where Factory may use the
-role**; the instructions determine **what it does**.
+```toml
+[roles.performance_analyst]
+name = "Performance Analyst"
+description = "Reviews performance-sensitive changes."
+execution_class = "review"
+instructions = """
+Purpose: evaluate whether the change hurts performance.
+...
+"""
+```
 
-| Class         | Meaning in Factory                                            |
-| ------------- | -------------------------------------------------------------- |
-| `planning`    | Produces the plan for a workflow                              |
-| `execution`   | Implements tasks                                              |
-| `review`      | Evaluates output against criteria                             |
-| `advisory`    | Produces context or analysis for other roles                  |
-| `post_process`| Follows implementation, for example documentation             |
+See [Writing good role instructions](#writing-good-role-instructions) for guidance.
 
-Core role mapping: Planner → planning, Worker → execution, Reviewer → review,
-Architect → advisory, Researcher → advisory, Test Engineer → execution,
-Security Auditor → review, Documentation Writer → post_process.
+## Role-aware task planning
 
-In the current runtime every task role executes through the same
-implement → evidence → review pipeline regardless of class; the class mainly guides
-the Planner's catalog, the graph, and the team UI. Custom review roles that replace
-the post-task Reviewer are not supported yet — the Reviewer role always performs
-post-task review.
+The Planner receives a **concise catalog** of the roles available in the workflow's
+selected team: role id, display name, execution class, and description. Full role
+instruction bodies are not injected into the planning prompt.
+
+The Planner is explicitly instructed to keep plans **proportional to the objective**
+and not to use every role:
+
+- a small CSS fix needs only a general implementation task (Worker);
+- an authentication subsystem may need an Architect task, implementation tasks, a
+  Test Engineer task, a Security Auditor review, and a Documentation Writer task;
+- an unfamiliar dependency or API may need a Researcher task before implementation;
+- a database migration may need an Architect or Database Engineer task, verification,
+  and a review.
+
+Researcher, Architect, Test Engineer, Security Auditor, and Documentation Writer
+tasks are **not** created automatically just because those roles exist. A plan that
+references a role the workflow did not select, or pairs an operation with an
+incompatible class, is rejected and the Planner is asked to repair it (up to the
+usual three attempts).
+
+## Upstream context and artifacts
+
+Downstream agents receive only the artifacts produced by their **direct
+dependencies**. Artifacts follow the DAG:
+
+```text
+Research A → Worker A
+Research B → Worker B
+```
+
+Worker A receives Research A's artifact, never Research B's. Factory does not dump
+the workflow database or every previous agent log into a mission; prompts stay
+bounded, individual artifacts are capped, and oversized context is truncated with a
+visible marker instead of silently dropped.
 
 ## Writing good role instructions
 
@@ -276,7 +474,7 @@ not a role.
 ### Database Engineer
 
 ```text
-Class: implementation (execution)
+Class: execution (implement / verify)
 
 Description:
 Owns relational schema, migrations, query correctness and data integrity.
@@ -441,6 +639,9 @@ original file as `config.toml.bak`, and writes the new file atomically. No
   offers core roles worth enabling and the custom role editor.
 - A compact Roles filter hides role nodes and their assignment edges when the graph
   gets dense.
+- **Task nodes show their semantic operation** (Implement / Verify / Review /
+  Analysis / Docs) and their state, so role-aware execution is readable at a glance.
+  The graph remains brain/network oriented — no stage boards, no decorative effects.
 
 ## Runtime behavior
 
@@ -448,30 +649,48 @@ Planning:
 
 ```text
 workflow objective
-+ AVAILABLE ROLES catalog (task-capable roles in the workflow's team)
++ AVAILABLE ROLES catalog (task-capable roles in the workflow's team,
+  with id / name / execution class / description)
 → Planner produces a task DAG
-→ tasks may carry an optional role id
+→ tasks may carry a role id and an operation
 → role must be enabled for the workflow, otherwise the plan is rejected and repaired
+→ operation must be compatible with the role's execution class, otherwise the plan
+   is rejected and repaired
+→ missing operations are derived from the role class
 ```
 
-A task without a role defaults to Worker. Unknown roles are never silently mapped to
-Worker — a plan that references a role the workflow did not select is rejected, and
-the Planner is asked to correct it (up to the usual three attempts).
+A task without a role defaults to Worker (`implement`). Unknown roles are never
+silently mapped to Worker — a plan that references a role the workflow did not select
+is rejected, and the Planner is asked to correct it (up to the usual three attempts).
 
 Task execution resolves deterministically:
 
 ```text
-task.role (or worker)
+task.role (or worker) + task.operation (or derived default)
 → workflow team assignment set for that role
 → routing policy (preferred default; round-robin within the team)
 → selected agent
-→ AgentSession(role = actual role id, agent)
-→ TaskAttempt(role, agent)
+→ AgentSession(role = actual role id, operation)
+→ TaskAttempt(role, operation, agent)
+```
+
+The dispatch then depends on the operation:
+
+```text
+advisory       → agent produces context → role artifact persisted → completed
+implement      → agent changes worktree → built-in Reviewer → accepted or requests
+                 changes (bounded retry)
+verify         → agent runs tests → verification artifact → built-in Reviewer
+post_process   → agent updates docs → documentation context artifact → built-in
+                 Reviewer
+review         → agent evaluates evidence + diff → review artifact → approve, or
+                 request_changes → implementation rework (bounded)
 ```
 
 Every workflow preserves its team snapshot, so later changes to global assignments
-never rewrite history: sessions and attempts keep the role id that actually ran (for
-example `database_engineer`, not `worker`), and completed workflows stay auditable.
+never rewrite history: sessions and attempts keep the role id and operation that
+actually ran (for example `researcher` with `advisory`, not `worker`), and completed
+workflows stay auditable.
 
 Execution remains sequential. Multiple selected workers widen the pool the router
 chooses from; they do not run tasks in parallel. The design is parallel-ready, but no
@@ -481,6 +700,21 @@ Start refuses a workflow whose team is incomplete or no longer valid — for exa
 when a task requires a role whose agent assignment was removed — with a diagnostic
 naming the role and agent. Agent availability (executable resolution) is checked
 before any task starts, preserving the existing fail-fast behavior.
+
+## Workflow stages
+
+The Workflow Inspector derives a compact *stage* overview from the tasks in the plan
+and their operations. Stages answer "what kind of work is currently happening?" and
+are distinct from the operational workflow status:
+
+```text
+Planning → Analysis → Implementation → Verification → Review → Post-processing
+```
+
+Only stages that actually exist in the workflow are shown — a simple Worker →
+Reviewer workflow shows Planning and Implementation, not a wall of empty rows. The
+Task Inspector shows role, operation, execution class, agent, dependencies, produced
+and consumed artifacts, attempts, and evidence.
 
 ## Troubleshooting
 
@@ -500,6 +734,11 @@ the team to include an agent for that role, or re-plan the workflow.
 **A plan was rejected with "role 'x' which is not enabled for this workflow"**
 The Planner invented a role outside the team. Add the role to the workflow's advanced
 team, or make the task a regular Worker task.
+
+**A plan was rejected with "cannot perform operation 'implement'"**
+The Planner assigned an operation that is incompatible with the role's execution
+class. The Planner is asked to repair the plan; this is intentional — Factory does
+not silently reinterpret role semantics.
 
 **"role 'x' is used by an active workflow and cannot be deleted"**
 Delete or finish the workflow first. Historical workflows keep working because they

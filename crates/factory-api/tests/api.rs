@@ -657,6 +657,7 @@ async fn agent_session_endpoints_return_persisted_output_and_close_completed_str
             task_id: None,
             attempt_id: None,
             role: "worker".to_string(),
+            operation: None,
             agent: "codex".to_string(),
             mode: AgentSessionMode::Automated,
             command: "codex exec".to_string(),
@@ -878,6 +879,163 @@ async fn workflow_api_plans_and_executes_through_factory_core() {
     assert_eq!(detail["tasks"][0]["state"], "completed");
     assert_eq!(detail["attempts"][0]["status"], "approved");
     assert_eq!(detail["sessions"].as_array().unwrap().len(), 3);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn role_aware_artifacts_and_stages_are_exposed() {
+    let dir = TempDir::new().unwrap();
+    init_root(dir.path());
+    init_git(dir.path());
+    let plan = r#"{"objective":"API roles","tasks":[
+    {"id":"T1","title":"Research","objective":"understand","dependencies":[],"acceptanceCriteria":["findings"],"role":"researcher","operation":"advisory"},
+    {"id":"T2","title":"Implement","objective":"build","dependencies":["T1"],"acceptanceCriteria":["works"]}]}"#;
+    let plan_path = dir.path().join("plan.json");
+    let research_path = dir.path().join("research.json");
+    std::fs::write(&plan_path, plan).unwrap();
+    std::fs::write(
+        &research_path,
+        r#"{"summary":"JWT findings","findings":["httpOnly"],"recommendations":["middleware"]}"#,
+    )
+    .unwrap();
+    let worker_output = dir.path().join("worker-output.json");
+    std::fs::write(&worker_output, r#"{"commands":["cargo check"]}"#).unwrap();
+    let reviewer_output = dir.path().join("reviewer.json");
+    std::fs::write(&reviewer_output, r#"{"decision":"approve","reason":"ok"}"#).unwrap();
+
+    let mut config = Config::default();
+    let insert_agent = |config: &mut Config, name: &str, script: String| {
+        config.agents.insert(name.into(), command_entry(&script));
+    };
+    insert_agent(
+        &mut config,
+        "planner-api",
+        format!("type {}", plan_path.display()),
+    );
+    insert_agent(
+        &mut config,
+        "researcher-api",
+        format!("echo found>research.txt & type {}", research_path.display()),
+    );
+    insert_agent(
+        &mut config,
+        "worker-api",
+        format!(
+            "echo done>worker-output.txt & type {}",
+            worker_output.display()
+        ),
+    );
+    insert_agent(
+        &mut config,
+        "reviewer-api",
+        format!("type {}", reviewer_output.display()),
+    );
+    for (role, agent, preferred) in [
+        ("planner", "planner-api", true),
+        ("worker", "worker-api", true),
+        ("reviewer", "reviewer-api", true),
+        ("researcher", "researcher-api", true),
+    ] {
+        config.role_assignments.push(RoleAssignment {
+            role: role.into(),
+            agent: agent.into(),
+            preferred,
+        });
+    }
+    config.write_atomic(dir.path()).unwrap();
+
+    let app = factory_api::router(make_state(dir.path()));
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/runs")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "objective": "API roles",
+                        "team": {
+                            "planner": "planner-api",
+                            "workers": ["worker-api"],
+                            "reviewers": ["reviewer-api"],
+                            "additional": { "researcher": ["researcher-api"] }
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let run: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+    let run_id = run["id"].as_i64().unwrap();
+    wait_for_run(dir.path(), run_id, RunStatus::Planned).await;
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/runs/{run_id}/start"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    wait_for_run(dir.path(), run_id, RunStatus::Completed).await;
+
+    // Run detail exposes derived stages and persisted artifacts.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/runs/{run_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let detail: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+    let stages = detail["stages"].as_array().unwrap();
+    assert!(
+        stages.iter().any(|stage| stage["key"] == "analysis"),
+        "advisory stage derived: {stages:?}"
+    );
+    assert!(stages.iter().any(|stage| stage["key"] == "implementation"));
+    assert_eq!(detail["artifacts"].as_array().unwrap().len(), 1);
+    assert_eq!(detail["artifacts"][0]["kind"], "research");
+    assert_eq!(detail["tasks"][0]["operation"], "advisory");
+    assert_eq!(detail["tasks"][1]["operation"], "implement");
+    assert_eq!(detail["attempts"][0]["operation"], "advisory");
+
+    // The dedicated artifact endpoints serve the same records.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/runs/{run_id}/artifacts"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let artifacts: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+    assert_eq!(artifacts.as_array().unwrap().len(), 1);
+    assert!(artifacts[0]["content"].to_string().contains("httpOnly"));
+
+    let research_task_id = detail["tasks"][0]["id"].as_i64().unwrap();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/tasks/{research_task_id}/artifacts"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let artifacts: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+    assert_eq!(artifacts.as_array().unwrap().len(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

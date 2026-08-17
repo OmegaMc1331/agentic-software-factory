@@ -1,5 +1,6 @@
 import { useMemo } from "react";
 import type { Task } from "../types";
+import { operationStage, STAGE_META } from "../types";
 import { STATE_META } from "../state";
 import { NODE_HEIGHT, NODE_WIDTH, computeLayout, truncate } from "../layout";
 
@@ -61,6 +62,7 @@ export function TaskGraph({ tasks }: { tasks: Task[] }) {
         const task = byId.get(node.id);
         if (!task) return null;
         const meta = STATE_META[task.state];
+        const stage = task.operation ? operationStage(task.operation) : null;
         return (
           <g key={node.id} className="graph-node">
             <rect
@@ -77,6 +79,17 @@ export function TaskGraph({ tasks }: { tasks: Task[] }) {
             <text x={node.x + 28} y={node.y + NODE_HEIGHT / 2 + 4} className="graph-label">
               {truncate(task.title)}
             </text>
+            {stage && (
+              <text
+                x={node.x + NODE_WIDTH - 12}
+                y={node.y + NODE_HEIGHT - 8}
+                className="graph-op-tag"
+                textAnchor="end"
+                fill={STAGE_META[stage].color}
+              >
+                {STAGE_META[stage].short}
+              </text>
+            )}
             <text
               x={node.x + NODE_WIDTH - 12}
               y={node.y + NODE_HEIGHT / 2 + 4}

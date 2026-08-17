@@ -1,6 +1,6 @@
 use serde::Serialize;
 
-use factory_types::{AgentSession, Run, Task, TaskAttempt, TaskState};
+use factory_types::{AgentSession, RoleArtifact, Run, Task, TaskAttempt, TaskState};
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -64,6 +64,23 @@ pub struct RunDetail {
     pub tasks: Vec<Task>,
     pub attempts: Vec<TaskAttempt>,
     pub sessions: Vec<AgentSession>,
+    /// Derived role-aware stage overview of this workflow.
+    pub stages: Vec<StageStatus>,
+    /// Artifacts persisted by the workflow's advisory/verification/review tasks.
+    pub artifacts: Vec<RoleArtifact>,
+}
+
+/// One derived workflow stage ("what kind of work is happening") with its
+/// progress across the tasks that belong to it.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StageStatus {
+    pub key: String,
+    pub label: String,
+    pub total: usize,
+    pub completed: usize,
+    /// `active` when any task in the stage is ready or running.
+    pub state: String,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -27,6 +27,8 @@ vi.mock("../api", () => ({
   fetchGraph: vi.fn(),
   fetchGraphWorkspace: vi.fn(),
   fetchRoles: vi.fn(),
+  fetchRunArtifacts: vi.fn().mockResolvedValue([]),
+  fetchTaskArtifacts: vi.fn().mockResolvedValue([]),
   removeRoleAssignment: vi.fn(),
   retryTask: vi.fn(),
   saveConfig: vi.fn(),

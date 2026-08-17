@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { fetchRoles, fetchRun, updateWorkflowTeam } from "../api";
 import type { GraphNode, RoleInfo, RunDetail, Task, WorkflowTeam } from "../types";
 import { PIPELINE_ROLE_IDS, roleAgents, runMeta } from "../types";
+import { ArtifactList } from "./ArtifactList";
 
 type WorkflowTab = "overview" | "tasks" | "activity";
 
@@ -281,6 +282,30 @@ export function WorkflowInspector({
             </div>
           </dl>
 
+          {detail && detail.stages.length > 0 && (
+            <section className="workflow-stages" aria-label="Workflow stages">
+              <h4>Stages</h4>
+              <ul>
+                {detail.stages.map((stage) => (
+                  <li key={stage.key} className={`stage--${stage.state}`}>
+                    <span>{stage.label}</span>
+                    <strong>{stage.state === "completed" ? "✓" : stage.state}</strong>
+                    <small>
+                      {stage.completed}/{stage.total}
+                    </small>
+                  </li>
+                ))}
+              </ul>
+            </section>
+          )}
+
+          {detail && detail.artifacts.length > 0 && (
+            <details className="agent-advanced workflow-artifacts">
+              <summary>Role artifacts ({detail.artifacts.length})</summary>
+              <ArtifactList artifacts={detail.artifacts} />
+            </details>
+          )}
+
           {editingTeam ? (
             <div className="workflow-team-editor">
               {roles === null ? (
@@ -427,6 +452,10 @@ export function WorkflowInspector({
                   </strong>
                   <span>{task.state}</span>
                 </div>
+                <p className="workflow-task-meta">
+                  <span className="op-chip">{task.operation ?? "implement"}</span>
+                  <span>{task.role ?? "worker"}</span>
+                </p>
                 <p>{task.objective}</p>
                 <ul>
                   {task.acceptanceCriteria.map((criterion) => (

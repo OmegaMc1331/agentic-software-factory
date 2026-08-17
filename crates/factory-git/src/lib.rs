@@ -21,6 +21,13 @@ pub struct WorktreeEvidence {
     pub commit_sha: Option<String>,
 }
 
+impl WorktreeEvidence {
+    /// Whether any repository change was recorded for the attempt.
+    pub fn is_change(&self) -> bool {
+        !self.changed_files.is_empty() || !self.diff_summary.is_empty()
+    }
+}
+
 pub struct Repo {
     root: PathBuf,
 }
@@ -228,6 +235,30 @@ impl Repo {
             diff_summary: diff_summary.trim().to_string(),
             commit_sha: (head != base_sha).then_some(head),
         })
+    }
+
+    /// The full patch text (`git diff <base>`) of a worktree, bounded to
+    /// `max_chars` characters at a character boundary. Specialized review roles
+    /// receive this so they can evaluate the actual change without sharing the
+    /// implementation worktree.
+    pub fn diff_patch(
+        &self,
+        worktree_path: &Path,
+        base_sha: &str,
+        max_chars: usize,
+    ) -> Result<String> {
+        let full = git(worktree_path, &["diff", base_sha, "--", "."], None)?;
+        let mut bounded = String::new();
+        let mut chars = 0usize;
+        for line in full.lines() {
+            if chars + line.len() > max_chars {
+                break;
+            }
+            bounded.push_str(line);
+            bounded.push('\n');
+            chars += line.len() + 1;
+        }
+        Ok(bounded)
     }
 }
 

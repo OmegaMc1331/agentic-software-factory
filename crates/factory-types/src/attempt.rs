@@ -52,6 +52,14 @@ pub struct TaskEvidence {
     pub commands: Vec<String>,
     pub acceptance_criteria: Vec<String>,
     pub worker_exit_code: Option<i32>,
+    /// Identifiers of persisted role artifacts produced by this attempt.
+    #[serde(default)]
+    pub artifacts: Vec<i64>,
+    /// The bounded patch text of the change, captured when the attempt
+    /// finished. Review roles consume it without sharing the implementation
+    /// worktree.
+    #[serde(default)]
+    pub diff_patch: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -59,6 +67,49 @@ pub struct TaskEvidence {
 pub enum ReviewDecision {
     Approve,
     RequestChanges,
+}
+
+/// Severity of a finding from a specialized review. Deliberately compact; the
+/// Factory does not compute CVSS scores.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewSeverity {
+    #[default]
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+impl ReviewSeverity {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReviewSeverity::Low => "low",
+            ReviewSeverity::Medium => "medium",
+            ReviewSeverity::High => "high",
+            ReviewSeverity::Critical => "critical",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewFinding {
+    pub severity: ReviewSeverity,
+    pub summary: String,
+    #[serde(default)]
+    pub evidence: String,
+}
+
+/// Structured output of a specialized review task (a review-class role such as
+/// Security Auditor or a custom review role). Findings are persisted as a
+/// review artifact and shown in inspectors.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpecializedReview {
+    pub decision: ReviewDecision,
+    #[serde(default)]
+    pub findings: Vec<ReviewFinding>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,6 +130,9 @@ pub struct TaskAttempt {
     pub agent: String,
     #[serde(default)]
     pub role: Option<String>,
+    /// The semantic operation of the attempt (implementation, review, ...).
+    #[serde(default)]
+    pub operation: Option<crate::artifact::TaskOperation>,
     pub status: AttemptStatus,
     pub started_at: String,
     pub finished_at: Option<String>,

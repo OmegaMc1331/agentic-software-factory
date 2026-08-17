@@ -126,6 +126,7 @@ impl Runtime {
             task_id: None,
             attempt_id: None,
             role: "console".into(),
+            operation: None,
             agent: agent_name.to_string(),
             mode: AgentSessionMode::Interactive,
             command: invocation.command_line(),

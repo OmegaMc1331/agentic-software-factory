@@ -1,8 +1,33 @@
 import { useEffect, useMemo, useState } from "react";
-import type { GraphEdge, GraphNode } from "../types";
-import { agentMeta, agentResolutionStatusLabel, runMeta, taskMeta } from "../types";
+import { fetchRunArtifacts } from "../api";
+import type { GraphEdge, GraphNode, RoleArtifact, RoleMeta } from "../types";
+import {
+  agentMeta,
+  agentResolutionStatusLabel,
+  operationStage,
+  roleMeta,
+  runMeta,
+  STAGE_META,
+  taskMeta,
+} from "../types";
 import { STATE_META } from "../state";
 import { connectionKind } from "../graphWorkspace";
+import { ArtifactList } from "./ArtifactList";
+import { useRunArtifactsForTask } from "../artifactHelpers";
+
+function executionClassFor(
+  roleId: string | null,
+  nodesById: Map<string, GraphNode>
+): string | null {
+  if (!roleId) return null;
+  for (const node of nodesById.values()) {
+    if (node.kind === "role") {
+      const meta: RoleMeta = roleMeta(node);
+      if (meta.id === roleId) return meta.executionClass;
+    }
+  }
+  return null;
+}
 
 function Frame({
   title,
@@ -57,6 +82,31 @@ export function NodeInspector({
 }) {
   const [target, setTarget] = useState("");
   useEffect(() => setTarget(""), [node?.id]);
+  const [runArtifacts, setRunArtifacts] = useState<RoleArtifact[]>([]);
+  useEffect(() => {
+    if (node?.kind !== "task") return;
+    let active = true;
+    setRunArtifacts([]);
+    const runId = taskMeta(node).runId;
+    fetchRunArtifacts(runId)
+      .then((artifacts) => {
+        if (active) setRunArtifacts(artifacts);
+      })
+      .catch(() => {
+        if (active) setRunArtifacts([]);
+      });
+    return () => {
+      active = false;
+    };
+  }, [node]);
+
+  const selectedTaskId = node?.kind === "task" ? taskMeta(node).taskId : null;
+  const selectedTaskDeps = node?.kind === "task" ? taskMeta(node).dependencies : [];
+  const { produced, consumed } = useRunArtifactsForTask(
+    runArtifacts,
+    selectedTaskId,
+    selectedTaskDeps
+  );
   const targets = useMemo(
     () =>
       node
@@ -162,13 +212,30 @@ export function NodeInspector({
     );
   } else if (node.kind === "task") {
     const meta = taskMeta(node);
+    const stage = operationStage(meta.operation);
+    const executionClass =
+      meta.operation === null
+        ? executionClassFor(meta.role, nodesById)
+        : meta.operation === "implement" || meta.operation === "verify"
+          ? "execution"
+          : meta.operation;
+    const attempt = meta.currentAttempt;
     details = (
       <>
         <Row label="State">
           <span style={{ color: STATE_META[meta.state].color }}>{meta.state}</span>
         </Row>
         <Row label="Run">#{meta.runId}</Row>
-        {meta.role && <Row label="Role">{meta.role}</Row>}
+        {meta.operation && (
+          <Row label="Operation">
+            <span className="op-chip" style={{ color: STAGE_META[stage].color }}>
+              {meta.operation}
+            </span>
+          </Row>
+        )}
+        {executionClass && <Row label="Execution class">{executionClass}</Row>}
+        {meta.role ? <Row label="Role">{meta.role}</Row> : <Row label="Role">worker (default)</Row>}
+        {attempt && <Row label="Agent">{attempt.agent}</Row>}
         <Row label="Depends on">
           {meta.dependencies.length ? meta.dependencies.map((id) => `#${id}`).join(", ") : "None"}
         </Row>
@@ -188,19 +255,67 @@ export function NodeInspector({
             "None"
           )}
         </Row>
-        {meta.currentAttempt && (
+        {attempt && (
           <>
-            <Row label="Current attempt">
-              #{meta.currentAttempt.attemptNumber} —{" "}
-              {meta.currentAttempt.status.replaceAll("_", " ")}
-            </Row>
-            <Row label="Worker">{meta.currentAttempt.agent}</Row>
-            {meta.currentAttempt.error && <Row label="Reason">{meta.currentAttempt.error}</Row>}
-            {meta.currentAttempt.review && (
-              <Row label="Review">{meta.currentAttempt.review.reason}</Row>
+            <details className="agent-advanced">
+              <summary>
+                Attempt #{attempt.attemptNumber} — {attempt.status.replaceAll("_", " ")}
+              </summary>
+              <div className="inspector-row">
+                <span className="inspector-label">Agent</span>
+                <span className="inspector-value">{attempt.agent}</span>
+              </div>
+              {attempt.operation && (
+                <div className="inspector-row">
+                  <span className="inspector-label">Operation</span>
+                  <span className="inspector-value">{attempt.operation}</span>
+                </div>
+              )}
+              {attempt.error && (
+                <div className="inspector-row">
+                  <span className="inspector-label">Reason</span>
+                  <span className="inspector-value">{attempt.error}</span>
+                </div>
+              )}
+              {attempt.review && (
+                <div className="inspector-row">
+                  <span className="inspector-label">Review</span>
+                  <span className="inspector-value">{attempt.review.reason}</span>
+                </div>
+              )}
+              {attempt.evidence && (
+                <div className="inspector-row">
+                  <span className="inspector-label">Changed files</span>
+                  <span className="inspector-value">
+                    {attempt.evidence.changedFiles.length
+                      ? attempt.evidence.changedFiles.join(", ")
+                      : "none (no repository changes required)"}
+                  </span>
+                </div>
+              )}
+              {attempt.evidence && attempt.evidence.commands.length > 0 && (
+                <div className="inspector-row">
+                  <span className="inspector-label">Commands</span>
+                  <span className="inspector-value">{attempt.evidence.commands.join("; ")}</span>
+                </div>
+              )}
+            </details>
+            {attempt.evidence && (
+              <div className="inspector-row">
+                <span className="inspector-label">Diff</span>
+                <span className="inspector-value">
+                  {attempt.evidence.diffPatch ? "captured" : attempt.evidence.diffSummary || "—"}
+                </span>
+              </div>
             )}
           </>
         )}
+        <div className="inspector-artifacts">
+          <span className="inspector-label">Produced artifacts</span>
+          <ArtifactList artifacts={produced} empty="None." />
+          <span className="inspector-label">Consumed artifacts (dependencies)</span>
+          <ArtifactList artifacts={consumed} empty="None." />
+        </div>
         {onRetry && ["failed", "blocked"].includes(meta.state) && (
           <button className="button" onClick={() => onRetry(meta.taskId)}>
             Retry task

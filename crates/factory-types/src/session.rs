@@ -36,6 +36,10 @@ pub struct AgentSession {
     pub task_id: Option<i64>,
     pub attempt_id: Option<i64>,
     pub role: String,
+    /// The semantic operation performed by this session when it belongs to a
+    /// planned task; persisted for historical observability.
+    #[serde(default)]
+    pub operation: Option<crate::artifact::TaskOperation>,
     pub agent: String,
     pub mode: AgentSessionMode,
     pub command: String,

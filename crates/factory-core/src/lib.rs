@@ -1,5 +1,6 @@
 pub mod config;
 pub mod factory;
+pub mod mission;
 pub mod planner;
 pub mod roles;
 pub mod workflow;

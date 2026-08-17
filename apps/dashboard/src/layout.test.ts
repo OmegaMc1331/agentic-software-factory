@@ -14,6 +14,7 @@ function task(id: number, dependencies: number[]): Task {
     dependencies,
     worktreePath: null,
     role: null,
+    operation: null,
     createdAt: "2026-01-01T00:00:00Z",
     updatedAt: "2026-01-01T00:00:00Z",
   };

@@ -60,6 +60,10 @@ pub struct Task {
     pub worktree_path: Option<String>,
     #[serde(default)]
     pub role: Option<String>,
+    /// The semantic operation for this task. Nullable for rows persisted by
+    /// older releases; Factory Core derives a compatible default when missing.
+    #[serde(default)]
+    pub operation: Option<crate::artifact::TaskOperation>,
     pub created_at: String,
     pub updated_at: String,
 }

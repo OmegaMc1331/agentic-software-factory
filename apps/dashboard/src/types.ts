@@ -1,5 +1,68 @@
 export type TaskState = "pending" | "ready" | "running" | "blocked" | "failed" | "completed";
 
+export type TaskOperation =
+  "planning" | "advisory" | "implement" | "verify" | "review" | "post_process";
+
+export type ArtifactKind =
+  "research" | "architecture" | "analysis" | "review" | "verification" | "documentation_context";
+
+export interface RoleArtifact {
+  id: number;
+  runId: number;
+  taskId: number | null;
+  attemptId: number | null;
+  role: string;
+  operation: TaskOperation | null;
+  kind: ArtifactKind;
+  content: string;
+  createdAt: string;
+}
+
+/** Derived "what kind of work is happening" stage shown in inspectors. */
+export type WorkflowStage =
+  | "planning"
+  | "analysis"
+  | "implementation"
+  | "verification"
+  | "review"
+  | "post_processing"
+  | "completed";
+
+export interface StageStatus {
+  key: string;
+  label: string;
+  total: number;
+  completed: number;
+  state: "completed" | "active" | "pending";
+}
+
+export const STAGE_META: Record<WorkflowStage, { label: string; short: string; color: string }> = {
+  planning: { label: "Planning", short: "Plan", color: "#6b7280" },
+  analysis: { label: "Analysis", short: "Analysis", color: "#0d9488" },
+  implementation: { label: "Implementation", short: "Implement", color: "#2563eb" },
+  verification: { label: "Verification", short: "Verify", color: "#7c3aed" },
+  review: { label: "Review", short: "Review", color: "#b45309" },
+  post_processing: { label: "Post-processing", short: "Docs", color: "#334155" },
+  completed: { label: "Completed", short: "Done", color: "#16a34a" },
+};
+
+export function operationStage(operation: TaskOperation | null | undefined): WorkflowStage {
+  switch (operation) {
+    case "advisory":
+      return "analysis";
+    case "implement":
+      return "implementation";
+    case "verify":
+      return "verification";
+    case "review":
+      return "review";
+    case "post_process":
+      return "post_processing";
+    default:
+      return "planning";
+  }
+}
+
 export interface TaskCounts {
   pending: number;
   ready: number;
@@ -47,6 +110,7 @@ export interface Task {
   dependencies: number[];
   worktreePath: string | null;
   role: string | null;
+  operation: TaskOperation | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -56,6 +120,8 @@ export interface RunDetail {
   tasks: Task[];
   attempts: TaskAttempt[];
   sessions: AgentSession[];
+  stages: StageStatus[];
+  artifacts: RoleArtifact[];
 }
 
 export type AgentKind =
@@ -213,6 +279,8 @@ export interface TaskEvidence {
   commands: string[];
   acceptanceCriteria: string[];
   workerExitCode: number | null;
+  artifacts?: number[];
+  diffPatch?: string | null;
 }
 
 export interface ReviewResult {
@@ -227,6 +295,7 @@ export interface TaskAttempt {
   attemptNumber: number;
   agent: string;
   role: string | null;
+  operation: TaskOperation | null;
   status: AttemptStatus;
   startedAt: string;
   finishedAt: string | null;
@@ -248,6 +317,7 @@ export interface TaskMeta {
   acceptanceCriteria: string[];
   worktreePath: string | null;
   role: string | null;
+  operation: TaskOperation | null;
   currentAttempt: TaskAttempt | null;
 }
 
@@ -323,6 +393,7 @@ export interface AgentSession {
   taskId: number | null;
   attemptId: number | null;
   role: string;
+  operation: TaskOperation | null;
   agent: string;
   mode?: "automated" | "interactive";
   command: string;

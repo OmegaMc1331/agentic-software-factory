@@ -4,8 +4,8 @@ pub use error::DbError;
 
 use chrono::Utc;
 use factory_types::{
-    AgentSession, AgentSessionMode, AttemptStatus, Plan, ReviewResult, Run, RunStatus, Task,
-    TaskAttempt, TaskEvidence, TaskState,
+    AgentSession, AgentSessionMode, AttemptStatus, Plan, ReviewResult, RoleArtifact, Run,
+    RunStatus, Task, TaskAttempt, TaskEvidence, TaskOperation, TaskState,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
@@ -115,8 +115,8 @@ impl FactoryDb {
         for (position, task) in plan.tasks.iter().enumerate() {
             let criteria = serde_json::to_string(&task.acceptance_criteria)?;
             tx.execute(
-                "INSERT INTO tasks (run_id, title, objective, acceptance_criteria, state, position, role, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?7, ?8)",
+                "INSERT INTO tasks (run_id, title, objective, acceptance_criteria, state, position, role, operation, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?7, ?8, ?9)",
                 params![
                     run_id,
                     task.title,
@@ -124,6 +124,7 @@ impl FactoryDb {
                     criteria,
                     position as i32,
                     task.role,
+                    task.operation.map(TaskOperation::as_str),
                     ts,
                     ts
                 ],
@@ -166,12 +167,13 @@ impl FactoryDb {
         state: TaskState,
         position: i32,
         role: Option<&str>,
+        operation: Option<TaskOperation>,
     ) -> Result<i64> {
         let ts = now();
         let criteria = serde_json::to_string(acceptance_criteria)?;
         self.conn.execute(
-            "INSERT INTO tasks (run_id, title, objective, acceptance_criteria, state, position, role, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO tasks (run_id, title, objective, acceptance_criteria, state, position, role, operation, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 run_id,
                 title,
@@ -180,6 +182,7 @@ impl FactoryDb {
                 state.as_str(),
                 position,
                 role,
+                operation.map(TaskOperation::as_str),
                 ts,
                 ts
             ],
@@ -199,7 +202,7 @@ impl FactoryDb {
         let row = self
             .conn
             .query_row(
-                "SELECT t.id, t.run_id, t.title, t.objective, t.acceptance_criteria, t.state, t.position, t.worktree_path, t.created_at, t.updated_at, t.role
+                "SELECT t.id, t.run_id, t.title, t.objective, t.acceptance_criteria, t.state, t.position, t.worktree_path, t.created_at, t.updated_at, t.role, t.operation
                  FROM tasks t WHERE t.id = ?1",
                 params![id],
                 build_task,
@@ -214,7 +217,7 @@ impl FactoryDb {
 
     pub fn list_tasks(&self, run_id: i64) -> Result<Vec<Task>> {
         let mut stmt = self.conn.prepare(
-            "SELECT t.id, t.run_id, t.title, t.objective, t.acceptance_criteria, t.state, t.position, t.worktree_path, t.created_at, t.updated_at, t.role
+            "SELECT t.id, t.run_id, t.title, t.objective, t.acceptance_criteria, t.state, t.position, t.worktree_path, t.created_at, t.updated_at, t.role, t.operation
              FROM tasks t WHERE t.run_id = ?1 ORDER BY t.position",
         )?;
         let mut tasks = Vec::new();
@@ -278,13 +281,14 @@ impl FactoryDb {
     pub fn insert_agent_session(&self, session: &AgentSession) -> Result<AgentSession> {
         let mut session = session.clone();
         self.conn.execute(
-            "INSERT INTO agent_sessions (run_id, task_id, attempt_id, role, agent, mode, command, status, started_at, finished_at, exit_code, duration_ms, stdout, stderr)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            "INSERT INTO agent_sessions (run_id, task_id, attempt_id, role, operation, agent, mode, command, status, started_at, finished_at, exit_code, duration_ms, stdout, stderr)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 session.run_id,
                 session.task_id,
                 session.attempt_id,
                 session.role,
+                session.operation.map(TaskOperation::as_str),
                 session.agent,
                 session.mode.as_str(),
                 session.command,
@@ -303,7 +307,7 @@ impl FactoryDb {
 
     pub fn list_agent_sessions(&self, run_id: Option<i64>) -> Result<Vec<AgentSession>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, run_id, task_id, attempt_id, role, agent, mode, command, status, started_at, finished_at, exit_code, duration_ms, stdout, stderr
+            "SELECT id, run_id, task_id, attempt_id, role, operation, agent, mode, command, status, started_at, finished_at, exit_code, duration_ms, stdout, stderr
              FROM agent_sessions
              WHERE (?1 IS NULL OR run_id = ?1)
              ORDER BY id",
@@ -317,7 +321,7 @@ impl FactoryDb {
     pub fn get_agent_session(&self, id: i64) -> Result<Option<AgentSession>> {
         self.conn
             .query_row(
-                "SELECT id, run_id, task_id, attempt_id, role, agent, mode, command, status, started_at, finished_at, exit_code, duration_ms, stdout, stderr
+                "SELECT id, run_id, task_id, attempt_id, role, operation, agent, mode, command, status, started_at, finished_at, exit_code, duration_ms, stdout, stderr
                  FROM agent_sessions WHERE id = ?1",
                 params![id],
                 build_session,
@@ -332,7 +336,7 @@ impl FactoryDb {
         limit: usize,
     ) -> Result<Vec<AgentSession>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, run_id, task_id, attempt_id, role, agent, mode, command, status, started_at, finished_at, exit_code, duration_ms, stdout, stderr
+            "SELECT id, run_id, task_id, attempt_id, role, operation, agent, mode, command, status, started_at, finished_at, exit_code, duration_ms, stdout, stderr
              FROM agent_sessions
              WHERE agent = ?1
              ORDER BY id DESC
@@ -402,6 +406,7 @@ impl FactoryDb {
         &self,
         task_id: i64,
         role: &str,
+        operation: Option<TaskOperation>,
         agent: &str,
         worktree_path: &str,
     ) -> Result<TaskAttempt> {
@@ -412,9 +417,17 @@ impl FactoryDb {
         )?;
         self.conn.execute(
             "INSERT INTO task_attempts
-             (task_id, attempt_number, agent, role, status, started_at, worktree_path)
-             VALUES (?1, ?2, ?3, ?4, 'running', ?5, ?6)",
-            params![task_id, attempt_number, agent, role, now(), worktree_path],
+             (task_id, attempt_number, agent, role, operation, status, started_at, worktree_path)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'running', ?6, ?7)",
+            params![
+                task_id,
+                attempt_number,
+                agent,
+                role,
+                operation.map(TaskOperation::as_str),
+                now(),
+                worktree_path
+            ],
         )?;
         self.get_task_attempt(self.conn.last_insert_rowid())?
             .ok_or(DbError::NotFound("task attempt"))
@@ -434,7 +447,7 @@ impl FactoryDb {
         self.conn
             .query_row(
                 "SELECT id, task_id, attempt_number, agent, status, started_at, finished_at,
-                        worktree_path, commit_sha, exit_code, error, evidence, review, role
+                        worktree_path, commit_sha, exit_code, error, evidence, review, role, operation
                  FROM task_attempts WHERE id = ?1",
                 params![id],
                 build_attempt,
@@ -447,7 +460,7 @@ impl FactoryDb {
         let mut statement = self.conn.prepare(
             "SELECT a.id, a.task_id, a.attempt_number, a.agent, a.status, a.started_at,
                     a.finished_at, a.worktree_path, a.commit_sha, a.exit_code, a.error,
-                    a.evidence, a.review, a.role
+                    a.evidence, a.review, a.role, a.operation
              FROM task_attempts a
              JOIN tasks t ON t.id = a.task_id
              WHERE t.run_id = ?1
@@ -463,7 +476,7 @@ impl FactoryDb {
         self.conn
             .query_row(
                 "SELECT id, task_id, attempt_number, agent, status, started_at, finished_at,
-                        worktree_path, commit_sha, exit_code, error, evidence, review, role
+                        worktree_path, commit_sha, exit_code, error, evidence, review, role, operation
                  FROM task_attempts WHERE task_id = ?1 ORDER BY attempt_number DESC LIMIT 1",
                 params![task_id],
                 build_attempt,
@@ -510,6 +523,89 @@ impl FactoryDb {
             ],
         )?;
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_role_artifact(
+        &self,
+        run_id: i64,
+        task_id: Option<i64>,
+        attempt_id: Option<i64>,
+        role: &str,
+        operation: Option<TaskOperation>,
+        kind: &str,
+        content: &str,
+    ) -> Result<RoleArtifact> {
+        self.conn.execute(
+            "INSERT INTO role_artifacts (run_id, task_id, attempt_id, role, operation, kind, content, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                run_id,
+                task_id,
+                attempt_id,
+                role,
+                operation.map(TaskOperation::as_str),
+                kind,
+                content,
+                now()
+            ],
+        )?;
+        self.get_role_artifact(self.conn.last_insert_rowid())?
+            .ok_or(DbError::NotFound("role artifact"))
+    }
+
+    pub fn get_role_artifact(&self, id: i64) -> Result<Option<RoleArtifact>> {
+        self.conn
+            .query_row(
+                "SELECT id, run_id, task_id, attempt_id, role, operation, kind, content, created_at
+                 FROM role_artifacts WHERE id = ?1",
+                params![id],
+                build_artifact,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn list_role_artifacts(&self, run_id: i64) -> Result<Vec<RoleArtifact>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, run_id, task_id, attempt_id, role, operation, kind, content, created_at
+             FROM role_artifacts WHERE run_id = ?1 ORDER BY id",
+        )?;
+        let artifacts = stmt
+            .query_map(params![run_id], build_artifact)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(artifacts)
+    }
+
+    pub fn list_artifacts_for_task(&self, task_id: i64) -> Result<Vec<RoleArtifact>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, run_id, task_id, attempt_id, role, operation, kind, content, created_at
+             FROM role_artifacts WHERE task_id = ?1 ORDER BY id",
+        )?;
+        let artifacts = stmt
+            .query_map(params![task_id], build_artifact)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(artifacts)
+    }
+
+    /// Artifacts produced by the given task ids in a run, in task order. The
+    /// Factory uses this for dependency-aware context propagation: only
+    /// artifacts from the caller's dependency ancestry reach a mission.
+    pub fn list_artifacts_for_tasks(&self, task_ids: &[i64]) -> Result<Vec<RoleArtifact>> {
+        if task_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = vec!["?"; task_ids.len()].join(",");
+        let sql = format!(
+            "SELECT id, run_id, task_id, attempt_id, role, operation, kind, content, created_at
+             FROM role_artifacts WHERE task_id IN ({placeholders}) ORDER BY id"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let params = rusqlite::params_from_iter(task_ids.iter().copied());
+        let artifacts = stmt
+            .query_map(params, build_artifact)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(artifacts)
     }
 
     pub fn reconcile_interrupted(&self) -> Result<Reconciliation> {
@@ -580,6 +676,9 @@ fn build_task(r: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         dependencies: Vec::new(),
         worktree_path: r.get(7)?,
         role: r.get(10)?,
+        operation: r
+            .get::<_, Option<String>>(11)?
+            .and_then(|value| value.parse().ok()),
         created_at: r.get(8)?,
         updated_at: r.get(9)?,
     })
@@ -592,19 +691,22 @@ fn build_session(r: &rusqlite::Row<'_>) -> rusqlite::Result<AgentSession> {
         task_id: r.get(2)?,
         attempt_id: r.get(3)?,
         role: r.get(4)?,
-        agent: r.get(5)?,
+        operation: r
+            .get::<_, Option<String>>(5)?
+            .and_then(|value| value.parse().ok()),
+        agent: r.get(6)?,
         mode: r
-            .get::<_, String>(6)?
+            .get::<_, String>(7)?
             .parse()
             .unwrap_or(AgentSessionMode::Automated),
-        command: r.get(7)?,
-        status: r.get(8)?,
-        started_at: r.get(9)?,
-        finished_at: r.get(10)?,
-        exit_code: r.get(11)?,
-        duration_ms: r.get(12).map(|v: Option<i64>| v.map(|v| v as u64))?,
-        stdout: r.get(13)?,
-        stderr: r.get(14)?,
+        command: r.get(8)?,
+        status: r.get(9)?,
+        started_at: r.get(10)?,
+        finished_at: r.get(11)?,
+        exit_code: r.get(12)?,
+        duration_ms: r.get(13).map(|v: Option<i64>| v.map(|v| v as u64))?,
+        stdout: r.get(14)?,
+        stderr: r.get(15)?,
     })
 }
 
@@ -617,6 +719,9 @@ fn build_attempt(r: &rusqlite::Row<'_>) -> rusqlite::Result<TaskAttempt> {
         attempt_number: r.get(2)?,
         agent: r.get(3)?,
         role: r.get(13)?,
+        operation: r
+            .get::<_, Option<String>>(14)?
+            .and_then(|value| value.parse().ok()),
         status: r
             .get::<_, String>(4)?
             .parse()
@@ -629,6 +734,22 @@ fn build_attempt(r: &rusqlite::Row<'_>) -> rusqlite::Result<TaskAttempt> {
         error: r.get(10)?,
         evidence: evidence.and_then(|value| serde_json::from_str(&value).ok()),
         review: review.and_then(|value| serde_json::from_str(&value).ok()),
+    })
+}
+
+fn build_artifact(r: &rusqlite::Row<'_>) -> rusqlite::Result<RoleArtifact> {
+    Ok(RoleArtifact {
+        id: r.get(0)?,
+        run_id: r.get(1)?,
+        task_id: r.get(2)?,
+        attempt_id: r.get(3)?,
+        role: r.get(4)?,
+        operation: r
+            .get::<_, Option<String>>(5)?
+            .and_then(|value| value.parse().ok()),
+        kind: r.get(6)?,
+        content: r.get(7)?,
+        created_at: r.get(8)?,
     })
 }
 
@@ -722,7 +843,67 @@ ALTER TABLE task_attempts ADD COLUMN role TEXT;
 ALTER TABLE runs ADD COLUMN team TEXT;
 ";
 
-const MIGRATIONS: &[&str] = &[V1_SCHEMA, V2_SCHEMA, V3_SCHEMA, V4_SCHEMA, V5_SCHEMA];
+/// Role-aware workflow semantics: tasks carry a semantic operation, sessions
+/// and attempts persist the operation they performed, and advisory/verification/
+/// review outputs are stored as `role_artifacts` so downstream tasks can
+/// consume them.
+///
+/// Rows persisted before this migration have no operation. Known core roles
+/// are backfilled with a compatible default; unknown roles default to
+/// `implement`. Factory Core still derives defaults at runtime for custom
+/// roles, so no data must be deleted when upgrading.
+const V6_SCHEMA: &str = "
+ALTER TABLE tasks ADD COLUMN operation TEXT;
+ALTER TABLE task_attempts ADD COLUMN operation TEXT;
+ALTER TABLE agent_sessions ADD COLUMN operation TEXT;
+CREATE TABLE role_artifacts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    task_id INTEGER REFERENCES tasks(id) ON DELETE CASCADE,
+    attempt_id INTEGER REFERENCES task_attempts(id) ON DELETE SET NULL,
+    role TEXT NOT NULL,
+    operation TEXT,
+    kind TEXT NOT NULL,
+    content TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX idx_artifacts_run_task ON role_artifacts(run_id, task_id);
+CREATE INDEX idx_artifacts_task ON role_artifacts(task_id);
+UPDATE tasks SET operation = CASE
+    WHEN role IS NULL THEN 'implement'
+    WHEN role = 'worker' THEN 'implement'
+    WHEN role = 'reviewer' THEN 'review'
+    WHEN role = 'test_engineer' THEN 'verify'
+    WHEN role IN ('architect', 'researcher') THEN 'advisory'
+    WHEN role = 'security_auditor' THEN 'review'
+    WHEN role = 'documentation_writer' THEN 'post_process'
+    ELSE 'implement'
+END WHERE operation IS NULL;
+UPDATE task_attempts SET operation = CASE
+    WHEN role IS NULL THEN 'implement'
+    WHEN role = 'worker' THEN 'implement'
+    WHEN role = 'reviewer' THEN 'review'
+    WHEN role = 'test_engineer' THEN 'verify'
+    WHEN role IN ('architect', 'researcher') THEN 'advisory'
+    WHEN role = 'security_auditor' THEN 'review'
+    WHEN role = 'documentation_writer' THEN 'post_process'
+    ELSE 'implement'
+END WHERE operation IS NULL;
+UPDATE agent_sessions SET operation = CASE
+    WHEN role = 'planner' THEN 'planning'
+    WHEN role = 'worker' THEN 'implement'
+    WHEN role = 'reviewer' THEN 'review'
+    WHEN role = 'test_engineer' THEN 'verify'
+    WHEN role IN ('architect', 'researcher') THEN 'advisory'
+    WHEN role = 'security_auditor' THEN 'review'
+    WHEN role = 'documentation_writer' THEN 'post_process'
+    ELSE 'implement'
+END WHERE operation IS NULL;
+";
+
+const MIGRATIONS: &[&str] = &[
+    V1_SCHEMA, V2_SCHEMA, V3_SCHEMA, V4_SCHEMA, V5_SCHEMA, V6_SCHEMA,
+];
 
 fn migrate(conn: &mut Connection) -> Result<()> {
     migrate_schemas(conn, MIGRATIONS)
@@ -759,7 +940,7 @@ fn migrate_schemas(conn: &mut Connection, schemas: &[&str]) -> Result<()> {
 mod tests {
     use factory_types::{
         AgentSession, AgentSessionMode, AttemptStatus, Plan, PlannedTask, ReviewDecision,
-        ReviewResult, RunStatus, TaskEvidence, TaskState,
+        ReviewResult, RunStatus, TaskEvidence, TaskOperation, TaskState,
     };
     use rusqlite::Connection;
     use tempfile::TempDir;
@@ -772,12 +953,12 @@ mod tests {
         let path = dir.path().join("test.db");
         let db = FactoryDb::open(&path).unwrap();
         let versions = schema_versions(&path);
-        assert_eq!(versions, vec![1, 2, 3, 4, 5]);
+        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6]);
         db.create_run("objective", Some("codex")).unwrap();
         drop(db);
 
         let db = FactoryDb::open(&path).unwrap();
-        assert_eq!(schema_versions(&path), vec![1, 2, 3, 4, 5]);
+        assert_eq!(schema_versions(&path), vec![1, 2, 3, 4, 5, 6]);
         db.list_runs().unwrap();
     }
 
@@ -802,12 +983,82 @@ mod tests {
         drop(conn);
 
         let db = FactoryDb::open(&path).unwrap();
-        assert_eq!(schema_versions(&path), vec![1, 2, 3, 4, 5]);
+        assert_eq!(schema_versions(&path), vec![1, 2, 3, 4, 5, 6]);
         let run = db.get_run(1).unwrap().unwrap();
         assert_eq!(run.objective, "legacy");
         let tasks = db.list_tasks(1).unwrap();
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].title, "old task");
+        // backfilled operation for a role-less legacy task
+        assert_eq!(tasks[0].operation, Some(TaskOperation::Implement));
+    }
+
+    #[test]
+    fn v6_backfills_operations_and_creates_role_artifacts() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("old.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(V1_SCHEMA).unwrap();
+        conn.execute_batch(crate::V2_SCHEMA).unwrap();
+        conn.execute_batch(crate::V3_SCHEMA).unwrap();
+        conn.execute_batch(crate::V4_SCHEMA).unwrap();
+        conn.execute_batch(crate::V5_SCHEMA).unwrap();
+        // Record the applied versions so the real migration only adds V6.
+        conn.execute_batch(
+            "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+             INSERT INTO schema_migrations (version, applied_at) VALUES
+               (1, 'x'), (2, 'x'), (3, 'x'), (4, 'x'), (5, 'x');",
+        )
+        .unwrap();
+        for (name, role, state) in [
+            ("plain", None::<String>, "completed"),
+            (
+                "db work",
+                Some("database_engineer".to_string()),
+                "completed",
+            ),
+            ("tests", Some("test_engineer".to_string()), "completed"),
+            ("design", Some("architect".to_string()), "completed"),
+            ("audit", Some("security_auditor".to_string()), "completed"),
+        ] {
+            conn.execute(
+                "INSERT INTO runs (objective, status, planner_agent, created_at, updated_at)
+                 VALUES ('legacy', 'completed', NULL, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO tasks (run_id, title, objective, acceptance_criteria, state, position, role, created_at, updated_at)
+                 VALUES (1, ?1, 'old', '[]', ?3, 0, ?2, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+                rusqlite::params![name, role, state],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let db = FactoryDb::open(&path).unwrap();
+        // creation records version 6 exactly once
+        assert_eq!(schema_versions(&path), vec![1, 2, 3, 4, 5, 6]);
+        let tasks = db.list_tasks(1).unwrap();
+        let operation_of = |title: &str| {
+            tasks
+                .iter()
+                .find(|task| task.title == title)
+                .unwrap()
+                .operation
+                .expect("operation backfilled")
+        };
+        assert_eq!(operation_of("plain"), TaskOperation::Implement);
+        assert_eq!(
+            operation_of("db work"),
+            TaskOperation::Implement,
+            "unknown/execution custom roles default to implement"
+        );
+        assert_eq!(operation_of("tests"), TaskOperation::Verify);
+        assert_eq!(operation_of("design"), TaskOperation::Advisory);
+        assert_eq!(operation_of("audit"), TaskOperation::Review);
+        // the new table exists and is queryable
+        assert!(db.list_role_artifacts(1).unwrap().is_empty());
     }
 
     #[test]
@@ -829,10 +1080,10 @@ mod tests {
         let db = FactoryDb::open(&dir.path().join("test.db")).unwrap();
         let run = db.create_run("objective", Some("codex")).unwrap();
         let a = db
-            .create_task(run.id, "A", "a", &[], TaskState::Ready, 0, None)
+            .create_task(run.id, "A", "a", &[], TaskState::Ready, 0, None, None)
             .unwrap();
         let b = db
-            .create_task(run.id, "B", "b", &[], TaskState::Ready, 1, None)
+            .create_task(run.id, "B", "b", &[], TaskState::Ready, 1, None, None)
             .unwrap();
         assert_eq!(
             db.get_run(run.id).unwrap().unwrap().status,
@@ -901,6 +1152,7 @@ mod tests {
                 TaskState::Ready,
                 0,
                 None,
+                None,
             )
             .unwrap();
         let b = db
@@ -912,6 +1164,7 @@ mod tests {
                 TaskState::Pending,
                 1,
                 Some("database_engineer"),
+                Some(TaskOperation::Implement),
             )
             .unwrap();
         db.add_dependency(b, a).unwrap();
@@ -933,7 +1186,16 @@ mod tests {
         let db = FactoryDb::open(&dir.path().join("test.db")).unwrap();
         let run = db.create_run("objective", Some("codex")).unwrap();
         let task = db
-            .create_task(run.id, "T", "objective", &[], TaskState::Ready, 0, None)
+            .create_task(
+                run.id,
+                "T",
+                "objective",
+                &[],
+                TaskState::Ready,
+                0,
+                None,
+                None,
+            )
             .unwrap();
 
         db.set_task_state(task, TaskState::Running).unwrap();
@@ -962,6 +1224,7 @@ mod tests {
             task_id: None,
             attempt_id: None,
             role: "planner".to_string(),
+            operation: Some(TaskOperation::Planning),
             agent: "codex".to_string(),
             mode: AgentSessionMode::Automated,
             command: "codex exec".to_string(),
@@ -1015,6 +1278,7 @@ mod tests {
                             dependencies: Vec::new(),
                             acceptance_criteria: vec!["done".into()],
                             role: None,
+                            operation: Some(TaskOperation::Implement),
                         },
                         PlannedTask {
                             id: "B".into(),
@@ -1023,6 +1287,7 @@ mod tests {
                             dependencies: vec!["A".into()],
                             acceptance_criteria: vec!["reviewed".into()],
                             role: Some("database_engineer".into()),
+                            operation: Some(TaskOperation::Implement),
                         },
                     ],
                 },
@@ -1044,10 +1309,19 @@ mod tests {
         let db = FactoryDb::open(&dir.path().join("test.db")).unwrap();
         let run = db.create_run("objective", Some("planner")).unwrap();
         let task = db
-            .create_task(run.id, "Task", "objective", &[], TaskState::Ready, 0, None)
+            .create_task(
+                run.id,
+                "Task",
+                "objective",
+                &[],
+                TaskState::Ready,
+                0,
+                None,
+                None,
+            )
             .unwrap();
         let attempt = db
-            .create_task_attempt(task, "worker", "opencode", "worktree")
+            .create_task_attempt(task, "worker", None, "opencode", "worktree")
             .unwrap();
         let evidence = TaskEvidence {
             changed_files: vec!["src/lib.rs".into()],
@@ -1056,6 +1330,8 @@ mod tests {
             commands: vec!["cargo test".into()],
             acceptance_criteria: vec!["tests pass".into()],
             worker_exit_code: Some(0),
+            artifacts: vec![],
+            diff_patch: Some("diff --git a/src/lib.rs".into()),
         };
         let review = ReviewResult {
             decision: ReviewDecision::Approve,
@@ -1114,7 +1390,16 @@ mod tests {
         let run = db.create_run("objective", Some("codex")).unwrap();
         let other = db.create_run("other", Some("codex")).unwrap();
         let task = db
-            .create_task(run.id, "Task", "objective", &[], TaskState::Ready, 0, None)
+            .create_task(
+                run.id,
+                "Task",
+                "objective",
+                &[],
+                TaskState::Ready,
+                0,
+                None,
+                None,
+            )
             .unwrap();
         let other_task = db
             .create_task(
@@ -1125,17 +1410,82 @@ mod tests {
                 TaskState::Ready,
                 0,
                 None,
+                None,
             )
             .unwrap();
         assert_eq!(db.count_task_attempts(run.id).unwrap(), 0);
-        db.create_task_attempt(task, "worker", "opencode", "worktree")
+        db.create_task_attempt(task, "worker", None, "opencode", "worktree")
             .unwrap();
-        db.create_task_attempt(task, "worker", "qwen", "worktree")
+        db.create_task_attempt(task, "worker", None, "qwen", "worktree")
             .unwrap();
-        db.create_task_attempt(other_task, "worker", "claude", "worktree")
+        db.create_task_attempt(other_task, "worker", None, "claude", "worktree")
             .unwrap();
         assert_eq!(db.count_task_attempts(run.id).unwrap(), 2);
         assert_eq!(db.count_task_attempts(other.id).unwrap(), 1);
+    }
+
+    #[test]
+    fn role_artifacts_round_trip_and_filter_by_task() {
+        let dir = TempDir::new().unwrap();
+        let db = FactoryDb::open(&dir.path().join("test.db")).unwrap();
+        let run = db.create_run("objective", Some("planner")).unwrap();
+        let research = db
+            .create_task(
+                run.id,
+                "Research",
+                "find",
+                &[],
+                TaskState::Completed,
+                0,
+                Some("researcher"),
+                Some(TaskOperation::Advisory),
+            )
+            .unwrap();
+        let worker = db
+            .create_task(
+                run.id,
+                "Worker",
+                "build",
+                &[],
+                TaskState::Completed,
+                1,
+                None,
+                None,
+            )
+            .unwrap();
+        let attempt = db
+            .create_task_attempt(research, "researcher", None, "search-agent", "worktree")
+            .unwrap();
+        let artifact = db
+            .insert_role_artifact(
+                run.id,
+                Some(research),
+                Some(attempt.id),
+                "researcher",
+                Some(TaskOperation::Advisory),
+                "research",
+                r#"{"summary":"found","findings":[]}"#,
+            )
+            .unwrap();
+        assert!(artifact.id > 0);
+
+        let all = db.list_role_artifacts(run.id).unwrap();
+        assert_eq!(all, vec![artifact.clone()]);
+        let per_task = db.list_artifacts_for_task(research).unwrap();
+        assert_eq!(per_task, vec![artifact.clone()]);
+        let per_worker = db.list_artifacts_for_tasks(&[worker]).unwrap();
+        assert!(per_worker.is_empty(), "worker has no artifacts");
+        let selected = db.list_artifacts_for_tasks(&[research]).unwrap();
+        assert_eq!(selected, vec![artifact.clone()]);
+        assert_eq!(
+            db.get_role_artifact(artifact.id).unwrap().unwrap().kind,
+            "research"
+        );
+        let loaded = db.list_role_artifacts(run.id).unwrap().remove(0);
+        assert_eq!(
+            loaded.operation.as_deref(),
+            Some(TaskOperation::Advisory.as_str())
+        );
     }
 
     #[test]
@@ -1154,10 +1504,11 @@ mod tests {
                 TaskState::Running,
                 0,
                 None,
+                None,
             )
             .unwrap();
         let attempt = db
-            .create_task_attempt(task, "worker", "opencode", "worktree")
+            .create_task_attempt(task, "worker", None, "opencode", "worktree")
             .unwrap();
         let session = db
             .insert_agent_session(&AgentSession {
@@ -1166,6 +1517,7 @@ mod tests {
                 task_id: Some(task),
                 attempt_id: Some(attempt.id),
                 role: "worker".into(),
+                operation: None,
                 agent: "worker".into(),
                 mode: AgentSessionMode::Automated,
                 command: "worker --task".into(),

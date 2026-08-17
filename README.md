@@ -6,7 +6,21 @@ OpenCode, Gemini CLI, or another CLI). The Factory plans workflows into real tas
 runs tasks in isolated git worktrees, reviews evidence, and records each invocation in
 local SQLite state.
 
+The runtime is **role-aware**: a plan's tasks carry a semantic operation
+(`advisory`, `implement`, `verify`, `review`, `post_process`), matched to each role's
+execution class. Researchers and Architects produce persisted artifacts consumed by
+implementation tasks; a Test Engineer verifies; specialized review roles such as the
+Security Auditor evaluate the diff and can route `request_changes` back into bounded
+implementation rework; a Documentation Writer runs last. Custom roles work without
+source changes — for example a `performance_analyst` with `execution_class = "review"`
+behaves like any other specialized reviewer.
+
+Simple workflows stay simple: a small fix still plans as Worker → Reviewer.
+
 ![Factory Agent Graph](docs/assets/dashboard-network.png)
+
+See [docs/roles.md](docs/roles.md) for execution classes, operations, artifacts,
+specialized reviews, and custom roles.
 
 ## Install
 

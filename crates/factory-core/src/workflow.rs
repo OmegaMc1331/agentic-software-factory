@@ -25,6 +25,7 @@ impl Workflow {
                 )
                 | (TaskState::Blocked, TaskState::Ready)
                 | (TaskState::Failed, TaskState::Ready)
+                | (TaskState::Completed, TaskState::Ready)
         )
     }
 
@@ -35,7 +36,11 @@ impl Workflow {
             TaskState::Running => vec![TaskState::Completed, TaskState::Failed, TaskState::Blocked],
             TaskState::Blocked => vec![TaskState::Ready],
             TaskState::Failed => vec![TaskState::Ready],
-            TaskState::Completed => vec![],
+            // Completed → Ready is used by the runtime when a specialized
+            // review requests changes: the implementation task is reworked
+            // instead of restarting the workflow, represented as fresh
+            // attempts rather than a cyclic DAG.
+            TaskState::Completed => vec![TaskState::Ready],
         }
     }
 
@@ -89,8 +94,11 @@ mod tests {
     }
 
     #[test]
-    fn completed_is_terminal() {
-        assert!(Workflow::allowed_targets(Completed).is_empty());
+    fn completed_allows_explicit_rework() {
+        // A completed implementation can be reset to Ready when a specialized
+        // review requests changes; retries stay bounded by attempt counts.
+        assert_eq!(Workflow::allowed_targets(Completed), vec![Ready]);
+        assert!(Workflow::can_transition(Completed, Ready));
     }
 
     #[test]

@@ -57,15 +57,38 @@ their `.factory/config.toml` entry.
 PTY sessions run with the same OS permissions as Factory. A PTY is an interaction
 mechanism, not a sandbox.
 
-## Git worktrees
+## Role-aware execution
 
 Each task runs in `.factory/worktrees/t<task-id>` on its own Git branch. Worktrees
 separate task files and branches; they are not security sandboxes. An agent can still
 access anything permitted to the invoking OS user.
 
+The runtime dispatches every task by its **operation** (`advisory`, `implement`,
+`verify`, `review`, `post_process`), which is validated against the role's execution
+class before the workflow starts. Specialized review tasks receive a **diff snapshot**
+bounded to 60 kB and run in their own worktree rather than sharing the implementation
+worktree. They evaluate evidence; they cannot modify the implementation's files
+unless a plan explicitly allows it.
+
 Cancellation stops scheduling and terminates the current configured agent process tree
 when possible. Factory preserves the worktree, session output, and evidence instead of
 deleting partial work.
+
+### Custom and specialized role boundaries
+
+Role definitions — including custom and specialized review roles — are prompt
+context, **not authorization**. A role changes what the agent is asked to do; it does
+not change what the agent is allowed to do:
+
+- custom roles do not gain shell capabilities beyond the configured agent — they
+  select among already-configured agents and only alter mission text;
+- custom roles do not bypass worktree isolation or `.factory` state protection;
+- custom roles do not gain provider or network capabilities the agent CLI does not
+  already have (Factory never claims web research on behalf of an agent);
+- review roles cannot execute arbitrary API-side shell commands — the workflow
+  runtime owns task execution and the dashboard cannot invoke agent processes
+  directly;
+- agents still inherit the user's OS permissions; a mission cannot elevate them.
 
 ## Local files
 

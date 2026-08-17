@@ -5,6 +5,7 @@ import type {
   ExecutionClass,
   GraphData,
   GraphWorkspace,
+  RoleArtifact,
   RoleInfo,
   Run,
   RunDetail,
@@ -120,6 +121,14 @@ export function cancelWorkflow(id: number): Promise<void> {
 
 export function retryTask(id: number): Promise<{ runId: number }> {
   return post<{ runId: number }>(`/tasks/${id}/retry`);
+}
+
+export function fetchRunArtifacts(runId: number): Promise<RoleArtifact[]> {
+  return get<RoleArtifact[]>(`/runs/${runId}/artifacts`);
+}
+
+export function fetchTaskArtifacts(taskId: number): Promise<RoleArtifact[]> {
+  return get<RoleArtifact[]>(`/tasks/${taskId}/artifacts`);
 }
 
 export function fetchGraph(): Promise<GraphData> {
