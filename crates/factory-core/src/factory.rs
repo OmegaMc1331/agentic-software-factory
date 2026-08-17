@@ -12,8 +12,8 @@ use factory_types::{
 };
 use thiserror::Error;
 
-use crate::config::{AgentResolutionError, Agents, ConfigError};
 use crate::capacity::AgentCapacity;
+use crate::config::{AgentResolutionError, Agents, ConfigError};
 use crate::mission::{
     build_mission, parse_advisory_report, parse_producer_report, parse_review,
     parse_specialized_review, review_result_from, MissionContext, ReviewInput,
@@ -557,9 +557,10 @@ impl Factory {
                 .unwrap_or_else(|| roles::WORKER.to_string());
             let worker_pool = team.agents_for_role(&role).to_vec();
             let worker_index = self.db.count_task_attempts(task.run_id)?;
-            let worker_name = roles::select_agent_with_capacity(&worker_pool, worker_index, &self.capacity)
-                .ok_or_else(|| FactoryError::TaskRoleUnavailable(task.id, role.clone()))?
-                .clone();
+            let worker_name =
+                roles::select_agent_with_capacity(&worker_pool, worker_index, &self.capacity)
+                    .ok_or_else(|| FactoryError::TaskRoleUnavailable(task.id, role.clone()))?
+                    .clone();
             let worker = self.agents.command_agent_for(&role, &worker_name)?;
             let _worker_load = self.capacity.acquire(worker.name());
             let attempt = self.db.create_task_attempt(

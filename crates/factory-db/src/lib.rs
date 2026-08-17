@@ -1017,14 +1017,7 @@ const V8_SCHEMA: &str = "ALTER TABLE runs ADD COLUMN base_sha TEXT;";
 const V9_SCHEMA: &str = "ALTER TABLE task_attempts ADD COLUMN source_base TEXT;";
 
 const MIGRATIONS: &[&str] = &[
-    V1_SCHEMA,
-    V2_SCHEMA,
-    V3_SCHEMA,
-    V4_SCHEMA,
-    V5_SCHEMA,
-    V6_SCHEMA,
-    V7_SCHEMA,
-    V8_SCHEMA,
+    V1_SCHEMA, V2_SCHEMA, V3_SCHEMA, V4_SCHEMA, V5_SCHEMA, V6_SCHEMA, V7_SCHEMA, V8_SCHEMA,
     V9_SCHEMA,
 ];
 
@@ -1461,7 +1454,14 @@ mod tests {
             )
             .unwrap();
         let attempt = db
-            .create_task_attempt(task, "worker", None, "opencode", "worktree", Some("base123"))
+            .create_task_attempt(
+                task,
+                "worker",
+                None,
+                "opencode",
+                "worktree",
+                Some("base123"),
+            )
             .unwrap();
         let evidence = TaskEvidence {
             changed_files: vec!["src/lib.rs".into()],
@@ -1595,7 +1595,14 @@ mod tests {
             )
             .unwrap();
         let attempt = db
-            .create_task_attempt(research, "researcher", None, "search-agent", "worktree", None)
+            .create_task_attempt(
+                research,
+                "researcher",
+                None,
+                "search-agent",
+                "worktree",
+                None,
+            )
             .unwrap();
         let artifact = db
             .insert_role_artifact(

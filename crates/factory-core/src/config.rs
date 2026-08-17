@@ -1255,7 +1255,10 @@ mod tests {
         assert_eq!(team.planner, "codex");
         assert_eq!(team.workers, ["opencode"]);
         assert_eq!(team.reviewers, ["claude"]);
-        assert_eq!(config.runtime.max_parallel_tasks, DEFAULT_MAX_PARALLEL_TASKS);
+        assert_eq!(
+            config.runtime.max_parallel_tasks,
+            DEFAULT_MAX_PARALLEL_TASKS
+        );
     }
 
     #[test]
@@ -1276,7 +1279,10 @@ mod tests {
 
         config.agents.get_mut("opencode").unwrap().max_concurrency = Some(64);
         // out-of-range values are clamped, not fatal, at plan time
-        assert_eq!(config.agents["opencode"].concurrency(), MAX_AGENT_CONCURRENCY);
+        assert_eq!(
+            config.agents["opencode"].concurrency(),
+            MAX_AGENT_CONCURRENCY
+        );
         config.agents.get_mut("opencode").unwrap().max_concurrency = None;
 
         config.runtime.max_parallel_tasks = 0;

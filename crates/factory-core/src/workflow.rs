@@ -21,13 +21,21 @@ impl Workflow {
                 | (TaskState::Ready, TaskState::Running)
                 | (
                     TaskState::Running,
-                    TaskState::AwaitingIntegration | TaskState::Completed | TaskState::Failed
+                    TaskState::AwaitingIntegration
+                        | TaskState::Completed
+                        | TaskState::Failed
                         | TaskState::Blocked
                 )
-                | (TaskState::AwaitingIntegration, TaskState::Integrating | TaskState::Ready)
+                | (
+                    TaskState::AwaitingIntegration,
+                    TaskState::Integrating | TaskState::Ready
+                )
                 | (
                     TaskState::Integrating,
-                    TaskState::Completed | TaskState::Ready | TaskState::Failed | TaskState::Blocked
+                    TaskState::Completed
+                        | TaskState::Ready
+                        | TaskState::Failed
+                        | TaskState::Blocked
                 )
                 | (TaskState::Blocked, TaskState::Ready)
                 | (TaskState::Failed, TaskState::Ready)

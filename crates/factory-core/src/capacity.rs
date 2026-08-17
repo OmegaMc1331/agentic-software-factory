@@ -131,7 +131,9 @@ mod tests {
         let members = pool(&["busy", "idle"]);
         let _guard = capacity.acquire("busy");
         assert_eq!(
-            select_agent_with_capacity(&members, 0, &capacity).unwrap().as_str(),
+            select_agent_with_capacity(&members, 0, &capacity)
+                .unwrap()
+                .as_str(),
             "idle"
         );
     }
