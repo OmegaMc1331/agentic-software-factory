@@ -70,6 +70,7 @@ fn script_entry(dir: &Path, name: &str, body_unix: &str, body_win: &str) -> Agen
         prompt_transport: None,
         interactive_args: None,
         capabilities: Vec::new(),
+        max_concurrency: None,
     }
 }
 

@@ -386,6 +386,10 @@ pub fn select_agent(pool: &[String], index: usize) -> Option<&String> {
     Some(&pool[index % pool.len()])
 }
 
+/// Capacity-aware selection: prefers the least-loaded agent in the pool.
+/// Delegates to `crate::capacity`.
+pub use crate::capacity::select_agent_with_capacity;
+
 pub fn slugify(name: &str) -> String {
     let mut slug = String::new();
     let mut pending_underscore = false;

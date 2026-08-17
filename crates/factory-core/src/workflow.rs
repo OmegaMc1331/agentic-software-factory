@@ -21,7 +21,13 @@ impl Workflow {
                 | (TaskState::Ready, TaskState::Running)
                 | (
                     TaskState::Running,
-                    TaskState::Completed | TaskState::Failed | TaskState::Blocked
+                    TaskState::AwaitingIntegration | TaskState::Completed | TaskState::Failed
+                        | TaskState::Blocked
+                )
+                | (TaskState::AwaitingIntegration, TaskState::Integrating | TaskState::Ready)
+                | (
+                    TaskState::Integrating,
+                    TaskState::Completed | TaskState::Ready | TaskState::Failed | TaskState::Blocked
                 )
                 | (TaskState::Blocked, TaskState::Ready)
                 | (TaskState::Failed, TaskState::Ready)
@@ -33,7 +39,19 @@ impl Workflow {
         match from {
             TaskState::Pending => vec![TaskState::Ready, TaskState::Blocked],
             TaskState::Ready => vec![TaskState::Running],
-            TaskState::Running => vec![TaskState::Completed, TaskState::Failed, TaskState::Blocked],
+            TaskState::Running => vec![
+                TaskState::AwaitingIntegration,
+                TaskState::Completed,
+                TaskState::Failed,
+                TaskState::Blocked,
+            ],
+            TaskState::AwaitingIntegration => vec![TaskState::Integrating, TaskState::Ready],
+            TaskState::Integrating => vec![
+                TaskState::Completed,
+                TaskState::Ready,
+                TaskState::Failed,
+                TaskState::Blocked,
+            ],
             TaskState::Blocked => vec![TaskState::Ready],
             TaskState::Failed => vec![TaskState::Ready],
             // Completed → Ready is used by the runtime when a specialized
@@ -45,6 +63,8 @@ impl Workflow {
     }
 
     pub fn next_state_for_dependent(dep_states: &[TaskState]) -> TaskState {
+        // AwaitingIntegration / Integrating deps must integrate (reach
+        // Completed) before their dependents can schedule, just like Running.
         if dep_states
             .iter()
             .any(|s| matches!(s, TaskState::Failed | TaskState::Blocked))
@@ -77,6 +97,13 @@ mod tests {
         assert!(Workflow::can_transition(Running, Completed));
         assert!(Workflow::can_transition(Running, Failed));
         assert!(Workflow::can_transition(Running, Blocked));
+        assert!(Workflow::can_transition(Running, AwaitingIntegration));
+        assert!(Workflow::can_transition(AwaitingIntegration, Integrating));
+        assert!(Workflow::can_transition(AwaitingIntegration, Ready));
+        assert!(Workflow::can_transition(Integrating, Completed));
+        assert!(Workflow::can_transition(Integrating, Ready));
+        assert!(Workflow::can_transition(Integrating, Failed));
+        assert!(Workflow::can_transition(Integrating, Blocked));
         assert!(Workflow::can_transition(Blocked, Ready));
         assert!(Workflow::can_transition(Failed, Ready));
         assert!(Workflow::can_transition(Completed, Completed));
@@ -91,6 +118,10 @@ mod tests {
         assert!(!Workflow::can_transition(Blocked, Running));
         assert!(!Workflow::can_transition(Completed, Pending));
         assert!(!Workflow::can_transition(Failed, Running));
+        assert!(!Workflow::can_transition(AwaitingIntegration, Running));
+        assert!(!Workflow::can_transition(AwaitingIntegration, Completed));
+        assert!(!Workflow::can_transition(Integrating, Running));
+        assert!(!Workflow::can_transition(Integrating, AwaitingIntegration));
     }
 
     #[test]
@@ -116,6 +147,15 @@ mod tests {
         assert_eq!(
             Workflow::next_state_for_dependent(&[Blocked, Ready]),
             Blocked
+        );
+        // Not-yet-integrated deps keep dependents pending.
+        assert_eq!(
+            Workflow::next_state_for_dependent(&[Completed, AwaitingIntegration]),
+            Pending
+        );
+        assert_eq!(
+            Workflow::next_state_for_dependent(&[Completed, Integrating]),
+            Pending
         );
     }
 }

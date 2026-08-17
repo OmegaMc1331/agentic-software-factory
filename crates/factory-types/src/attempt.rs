@@ -137,6 +137,11 @@ pub struct TaskAttempt {
     pub started_at: String,
     pub finished_at: Option<String>,
     pub worktree_path: String,
+    /// The commit the attempt's worktree was based on (the integration head of
+    /// the run branch at worktree-creation time). Used to detect stale bases so
+    /// the integration lane can replay/rebase before merging.
+    #[serde(default)]
+    pub source_base: Option<String>,
     pub commit_sha: Option<String>,
     pub exit_code: Option<i32>,
     pub error: Option<String>,

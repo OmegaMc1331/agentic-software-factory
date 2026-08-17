@@ -6,6 +6,11 @@ pub enum TaskState {
     Pending,
     Ready,
     Running,
+    /// The task's latest attempt passed main review and is queued for the
+    /// per-workflow, serialized integration lane.
+    AwaitingIntegration,
+    /// The task is currently being integrated onto the run branch.
+    Integrating,
     Blocked,
     Failed,
     Completed,
@@ -17,6 +22,8 @@ impl TaskState {
             TaskState::Pending => "pending",
             TaskState::Ready => "ready",
             TaskState::Running => "running",
+            TaskState::AwaitingIntegration => "awaiting_integration",
+            TaskState::Integrating => "integrating",
             TaskState::Blocked => "blocked",
             TaskState::Failed => "failed",
             TaskState::Completed => "completed",
@@ -32,6 +39,8 @@ impl std::str::FromStr for TaskState {
             "pending" => Ok(TaskState::Pending),
             "ready" => Ok(TaskState::Ready),
             "running" => Ok(TaskState::Running),
+            "awaiting_integration" => Ok(TaskState::AwaitingIntegration),
+            "integrating" => Ok(TaskState::Integrating),
             "blocked" => Ok(TaskState::Blocked),
             "failed" => Ok(TaskState::Failed),
             "completed" => Ok(TaskState::Completed),

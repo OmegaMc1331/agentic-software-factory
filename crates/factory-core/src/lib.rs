@@ -1,3 +1,4 @@
+pub mod capacity;
 pub mod config;
 pub mod factory;
 pub mod mission;
@@ -16,8 +17,8 @@ pub use factory_agent::AgentStatus;
 pub use factory_types::WorkflowTeam;
 pub use planner::{parse_plan, validate_plan, PlanError, PlanOutcome, Planner};
 pub use roles::{
-    core_role, core_roles, is_core_role, is_pipeline_role, slugify, ExecutionClass, RoleCatalog,
-    RoleDefinition, RoleKind, CORE_ROLE_IDS, PIPELINE_ROLE_IDS, PLANNER, REVIEWER,
-    SECURITY_AUDITOR, TEST_ENGINEER, WORKER,
+    core_role, core_roles, is_core_role, is_pipeline_role, select_agent_with_capacity, slugify,
+    ExecutionClass, RoleCatalog, RoleDefinition, RoleKind, CORE_ROLE_IDS, PIPELINE_ROLE_IDS,
+    PLANNER, REVIEWER, SECURITY_AUDITOR, TEST_ENGINEER, WORKER,
 };
 pub use workflow::Workflow;

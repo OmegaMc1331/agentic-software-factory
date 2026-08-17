@@ -20,6 +20,7 @@ fn build_entry(command: &str, args: Vec<String>) -> AgentEntry {
         prompt_transport: None,
         interactive_args: None,
         capabilities: Vec::new(),
+        max_concurrency: None,
     }
 }
 
@@ -57,6 +58,7 @@ fn legacy_custom_configuration_keeps_stdin_transport() {
         agents: BTreeMap::from([("custom".into(), entry)]),
         roles: BTreeMap::new(),
         role_assignments: Vec::new(),
+        runtime: Default::default(),
     };
     let agent = config.agent_config("custom").unwrap();
     assert_eq!(agent.kind, AgentKind::Custom);
@@ -315,6 +317,7 @@ fn write_atomic_round_trips_configuration() {
             agent: "codex".to_string(),
             preferred: true,
         }],
+        runtime: Default::default(),
     };
     let path = config.write_atomic(dir.path()).unwrap();
     assert!(path.ends_with("config.toml"));
@@ -340,6 +343,7 @@ fn validation_rejects_unknown_role_agent() {
             agent: "ghost".into(),
             preferred: false,
         }],
+        runtime: Default::default(),
     };
     let err = config.validate().unwrap_err();
     assert!(err.contains("unknown agent 'ghost'"));
@@ -351,6 +355,7 @@ fn validation_rejects_empty_commands_and_invalid_names() {
         agents: BTreeMap::from([("bad name".into(), build_entry("", vec![]))]),
         roles: BTreeMap::new(),
         role_assignments: Vec::new(),
+        runtime: Default::default(),
     };
     let err = config.validate().unwrap_err();
     assert!(err.contains("invalid agent name"));
@@ -359,6 +364,7 @@ fn validation_rejects_empty_commands_and_invalid_names() {
         agents: BTreeMap::from([("codex".into(), build_entry("", vec![]))]),
         roles: BTreeMap::new(),
         role_assignments: Vec::new(),
+        runtime: Default::default(),
     };
     let err = config.validate().unwrap_err();
     assert!(err.contains("empty command"));

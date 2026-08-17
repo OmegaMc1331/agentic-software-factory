@@ -16,6 +16,32 @@ use crate::roles::{
 
 pub const CONFIG_FILE: &str = "config.toml";
 
+pub const DEFAULT_MAX_PARALLEL_TASKS: usize = 4;
+pub const MAX_PARALLEL_TASKS_LIMIT: usize = 32;
+pub const MAX_AGENT_CONCURRENCY: usize = 32;
+
+fn default_max_parallel_tasks() -> usize {
+    DEFAULT_MAX_PARALLEL_TASKS
+}
+
+/// Runtime tuning for the parallel scheduler. Backward compatible: absent in
+/// older configs, so it defaults to a serial-width-safe value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeConfig {
+    /// How many tasks of a run may execute concurrently. Each dispatch is its
+    /// own process, so this bounds process spread per run (1..=32).
+    #[serde(default = "default_max_parallel_tasks")]
+    pub max_parallel_tasks: usize,
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            max_parallel_tasks: DEFAULT_MAX_PARALLEL_TASKS,
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
@@ -24,6 +50,8 @@ pub struct Config {
     pub roles: BTreeMap<String, RoleDefinitionEntry>,
     #[serde(default)]
     pub role_assignments: Vec<RoleAssignment>,
+    #[serde(default)]
+    pub runtime: RuntimeConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -41,6 +69,10 @@ pub struct AgentEntry {
     pub interactive_args: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<String>,
+    /// How many automation processes this agent may run concurrently (default
+    /// 1; 1..=32). The parallel scheduler honors this alongside global limits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrency: Option<usize>,
 }
 
 /// A custom role definition stored under `[roles.<slug>]`.
@@ -323,6 +355,11 @@ impl Config {
     }
 
     pub fn validate(&self) -> std::result::Result<(), String> {
+        if !(1..=MAX_PARALLEL_TASKS_LIMIT).contains(&self.runtime.max_parallel_tasks) {
+            return Err(format!(
+                "runtime.max_parallel_tasks must be between 1 and {MAX_PARALLEL_TASKS_LIMIT}"
+            ));
+        }
         for (id, entry) in &self.roles {
             if !valid_name(id) {
                 return Err(format!("invalid role id '{id}'"));
@@ -398,6 +435,13 @@ impl Config {
         for (name, entry) in &self.agents {
             if !valid_name(name) {
                 return Err(format!("invalid agent name '{name}'"));
+            }
+            if let Some(concurrency) = entry.max_concurrency {
+                if !(1..=MAX_AGENT_CONCURRENCY).contains(&concurrency) {
+                    return Err(format!(
+                        "agent '{name}' max_concurrency must be between 1 and {MAX_AGENT_CONCURRENCY}"
+                    ));
+                }
             }
             let command = entry.command.trim();
             if command.is_empty() {
@@ -622,10 +666,17 @@ pub fn default_config_text() -> String {
 # defined under [roles.<slug>] with name, description, execution_class
 # and instructions.
 
+[runtime]
+# How many tasks of a run may execute concurrently (1..=32). Integration
+# stays serialized per run regardless of this value.
+max_parallel_tasks = 4
+
 [agents.codex]
 kind = \"codex\"
 command = \"codex\"
 args = [\"exec\"]
+# How many concurrent automation processes this agent may run (default 1).
+# max_concurrency = 2
 
 [agents.opencode]
 kind = \"open_code\"
@@ -668,6 +719,15 @@ impl Agents {
 
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// The global per-run task concurrency from `[runtime]`. Values outside
+    /// 1..=32 are clamped rather than treated as fatal.
+    pub fn max_parallel_tasks(&self) -> usize {
+        self.config
+            .runtime
+            .max_parallel_tasks
+            .clamp(1, MAX_PARALLEL_TASKS_LIMIT)
     }
 
     pub fn list(&self) -> Vec<AgentInfo> {
@@ -827,6 +887,14 @@ impl AgentEntry {
             .unwrap_or_else(|| infer_kind(&self.command, &self.args))
     }
 
+    /// Concurrent automation processes this agent may run (default 1),
+    /// clamped to valid bounds.
+    pub fn concurrency(&self) -> usize {
+        self.max_concurrency
+            .unwrap_or(1)
+            .clamp(1, MAX_AGENT_CONCURRENCY)
+    }
+
     fn effective_args(&self, kind: AgentKind) -> Vec<String> {
         if self.args.is_empty() && kind != AgentKind::Custom {
             kind.workflow_args()
@@ -935,6 +1003,7 @@ mod tests {
             prompt_transport: None,
             interactive_args: None,
             capabilities: Vec::new(),
+            max_concurrency: None,
         }
     }
 
@@ -1186,5 +1255,35 @@ mod tests {
         assert_eq!(team.planner, "codex");
         assert_eq!(team.workers, ["opencode"]);
         assert_eq!(team.reviewers, ["claude"]);
+        assert_eq!(config.runtime.max_parallel_tasks, DEFAULT_MAX_PARALLEL_TASKS);
+    }
+
+    #[test]
+    fn runtime_and_agent_concurrency_defaults_and_validate() {
+        let mut config: Config = toml::from_str(&default_config_text()).unwrap();
+
+        assert_eq!(config.runtime.max_parallel_tasks, 4);
+        assert_eq!(config.agents["opencode"].concurrency(), 1);
+
+        config.agents.get_mut("opencode").unwrap().max_concurrency = Some(2);
+        assert!(config.validate().is_ok());
+        assert_eq!(config.agents["opencode"].concurrency(), 2);
+
+        config.agents.get_mut("opencode").unwrap().max_concurrency = Some(0);
+        assert!(config.validate().is_err());
+        config.agents.get_mut("opencode").unwrap().max_concurrency = Some(999);
+        assert!(config.validate().is_err());
+
+        config.agents.get_mut("opencode").unwrap().max_concurrency = Some(64);
+        // out-of-range values are clamped, not fatal, at plan time
+        assert_eq!(config.agents["opencode"].concurrency(), MAX_AGENT_CONCURRENCY);
+        config.agents.get_mut("opencode").unwrap().max_concurrency = None;
+
+        config.runtime.max_parallel_tasks = 0;
+        assert!(config.validate().is_err());
+        config.runtime.max_parallel_tasks = 33;
+        assert!(config.validate().is_err());
+        config.runtime.max_parallel_tasks = 32;
+        assert!(config.validate().is_ok());
     }
 }

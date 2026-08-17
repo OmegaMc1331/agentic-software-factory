@@ -135,6 +135,55 @@ impl FactoryDb {
         Ok(sha.flatten())
     }
 
+    /// Records the immutable base commit the run started from (the head the
+    /// `factory/run-<id>` branch was created at). `None` clears it.
+    pub fn set_run_base(&self, id: i64, base_sha: Option<&str>) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE runs SET base_sha = ?1, updated_at = ?2 WHERE id = ?3",
+            params![base_sha, now(), id],
+        )?;
+        if changed == 0 {
+            return Err(DbError::NotFound("run"));
+        }
+        Ok(())
+    }
+
+    /// The base commit the run started from, or `None` when it has not started.
+    pub fn get_run_base(&self, id: i64) -> Result<Option<String>> {
+        let sha: Option<Option<String>> = self
+            .conn
+            .query_row(
+                "SELECT base_sha FROM runs WHERE id = ?1",
+                params![id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?;
+        Ok(sha.flatten())
+    }
+
+    /// Atomically claims a Ready task for dispatch. Returns `true` exactly when
+    /// this caller won the claim and the task is now Running.
+    pub fn try_claim_task(&self, id: i64) -> Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE tasks SET state = 'running', updated_at = ?1 WHERE id = ?2 AND state = 'ready'",
+            params![now(), id],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Atomically claims an AwaitingIntegration task for the serialized
+    /// integration lane. Returns `true` exactly when this caller won the claim
+    /// and the task is now Integrating.
+    pub fn try_claim_integration(&self, id: i64) -> Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE tasks
+             SET state = 'integrating', updated_at = ?1
+             WHERE id = ?2 AND state = 'awaiting_integration'",
+            params![now(), id],
+        )?;
+        Ok(changed == 1)
+    }
+
     pub fn persist_plan(&self, run_id: i64, plan: &Plan) -> Result<Vec<Task>> {
         let tx = self.conn.unchecked_transaction()?;
         let mut ids = std::collections::HashMap::new();
@@ -436,6 +485,7 @@ impl FactoryDb {
         operation: Option<TaskOperation>,
         agent: &str,
         worktree_path: &str,
+        source_base: Option<&str>,
     ) -> Result<TaskAttempt> {
         let attempt_number: u32 = self.conn.query_row(
             "SELECT COALESCE(MAX(attempt_number), 0) + 1 FROM task_attempts WHERE task_id = ?1",
@@ -444,8 +494,8 @@ impl FactoryDb {
         )?;
         self.conn.execute(
             "INSERT INTO task_attempts
-             (task_id, attempt_number, agent, role, operation, status, started_at, worktree_path)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'running', ?6, ?7)",
+             (task_id, attempt_number, agent, role, operation, status, started_at, worktree_path, source_base)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'running', ?6, ?7, ?8)",
             params![
                 task_id,
                 attempt_number,
@@ -453,7 +503,8 @@ impl FactoryDb {
                 role,
                 operation.map(TaskOperation::as_str),
                 now(),
-                worktree_path
+                worktree_path,
+                source_base
             ],
         )?;
         self.get_task_attempt(self.conn.last_insert_rowid())?
@@ -474,7 +525,7 @@ impl FactoryDb {
         self.conn
             .query_row(
                 "SELECT id, task_id, attempt_number, agent, status, started_at, finished_at,
-                        worktree_path, commit_sha, exit_code, error, evidence, review, role, operation
+                        worktree_path, commit_sha, exit_code, error, evidence, review, role, operation, source_base
                  FROM task_attempts WHERE id = ?1",
                 params![id],
                 build_attempt,
@@ -487,7 +538,7 @@ impl FactoryDb {
         let mut statement = self.conn.prepare(
             "SELECT a.id, a.task_id, a.attempt_number, a.agent, a.status, a.started_at,
                     a.finished_at, a.worktree_path, a.commit_sha, a.exit_code, a.error,
-                    a.evidence, a.review, a.role, a.operation
+                    a.evidence, a.review, a.role, a.operation, a.source_base
              FROM task_attempts a
              JOIN tasks t ON t.id = a.task_id
              WHERE t.run_id = ?1
@@ -503,7 +554,7 @@ impl FactoryDb {
         self.conn
             .query_row(
                 "SELECT id, task_id, attempt_number, agent, status, started_at, finished_at,
-                        worktree_path, commit_sha, exit_code, error, evidence, review, role, operation
+                        worktree_path, commit_sha, exit_code, error, evidence, review, role, operation, source_base
                  FROM task_attempts WHERE task_id = ?1 ORDER BY attempt_number DESC LIMIT 1",
                 params![task_id],
                 build_attempt,
@@ -548,6 +599,17 @@ impl FactoryDb {
                 review,
                 id
             ],
+        )?;
+        Ok(())
+    }
+
+    /// Records the commit the attempt was merged onto the run branch as. Used
+    /// by the integration lane after the freshness review approves; the
+    /// attempt stays `Approved` until integrated.
+    pub fn set_attempt_commit(&self, id: i64, commit_sha: Option<&str>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE task_attempts SET commit_sha = ?1 WHERE id = ?2",
+            params![commit_sha, id],
         )?;
         Ok(())
     }
@@ -654,6 +716,14 @@ impl FactoryDb {
             "UPDATE tasks SET state = 'failed', updated_at = ?1 WHERE state = 'running'",
             params![timestamp],
         )?;
+        // A task interrupted mid-integration retries the lane from its
+        // awaiting_integration spot on the next start; the run branch head is
+        // untouched because integration commits only land after approval.
+        let requeued_integrations = self.conn.execute(
+            "UPDATE tasks SET state = 'awaiting_integration', updated_at = ?1
+             WHERE state = 'integrating'",
+            params![timestamp],
+        )?;
         let runs = self.conn.execute(
             "UPDATE runs SET status = 'failed', updated_at = ?1
              WHERE status IN ('planning', 'active')",
@@ -663,6 +733,7 @@ impl FactoryDb {
             sessions,
             attempts,
             tasks,
+            requeued_integrations,
             runs,
         })
     }
@@ -673,6 +744,8 @@ pub struct Reconciliation {
     pub sessions: usize,
     pub attempts: usize,
     pub tasks: usize,
+    /// Integrating tasks reset to awaiting_integration on restart.
+    pub requeued_integrations: usize,
     pub runs: usize,
 }
 
@@ -756,6 +829,7 @@ fn build_attempt(r: &rusqlite::Row<'_>) -> rusqlite::Result<TaskAttempt> {
         started_at: r.get(5)?,
         finished_at: r.get(6)?,
         worktree_path: r.get(7)?,
+        source_base: r.get(15)?,
         commit_sha: r.get(8)?,
         exit_code: r.get(9)?,
         error: r.get(10)?,
@@ -933,8 +1007,25 @@ END WHERE operation IS NULL;
 /// `NULL` until the first implementation task is approved.
 const V7_SCHEMA: &str = "ALTER TABLE runs ADD COLUMN integration_sha TEXT;";
 
+/// Parallel runtime: the immutable base commit a run started from. The
+/// `factory/run-<id>` branch is created at this commit when the run starts.
+const V8_SCHEMA: &str = "ALTER TABLE runs ADD COLUMN base_sha TEXT;";
+
+/// Parallel runtime: the commit each task attempt's worktree was based on.
+/// The integration lane compares this with the run branch head to detect
+/// stale bases and replay/rebase before merging.
+const V9_SCHEMA: &str = "ALTER TABLE task_attempts ADD COLUMN source_base TEXT;";
+
 const MIGRATIONS: &[&str] = &[
-    V1_SCHEMA, V2_SCHEMA, V3_SCHEMA, V4_SCHEMA, V5_SCHEMA, V6_SCHEMA, V7_SCHEMA,
+    V1_SCHEMA,
+    V2_SCHEMA,
+    V3_SCHEMA,
+    V4_SCHEMA,
+    V5_SCHEMA,
+    V6_SCHEMA,
+    V7_SCHEMA,
+    V8_SCHEMA,
+    V9_SCHEMA,
 ];
 
 fn migrate(conn: &mut Connection) -> Result<()> {
@@ -985,12 +1076,12 @@ mod tests {
         let path = dir.path().join("test.db");
         let db = FactoryDb::open(&path).unwrap();
         let versions = schema_versions(&path);
-        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
         db.create_run("objective", Some("codex")).unwrap();
         drop(db);
 
         let db = FactoryDb::open(&path).unwrap();
-        assert_eq!(schema_versions(&path), vec![1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(schema_versions(&path), vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
         db.list_runs().unwrap();
     }
 
@@ -1015,7 +1106,7 @@ mod tests {
         drop(conn);
 
         let db = FactoryDb::open(&path).unwrap();
-        assert_eq!(schema_versions(&path), vec![1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(schema_versions(&path), vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
         let run = db.get_run(1).unwrap().unwrap();
         assert_eq!(run.objective, "legacy");
         let tasks = db.list_tasks(1).unwrap();
@@ -1070,7 +1161,7 @@ mod tests {
 
         let db = FactoryDb::open(&path).unwrap();
         // opening records versions 6 and 7 exactly once
-        assert_eq!(schema_versions(&path), vec![1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(schema_versions(&path), vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
         let tasks = db.list_tasks(1).unwrap();
         let operation_of = |title: &str| {
             tasks
@@ -1370,7 +1461,7 @@ mod tests {
             )
             .unwrap();
         let attempt = db
-            .create_task_attempt(task, "worker", None, "opencode", "worktree")
+            .create_task_attempt(task, "worker", None, "opencode", "worktree", Some("base123"))
             .unwrap();
         let evidence = TaskEvidence {
             changed_files: vec!["src/lib.rs".into()],
@@ -1402,6 +1493,7 @@ mod tests {
         assert_eq!(loaded.status, AttemptStatus::Approved);
         assert_eq!(loaded.agent, "opencode");
         assert_eq!(loaded.role.as_deref(), Some("worker"));
+        assert_eq!(loaded.source_base.as_deref(), Some("base123"));
         assert_eq!(loaded.evidence, Some(evidence));
         assert_eq!(loaded.review, Some(review));
         assert!(loaded.finished_at.is_some());
@@ -1463,11 +1555,11 @@ mod tests {
             )
             .unwrap();
         assert_eq!(db.count_task_attempts(run.id).unwrap(), 0);
-        db.create_task_attempt(task, "worker", None, "opencode", "worktree")
+        db.create_task_attempt(task, "worker", None, "opencode", "worktree", None)
             .unwrap();
-        db.create_task_attempt(task, "worker", None, "qwen", "worktree")
+        db.create_task_attempt(task, "worker", None, "qwen", "worktree", None)
             .unwrap();
-        db.create_task_attempt(other_task, "worker", None, "claude", "worktree")
+        db.create_task_attempt(other_task, "worker", None, "claude", "worktree", None)
             .unwrap();
         assert_eq!(db.count_task_attempts(run.id).unwrap(), 2);
         assert_eq!(db.count_task_attempts(other.id).unwrap(), 1);
@@ -1503,7 +1595,7 @@ mod tests {
             )
             .unwrap();
         let attempt = db
-            .create_task_attempt(research, "researcher", None, "search-agent", "worktree")
+            .create_task_attempt(research, "researcher", None, "search-agent", "worktree", None)
             .unwrap();
         let artifact = db
             .insert_role_artifact(
@@ -1557,7 +1649,7 @@ mod tests {
             )
             .unwrap();
         let attempt = db
-            .create_task_attempt(task, "worker", None, "opencode", "worktree")
+            .create_task_attempt(task, "worker", None, "opencode", "worktree", None)
             .unwrap();
         let session = db
             .insert_agent_session(&AgentSession {
@@ -1580,10 +1672,24 @@ mod tests {
             })
             .unwrap();
 
+        let integrating_task = db
+            .create_task(
+                run.id,
+                "Integrating",
+                "objective",
+                &[],
+                TaskState::Integrating,
+                1,
+                None,
+                None,
+            )
+            .unwrap();
+
         let reconciled = db.reconcile_interrupted().unwrap();
         assert_eq!(reconciled.sessions, 1);
         assert_eq!(reconciled.attempts, 1);
         assert_eq!(reconciled.tasks, 1);
+        assert_eq!(reconciled.requeued_integrations, 1);
         assert_eq!(reconciled.runs, 1);
         assert_eq!(
             db.get_agent_session(session.id).unwrap().unwrap().status,
@@ -1594,6 +1700,11 @@ mod tests {
             AttemptStatus::Interrupted
         );
         assert_eq!(db.get_task(task).unwrap().unwrap().state, TaskState::Failed);
+        // Interrupted integrations retry from the awaiting_integration spot.
+        assert_eq!(
+            db.get_task(integrating_task).unwrap().unwrap().state,
+            TaskState::AwaitingIntegration
+        );
         assert_eq!(
             db.get_run(run.id).unwrap().unwrap().status,
             RunStatus::Failed

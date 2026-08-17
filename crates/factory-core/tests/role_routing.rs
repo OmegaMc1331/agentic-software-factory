@@ -46,6 +46,7 @@ fn command_entry(script: &str) -> AgentEntry {
         prompt_transport: None,
         interactive_args: None,
         capabilities: Vec::new(),
+        max_concurrency: None,
     }
 }
 

@@ -40,6 +40,7 @@ fn command_entry(script: &str) -> AgentEntry {
             prompt_transport: None,
             interactive_args: None,
             capabilities: Vec::new(),
+            max_concurrency: None,
         }
     } else {
         AgentEntry {
@@ -50,6 +51,7 @@ fn command_entry(script: &str) -> AgentEntry {
             prompt_transport: None,
             interactive_args: None,
             capabilities: Vec::new(),
+            max_concurrency: None,
         }
     }
 }
@@ -317,6 +319,7 @@ fn a_broken_worker_executable_blocks_the_workflow_without_consuming_retries() {
             prompt_transport: None,
             interactive_args: None,
             capabilities: Vec::new(),
+            max_concurrency: None,
         },
     );
     config.write_atomic(dir.path()).unwrap();

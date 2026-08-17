@@ -531,6 +531,7 @@ mod tests {
                 prompt_transport: Some(PromptTransport::Disabled),
                 interactive_args: Some(interactive_args),
                 capabilities: Vec::new(),
+                max_concurrency: None,
             },
         );
         config.write_atomic(dir.path()).unwrap();
@@ -595,6 +596,7 @@ mod tests {
                 prompt_transport: Some(PromptTransport::Disabled),
                 interactive_args: Some(Vec::new()),
                 capabilities: Vec::new(),
+                max_concurrency: None,
             },
         );
         config.write_atomic(dir.path()).unwrap();

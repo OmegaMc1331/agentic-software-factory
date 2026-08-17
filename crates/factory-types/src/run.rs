@@ -37,17 +37,29 @@ impl RunStatus {
         if tasks.iter().any(|t| t.state == TaskState::Failed) {
             return RunStatus::Failed;
         }
+        // AwaitingIntegration/Integrating tasks are still active work: they must
+        // not let a Blocked sibling collapse the run while they can integrate.
         if tasks.iter().any(|t| t.state == TaskState::Blocked)
-            && !tasks
-                .iter()
-                .any(|t| matches!(t.state, TaskState::Ready | TaskState::Running))
+            && !tasks.iter().any(|t| {
+                matches!(
+                    t.state,
+                    TaskState::Ready
+                        | TaskState::Running
+                        | TaskState::AwaitingIntegration
+                        | TaskState::Integrating
+                )
+            })
         {
             return RunStatus::Blocked;
         }
         let started = tasks.iter().any(|t| {
             matches!(
                 t.state,
-                TaskState::Running | TaskState::Completed | TaskState::Blocked
+                TaskState::Running
+                    | TaskState::AwaitingIntegration
+                    | TaskState::Integrating
+                    | TaskState::Completed
+                    | TaskState::Blocked
             )
         });
         if started {

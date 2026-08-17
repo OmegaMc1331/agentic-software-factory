@@ -13,6 +13,7 @@ use factory_types::{
 use thiserror::Error;
 
 use crate::config::{AgentResolutionError, Agents, ConfigError};
+use crate::capacity::AgentCapacity;
 use crate::mission::{
     build_mission, parse_advisory_report, parse_producer_report, parse_review,
     parse_specialized_review, review_result_from, MissionContext, ReviewInput,
@@ -116,6 +117,7 @@ pub struct Factory {
     db: FactoryDb,
     agents: Agents,
     root: std::path::PathBuf,
+    capacity: AgentCapacity,
 }
 
 impl Factory {
@@ -128,6 +130,7 @@ impl Factory {
             db,
             agents: Agents::load(root)?,
             root: root.to_path_buf(),
+            capacity: AgentCapacity::new(),
         })
     }
 
@@ -140,6 +143,7 @@ impl Factory {
             db: FactoryDb::open(&db_path)?,
             agents: Agents::load(root)?,
             root: root.to_path_buf(),
+            capacity: AgentCapacity::new(),
         })
     }
 
@@ -553,16 +557,18 @@ impl Factory {
                 .unwrap_or_else(|| roles::WORKER.to_string());
             let worker_pool = team.agents_for_role(&role).to_vec();
             let worker_index = self.db.count_task_attempts(task.run_id)?;
-            let worker_name = roles::select_agent(&worker_pool, worker_index)
+            let worker_name = roles::select_agent_with_capacity(&worker_pool, worker_index, &self.capacity)
                 .ok_or_else(|| FactoryError::TaskRoleUnavailable(task.id, role.clone()))?
                 .clone();
             let worker = self.agents.command_agent_for(&role, &worker_name)?;
+            let _worker_load = self.capacity.acquire(worker.name());
             let attempt = self.db.create_task_attempt(
                 task_id,
                 &role,
                 Some(operation),
                 worker.name(),
                 &worktree.to_string_lossy(),
+                Some(&base_sha),
             )?;
             self.mark_task(task_id, TaskState::Running)?;
 
@@ -680,13 +686,15 @@ impl Factory {
 
             self.db
                 .set_task_attempt_status(attempt.id, AttemptStatus::Reviewing)?;
-            let reviewer_name = roles::select_agent(
+            let reviewer_name = roles::select_agent_with_capacity(
                 &team.reviewers,
                 attempt.attempt_number.saturating_sub(1) as usize,
+                &self.capacity,
             )
             .ok_or_else(|| FactoryError::TaskRoleUnavailable(task.id, "reviewer".into()))?
             .clone();
             let reviewer = self.agents.command_agent_for("reviewer", &reviewer_name)?;
+            let _reviewer_load = self.capacity.acquire(reviewer.name());
             let reviewer_role = catalog
                 .get(roles::REVIEWER)
                 .cloned()
@@ -857,16 +865,18 @@ impl Factory {
                 .unwrap_or_else(|| roles::WORKER.to_string());
             let pool = team.agents_for_role(&role).to_vec();
             let index = self.db.count_task_attempts(task.run_id)?;
-            let agent_name = roles::select_agent(&pool, index)
+            let agent_name = roles::select_agent_with_capacity(&pool, index, &self.capacity)
                 .ok_or_else(|| FactoryError::TaskRoleUnavailable(task.id, role.clone()))?
                 .clone();
             let agent = self.agents.command_agent_for(&role, &agent_name)?;
+            let _advisory_load = self.capacity.acquire(agent.name());
             let attempt = self.db.create_task_attempt(
                 task_id,
                 &role,
                 Some(TaskOperation::Advisory),
                 agent.name(),
                 &worktree.to_string_lossy(),
+                Some(&base_sha),
             )?;
             self.mark_task(task_id, TaskState::Running)?;
 
@@ -1017,10 +1027,11 @@ impl Factory {
             .unwrap_or_else(|| roles::REVIEWER.to_string());
         let pool = team.agents_for_role(&role).to_vec();
         let index = self.db.count_task_attempts(task.run_id)?;
-        let reviewer_name = roles::select_agent(&pool, index)
+        let reviewer_name = roles::select_agent_with_capacity(&pool, index, &self.capacity)
             .ok_or_else(|| FactoryError::TaskRoleUnavailable(task.id, role.clone()))?
             .clone();
         let reviewer = self.agents.command_agent_for(&role, &reviewer_name)?;
+        let _reviewer_load = self.capacity.acquire(reviewer.name());
 
         loop {
             let task = self
@@ -1047,6 +1058,7 @@ impl Factory {
                 Some(TaskOperation::Review),
                 reviewer.name(),
                 &worktree.to_string_lossy(),
+                Some(&base_sha),
             )?;
             self.mark_task(task_id, TaskState::Running)?;
 
