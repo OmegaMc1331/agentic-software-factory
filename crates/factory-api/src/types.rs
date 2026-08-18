@@ -13,6 +13,9 @@ pub struct TaskCounts {
     pub blocked: usize,
     pub failed: usize,
     pub completed: usize,
+    /// Replaced by a replan; terminal but inert.
+    #[serde(default)]
+    pub superseded: usize,
     pub total: usize,
 }
 
@@ -27,6 +30,7 @@ impl TaskCounts {
             blocked: 0,
             failed: 0,
             completed: 0,
+            superseded: 0,
             total: tasks.len(),
         };
         for task in tasks {
@@ -39,6 +43,7 @@ impl TaskCounts {
                 TaskState::Blocked => counts.blocked += 1,
                 TaskState::Failed => counts.failed += 1,
                 TaskState::Completed => counts.completed += 1,
+                TaskState::Superseded => counts.superseded += 1,
             }
         }
         counts

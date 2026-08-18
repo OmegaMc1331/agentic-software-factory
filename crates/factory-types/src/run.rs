@@ -31,11 +31,16 @@ impl RunStatus {
         if tasks.is_empty() {
             return RunStatus::Planned;
         }
-        if tasks.iter().all(|t| t.state == TaskState::Completed) {
-            return RunStatus::Completed;
-        }
         if tasks.iter().any(|t| t.state == TaskState::Failed) {
             return RunStatus::Failed;
+        }
+        // Superseded tasks are terminal-but-inert: they no longer advance the
+        // run, so a run whose active work is fully settled is Completed.
+        if tasks
+            .iter()
+            .all(|t| matches!(t.state, TaskState::Completed | TaskState::Superseded))
+        {
+            return RunStatus::Completed;
         }
         // AwaitingIntegration/Integrating tasks are still active work: they must
         // not let a Blocked sibling collapse the run while they can integrate.
@@ -94,6 +99,9 @@ pub struct Run {
     pub objective: String,
     pub status: RunStatus,
     pub planner_agent: Option<String>,
+    /// Durable plan revision; bumped by the planner, manual edits, and replans.
+    #[serde(default)]
+    pub plan_revision: i64,
     #[serde(default)]
     pub team: Option<crate::team::WorkflowTeam>,
     pub created_at: String,

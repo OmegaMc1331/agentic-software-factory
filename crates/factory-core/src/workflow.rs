@@ -67,6 +67,9 @@ impl Workflow {
             // instead of restarting the workflow, represented as fresh
             // attempts rather than a cyclic DAG.
             TaskState::Completed => vec![TaskState::Ready],
+            // A superseded task was replaced by a replan; it is terminal and
+            // inert, so it never transitions to an active state.
+            TaskState::Superseded => Vec::new(),
         }
     }
 
@@ -78,7 +81,10 @@ impl Workflow {
             .any(|s| matches!(s, TaskState::Failed | TaskState::Blocked))
         {
             TaskState::Blocked
-        } else if dep_states.iter().all(|s| *s == TaskState::Completed) {
+        } else if dep_states
+            .iter()
+            .all(|s| matches!(s, TaskState::Completed | TaskState::Superseded))
+        {
             TaskState::Ready
         } else {
             TaskState::Pending
@@ -138,6 +144,20 @@ mod tests {
         // review requests changes; retries stay bounded by attempt counts.
         assert_eq!(Workflow::allowed_targets(Completed), vec![Ready]);
         assert!(Workflow::can_transition(Completed, Ready));
+    }
+
+    #[test]
+    fn superseded_is_terminal_and_unblocks_dependents() {
+        // A replan archives the replaced scope; superseded tasks never run
+        // again but count as satisfied for downstream scheduling.
+        assert_eq!(Workflow::allowed_targets(Superseded), Vec::new());
+        assert!(!Workflow::can_transition(Superseded, Ready));
+        assert!(!Workflow::can_transition(Superseded, Running));
+        assert!(Workflow::can_transition(Superseded, Superseded));
+        assert_eq!(
+            Workflow::next_state_for_dependent(&[Completed, Superseded]),
+            Ready
+        );
     }
 
     #[test]

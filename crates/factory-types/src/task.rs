@@ -14,6 +14,10 @@ pub enum TaskState {
     Blocked,
     Failed,
     Completed,
+    /// The task was superseded by a partial replan: it no longer advances the
+    /// run but its rows and dependency edges are kept for visual reference.
+    /// Never scheduled, never considered for completion or blocking.
+    Superseded,
 }
 
 impl TaskState {
@@ -27,6 +31,7 @@ impl TaskState {
             TaskState::Blocked => "blocked",
             TaskState::Failed => "failed",
             TaskState::Completed => "completed",
+            TaskState::Superseded => "superseded",
         }
     }
 }
@@ -44,6 +49,7 @@ impl std::str::FromStr for TaskState {
             "blocked" => Ok(TaskState::Blocked),
             "failed" => Ok(TaskState::Failed),
             "completed" => Ok(TaskState::Completed),
+            "superseded" => Ok(TaskState::Superseded),
             other => Err(format!("unknown task state '{other}'")),
         }
     }

@@ -2115,6 +2115,7 @@ mod tests {
             status,
             planner_agent: None,
             team: None,
+            plan_revision: 1,
             created_at: String::new(),
             updated_at: String::new(),
         };

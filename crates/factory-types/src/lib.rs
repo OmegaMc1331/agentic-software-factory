@@ -1,6 +1,8 @@
 pub mod artifact;
 pub mod attempt;
 pub mod plan;
+pub mod plan_edit;
+pub mod plans;
 pub mod run;
 pub mod session;
 pub mod task;
@@ -12,6 +14,14 @@ pub use attempt::{
     TaskAttempt, TaskEvidence,
 };
 pub use plan::{Plan, PlannedTask};
+pub use plan_edit::{
+    is_immutable, mutable_scope, resolve_patch, resolve_replan, PlanApplyOutcome, PlanState,
+    ResolvedPlan, ResolvedTask,
+};
+pub use plans::{
+    PlanDiagnostic, PlanMutation, PlanPatch, PlanRevisionRecord, PlanRevisionSource, PlanSnapshot,
+    ReplanRequest, TaskRef,
+};
 pub use run::{Run, RunStatus};
 pub use session::{AgentSession, AgentSessionMode};
 pub use task::{Task, TaskState};

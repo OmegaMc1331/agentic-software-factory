@@ -4,10 +4,13 @@ pub use error::DbError;
 
 use chrono::Utc;
 use factory_types::{
-    AgentSession, AgentSessionMode, AttemptStatus, Plan, ReviewResult, RoleArtifact, Run,
-    RunStatus, Task, TaskAttempt, TaskEvidence, TaskOperation, TaskState,
+    resolve_patch, resolve_replan, AgentSession, AgentSessionMode, AttemptStatus, Plan,
+    PlanApplyOutcome, PlanPatch, PlanRevisionRecord, PlanRevisionSource, PlanSnapshot, PlanState,
+    ReplanRequest, ResolvedPlan, ReviewResult, RoleArtifact, Run, RunStatus, Task, TaskAttempt,
+    TaskEvidence, TaskOperation, TaskState,
 };
 use rusqlite::{params, Connection, OptionalExtension};
+use std::collections::HashMap;
 use std::path::Path;
 
 pub type Result<T> = std::result::Result<T, DbError>;
@@ -54,7 +57,7 @@ impl FactoryDb {
         let row = self
             .conn
             .query_row(
-                "SELECT id, objective, status, planner_agent, created_at, updated_at, team
+                "SELECT id, objective, status, planner_agent, created_at, updated_at, team, plan_revision
                  FROM runs WHERE id = ?1",
                 params![id],
                 build_run,
@@ -65,7 +68,7 @@ impl FactoryDb {
 
     pub fn list_runs(&self) -> Result<Vec<Run>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, objective, status, planner_agent, created_at, updated_at, team
+            "SELECT id, objective, status, planner_agent, created_at, updated_at, team, plan_revision
              FROM runs ORDER BY id DESC",
         )?;
         let rows = stmt
@@ -225,12 +228,45 @@ impl FactoryDb {
                 params![state.as_str(), ts, task_id],
             )?;
         }
+        let final_tasks: Vec<Task> = plan
+            .tasks
+            .iter()
+            .enumerate()
+            .map(|(position, task)| Task {
+                id: ids[&task.id],
+                run_id,
+                title: task.title.clone(),
+                objective: task.objective.clone(),
+                acceptance_criteria: task.acceptance_criteria.clone(),
+                state: if task.dependencies.is_empty() {
+                    TaskState::Ready
+                } else {
+                    TaskState::Pending
+                },
+                position: position as i32,
+                dependencies: task.dependencies.iter().map(|d| ids[d]).collect(),
+                worktree_path: None,
+                role: task.role.clone(),
+                operation: task.operation,
+                created_at: ts.clone(),
+                updated_at: ts.clone(),
+            })
+            .collect();
         tx.execute(
-            "UPDATE runs SET objective = ?1, status = 'planned', updated_at = ?2 WHERE id = ?3",
+            "UPDATE runs SET objective = ?1, status = 'planned', plan_revision = 1, updated_at = ?2 WHERE id = ?3",
             params![plan.objective, ts, run_id],
         )?;
+        let snapshot = serde_json::to_string(&PlanSnapshot {
+            objective: plan.objective.clone(),
+            tasks: final_tasks.clone(),
+        })?;
+        tx.execute(
+            "INSERT INTO plan_revisions (run_id, revision, source, reason, planner_session_id, snapshot, created_at)
+             VALUES (?1, 1, 'planner', NULL, NULL, ?2, ?3)",
+            params![run_id, snapshot, ts],
+        )?;
         tx.commit()?;
-        self.list_tasks(run_id)
+        Ok(final_tasks)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -344,6 +380,135 @@ impl FactoryDb {
             self.set_run_status(run_id, status)?;
         }
         Ok(())
+    }
+
+    /// The run's current plan revision. Initial planner output is revision 1.
+    pub fn get_plan_revision(&self, run_id: i64) -> Result<i64> {
+        self.conn
+            .query_row(
+                "SELECT plan_revision FROM runs WHERE id = ?1",
+                params![run_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or(DbError::NotFound("run"))
+    }
+
+    /// Snapshot of the run's plan for validation and resolution: revision,
+    /// objective, tasks, and per-task attempt counts.
+    pub fn plan_state(&self, run_id: i64) -> Result<PlanState> {
+        load_plan_state(&self.conn, run_id)
+    }
+
+    /// Applies a batch of plan mutations atomically. The expected revision is
+    /// re-checked inside the transaction so a stale editor session is rejected
+    /// with [`DbError::Conflict`], while a structurally invalid patch returns
+    /// [`PlanApplyOutcome::Invalid`] (nothing is written).
+    pub fn apply_plan_patch(
+        &self,
+        run_id: i64,
+        patch: &PlanPatch,
+        source: PlanRevisionSource,
+        reason: Option<&str>,
+        planner_session_id: Option<i64>,
+    ) -> Result<PlanApplyOutcome> {
+        let tx = self.conn.unchecked_transaction()?;
+        let state = load_plan_state(&tx, run_id)?;
+        if state.revision != patch.expected_revision {
+            return Err(DbError::Conflict {
+                expected: patch.expected_revision,
+                current: state.revision,
+            });
+        }
+        let resolved = match resolve_patch(&state, patch) {
+            Ok(resolved) => resolved,
+            Err(diagnostics) => return Ok(PlanApplyOutcome::Invalid(diagnostics)),
+        };
+        let (revision, tasks) = apply_resolved(
+            &tx,
+            run_id,
+            &state,
+            &resolved,
+            source,
+            reason,
+            planner_session_id,
+        )?;
+        tx.commit()?;
+        Ok(PlanApplyOutcome::Applied {
+            run_id,
+            revision,
+            tasks,
+        })
+    }
+
+    /// Applies a partial replan atomically. The scope is computed from the
+    /// real dependency graph inside the transaction; the mutable scope is
+    /// superseded and the new plan is spliced in. Conflicts and invalid replans
+    /// behave like [`apply_plan_patch`](Self::apply_plan_patch).
+    pub fn apply_replan(
+        &self,
+        run_id: i64,
+        request: &ReplanRequest,
+        source: PlanRevisionSource,
+        reason: Option<&str>,
+        planner_session_id: Option<i64>,
+    ) -> Result<PlanApplyOutcome> {
+        let tx = self.conn.unchecked_transaction()?;
+        let state = load_plan_state(&tx, run_id)?;
+        if state.revision != request.expected_revision {
+            return Err(DbError::Conflict {
+                expected: request.expected_revision,
+                current: state.revision,
+            });
+        }
+        let resolved = match resolve_replan(&state, request) {
+            Ok(resolved) => resolved,
+            Err(diagnostics) => return Ok(PlanApplyOutcome::Invalid(diagnostics)),
+        };
+        let (revision, tasks) = apply_resolved(
+            &tx,
+            run_id,
+            &state,
+            &resolved,
+            source,
+            reason,
+            planner_session_id,
+        )?;
+        tx.commit()?;
+        Ok(PlanApplyOutcome::Applied {
+            run_id,
+            revision,
+            tasks,
+        })
+    }
+
+    /// Every durable revision of the run's plan, oldest first.
+    pub fn list_plan_revisions(&self, run_id: i64) -> Result<Vec<PlanRevisionRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, run_id, revision, source, reason, planner_session_id, snapshot, created_at
+             FROM plan_revisions WHERE run_id = ?1 ORDER BY revision",
+        )?;
+        let rows = stmt
+            .query_map(params![run_id], build_plan_revision)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// A single durable revision record, when it exists.
+    pub fn get_plan_revision_record(
+        &self,
+        run_id: i64,
+        revision: i64,
+    ) -> Result<Option<PlanRevisionRecord>> {
+        self.conn
+            .query_row(
+                "SELECT id, run_id, revision, source, reason, planner_session_id, snapshot, created_at
+                 FROM plan_revisions WHERE run_id = ?1 AND revision = ?2",
+                params![run_id, revision],
+                build_plan_revision,
+            )
+            .optional()
+            .map_err(Into::into)
     }
 
     pub fn set_worktree_path(&self, id: i64, path: Option<&str>) -> Result<()> {
@@ -757,6 +922,7 @@ fn build_run(r: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
         status: run_status(r.get::<_, String>(2)?),
         planner_agent: r.get(3)?,
         team: team.and_then(|value| serde_json::from_str(&value).ok()),
+        plan_revision: r.get(7)?,
         created_at: r.get(4)?,
         updated_at: r.get(5)?,
     })
@@ -782,6 +948,274 @@ fn build_task(r: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         created_at: r.get(8)?,
         updated_at: r.get(9)?,
     })
+}
+
+fn build_plan_revision(r: &rusqlite::Row<'_>) -> rusqlite::Result<PlanRevisionRecord> {
+    let snapshot: String = r.get(6)?;
+    Ok(PlanRevisionRecord {
+        id: r.get(0)?,
+        run_id: r.get(1)?,
+        revision: r.get(2)?,
+        source: r
+            .get::<_, String>(3)?
+            .parse()
+            .unwrap_or(PlanRevisionSource::Planner),
+        reason: r.get(4)?,
+        planner_session_id: r.get(5)?,
+        snapshot: serde_json::from_str(&snapshot)
+            .unwrap_or_else(|_| PlanSnapshot {
+                objective: String::new(),
+                tasks: Vec::new(),
+            }),
+        created_at: r.get(7)?,
+    })
+}
+
+/// Loads the run's current plan (revision, objective, full task graph with
+/// dependencies and attempt counts) for validation and resolution.
+fn load_plan_state(conn: &Connection, run_id: i64) -> Result<PlanState> {
+    let objective = conn
+        .query_row(
+            "SELECT objective FROM runs WHERE id = ?1",
+            params![run_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .ok_or(DbError::NotFound("run"))?;
+    let revision = conn.query_row(
+        "SELECT plan_revision FROM runs WHERE id = ?1",
+        params![run_id],
+        |row| row.get::<_, i64>(0),
+    )?;
+
+    let mut stmt = conn.prepare(
+        "SELECT id, run_id, title, objective, acceptance_criteria, state, position, worktree_path, created_at, updated_at, role, operation
+         FROM tasks WHERE run_id = ?1 ORDER BY position",
+    )?;
+    let mut tasks: Vec<Task> = stmt
+        .query_map(params![run_id], build_task)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    let mut dep_stmt = conn.prepare(
+        "SELECT td.task_id, td.depends_on
+         FROM task_dependencies td JOIN tasks t ON t.id = td.task_id
+         WHERE t.run_id = ?1 ORDER BY td.task_id",
+    )?;
+    let mut deps: HashMap<i64, Vec<i64>> = HashMap::new();
+    let dep_rows = dep_stmt.query_map(params![run_id], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+    })?;
+    for row in dep_rows {
+        let (task_id, depends_on) = row?;
+        deps.entry(task_id).or_default().push(depends_on);
+    }
+    for task in &mut tasks {
+        task.dependencies = deps.remove(&task.id).unwrap_or_default();
+    }
+
+    let mut attempt_stmt = conn.prepare(
+        "SELECT a.task_id, COUNT(*)
+         FROM task_attempts a JOIN tasks t ON t.id = a.task_id
+         WHERE t.run_id = ?1 GROUP BY a.task_id",
+    )?;
+    let mut attempts: HashMap<i64, usize> = HashMap::new();
+    let attempt_rows = attempt_stmt.query_map(params![run_id], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)? as usize))
+    })?;
+    for row in attempt_rows {
+        let (task_id, count) = row?;
+        attempts.insert(task_id, count);
+    }
+
+    Ok(PlanState {
+        revision,
+        objective,
+        tasks,
+        attempts,
+    })
+}
+
+/// Persists a fully resolved plan as the run's new revision: mutates tasks,
+/// supersedes/removes scope, rewrites the dependency graph, records the
+/// snapshot in `plan_revisions`, and reconciles the run status.
+#[allow(clippy::too_many_arguments)]
+fn apply_resolved(
+    tx: &rusqlite::Transaction,
+    run_id: i64,
+    state: &PlanState,
+    resolved: &ResolvedPlan,
+    source: PlanRevisionSource,
+    reason: Option<&str>,
+    planner_session_id: Option<i64>,
+) -> Result<(i64, Vec<Task>)> {
+    let ts = now();
+    let mut id_map: HashMap<i64, i64> = HashMap::new();
+
+    for task in &resolved.tasks {
+        if !task.insert {
+            continue;
+        }
+        let criteria = serde_json::to_string(&task.acceptance_criteria)?;
+        tx.execute(
+            "INSERT INTO tasks (run_id, title, objective, acceptance_criteria, state, position, role, operation, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                run_id,
+                task.title,
+                task.objective,
+                criteria,
+                task.state.as_str(),
+                task.position,
+                task.role,
+                task.operation.map(TaskOperation::as_str),
+                ts,
+                ts
+            ],
+        )?;
+        id_map.insert(task.id, tx.last_insert_rowid());
+    }
+
+    for task in &resolved.tasks {
+        if task.insert {
+            continue;
+        }
+        let criteria = serde_json::to_string(&task.acceptance_criteria)?;
+        tx.execute(
+            "UPDATE tasks SET title = ?1, objective = ?2, acceptance_criteria = ?3, state = ?4, position = ?5, role = ?6, operation = ?7, updated_at = ?8
+             WHERE id = ?9",
+            params![
+                task.title,
+                task.objective,
+                criteria,
+                task.state.as_str(),
+                task.position,
+                task.role,
+                task.operation.map(TaskOperation::as_str),
+                ts,
+                task.id
+            ],
+        )?;
+    }
+
+    for id in &resolved.superseded {
+        tx.execute(
+            "UPDATE tasks SET state = 'superseded', updated_at = ?1 WHERE id = ?2",
+            params![ts, id],
+        )?;
+    }
+
+    if !resolved.removed.is_empty() {
+        let placeholders = vec!["?"; resolved.removed.len()].join(",");
+        let sql = format!("DELETE FROM tasks WHERE id IN ({placeholders})");
+        tx.execute(&sql, rusqlite::params_from_iter(resolved.removed.iter().copied()))?;
+    }
+
+    for task in &resolved.tasks {
+        let real_id = id_map.get(&task.id).copied().unwrap_or(task.id);
+        tx.execute(
+            "DELETE FROM task_dependencies WHERE task_id = ?1",
+            params![real_id],
+        )?;
+        for dep in &task.dependencies {
+            let real_dep = id_map.get(dep).copied().unwrap_or(*dep);
+            tx.execute(
+                "INSERT INTO task_dependencies (task_id, depends_on) VALUES (?1, ?2)",
+                params![real_id, real_dep],
+            )?;
+        }
+    }
+
+    let mut final_tasks: Vec<Task> = Vec::new();
+    for original in &state.tasks {
+        if resolved.removed.contains(&original.id) {
+            continue;
+        }
+        let mut task = original.clone();
+        if resolved.superseded.contains(&original.id) {
+            task.state = TaskState::Superseded;
+            final_tasks.push(task);
+            continue;
+        }
+        if let Some(rt) = resolved
+            .tasks
+            .iter()
+            .find(|rt| !rt.insert && rt.id == original.id)
+        {
+            task.title = rt.title.clone();
+            task.objective = rt.objective.clone();
+            task.acceptance_criteria = rt.acceptance_criteria.clone();
+            task.state = rt.state;
+            task.position = rt.position;
+            task.role = rt.role.clone();
+            task.operation = rt.operation;
+            task.dependencies = rt
+                .dependencies
+                .iter()
+                .map(|d| id_map.get(d).copied().unwrap_or(*d))
+                .collect();
+            task.updated_at = ts.clone();
+        }
+        final_tasks.push(task);
+    }
+    for rt in resolved.tasks.iter().filter(|rt| rt.insert) {
+        let real_id = id_map[&rt.id];
+        final_tasks.push(Task {
+            id: real_id,
+            run_id,
+            title: rt.title.clone(),
+            objective: rt.objective.clone(),
+            acceptance_criteria: rt.acceptance_criteria.clone(),
+            state: rt.state,
+            position: rt.position,
+            dependencies: rt
+                .dependencies
+                .iter()
+                .map(|d| id_map.get(d).copied().unwrap_or(*d))
+                .collect(),
+            worktree_path: None,
+            role: rt.role.clone(),
+            operation: rt.operation,
+            created_at: ts.clone(),
+            updated_at: ts.clone(),
+        });
+    }
+
+    let status = RunStatus::from_tasks(&final_tasks);
+    let current: String = tx.query_row(
+        "SELECT status FROM runs WHERE id = ?1",
+        params![run_id],
+        |row| row.get(0),
+    )?;
+    if !matches!(current.as_str(), "planning" | "cancelled") {
+        tx.execute(
+            "UPDATE runs SET status = ?1, updated_at = ?2 WHERE id = ?3",
+            params![status.as_str(), ts, run_id],
+        )?;
+    }
+    tx.execute(
+        "UPDATE runs SET objective = ?1, plan_revision = ?2, updated_at = ?3 WHERE id = ?4",
+        params![resolved.objective, resolved.revision, ts, run_id],
+    )?;
+
+    let snapshot = serde_json::to_string(&PlanSnapshot {
+        objective: resolved.objective.clone(),
+        tasks: final_tasks.clone(),
+    })?;
+    tx.execute(
+        "INSERT INTO plan_revisions (run_id, revision, source, reason, planner_session_id, snapshot, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            run_id,
+            resolved.revision,
+            source.as_str(),
+            reason,
+            planner_session_id,
+            snapshot,
+            ts
+        ],
+    )?;
+
+    Ok((resolved.revision, final_tasks))
 }
 
 fn build_session(r: &rusqlite::Row<'_>) -> rusqlite::Result<AgentSession> {
@@ -1016,9 +1450,29 @@ const V8_SCHEMA: &str = "ALTER TABLE runs ADD COLUMN base_sha TEXT;";
 /// stale bases and replay/rebase before merging.
 const V9_SCHEMA: &str = "ALTER TABLE task_attempts ADD COLUMN source_base TEXT;";
 
+/// Visual plan editor: durable plan revisions with optimistic concurrency.
+/// `runs.plan_revision` is bumped on every plan change (planner, manual edit,
+/// replan); `plan_revisions` records each revision with a full JSON snapshot
+/// of the objective and task list.
+const V10_SCHEMA: &str = "
+ALTER TABLE runs ADD COLUMN plan_revision INTEGER NOT NULL DEFAULT 1;
+CREATE TABLE plan_revisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    revision INTEGER NOT NULL,
+    source TEXT NOT NULL,
+    reason TEXT,
+    planner_session_id INTEGER REFERENCES agent_sessions(id) ON DELETE SET NULL,
+    snapshot TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(run_id, revision)
+);
+CREATE INDEX idx_plan_revisions_run ON plan_revisions(run_id, revision);
+";
+
 const MIGRATIONS: &[&str] = &[
     V1_SCHEMA, V2_SCHEMA, V3_SCHEMA, V4_SCHEMA, V5_SCHEMA, V6_SCHEMA, V7_SCHEMA, V8_SCHEMA,
-    V9_SCHEMA,
+    V9_SCHEMA, V10_SCHEMA,
 ];
 
 fn migrate(conn: &mut Connection) -> Result<()> {
@@ -1055,13 +1509,14 @@ fn migrate_schemas(conn: &mut Connection, schemas: &[&str]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use factory_types::{
-        AgentSession, AgentSessionMode, AttemptStatus, Plan, PlannedTask, ReviewDecision,
-        ReviewResult, RunStatus, TaskEvidence, TaskOperation, TaskState,
+        AgentSession, AgentSessionMode, AttemptStatus, Plan, PlanApplyOutcome, PlanMutation,
+        PlanPatch, PlanRevisionSource, PlannedTask, ReplanRequest, ReviewDecision, ReviewResult,
+        RunStatus, TaskEvidence, TaskOperation, TaskRef, TaskState,
     };
     use rusqlite::Connection;
     use tempfile::TempDir;
 
-    use crate::{FactoryDb, V1_SCHEMA};
+    use crate::{DbError, FactoryDb, V1_SCHEMA};
 
     #[test]
     fn applies_all_migrations_exactly_once() {
@@ -1069,12 +1524,12 @@ mod tests {
         let path = dir.path().join("test.db");
         let db = FactoryDb::open(&path).unwrap();
         let versions = schema_versions(&path);
-        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
         db.create_run("objective", Some("codex")).unwrap();
         drop(db);
 
         let db = FactoryDb::open(&path).unwrap();
-        assert_eq!(schema_versions(&path), vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        assert_eq!(schema_versions(&path), vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
         db.list_runs().unwrap();
     }
 
@@ -1099,7 +1554,7 @@ mod tests {
         drop(conn);
 
         let db = FactoryDb::open(&path).unwrap();
-        assert_eq!(schema_versions(&path), vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        assert_eq!(schema_versions(&path), vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
         let run = db.get_run(1).unwrap().unwrap();
         assert_eq!(run.objective, "legacy");
         let tasks = db.list_tasks(1).unwrap();
@@ -1154,7 +1609,7 @@ mod tests {
 
         let db = FactoryDb::open(&path).unwrap();
         // opening records versions 6 and 7 exactly once
-        assert_eq!(schema_versions(&path), vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        assert_eq!(schema_versions(&path), vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
         let tasks = db.list_tasks(1).unwrap();
         let operation_of = |title: &str| {
             tasks
@@ -1434,6 +1889,281 @@ mod tests {
         let loaded = db.get_run(run.id).unwrap().unwrap();
         assert_eq!(loaded.status, RunStatus::Planned);
         assert_eq!(loaded.objective, "normalized objective");
+    }
+
+    #[test]
+    fn plan_revisions_record_every_change_with_concurrency_guard() {
+        let dir = TempDir::new().unwrap();
+        let db = FactoryDb::open(&dir.path().join("test.db")).unwrap();
+        let run = db
+            .create_run_with_status("draft", Some("planner"), RunStatus::Planning)
+            .unwrap();
+        let tasks = db
+            .persist_plan(
+                run.id,
+                &Plan {
+                    objective: "objective".into(),
+                    tasks: vec![PlannedTask {
+                        id: "A".into(),
+                        title: "First".into(),
+                        objective: "first".into(),
+                        dependencies: Vec::new(),
+                        acceptance_criteria: vec!["done".into()],
+                        role: None,
+                        operation: Some(TaskOperation::Implement),
+                    }],
+                },
+            )
+            .unwrap();
+
+        assert_eq!(db.get_plan_revision(run.id).unwrap(), 1);
+        let state = db.plan_state(run.id).unwrap();
+        assert_eq!(state.revision, 1);
+        assert_eq!(state.tasks.len(), 1);
+        assert_eq!(state.tasks[0].id, tasks[0].id);
+
+        let outcome = db
+            .apply_plan_patch(
+                run.id,
+                &PlanPatch {
+                    expected_revision: 1,
+                    mutations: vec![PlanMutation::AddTask {
+                        client_id: "draft-B".into(),
+                        title: "Second".into(),
+                        objective: "second".into(),
+                        acceptance_criteria: vec!["reviewed".into()],
+                        dependencies: vec![TaskRef::Id(tasks[0].id)],
+                        role: Some("database_engineer".into()),
+                        operation: Some(TaskOperation::Implement),
+                    }],
+                },
+                PlanRevisionSource::Manual,
+                Some("edit session"),
+                None,
+            )
+            .unwrap();
+        let PlanApplyOutcome::Applied {
+            run_id,
+            revision,
+            tasks,
+        } = outcome
+        else {
+            panic!("expected applied");
+        };
+        assert_eq!(run_id, run.id);
+        assert_eq!(revision, 2);
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[1].title, "Second");
+        assert_eq!(tasks[1].dependencies, vec![tasks[0].id]);
+        assert_eq!(tasks[1].role.as_deref(), Some("database_engineer"));
+
+        assert_eq!(db.get_plan_revision(run.id).unwrap(), 2);
+        let state = db.plan_state(run.id).unwrap();
+        assert_eq!(state.revision, 2);
+        assert_eq!(state.tasks.len(), 2);
+
+        let revisions = db.list_plan_revisions(run.id).unwrap();
+        assert_eq!(revisions.len(), 2);
+        assert_eq!(revisions[0].revision, 1);
+        assert_eq!(revisions[0].source, PlanRevisionSource::Planner);
+        assert_eq!(revisions[0].reason, None);
+        assert_eq!(revisions[1].revision, 2);
+        assert_eq!(revisions[1].source, PlanRevisionSource::Manual);
+        assert_eq!(revisions[1].reason.as_deref(), Some("edit session"));
+        assert_eq!(revisions[1].snapshot.tasks.len(), 2);
+
+        let record = db.get_plan_revision_record(run.id, 2).unwrap().unwrap();
+        assert_eq!(record.revision, 2);
+        assert_eq!(record.snapshot.objective, "objective");
+        assert!(!record.snapshot.tasks.is_empty());
+
+        let stale = db
+            .apply_plan_patch(
+                run.id,
+                &PlanPatch {
+                    expected_revision: 1,
+                    mutations: vec![PlanMutation::RemoveTask {
+                        task: TaskRef::Id(tasks[0].id),
+                    }],
+                },
+                PlanRevisionSource::Manual,
+                None,
+                None,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            stale,
+            DbError::Conflict {
+                expected: 1,
+                current: 2
+            }
+        ));
+    }
+
+    #[test]
+    fn invalid_plan_patch_writes_nothing() {
+        let dir = TempDir::new().unwrap();
+        let db = FactoryDb::open(&dir.path().join("test.db")).unwrap();
+        let run = db
+            .create_run_with_status("draft", Some("planner"), RunStatus::Planning)
+            .unwrap();
+        let tasks = db
+            .persist_plan(
+                run.id,
+                &Plan {
+                    objective: "objective".into(),
+                    tasks: vec![PlannedTask {
+                        id: "A".into(),
+                        title: "First".into(),
+                        objective: "first".into(),
+                        dependencies: Vec::new(),
+                        acceptance_criteria: vec!["done".into()],
+                        role: None,
+                        operation: Some(TaskOperation::Implement),
+                    }],
+                },
+            )
+            .unwrap();
+
+        db.set_task_state(tasks[0].id, TaskState::Running).unwrap();
+
+        let outcome = db
+            .apply_plan_patch(
+                run.id,
+                &PlanPatch {
+                    expected_revision: 1,
+                    mutations: vec![PlanMutation::RemoveTask {
+                        task: TaskRef::Id(tasks[0].id),
+                    }],
+                },
+                PlanRevisionSource::Manual,
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(matches!(outcome, PlanApplyOutcome::Invalid(_)));
+
+        assert_eq!(db.get_plan_revision(run.id).unwrap(), 1);
+        assert_eq!(db.plan_state(run.id).unwrap().tasks.len(), 1);
+    }
+
+    #[test]
+    fn replan_supersedes_scope_and_bumps_revision() {
+        let dir = TempDir::new().unwrap();
+        let db = FactoryDb::open(&dir.path().join("test.db")).unwrap();
+        let run = db
+            .create_run_with_status("draft", Some("planner"), RunStatus::Planning)
+            .unwrap();
+        let tasks = db
+            .persist_plan(
+                run.id,
+                &Plan {
+                    objective: "objective".into(),
+                    tasks: vec![
+                        PlannedTask {
+                            id: "A".into(),
+                            title: "First".into(),
+                            objective: "first".into(),
+                            dependencies: Vec::new(),
+                            acceptance_criteria: vec!["done".into()],
+                            role: None,
+                            operation: Some(TaskOperation::Implement),
+                        },
+                        PlannedTask {
+                            id: "C".into(),
+                            title: "Third".into(),
+                            objective: "third".into(),
+                            dependencies: vec!["A".into()],
+                            acceptance_criteria: vec!["done".into()],
+                            role: None,
+                            operation: Some(TaskOperation::Implement),
+                        },
+                    ],
+                },
+            )
+            .unwrap();
+
+        db.create_task_attempt(
+            tasks[0].id,
+            "worker",
+            Some(TaskOperation::Implement),
+            "opencode",
+            "worktree",
+            None,
+        )
+        .unwrap();
+
+        let outcome = db
+            .apply_replan(
+                run.id,
+                &ReplanRequest {
+                    expected_revision: 1,
+                    seed: TaskRef::Id(tasks[0].id),
+                    reason: Some("scope changed".into()),
+                    plan: Plan {
+                        objective: "new objective".into(),
+                        tasks: vec![
+                            PlannedTask {
+                                id: "A".into(),
+                                title: "First (revised)".into(),
+                                objective: "first".into(),
+                                dependencies: Vec::new(),
+                                acceptance_criteria: vec!["done".into()],
+                                role: None,
+                                operation: Some(TaskOperation::Implement),
+                            },
+                            PlannedTask {
+                                id: "B".into(),
+                                title: "Second".into(),
+                                objective: "second".into(),
+                                dependencies: vec!["A".into()],
+                                acceptance_criteria: vec!["reviewed".into()],
+                                role: None,
+                                operation: Some(TaskOperation::Implement),
+                            },
+                        ],
+                    },
+                },
+                PlanRevisionSource::Replan,
+                Some("replanned"),
+                None,
+            )
+            .unwrap();
+        let PlanApplyOutcome::Applied { revision, .. } = outcome else {
+            panic!("expected applied");
+        };
+        assert_eq!(revision, 2);
+        assert_eq!(db.get_plan_revision(run.id).unwrap(), 2);
+        assert_eq!(db.get_run(run.id).unwrap().unwrap().objective, "new objective");
+
+        let state = db.plan_state(run.id).unwrap();
+        assert_eq!(state.tasks.len(), 4);
+        let old_a = state.tasks.iter().find(|t| t.id == tasks[0].id).unwrap();
+        assert_eq!(old_a.state, TaskState::Ready);
+        assert_eq!(old_a.title, "First");
+        let superseded_c = state.tasks.iter().find(|t| t.title == "Third").unwrap();
+        assert_eq!(superseded_c.state, TaskState::Superseded);
+        let new_a = state.tasks.iter().find(|t| t.title == "First (revised)").unwrap();
+        assert_eq!(new_a.state, TaskState::Ready);
+        assert_ne!(new_a.id, tasks[0].id);
+        let b = state.tasks.iter().find(|t| t.title == "Second").unwrap();
+        assert_eq!(b.state, TaskState::Pending);
+        assert_eq!(b.dependencies, vec![new_a.id]);
+
+        let revisions = db.list_plan_revisions(run.id).unwrap();
+        assert_eq!(revisions.len(), 2);
+        assert_eq!(revisions[1].source, PlanRevisionSource::Replan);
+        assert_eq!(revisions[1].snapshot.tasks.len(), 4);
+        assert_eq!(
+            revisions[1]
+                .snapshot
+                .tasks
+                .iter()
+                .find(|t| t.title == "Third")
+                .unwrap()
+                .state,
+            TaskState::Superseded
+        );
     }
 
     #[test]
