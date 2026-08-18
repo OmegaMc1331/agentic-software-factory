@@ -962,11 +962,10 @@ fn build_plan_revision(r: &rusqlite::Row<'_>) -> rusqlite::Result<PlanRevisionRe
             .unwrap_or(PlanRevisionSource::Planner),
         reason: r.get(4)?,
         planner_session_id: r.get(5)?,
-        snapshot: serde_json::from_str(&snapshot)
-            .unwrap_or_else(|_| PlanSnapshot {
-                objective: String::new(),
-                tasks: Vec::new(),
-            }),
+        snapshot: serde_json::from_str(&snapshot).unwrap_or_else(|_| PlanSnapshot {
+            objective: String::new(),
+            tasks: Vec::new(),
+        }),
         created_at: r.get(7)?,
     })
 }
@@ -1107,7 +1106,10 @@ fn apply_resolved(
     if !resolved.removed.is_empty() {
         let placeholders = vec!["?"; resolved.removed.len()].join(",");
         let sql = format!("DELETE FROM tasks WHERE id IN ({placeholders})");
-        tx.execute(&sql, rusqlite::params_from_iter(resolved.removed.iter().copied()))?;
+        tx.execute(
+            &sql,
+            rusqlite::params_from_iter(resolved.removed.iter().copied()),
+        )?;
     }
 
     for task in &resolved.tasks {
@@ -2134,7 +2136,10 @@ mod tests {
         };
         assert_eq!(revision, 2);
         assert_eq!(db.get_plan_revision(run.id).unwrap(), 2);
-        assert_eq!(db.get_run(run.id).unwrap().unwrap().objective, "new objective");
+        assert_eq!(
+            db.get_run(run.id).unwrap().unwrap().objective,
+            "new objective"
+        );
 
         let state = db.plan_state(run.id).unwrap();
         assert_eq!(state.tasks.len(), 4);
@@ -2143,7 +2148,11 @@ mod tests {
         assert_eq!(old_a.title, "First");
         let superseded_c = state.tasks.iter().find(|t| t.title == "Third").unwrap();
         assert_eq!(superseded_c.state, TaskState::Superseded);
-        let new_a = state.tasks.iter().find(|t| t.title == "First (revised)").unwrap();
+        let new_a = state
+            .tasks
+            .iter()
+            .find(|t| t.title == "First (revised)")
+            .unwrap();
         assert_eq!(new_a.state, TaskState::Ready);
         assert_ne!(new_a.id, tasks[0].id);
         let b = state.tasks.iter().find(|t| t.title == "Second").unwrap();

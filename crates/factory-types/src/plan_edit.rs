@@ -141,7 +141,10 @@ fn recompute_states(tasks: &mut [ResolvedTask], attempts: &HashMap<i64, usize>) 
         .filter(|t| {
             t.insert
                 || (attempts.get(&t.id).copied().unwrap_or(0) == 0
-                    && matches!(t.state, TaskState::Pending | TaskState::Ready | TaskState::Blocked))
+                    && matches!(
+                        t.state,
+                        TaskState::Pending | TaskState::Ready | TaskState::Blocked
+                    ))
         })
         .map(|t| t.id)
         .collect();
@@ -171,7 +174,10 @@ fn recompute_states(tasks: &mut [ResolvedTask], attempts: &HashMap<i64, usize>) 
             if *indegree.get(other).expect("known") == 0 {
                 continue;
             }
-            let other_task = tasks.iter().find(|t| t.id == *other).expect("mutable known");
+            let other_task = tasks
+                .iter()
+                .find(|t| t.id == *other)
+                .expect("mutable known");
             if other_task.dependencies.contains(&id) {
                 let degree = indegree.get_mut(other).expect("known");
                 *degree -= 1;
@@ -467,8 +473,7 @@ pub fn resolve_patch(
                         Some(task.clone()),
                         Some("task"),
                         "immutable_task",
-                        "A task that has started or finished can no longer be edited."
-                            .to_string(),
+                        "A task that has started or finished can no longer be edited.".to_string(),
                     ));
                     continue;
                 }
@@ -573,8 +578,7 @@ pub fn resolve_patch(
                             Some(task.clone()),
                             Some("task"),
                             "immutable_dependent",
-                            "The task depends on completed work and cannot be removed."
-                                .to_string(),
+                            "The task depends on completed work and cannot be removed.".to_string(),
                         ));
                         break;
                     }
@@ -996,7 +1000,8 @@ pub fn resolve_replan(
             splice_position = after;
         }
     }
-    let mut resolved_tasks: Vec<ResolvedTask> = Vec::with_capacity(remaining.len() + new_tasks.len());
+    let mut resolved_tasks: Vec<ResolvedTask> =
+        Vec::with_capacity(remaining.len() + new_tasks.len());
     resolved_tasks.extend(remaining.drain(..splice_position));
     resolved_tasks.extend(new_tasks);
     resolved_tasks.extend(remaining);

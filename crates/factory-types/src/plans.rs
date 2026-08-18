@@ -75,24 +75,13 @@ pub enum PlanMutation {
     },
     /// Removes a mutable task. Fails if the task has any attempt, is mid-run,
     /// or is depended on by an immutable task.
-    RemoveTask {
-        task: TaskRef,
-    },
+    RemoveTask { task: TaskRef },
     /// Adds a dependency edge: `task` becomes a dependent of `depends_on`.
-    AddDependency {
-        task: TaskRef,
-        depends_on: TaskRef,
-    },
+    AddDependency { task: TaskRef, depends_on: TaskRef },
     /// Removes the dependency edge `task -> depends_on`.
-    RemoveDependency {
-        task: TaskRef,
-        depends_on: TaskRef,
-    },
+    RemoveDependency { task: TaskRef, depends_on: TaskRef },
     /// Moves `task` in the plan-ordered task list (visual ordering).
-    ReorderTask {
-        task: TaskRef,
-        position: u32,
-    },
+    ReorderTask { task: TaskRef, position: u32 },
 }
 
 /// Batch of mutations plus the revision the editor was opened against.
