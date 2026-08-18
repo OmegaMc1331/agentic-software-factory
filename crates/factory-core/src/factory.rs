@@ -929,8 +929,14 @@ impl Factory {
             self.mark_task(task_id, TaskState::Running)?;
 
             let upstream = self.upstream_artifacts(&task)?;
-            let repository_context =
-                self.repository_context(&task, TaskOperation::Advisory, &worktree, &base_sha, &[], &upstream);
+            let repository_context = self.repository_context(
+                &task,
+                TaskOperation::Advisory,
+                &worktree,
+                &base_sha,
+                &[],
+                &upstream,
+            );
             let instruction = build_mission(&MissionContext {
                 role: role_definition,
                 operation: TaskOperation::Advisory,

@@ -7,7 +7,7 @@ use std::sync::OnceLock;
 
 use crate::error::Result;
 use crate::ignore::IgnoreRules;
-use crate::index::{ContextIndex, MAX_INDEX_FILE_READ_BYTES, forward_slash, normalize};
+use crate::index::{forward_slash, normalize, ContextIndex, MAX_INDEX_FILE_READ_BYTES};
 use crate::rank::query_tokens;
 use crate::symbols::Symbol;
 
@@ -101,8 +101,20 @@ fn ripgrep_available() -> bool {
 fn content_glob_flags() -> Vec<String> {
     let mut flags = Vec::new();
     const DIRS: &[&str] = &[
-        ".factory", "node_modules", "target", "dist", "build", "vendor",
-        "__pycache__", ".venv", "venv", "coverage", ".pytest_cache", ".ruff_cache", ".next", ".git",
+        ".factory",
+        "node_modules",
+        "target",
+        "dist",
+        "build",
+        "vendor",
+        "__pycache__",
+        ".venv",
+        "venv",
+        "coverage",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".next",
+        ".git",
     ];
     for dir in DIRS {
         flags.push(format!("-g!{dir}/**"));
@@ -218,7 +230,10 @@ fn fallback_paths(root: &Path, ignore: &IgnoreRules, query: &str) -> Vec<PathBuf
             if bytes.len() as u64 > MAX_INDEX_FILE_READ_BYTES {
                 continue;
             }
-            if String::from_utf8_lossy(&bytes).to_ascii_lowercase().contains(&query) {
+            if String::from_utf8_lossy(&bytes)
+                .to_ascii_lowercase()
+                .contains(&query)
+            {
                 found.push(path);
             }
         }
@@ -266,7 +281,9 @@ mod tests {
             .into_iter()
             .map(|(path, text)| {
                 let language = language_for(Path::new(path));
-                let symbols = language.map(|l| extract_symbols(l, text)).unwrap_or_default();
+                let symbols = language
+                    .map(|l| extract_symbols(l, text))
+                    .unwrap_or_default();
                 (
                     path.to_string(),
                     crate::index::IndexedFile {

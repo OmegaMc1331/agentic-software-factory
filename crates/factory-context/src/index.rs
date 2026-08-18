@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::MAX_INDEX_ENTRIES;
 use crate::error::{ContextError, Result};
 use crate::ignore::IgnoreRules;
-use crate::symbols::{language_for, extract_symbols, Symbol};
+use crate::symbols::{extract_symbols, language_for, Symbol};
 
 /// Bounded read cap for a single file during indexing. Larger files are still
 /// indexed (metadata + search) but contribute no symbols, keeping extraction
@@ -40,10 +40,7 @@ pub struct IndexedFile {
 
 impl IndexedFile {
     pub fn basename(&self) -> &str {
-        self.path
-            .rsplit('/')
-            .next()
-            .unwrap_or(&self.path)
+        self.path.rsplit('/').next().unwrap_or(&self.path)
     }
 }
 
@@ -180,10 +177,14 @@ impl ContextIndex {
                 }
                 let language = language_for(&relative);
                 let symbols = match language {
-                    Some(language) if size <= MAX_INDEX_FILE_READ_BYTES => match std::fs::read(entry.path()) {
-                        Ok(bytes) => extract_symbols(language, &String::from_utf8_lossy(&bytes)),
-                        Err(_) => Vec::new(),
-                    },
+                    Some(language) if size <= MAX_INDEX_FILE_READ_BYTES => {
+                        match std::fs::read(entry.path()) {
+                            Ok(bytes) => {
+                                extract_symbols(language, &String::from_utf8_lossy(&bytes))
+                            }
+                            Err(_) => Vec::new(),
+                        }
+                    }
                     _ => Vec::new(),
                 };
                 let is_new = cached.is_none();
@@ -252,10 +253,11 @@ pub fn load_manifest(index_path: &Path) -> Result<Option<IndexManifest>> {
 /// reliable on Windows, so a failed rename falls back to a direct write
 /// (last writer wins; snapshots are self-contained).
 pub fn save_manifest(index_path: &Path, manifest: &IndexManifest) -> Result<()> {
-    let text = serde_json::to_string_pretty(manifest).map_err(|source| ContextError::IndexWrite {
-        path: index_path.to_path_buf(),
-        source,
-    })?;
+    let text =
+        serde_json::to_string_pretty(manifest).map_err(|source| ContextError::IndexWrite {
+            path: index_path.to_path_buf(),
+            source,
+        })?;
     if let Some(parent) = index_path.parent() {
         std::fs::create_dir_all(parent).map_err(|source| ContextError::Io {
             path: parent.to_path_buf(),
@@ -269,11 +271,12 @@ pub fn save_manifest(index_path: &Path, manifest: &IndexManifest) -> Result<()> 
         source,
     })?;
     if std::fs::rename(&tmp, index_path).is_err() {
-        std::fs::write(index_path, std::fs::read(&tmp).unwrap_or_default())
-            .map_err(|source| ContextError::Io {
+        std::fs::write(index_path, std::fs::read(&tmp).unwrap_or_default()).map_err(|source| {
+            ContextError::Io {
                 path: index_path.to_path_buf(),
                 source,
-            })?;
+            }
+        })?;
     }
     let _ = std::fs::remove_file(&tmp);
     Ok(())
@@ -375,10 +378,7 @@ mod tests {
         let second_stats = index.refresh(&root, &IgnoreRules::empty()).unwrap();
         assert_eq!(second_stats.updated, 1);
         assert_eq!(second_stats.added, 0);
-        assert_eq!(
-            index.files["src/main.rs"].symbols[0].name,
-            "renamed"
-        );
+        assert_eq!(index.files["src/main.rs"].symbols[0].name, "renamed");
     }
 
     #[test]

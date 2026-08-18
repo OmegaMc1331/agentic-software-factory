@@ -12,11 +12,11 @@ use crate::config::ContextConfig;
 use crate::error::Result;
 use crate::ignore::IgnoreRules;
 use crate::index::{
-    ContextIndex, IndexSummary, IndexedFile, RefreshStats, load_manifest, normalize, now_secs,
-    save_manifest,
+    load_manifest, normalize, now_secs, save_manifest, ContextIndex, IndexSummary, IndexedFile,
+    RefreshStats,
 };
-use crate::rank::{self, ContextRequest, RankedFile, is_test_path, query_terms_for};
-use crate::search::{self, SearchHit, search_index};
+use crate::rank::{self, is_test_path, query_terms_for, ContextRequest, RankedFile};
+use crate::search::{self, search_index, SearchHit};
 use crate::symbols::Symbol;
 
 /// Maximum characters of a per-file excerpt embedded in a resolved context.
@@ -202,7 +202,8 @@ impl ContextEngine {
         self.ensure_index()?;
         let index = self.index.as_ref().expect("index loaded");
 
-        let (is_worktree, branch, head, base_sha) = scope_git_info(&request.scope_dir, request.base_sha.as_deref());
+        let (is_worktree, branch, head, base_sha) =
+            scope_git_info(&request.scope_dir, request.base_sha.as_deref());
 
         let mut ranked = rank::rank_candidates(index, request);
         ranked.retain(|file| file.score > 0);
@@ -226,11 +227,7 @@ impl ContextEngine {
         let mut selected: Vec<SelectedFile> = Vec::with_capacity(selected_ranked.len());
         let anchor_terms = query_terms_for(request);
         for ranked_file in &selected_ranked {
-            let span = extract_excerpt(
-                &self.root,
-                &ranked_file.file,
-                &anchor_terms,
-            );
+            let span = extract_excerpt(&self.root, &ranked_file.file, &anchor_terms);
             selected.push(SelectedFile {
                 path: ranked_file.file.path.clone(),
                 language: ranked_file.file.language.clone(),
@@ -320,7 +317,8 @@ fn extract_excerpt(root: &Path, file: &IndexedFile, anchor_terms: &[String]) -> 
                 .find(|term| lower.contains(term.as_str()))
                 .and_then(|term| {
                     lines.iter().position(|line| {
-                        line.to_ascii_lowercase().contains(&term.to_ascii_lowercase())
+                        line.to_ascii_lowercase()
+                            .contains(&term.to_ascii_lowercase())
                     })
                 })
                 .map(|index| index + 1)

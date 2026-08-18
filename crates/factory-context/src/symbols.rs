@@ -169,10 +169,7 @@ mod tests {
     fn extracts_rust_symbols_with_lines_and_dedup() {
         let content = "mod auth;\n\npub fn login() {}\nfn login() {}\npub struct Session {}\n";
         let symbols = extract_symbols("rust", content);
-        let names: Vec<(&str, usize)> = symbols
-            .iter()
-            .map(|s| (s.name.as_str(), s.line))
-            .collect();
+        let names: Vec<(&str, usize)> = symbols.iter().map(|s| (s.name.as_str(), s.line)).collect();
         assert_eq!(names, vec![("auth", 1), ("login", 3), ("Session", 5)]);
         assert_eq!(symbols[1].kind, "function");
         assert_eq!(symbols[2].kind, "struct");
@@ -182,9 +179,13 @@ mod tests {
     fn extracts_typescript_declarations() {
         let content = "export interface User { id: string }\nexport type Id = string;\nexport function load() {}\nconst parse = (s: string) => s;\n";
         let symbols = extract_symbols("typescript", content);
-        assert!(symbols.iter().any(|s| s.name == "User" && s.kind == "interface"));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "User" && s.kind == "interface"));
         assert!(symbols.iter().any(|s| s.name == "Id" && s.kind == "type"));
-        assert!(symbols.iter().any(|s| s.name == "load" && s.kind == "function"));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "load" && s.kind == "function"));
         assert!(symbols.iter().any(|s| s.name == "parse"));
     }
 
@@ -192,17 +193,27 @@ mod tests {
     fn extracts_python_def_and_class() {
         let content = "import os\n\ndef parse_config(path: str) -> dict:\n    pass\n\nclass Engine:\n    pass\n";
         let symbols = extract_symbols("python", content);
-        assert!(symbols.iter().any(|s| s.name == "parse_config" && s.line == 3));
-        assert!(symbols.iter().any(|s| s.name == "Engine" && s.line == 3 + 3));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "parse_config" && s.line == 3));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "Engine" && s.line == 3 + 3));
     }
 
     #[test]
     fn extracts_go_functions_and_methods() {
         let content = "func main() {}\nfunc (e *Engine) Start() {}\ntype Engine struct {}\n";
         let symbols = extract_symbols("go", content);
-        assert!(symbols.iter().any(|s| s.name == "main" && s.kind == "function"));
-        assert!(symbols.iter().any(|s| s.name == "Start" && s.kind == "method"));
-        assert!(symbols.iter().any(|s| s.name == "Engine" && s.kind == "type"));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "main" && s.kind == "function"));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "Start" && s.kind == "method"));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "Engine" && s.kind == "type"));
     }
 
     #[test]

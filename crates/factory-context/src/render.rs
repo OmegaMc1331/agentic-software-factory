@@ -67,7 +67,9 @@ pub fn render_repository_context(resolved: &ResolvedContext) -> String {
     }
     if out.chars().count() > budget_chars {
         out = out.chars().take(budget_chars).collect();
-        out.push_str(&format!("…[repository context truncated to {budget_chars} chars]"));
+        out.push_str(&format!(
+            "…[repository context truncated to {budget_chars} chars]"
+        ));
         out.push('\n');
     }
     out.trim_end().to_string() + "\n"

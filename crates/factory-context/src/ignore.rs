@@ -171,16 +171,10 @@ impl IgnoreRules {
     pub fn is_ignored(&self, relative: &Path, is_directory: bool) -> bool {
         // Builtin directory rules apply to every nested component, whether the
         // entry itself is a file or a directory.
-        if relative
-            .components()
-            .any(|component| match component {
-                Component::Normal(name) => name
-                    .to_str()
-                    .map(is_builtin_ignored_dir)
-                    .unwrap_or(false),
-                _ => false,
-            })
-        {
+        if relative.components().any(|component| match component {
+            Component::Normal(name) => name.to_str().map(is_builtin_ignored_dir).unwrap_or(false),
+            _ => false,
+        }) {
             return true;
         }
         if !is_directory

@@ -92,11 +92,21 @@ fn split_camel(word: &str, tokens: &mut Vec<String>) {
             && (previous.is_lowercase() || previous.is_ascii_digit())
             || current.is_uppercase() && next_is_lower && i - start > 1;
         if boundary {
-            tokens.push(chars[start..i].iter().collect::<String>().to_ascii_lowercase());
+            tokens.push(
+                chars[start..i]
+                    .iter()
+                    .collect::<String>()
+                    .to_ascii_lowercase(),
+            );
             start = i;
         }
     }
-    tokens.push(chars[start..].iter().collect::<String>().to_ascii_lowercase());
+    tokens.push(
+        chars[start..]
+            .iter()
+            .collect::<String>()
+            .to_ascii_lowercase(),
+    );
 }
 
 /// Lowercase tokens of `text` that are at least `min_len` characters long.
@@ -111,10 +121,43 @@ pub fn query_tokens(text: &str, min_len: usize) -> Vec<String> {
 }
 
 const STOPWORDS: &[&str] = &[
-    "the", "and", "for", "with", "that", "this", "from", "into", "within", "make", "use", "used",
-    "uses", "using", "should", "will", "can", "could", "would", "task", "feature", "implement",
-    "implementation", "need", "needs", "ensure", "add", "support", "its", "their", "are", "was",
-    "were", "not", "work", "works", "working",
+    "the",
+    "and",
+    "for",
+    "with",
+    "that",
+    "this",
+    "from",
+    "into",
+    "within",
+    "make",
+    "use",
+    "used",
+    "uses",
+    "using",
+    "should",
+    "will",
+    "can",
+    "could",
+    "would",
+    "task",
+    "feature",
+    "implement",
+    "implementation",
+    "need",
+    "needs",
+    "ensure",
+    "add",
+    "support",
+    "its",
+    "their",
+    "are",
+    "was",
+    "were",
+    "not",
+    "work",
+    "works",
+    "working",
 ];
 
 /// Primary ranking terms from the task text, deduplicated and deterministic.
@@ -132,11 +175,7 @@ pub fn query_terms_for(request: &ContextRequest) -> Vec<String> {
     for criterion in &request.acceptance_criteria {
         consider(criterion, 3);
     }
-    for snippet in request
-        .upstream_artifact_snippets
-        .iter()
-        .take(6)
-    {
+    for snippet in request.upstream_artifact_snippets.iter().take(6) {
         consider(&snippet.chars().take(500).collect::<String>(), 4);
     }
     set.into_iter().collect()
@@ -153,13 +192,13 @@ fn testing_intent(request: &ContextRequest) -> bool {
     {
         return true;
     }
-    let words = [
-        request.title.as_str(),
-        request.objective.as_str(),
-    ];
+    let words = [request.title.as_str(), request.objective.as_str()];
     let mut tokens = words.into_iter().flat_map(query_tokens_min_3);
     tokens.any(|token| {
-        matches!(token.as_str(), "test" | "tests" | "testing" | "spec" | "specs" | "verify")
+        matches!(
+            token.as_str(),
+            "test" | "tests" | "testing" | "spec" | "specs" | "verify"
+        )
     })
 }
 
@@ -228,7 +267,8 @@ pub fn rank_candidates(index: &ContextIndex, request: &ContextRequest) -> Vec<Ra
             for symbol in &file.file.symbols {
                 let name = symbol.name.to_ascii_lowercase();
                 if terms.iter().any(|term| {
-                    term.len() >= 4 && (name.contains(term.as_str()) || term.contains(name.as_str()))
+                    term.len() >= 4
+                        && (name.contains(term.as_str()) || term.contains(name.as_str()))
                 }) {
                     matched_symbols += 1;
                 }
@@ -241,8 +281,7 @@ pub fn rank_candidates(index: &ContextIndex, request: &ContextRequest) -> Vec<Ra
         }
         if changed.contains(&file.file.path) {
             file.score += CHANGED_BONUS;
-            file.reasons
-                .push("changed in this attempt".to_string());
+            file.reasons.push("changed in this attempt".to_string());
         }
         let is_test = is_test_path(&file.file.path);
         if is_test {
@@ -278,10 +317,15 @@ pub fn expand_links(pool: &mut [RankedFile], root: &Path) {
     let mut contents: Vec<String> = Vec::with_capacity(n);
     for file in pool.iter().take(n) {
         let path = root.join(&file.file.path);
-        contents.push(std::fs::read(&path).ok().and_then(|bytes| {
-            (bytes.len() as u64 <= MAX_INDEX_FILE_READ_BYTES)
-                .then(|| String::from_utf8_lossy(&bytes).to_ascii_lowercase())
-        }).unwrap_or_default());
+        contents.push(
+            std::fs::read(&path)
+                .ok()
+                .and_then(|bytes| {
+                    (bytes.len() as u64 <= MAX_INDEX_FILE_READ_BYTES)
+                        .then(|| String::from_utf8_lossy(&bytes).to_ascii_lowercase())
+                })
+                .unwrap_or_default(),
+        );
     }
     let mut pairs = 0usize;
     for i in 0..n {
@@ -303,11 +347,15 @@ pub fn expand_links(pool: &mut [RankedFile], root: &Path) {
             });
             if references {
                 pool[i].score += LINK_BONUS;
-                pool[i].reasons.push(format!("references {}", pool[j].file.path));
+                pool[i]
+                    .reasons
+                    .push(format!("references {}", pool[j].file.path));
             }
             if referenced_by {
                 pool[j].score += LINK_BONUS;
-                pool[j].reasons.push(format!("referenced by {}", pool[i].file.path));
+                pool[j]
+                    .reasons
+                    .push(format!("referenced by {}", pool[i].file.path));
             }
         }
     }
@@ -443,8 +491,14 @@ mod tests {
         // Two identical runs select identical files.
         let again = rank_candidates(&index, &request);
         assert_eq!(
-            ranked.iter().map(|r| r.file.path.clone()).collect::<Vec<_>>(),
-            again.iter().map(|r| r.file.path.clone()).collect::<Vec<_>>()
+            ranked
+                .iter()
+                .map(|r| r.file.path.clone())
+                .collect::<Vec<_>>(),
+            again
+                .iter()
+                .map(|r| r.file.path.clone())
+                .collect::<Vec<_>>()
         );
     }
 
@@ -521,9 +575,10 @@ mod tests {
 
     #[test]
     fn tokenize_handles_camel_and_snake() {
-        assert_eq!(tokenize("acceptanceCriteria for LoginFlow"), vec![
-            "acceptance", "criteria", "for", "login", "flow"
-        ]);
+        assert_eq!(
+            tokenize("acceptanceCriteria for LoginFlow"),
+            vec!["acceptance", "criteria", "for", "login", "flow"]
+        );
         assert_eq!(tokenize("auth.rs"), vec!["auth", "rs"]);
     }
 }
