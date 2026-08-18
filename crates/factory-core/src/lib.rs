@@ -14,6 +14,7 @@ pub use factory::{
     Factory, FactoryError, MarkOutcome, RunOutcome, WorkflowResult, FACTORY_DIR, MAX_TASK_ATTEMPTS,
 };
 pub use factory_agent::AgentStatus;
+pub use factory_context::ContextConfig;
 pub use factory_types::WorkflowTeam;
 pub use planner::{parse_plan, validate_plan, PlanError, PlanOutcome, Planner};
 pub use roles::{

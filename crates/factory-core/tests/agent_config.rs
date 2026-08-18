@@ -59,6 +59,7 @@ fn legacy_custom_configuration_keeps_stdin_transport() {
         roles: BTreeMap::new(),
         role_assignments: Vec::new(),
         runtime: Default::default(),
+        context: Default::default(),
     };
     let agent = config.agent_config("custom").unwrap();
     assert_eq!(agent.kind, AgentKind::Custom);
@@ -318,6 +319,7 @@ fn write_atomic_round_trips_configuration() {
             preferred: true,
         }],
         runtime: Default::default(),
+        context: Default::default(),
     };
     let path = config.write_atomic(dir.path()).unwrap();
     assert!(path.ends_with("config.toml"));
@@ -344,6 +346,7 @@ fn validation_rejects_unknown_role_agent() {
             preferred: false,
         }],
         runtime: Default::default(),
+        context: Default::default(),
     };
     let err = config.validate().unwrap_err();
     assert!(err.contains("unknown agent 'ghost'"));
@@ -356,6 +359,7 @@ fn validation_rejects_empty_commands_and_invalid_names() {
         roles: BTreeMap::new(),
         role_assignments: Vec::new(),
         runtime: Default::default(),
+        context: Default::default(),
     };
     let err = config.validate().unwrap_err();
     assert!(err.contains("invalid agent name"));
@@ -365,6 +369,7 @@ fn validation_rejects_empty_commands_and_invalid_names() {
         roles: BTreeMap::new(),
         role_assignments: Vec::new(),
         runtime: Default::default(),
+        context: Default::default(),
     };
     let err = config.validate().unwrap_err();
     assert!(err.contains("empty command"));

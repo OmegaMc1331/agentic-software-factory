@@ -11,6 +11,7 @@ repository = "https://github.com/OmegaMc1331/agentic-software-factory"
 [workspace.dependencies]
 factory-types = { path = "crates/factory-types" }
 factory-agent = { path = "crates/factory-agent" }
+factory-context = { path = "crates/factory-context" }
 factory-db = { path = "crates/factory-db" }
 factory-git = { path = "crates/factory-git" }
 factory-core = { path = "crates/factory-core" }

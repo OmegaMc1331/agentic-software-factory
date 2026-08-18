@@ -1,20 +1,16 @@
 [package]
-name = "factory-core"
+name = "factory-context"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
 factory-types = { workspace = true }
-factory-agent = { workspace = true }
-factory-context = { workspace = true }
-factory-db = { workspace = true }
 factory-git = { workspace = true }
-thiserror = { workspace = true }
+regex = "1"
 serde = { workspace = true }
 serde_json = { workspace = true }
-chrono = { workspace = true }
-toml = "0.8"
+thiserror = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

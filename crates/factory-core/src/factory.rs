@@ -206,6 +206,49 @@ impl Factory {
         Ok(team)
     }
 
+    /// Best-effort rendered repository context for a mission. The engine never
+    /// blocks a task: a disabled config or any git/index failure degrades to an
+    /// empty section rather than an error.
+    #[allow(clippy::too_many_arguments)]
+    fn repository_context(
+        &self,
+        task: &Task,
+        operation: TaskOperation,
+        scope_dir: &Path,
+        base_sha: &str,
+        changed_files: &[String],
+        upstream: &[RoleArtifact],
+    ) -> String {
+        let config = self.agents.config().context;
+        if !config.enabled {
+            return String::new();
+        }
+        let role_id = task.role.as_deref().unwrap_or(roles::WORKER);
+        let request = factory_context::ContextRequest {
+            scope_dir: scope_dir.to_path_buf(),
+            root_dir: self.root.clone(),
+            base_sha: Some(base_sha.to_string()),
+            role_id: Some(role_id.to_string()),
+            operation: Some(operation),
+            title: task.title.clone(),
+            objective: task.objective.clone(),
+            acceptance_criteria: task.acceptance_criteria.clone(),
+            changed_files: changed_files.to_vec(),
+            upstream_artifact_snippets: upstream
+                .iter()
+                .rev()
+                .take(6)
+                .map(|artifact| artifact.content.chars().take(2000).collect())
+                .collect(),
+        };
+        let mut engine =
+            factory_context::ContextEngine::new(&self.root, &self.root.join(FACTORY_DIR), config);
+        match engine.resolve(&request) {
+            Ok(resolved) => factory_context::render_repository_context(&resolved),
+            Err(_) => String::new(),
+        }
+    }
+
     pub fn create_run(&self, objective: &str) -> Result<RunOutcome, FactoryError> {
         let run = self.begin_run(objective, None)?;
         self.plan_run(run.id, &AtomicBool::new(false))
@@ -574,12 +617,15 @@ impl Factory {
             self.mark_task(task_id, TaskState::Running)?;
 
             let upstream = self.upstream_artifacts(&task)?;
+            let repository_context =
+                self.repository_context(&task, operation, &worktree, &base_sha, &[], &upstream);
             let worker_instruction = build_mission(&MissionContext {
                 role: role_definition,
                 operation,
                 task: &task,
                 run_objective: &run.objective,
                 upstream_artifacts: &upstream,
+                repository_context: Some(&repository_context),
                 previous_feedback: previous_feedback.as_ref(),
                 review_input: None,
                 final_review: false,
@@ -706,6 +752,7 @@ impl Factory {
                 task: &task,
                 run_objective: &run.objective,
                 upstream_artifacts: &upstream,
+                repository_context: Some(&repository_context),
                 previous_feedback: None,
                 review_input: Some(&ReviewInput {
                     producer_title: task.title.clone(),
@@ -882,12 +929,15 @@ impl Factory {
             self.mark_task(task_id, TaskState::Running)?;
 
             let upstream = self.upstream_artifacts(&task)?;
+            let repository_context =
+                self.repository_context(&task, TaskOperation::Advisory, &worktree, &base_sha, &[], &upstream);
             let instruction = build_mission(&MissionContext {
                 role: role_definition,
                 operation: TaskOperation::Advisory,
                 task: &task,
                 run_objective: &run.objective,
                 upstream_artifacts: &upstream,
+                repository_context: Some(&repository_context),
                 previous_feedback: None,
                 review_input: None,
                 final_review: false,
@@ -1066,12 +1116,21 @@ impl Factory {
             let run_tasks = self.db.list_tasks(task.run_id)?;
             let upstream = self.upstream_artifacts(&task)?;
             let review_input = self.build_review_input(&task, &run_tasks, catalog)?;
+            let repository_context = self.repository_context(
+                &task,
+                TaskOperation::Review,
+                &worktree,
+                &base_sha,
+                &review_input.evidence.changed_files,
+                &upstream,
+            );
             let instruction = build_mission(&MissionContext {
                 role: role_definition,
                 operation: TaskOperation::Review,
                 task: &task,
                 run_objective: &run.objective,
                 upstream_artifacts: &upstream,
+                repository_context: Some(&repository_context),
                 previous_feedback: None,
                 review_input: Some(&review_input),
                 final_review: false,
@@ -2178,6 +2237,7 @@ mod tests {
             task: &task,
             run_objective: "objective",
             upstream_artifacts: &[],
+            repository_context: None,
             previous_feedback: None,
             review_input: None,
             final_review: false,
@@ -2199,6 +2259,7 @@ mod tests {
             task: &task,
             run_objective: "objective",
             upstream_artifacts: &[],
+            repository_context: None,
             previous_feedback: Some(&review),
             review_input: None,
             final_review: false,

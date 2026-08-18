@@ -52,6 +52,10 @@ pub struct Config {
     pub role_assignments: Vec<RoleAssignment>,
     #[serde(default)]
     pub runtime: RuntimeConfig,
+    /// Repository context engine tunables. Absent in older configs, so the
+    /// serde defaults keep the engine enabled with the standard budgets.
+    #[serde(default)]
+    pub context: factory_context::ContextConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -275,6 +279,7 @@ impl Config {
         }
         self.role_assignments
             .sort_by(|a, b| (&a.role, &a.agent).cmp(&(&b.role, &b.agent)));
+        self.context.normalize();
         changed
     }
 
@@ -359,6 +364,9 @@ impl Config {
             return Err(format!(
                 "runtime.max_parallel_tasks must be between 1 and {MAX_PARALLEL_TASKS_LIMIT}"
             ));
+        }
+        if let Err(error) = self.context.validate() {
+            return Err(error.to_string());
         }
         for (id, entry) in &self.roles {
             if !valid_name(id) {
@@ -670,6 +678,19 @@ pub fn default_config_text() -> String {
 # How many tasks of a run may execute concurrently (1..=32). Integration
 # stays serialized per run regardless of this value.
 max_parallel_tasks = 4
+
+[context]
+# Repository context engine: injects a bounded, ranked REPOSITORY CONTEXT
+# section (indexed paths, symbols, excerpts, related tests) into missions.
+enabled = true
+# Maximum files selected for a task context (1..=200).
+max_files = 12
+# Maximum characters of the rendered repository context section.
+max_chars = 40000
+# Whether related test files are discovered and rendered.
+include_tests = true
+# Whether per-file symbol lists are extracted and rendered.
+include_symbols = true
 
 [agents.codex]
 kind = \"codex\"

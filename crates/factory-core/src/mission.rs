@@ -31,6 +31,10 @@ pub struct MissionContext<'a> {
     pub task: &'a Task,
     pub run_objective: &'a str,
     pub upstream_artifacts: &'a [RoleArtifact],
+    /// Rendered `REPOSITORY CONTEXT` section produced by the repository
+    /// context engine, when enabled and non-empty. Absent (or empty) renders
+    /// "none." so the agent knows the engine is active but found nothing.
+    pub repository_context: Option<&'a str>,
     /// Feedback from the previous review attempt of this task, if any.
     pub previous_feedback: Option<&'a ReviewResult>,
     /// Evidence and diff of the implementation a review task evaluates.
@@ -82,6 +86,15 @@ pub fn build_mission(context: &MissionContext<'_>) -> String {
         mission.push_str("none.");
     } else {
         mission.push_str(&render_upstream_context(context.upstream_artifacts));
+    }
+
+    mission.push_str("\n\nREPOSITORY CONTEXT\n");
+    match context.repository_context {
+        Some(rendered) if !rendered.trim().is_empty() => {
+            mission.push_str(rendered.trim_end());
+            mission.push('\n');
+        }
+        _ => mission.push_str("none."),
     }
 
     mission.push_str("\n\nACCEPTANCE CRITERIA\n");
@@ -449,6 +462,7 @@ mod tests {
             task: &task("Research auth", Some(roles::RESEARCHER)),
             run_objective: "Authenticate users",
             upstream_artifacts: &[],
+            repository_context: None,
             previous_feedback: None,
             review_input: None,
             final_review: false,
@@ -457,6 +471,7 @@ mod tests {
         assert!(mission.contains("WORKFLOW OBJECTIVE\nAuthenticate users"));
         assert!(mission.contains("OPERATION\nadvisory"));
         assert!(mission.contains("UPSTREAM CONTEXT\nnone."));
+        assert!(mission.contains("REPOSITORY CONTEXT\nnone."));
         assert!(mission.contains("\"findings\": [string]"));
         assert!(mission.contains("do not change production files"));
     }
@@ -486,6 +501,7 @@ mod tests {
             task: &task("Audit auth", Some(roles::SECURITY_AUDITOR)),
             run_objective: "Authenticate users",
             upstream_artifacts: &[],
+            repository_context: None,
             previous_feedback: None,
             review_input: Some(&input),
             final_review: false,
@@ -589,6 +605,7 @@ mod tests {
                 task: &task("T", None),
                 run_objective: "o",
                 upstream_artifacts: &[],
+                repository_context: None,
                 previous_feedback: None,
                 review_input: None,
                 final_review: false,
