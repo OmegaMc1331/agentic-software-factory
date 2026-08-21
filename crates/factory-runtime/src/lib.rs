@@ -483,7 +483,7 @@ fn publish_terminal_output(terminal: &InteractiveTerminal, chunk: &[u8]) {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::io::{IsTerminal, Read as _};
+    use std::io::IsTerminal;
 
     use factory_agent::{AgentKind, PromptTransport};
     use factory_core::{AgentEntry, Config, Factory};
@@ -496,7 +496,7 @@ mod tests {
         if std::env::var("FACTORY_PTY_CHILD").as_deref() == Ok("1") {
             println!("TTY={}", std::io::stdin().is_terminal());
             std::io::stdout().flush().unwrap();
-            let _ = std::io::stdin().read(&mut [0_u8; 1]);
+            let _ = std::io::Read::read(&mut std::io::stdin(), &mut [0_u8; 1]);
             std::process::exit(0);
         }
     }
