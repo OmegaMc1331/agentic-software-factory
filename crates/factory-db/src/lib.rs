@@ -522,8 +522,8 @@ impl FactoryDb {
     pub fn insert_agent_session(&self, session: &AgentSession) -> Result<AgentSession> {
         let mut session = session.clone();
         self.conn.execute(
-            "INSERT INTO agent_sessions (run_id, task_id, attempt_id, role, operation, agent, mode, command, status, started_at, finished_at, exit_code, duration_ms, stdout, stderr)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            "INSERT INTO agent_sessions (run_id, task_id, attempt_id, role, operation, agent, mode, command, status, started_at, finished_at, exit_code, duration_ms, stdout, stderr, policy_audit)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 session.run_id,
                 session.task_id,
@@ -539,7 +539,11 @@ impl FactoryDb {
                 session.exit_code,
                 session.duration_ms.map(|d| d as i64),
                 session.stdout,
-                session.stderr
+                session.stderr,
+                session
+                    .policy_audit
+                    .as_ref()
+                    .map(|audit| serde_json::to_string(audit).unwrap_or_default())
             ],
         )?;
         session.id = self.conn.last_insert_rowid();
@@ -548,7 +552,7 @@ impl FactoryDb {
 
     pub fn list_agent_sessions(&self, run_id: Option<i64>) -> Result<Vec<AgentSession>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, run_id, task_id, attempt_id, role, operation, agent, mode, command, status, started_at, finished_at, exit_code, duration_ms, stdout, stderr
+            "SELECT id, run_id, task_id, attempt_id, role, operation, agent, mode, command, status, started_at, finished_at, exit_code, duration_ms, stdout, stderr, policy_audit
              FROM agent_sessions
              WHERE (?1 IS NULL OR run_id = ?1)
              ORDER BY id",
@@ -562,7 +566,7 @@ impl FactoryDb {
     pub fn get_agent_session(&self, id: i64) -> Result<Option<AgentSession>> {
         self.conn
             .query_row(
-                "SELECT id, run_id, task_id, attempt_id, role, operation, agent, mode, command, status, started_at, finished_at, exit_code, duration_ms, stdout, stderr
+                "SELECT id, run_id, task_id, attempt_id, role, operation, agent, mode, command, status, started_at, finished_at, exit_code, duration_ms, stdout, stderr, policy_audit
                  FROM agent_sessions WHERE id = ?1",
                 params![id],
                 build_session,
@@ -577,7 +581,7 @@ impl FactoryDb {
         limit: usize,
     ) -> Result<Vec<AgentSession>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, run_id, task_id, attempt_id, role, operation, agent, mode, command, status, started_at, finished_at, exit_code, duration_ms, stdout, stderr
+            "SELECT id, run_id, task_id, attempt_id, role, operation, agent, mode, command, status, started_at, finished_at, exit_code, duration_ms, stdout, stderr, policy_audit
              FROM agent_sessions
              WHERE agent = ?1
              ORDER BY id DESC
@@ -1221,6 +1225,7 @@ fn apply_resolved(
 }
 
 fn build_session(r: &rusqlite::Row<'_>) -> rusqlite::Result<AgentSession> {
+    let policy_audit: Option<String> = r.get(16)?;
     Ok(AgentSession {
         id: r.get(0)?,
         run_id: r.get(1)?,
@@ -1243,6 +1248,7 @@ fn build_session(r: &rusqlite::Row<'_>) -> rusqlite::Result<AgentSession> {
         duration_ms: r.get(13).map(|v: Option<i64>| v.map(|v| v as u64))?,
         stdout: r.get(14)?,
         stderr: r.get(15)?,
+        policy_audit: policy_audit.and_then(|value| serde_json::from_str(&value).ok()),
     })
 }
 
@@ -1472,9 +1478,14 @@ CREATE TABLE plan_revisions (
 CREATE INDEX idx_plan_revisions_run ON plan_revisions(run_id, revision);
 ";
 
+/// Policy engine: which policy applied to an automated AgentSession. The
+/// audit keeps compact *metadata* (source, mode, write scopes) only — never
+/// secret values.
+const V11_SCHEMA: &str = "ALTER TABLE agent_sessions ADD COLUMN policy_audit TEXT;";
+
 const MIGRATIONS: &[&str] = &[
     V1_SCHEMA, V2_SCHEMA, V3_SCHEMA, V4_SCHEMA, V5_SCHEMA, V6_SCHEMA, V7_SCHEMA, V8_SCHEMA,
-    V9_SCHEMA, V10_SCHEMA,
+    V9_SCHEMA, V10_SCHEMA, V11_SCHEMA,
 ];
 
 fn migrate(conn: &mut Connection) -> Result<()> {
@@ -1526,12 +1537,15 @@ mod tests {
         let path = dir.path().join("test.db");
         let db = FactoryDb::open(&path).unwrap();
         let versions = schema_versions(&path);
-        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
         db.create_run("objective", Some("codex")).unwrap();
         drop(db);
 
         let db = FactoryDb::open(&path).unwrap();
-        assert_eq!(schema_versions(&path), vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        assert_eq!(
+            schema_versions(&path),
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+        );
         db.list_runs().unwrap();
     }
 
@@ -1556,7 +1570,10 @@ mod tests {
         drop(conn);
 
         let db = FactoryDb::open(&path).unwrap();
-        assert_eq!(schema_versions(&path), vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        assert_eq!(
+            schema_versions(&path),
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+        );
         let run = db.get_run(1).unwrap().unwrap();
         assert_eq!(run.objective, "legacy");
         let tasks = db.list_tasks(1).unwrap();
@@ -1611,7 +1628,10 @@ mod tests {
 
         let db = FactoryDb::open(&path).unwrap();
         // opening records versions 6 and 7 exactly once
-        assert_eq!(schema_versions(&path), vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        assert_eq!(
+            schema_versions(&path),
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+        );
         let tasks = db.list_tasks(1).unwrap();
         let operation_of = |title: &str| {
             tasks
@@ -1825,6 +1845,7 @@ mod tests {
             duration_ms: Some(1200),
             stdout: Some("{\"objective\":\"x\"}".to_string()),
             stderr: Some(String::new()),
+            policy_audit: None,
         };
         let saved = db.insert_agent_session(&session).unwrap();
         assert!(saved.id > 0);
@@ -2415,6 +2436,7 @@ mod tests {
                 duration_ms: None,
                 stdout: Some("partial".into()),
                 stderr: Some(String::new()),
+                policy_audit: None,
             })
             .unwrap();
 

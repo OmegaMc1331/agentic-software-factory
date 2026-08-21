@@ -16,6 +16,7 @@ import { STATE_META } from "../state";
 import { connectionKind } from "../graphWorkspace";
 import { ArtifactList } from "./ArtifactList";
 import { useRunArtifactsForTask } from "../artifactHelpers";
+import { PolicySummary } from "./PolicySummary";
 
 function executionClassFor(
   roleId: string | null,
@@ -209,6 +210,7 @@ export function NodeInspector({
             <span className="inspector-value">{meta.pathEntriesChecked ?? 0} checked</span>
           </div>
         </details>
+        <PolicySummary permissions={meta.permissions} />
       </>
     );
   } else if (node.kind === "run") {

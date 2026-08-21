@@ -159,6 +159,14 @@ pub struct AgentRequest {
     pub mission: String,
     pub working_dir: PathBuf,
     pub env: BTreeMap<String, String>,
+    /// Keys removed from the process environment even when configured on the
+    /// agent or passed in `env` (deny wins over allow).
+    pub env_deny: Vec<String>,
+    /// When set, the child process environment is *replaced* by the computed
+    /// one instead of inheriting Factory's full environment. Used by the
+    /// policy engine's environment filtering; the caller must pass the exact
+    /// environment in `env` in that case.
+    pub clear_env: bool,
 }
 
 impl AgentRequest {
@@ -167,6 +175,8 @@ impl AgentRequest {
             mission: mission.into(),
             working_dir: working_dir.into(),
             env: BTreeMap::new(),
+            env_deny: Vec::new(),
+            clear_env: false,
         }
     }
 }
@@ -300,7 +310,7 @@ impl CommandAgent {
             command: self.config.command.clone(),
             executable,
             args,
-            env: merged_env(&self.config.env, &request.env),
+            env: merged_env(&self.config.env, &request.env, &request.env_deny),
             working_dir: request.working_dir.clone(),
             stdin_payload,
         })
@@ -400,6 +410,11 @@ impl CommandAgent {
             use std::os::unix::process::CommandExt;
             cmd.process_group(0);
         }
+        if request.clear_env {
+            // Policy-managed environment: the child gets exactly the computed
+            // variables, not Factory's full inherited environment.
+            cmd.env_clear();
+        }
         for (key, value) in &invocation.env {
             cmd.env(key, value);
         }
@@ -482,13 +497,21 @@ impl CommandAgent {
 fn merged_env(
     configured: &BTreeMap<String, String>,
     request: &BTreeMap<String, String>,
+    denied: &[String],
 ) -> BTreeMap<String, String> {
-    let mut env = configured.clone();
-    env.extend(
-        request
-            .iter()
-            .map(|(key, value)| (key.clone(), value.clone())),
-    );
+    let minimized: Vec<String> = denied.iter().map(|key| key.to_lowercase()).collect();
+    let allowed = |key: &str| !minimized.contains(&key.to_lowercase());
+    let mut env = BTreeMap::new();
+    for (key, value) in configured {
+        if allowed(key) {
+            env.insert(key.clone(), value.clone());
+        }
+    }
+    for (key, value) in request {
+        if allowed(key) {
+            env.insert(key.clone(), value.clone());
+        }
+    }
     env
 }
 

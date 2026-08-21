@@ -15,6 +15,7 @@ pub use factory::{
 };
 pub use factory_agent::AgentStatus;
 pub use factory_context::ContextConfig;
+pub use factory_policy;
 pub use factory_types::WorkflowTeam;
 pub use planner::{parse_plan, validate_plan, PlanError, PlanOutcome, Planner};
 pub use roles::{

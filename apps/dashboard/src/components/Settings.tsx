@@ -18,7 +18,7 @@ import {
   type PromptTransport,
   type RoleInfo,
 } from "../types";
-import { RoleForm } from "./RoleForm";
+import { RoleForm, type RoleFormInitial } from "./RoleForm";
 
 const PRESETS: Record<
   Exclude<AgentKind, "custom">,
@@ -377,7 +377,10 @@ export function SettingsView() {
           <RoleForm
             mode="edit"
             agents={agentNames}
-            initial={editingRole}
+            initial={{
+              ...editingRole,
+              policyPreset: (editingRole.policyPreset as RoleFormInitial["policyPreset"]) ?? null,
+            }}
             error={error}
             submitLabel="Save role"
             onSubmit={(value) => {
@@ -387,6 +390,7 @@ export function SettingsView() {
                 description: value.description,
                 executionClass: value.executionClass,
                 instructions: value.instructions,
+                policyPreset: value.policyPreset ?? undefined,
               })
                 .then(() => {
                   setEditingRole(null);

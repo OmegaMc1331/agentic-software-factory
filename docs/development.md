@@ -205,3 +205,30 @@ with fake agent executables:
 
 Dashboard tests cover stage display, operation chips, the artifact inspector, and
 request-changes state rendering.
+
+## Policy engine internals
+
+The policy model and its single resolver live in `crates/factory-policy`
+(`policy.rs` for the model/precedence, `path.rs` for repository-relative glob
+matching and traversal rejection, `environment.rs` for filtering and secret
+redaction). Factory Core consumes one `EffectivePolicy` per (role, agent) pair —
+never re-implement permission logic in the runtime, API, or dashboard:
+
+- `Config::effective_policy(role, agent)` is the only resolution entry point;
+- `factory_policy::validate_executable` gates start and retry (policy blocks must
+  not consume the normal retry budget);
+- `invoke_with_agent` computes the child environment (replace-instead-of-inherit
+  when filtering) and registers denied values for redaction before the process
+  starts;
+- `enforce_evidence_policy` checks recorded changed files and reported commands
+  after each attempt — a violation fails the attempt without a retry;
+- every automated `AgentSession` persists the compact `policy_audit` snapshot (no
+  secret values).
+
+Policy integration tests live in `crates/factory-core/tests/policy_enforcement.rs`
+(fake agents): pre-start blocking, retry-budget preservation, write-scope and
+command violations, baseline `.factory` protection with open scopes, agent-scope
+narrowing, environment filtering with secret redaction, and per-session audits.
+`factory-policy` unit tests cover resolution precedence, glob matching, deny-wins,
+traversal rejection, and the preset expansion. Keep new enforcement points in
+Factory Core centralized — do not add scattered permission checks.

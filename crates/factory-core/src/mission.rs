@@ -6,6 +6,7 @@
 //! so a Researcher writes findings, a Worker reports commands, and a Security
 //! Auditor returns a decision with findings — without per-role branching.
 
+use factory_policy::EffectivePolicy;
 use factory_types::{
     ReviewDecision, ReviewFinding, ReviewResult, RoleArtifact, Task, TaskEvidence, TaskOperation,
 };
@@ -43,6 +44,10 @@ pub struct MissionContext<'a> {
     /// `{decision, reason, feedback}` contract instead of the findings shape
     /// used by specialized review tasks.
     pub final_review: bool,
+    /// The effective policy applied to this session. Rendered as a
+    /// `PERMISSIONS` section so agents see the enforced boundary; the mission
+    /// text is guidance, the enforcement boundary is Factory Core.
+    pub policy: Option<&'a EffectivePolicy>,
 }
 
 /// The implementation evidence a review (or final acceptance) task inspects.
@@ -120,6 +125,10 @@ pub fn build_mission(context: &MissionContext<'_>) -> String {
 
     if let Some(input) = context.review_input {
         mission.push_str(&render_review_input(input));
+    }
+
+    if let Some(policy) = context.policy {
+        mission.push_str(&format!("\n\nPERMISSIONS\n{}", render_policy(policy)));
     }
 
     mission.push_str("\n\nOUTPUT CONTRACT\n");
@@ -225,6 +234,67 @@ fn render_upstream_context(artifacts: &[RoleArtifact]) -> String {
         out.push_str("\n…[upstream context truncated; only the artifacts above were provided]\n");
     }
     out
+}
+
+/// Renders the effective policy attached to a session. This is the same
+/// resolved policy used by execution and validation; the text below is explicit
+/// about what Factory enforces versus what is advisory.
+fn render_policy(policy: &EffectivePolicy) -> String {
+    let filesystem = if policy.filesystem.read_only() {
+        "read-only (no writes)".to_string()
+    } else {
+        let scopes = policy.filesystem.effective_write_scopes();
+        let denials = policy.filesystem.deny_scopes();
+        let mut line = format!(
+            "Filesystem: read {}, write {}",
+            policy.filesystem.read_scopes().join(", "),
+            if scopes.is_empty() {
+                "none".to_string()
+            } else {
+                scopes.join(", ")
+            }
+        );
+        if !denials.is_empty() {
+            line.push_str(&format!(", deny {}", denials.join(", ")));
+        }
+        line
+    };
+    let commands = match policy.commands.mode {
+        factory_policy::CommandsMode::Unrestricted => "unrestricted".to_string(),
+        factory_policy::CommandsMode::Restricted => {
+            format!(
+                "restricted (allowed: {}, denied: {})",
+                policy.commands.allow.join(", "),
+                policy.commands.deny.join(", ")
+            )
+        }
+        factory_policy::CommandsMode::Denied => "denied (no commands may be run)".to_string(),
+    };
+    let network = if policy.network.allowed() {
+        "network: allow (advisory — Factory cannot sandbox the process)".to_string()
+    } else {
+        "network: deny (advisory — blocked only by instruction, not enforced)".to_string()
+    };
+    let environment = if policy.environment.filtered {
+        "environment: filtered".to_string()
+    } else if !policy.environment.denied.is_empty() {
+        "environment: inherited, some variables denied".to_string()
+    } else {
+        "environment: full inheritance".to_string()
+    };
+    let git_allowed: Vec<String> = policy
+        .git
+        .allowed
+        .iter()
+        .map(|operation| operation.as_str().to_string())
+        .collect();
+    format!(
+        "{filesystem}\nCommands: {commands}\n{network}\n{environment}\nGit: {}\n\
+         Dangerous Git operations (push, force push, branch deletion, reset, remote \
+         modification) are always denied. Factory blocks writes outside the scopes above \
+         and never lets task agents touch the integration branch.",
+        git_allowed.join(", "),
+    )
 }
 
 fn render_review_input(input: &ReviewInput) -> String {
@@ -466,6 +536,7 @@ mod tests {
             previous_feedback: None,
             review_input: None,
             final_review: false,
+            policy: None,
         });
         assert!(mission.contains("ROLE\nResearcher — "));
         assert!(mission.contains("WORKFLOW OBJECTIVE\nAuthenticate users"));
@@ -505,6 +576,7 @@ mod tests {
             previous_feedback: None,
             review_input: Some(&input),
             final_review: false,
+            policy: None,
         });
         assert!(mission.contains("CHANGE UNDER REVIEW"));
         assert!(mission.contains("Produced by: Implement auth (worker)"));
@@ -569,6 +641,57 @@ mod tests {
     }
 
     #[test]
+    fn permission_section_renders_the_effective_policy() {
+        use factory_policy::PoliciesConfig;
+        #[derive(serde::Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            policies: PoliciesConfig,
+        }
+        let wrapper: Wrapper = toml::from_str(
+            r#"
+[policies.roles.doc_writer]
+preset = "documentation"
+"#,
+        )
+        .unwrap();
+        let policy = wrapper.policies.effective("doc_writer", "claude");
+        let role = crate::roles::core_role(crate::roles::DOCUMENTATION_WRITER).unwrap();
+        let mission = build_mission(&MissionContext {
+            role: &role,
+            operation: TaskOperation::PostProcess,
+            task: &task("T", None),
+            run_objective: "o",
+            upstream_artifacts: &[],
+            repository_context: None,
+            previous_feedback: None,
+            review_input: None,
+            final_review: false,
+            policy: Some(&policy),
+        });
+        assert!(
+            mission.contains("PERMISSIONS"),
+            "mission shows the enforced boundary"
+        );
+        assert!(mission.contains("write README.md, docs/**"));
+        assert!(mission.contains("push, force push, branch deletion, reset, remote modification"));
+        // No policy => no PERMISSIONS section (legacy missions unchanged).
+        let bare = build_mission(&MissionContext {
+            role: &role,
+            operation: TaskOperation::PostProcess,
+            task: &task("T", None),
+            run_objective: "o",
+            upstream_artifacts: &[],
+            repository_context: None,
+            previous_feedback: None,
+            review_input: None,
+            final_review: false,
+            policy: None,
+        });
+        assert!(!bare.contains("PERMISSIONS"));
+    }
+
+    #[test]
     fn advisory_tolerates_non_json_output() {
         let (report, parsed) = parse_advisory_report("I inspected the repo…");
         assert!(!parsed);
@@ -609,6 +732,7 @@ mod tests {
                 previous_feedback: None,
                 review_input: None,
                 final_review: false,
+                policy: None,
             });
             assert!(mission.contains("OUTPUT CONTRACT"), "{operation}");
         }

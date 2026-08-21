@@ -326,6 +326,13 @@ or by editing `.factory/config.toml`. Custom roles are project-local definitions
 Custom roles do not own model settings. Temperature, model choice, provider, and
 token limits belong to the agent CLI, not to Factory.
 
+Instructions are guidance, never permissions: what Factory permits a role (or an
+agent) to do is decided by its **policy** — filesystem write scopes, command
+allow/deny lists, environment filtering, and Git limits configured in
+`.factory/config.toml` or through the Role Inspector's policy preset. Custom roles
+select a preset (`read_only`, `implementation`, `documentation`, `review`, or
+`custom`). See [Policies](policies.md).
+
 The slug is derived from the name (`Database Engineer` → `database_engineer`) and is
 editable until first save. After a role has been used by persisted workflows, keep
 its id stable: renaming the display name is safe; changing the slug orphans historical

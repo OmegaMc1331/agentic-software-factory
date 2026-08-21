@@ -173,3 +173,69 @@ describe("Node Inspector (role-aware task)", () => {
     expect(screen.getByText(/uses JWT/)).toBeTruthy();
   });
 });
+
+describe("Node Inspector (agent permissions)", () => {
+  const agentNode: GraphNode = {
+    id: "agent:claude",
+    kind: "agent",
+    label: "claude",
+    meta: {
+      command: "claude -p",
+      available: true,
+      roles: ["security_auditor"],
+      permissions: {
+        source: "agent:claude",
+        permissive: false,
+        filesystemMode: "read_only",
+        readScopes: ["**"],
+        writeScopes: [],
+        denyWriteScopes: [".factory/**"],
+        commandsMode: "restricted",
+        commandsAllow: ["git"],
+        commandsDeny: ["bash"],
+        network: "deny",
+        networkEnforcement: "advisory",
+        environmentMode: "filtered",
+        environmentAllowed: ["PATH"],
+        environmentDenied: ["GITHUB_TOKEN"],
+        gitAllowed: ["read"],
+        gitDenied: ["push", "force_push", "delete_branch", "reset_branch", "modify_remotes"],
+      },
+    },
+  };
+
+  it("shows the agent's effective permissions including advisory network", () => {
+    render(
+      <NodeInspector
+        node={agentNode}
+        edge={null as GraphEdge | null}
+        nodesById={new Map([[agentNode.id, agentNode]])}
+        onClose={vi.fn()}
+        onDelete={vi.fn()}
+        onConnect={vi.fn()}
+      />
+    );
+
+    expect(screen.getByText("Permissions")).toBeTruthy();
+    expect(screen.getByText("Read-only")).toBeTruthy();
+    expect(screen.getByText("Denied")).toBeTruthy();
+    expect(screen.getByText(/advisory — not process-enforced/)).toBeTruthy();
+    expect(screen.getByText("Policy source: agent:claude")).toBeTruthy();
+  });
+
+  it("omits nothing when the agent carries no policy information", () => {
+    const bare = { ...agentNode, meta: { command: "claude -p", available: true, roles: [] } };
+    render(
+      <NodeInspector
+        node={bare}
+        edge={null as GraphEdge | null}
+        nodesById={new Map([[bare.id, bare]])}
+        onClose={vi.fn()}
+        onDelete={vi.fn()}
+        onConnect={vi.fn()}
+      />
+    );
+
+    expect(screen.getByText("No policy information available.")).toBeTruthy();
+  });
+});

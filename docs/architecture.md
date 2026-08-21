@@ -38,6 +38,7 @@ crates/
   factory-types     Run, Task, TaskOperation, RoleArtifact, TaskAttempt, evidence,
                     review, and session types
   factory-agent     Configured subprocess execution, output capture, cancellation
+  factory-policy    Policy model, precedence resolver, path/environment enforcement
   factory-db        SQLite persistence and versioned migrations
   factory-git       Repository checks, worktrees, and Git evidence
   factory-core      Planning, invariants, mission building, task transitions, and
@@ -66,9 +67,14 @@ planning → planned → active → completed
                     └────────→ cancelled
 ```
 
+A `blocked` run keeps its tasks untouched and can be started again once the blocking
+problem (typically a policy or dependency issue) is fixed; starting re-validates
+everything from scratch.
+
 Start validates the workflow team (planner, workers, reviewers, and any additional
-roles), the Git repository, the task DAG, and the presence of planned tasks. The first
-runtime is sequential:
+roles), the Git repository, the task DAG, the presence of planned tasks, and every
+task's effective policy — a task that cannot legally execute blocks the run before
+any agent process starts, without consuming retries. The first runtime is sequential:
 
 ```text
 lowest-position ready task
@@ -168,9 +174,38 @@ routing. Execution stays sequential; the pool topology is parallel-ready.
 
 The mission for every task is assembled by one centralized role-aware mission builder
 in Factory Core. It composes the role definition, the operation's semantics and
-output contract, the run objective, and the dependency-aware upstream context. See
+output contract, the run objective, the dependency-aware upstream context, and a
+`PERMISSIONS` section rendering the session's effective policy. See
 [Roles — Execution classes and operations](roles.md#execution-classes-and-operations)
 for the compatibility matrix and per-operation behavior.
+
+## Policy engine
+
+`factory-policy` owns the policy model and the single resolver. Policies are
+project-local (`[policies.roles.<id>]` / `[policies.agents.<name>]` in
+`.factory/config.toml`) and merge with fixed precedence — Factory safety invariants,
+then the role policy, then agent-specific restrictions — into one `EffectivePolicy`
+per running (role, agent) pair:
+
+```text
+PoliciesConfig.effective(role, agent) → EffectivePolicy
+  filesystem   repository-relative read/write/deny glob scopes
+  commands     unrestricted / restricted / denied, executable-name matching
+  network      allow / deny (advisory only)
+  environment  allow/deny lists applied before process launch
+  git          read + commit-in-task-worktree; dangerous ops are invariants
+```
+
+Factory Core consumes that one resolution at every boundary: the pre-start gate
+(blocks a run when a task cannot legally execute, without consuming retries),
+policy-aware agent selection within a role's pool, the child process environment
+(replace-instead-of-inherit when filtering), secret redaction of denied values in
+captured output, post-attempt evidence checks (changed files and reported commands),
+and the compact `AgentSession.policy_audit` snapshot. The API serializes
+`PolicyView`s derived from the same effective policies for the dashboard's
+Permissions sections. Permission logic is never duplicated in the runtime, API, or
+frontend. See [Policies](policies.md) for the model, presets, and the precise
+enforcement boundary.
 
 ## Persistence and concurrency
 
@@ -243,6 +278,7 @@ macOS use the platform PTY through `portable-pty`.
 | POST   | `/api/roles/:id/assignments`  | Assign an agent to a role                    |
 | DELETE | `/api/roles/:id/assignments/:agent` | Remove one role assignment            |
 | PUT    | `/api/roles/:id/preferred`    | Mark one assignment as preferred             |
+| PUT    | `/api/roles/:id/policy`       | Set or clear a role's policy preset          |
 | GET    | `/api/graph`                  | Read Factory entities and semantic links     |
 | GET    | `/api/sessions/:id/stream`    | Stream one known session through SSE         |
 | POST   | `/api/agents/:agent/sessions` | Start that configured agent in a PTY          |

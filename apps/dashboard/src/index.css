@@ -2367,3 +2367,62 @@ code {
   font-family: var(--mono);
   font-size: 10px;
 }
+
+/* --- Policy (permissions) sections in inspectors --- */
+
+.policy-section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 14px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+
+.policy-section h4 {
+  margin: 0;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+}
+
+.policy-permissive-note,
+.policy-invariant-note,
+.policy-distinction-note {
+  margin: 0;
+  font-size: 10.5px;
+  color: var(--text-muted);
+}
+
+.policy-permissive-note {
+  color: #d6a85f;
+}
+
+.policy-advisory {
+  color: var(--text-muted);
+  font-size: 10.5px;
+}
+
+.policy-scopes {
+  overflow-wrap: anywhere;
+}
+
+.policy-source {
+  margin: 0;
+  font-size: 10px;
+  color: var(--text-muted);
+  font-family: var(--mono);
+}
+
+.role-policy-editor .role-policy-select {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 4px;
+}
+
+.role-policy-editor .role-policy-select label {
+  font-size: 10.5px;
+  color: var(--text-secondary);
+}

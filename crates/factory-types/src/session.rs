@@ -28,6 +28,25 @@ impl std::str::FromStr for AgentSessionMode {
     }
 }
 
+/// Compact policy audit snapshot persisted with an automated AgentSession:
+/// enough to know which policy applied, without storing any secret values.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionPolicyAudit {
+    /// Where the policy came from (`role:worker`, `role:worker + agent:codex`,
+    /// `default` for the permissive legacy policy).
+    pub source: String,
+    /// `open`, `restricted`, or `read_only`.
+    pub filesystem: String,
+    /// `allow` or `deny` (enforcement advisory).
+    pub network: String,
+    /// `filtered` or `full`.
+    pub environment: String,
+    /// Effective write scopes at session start.
+    #[serde(default)]
+    pub write_scopes: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentSession {
@@ -50,4 +69,8 @@ pub struct AgentSession {
     pub duration_ms: Option<u64>,
     pub stdout: Option<String>,
     pub stderr: Option<String>,
+    /// Which policy applied to this automated session (null for sessions
+    /// recorded before the policy engine or for interactive consoles).
+    #[serde(default)]
+    pub policy_audit: Option<SessionPolicyAudit>,
 }

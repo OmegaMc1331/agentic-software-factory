@@ -7,6 +7,7 @@ import type {
   GraphWorkspace,
   RoleArtifact,
   RoleInfo,
+  RolePolicyPreset,
   Run,
   RunDetail,
   RunSummary,
@@ -173,6 +174,8 @@ export interface RoleCreateRequest {
   instructions?: string;
   agents?: string[];
   preferredAgent?: string;
+  /** Policy preset: what Factory permits the role to do (not its instructions). */
+  policyPreset?: RolePolicyPreset;
 }
 
 export function createRole(request: RoleCreateRequest): Promise<RoleInfo> {
@@ -186,9 +189,19 @@ export function updateRole(
     description: string;
     executionClass: ExecutionClass;
     instructions?: string;
+    policyPreset?: RolePolicyPreset;
   }
 ): Promise<RoleInfo> {
   return put<RoleInfo>(`/roles/${encodeURIComponent(id)}`, body);
+}
+
+/**
+ * Sets (or clears with null) a role's policy preset. Works for core and custom
+ * roles: the policy is Factory's enforcement boundary, independent of the
+ * role's instructions.
+ */
+export function setRolePolicy(roleId: string, preset: RolePolicyPreset | null): Promise<RoleInfo> {
+  return put<RoleInfo>(`/roles/${encodeURIComponent(roleId)}/policy`, { preset });
 }
 
 export function deleteRole(id: string): Promise<void> {

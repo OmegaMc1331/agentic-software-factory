@@ -670,6 +670,7 @@ async fn agent_session_endpoints_return_persisted_output_and_close_completed_str
             duration_ms: Some(2_000),
             stdout: Some("compiled\n".to_string()),
             stderr: Some("warning\n".to_string()),
+            policy_audit: None,
         })
         .unwrap()
     };
@@ -1118,4 +1119,168 @@ async fn workflow_cancel_stops_a_known_planning_session() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert!(body_text(response).await.contains("while it is cancelled"));
+}
+
+#[tokio::test]
+async fn role_policy_endpoint_sets_and_clears_presets() {
+    let dir = TempDir::new().unwrap();
+    init_root(dir.path());
+    let app = factory_api::router(make_state(dir.path()));
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/roles/worker/policy")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "preset": "read_only" }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let role: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+    assert_eq!(role["permissions"]["filesystemMode"], "read_only");
+    assert_eq!(
+        role["permissions"]["writeScopes"].as_array().unwrap().len(),
+        0
+    );
+
+    // The preset is persisted as a project-local policy in config.toml.
+    let config = factory_core::Config::load(dir.path()).unwrap();
+    let policy = config.effective_policy("worker", "codex");
+    assert!(policy.filesystem.read_only());
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/roles/worker/policy")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "preset": null }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let role: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+    assert_eq!(
+        role["permissions"]["filesystemMode"], "open",
+        "clearing the preset removes the role scope entirely"
+    );
+    assert_eq!(role["permissions"]["permissive"], true);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/roles/worker/policy")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "preset": " sideways" }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn custom_roles_can_select_a_policy_preset_at_creation() {
+    let dir = TempDir::new().unwrap();
+    init_root(dir.path());
+    let app = factory_api::router(make_state(dir.path()));
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/roles")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "name": "Docs Specialist",
+                        "description": "Writes documentation.",
+                        "executionClass": "post_process",
+                        "instructions": "Update the docs.",
+                        "policyPreset": "documentation"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let role: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+    assert_eq!(role["permissions"]["filesystemMode"], "restricted");
+    assert_eq!(
+        role["permissions"]["writeScopes"],
+        json!(["README.md", "docs/**"])
+    );
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/roles/docs_specialist")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let config = factory_core::Config::load(dir.path()).unwrap();
+    assert!(
+        !config.policies.roles.contains_key("docs_specialist"),
+        "deleting a role must not leave its policy behind"
+    );
+}
+
+#[tokio::test]
+async fn graph_exposes_effective_permissions_for_agents_and_roles() {
+    let dir = TempDir::new().unwrap();
+    init_root(dir.path());
+    let app = factory_api::router(make_state(dir.path()));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/graph")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let graph: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+    let worker_role = graph["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| node["id"] == "role:worker")
+        .expect("worker role node");
+    assert_eq!(worker_role["meta"]["permissions"]["filesystemMode"], "open");
+    assert_eq!(
+        worker_role["meta"]["permissions"]["gitDenied"],
+        json!([
+            "push",
+            "force_push",
+            "delete_branch",
+            "reset_branch",
+            "modify_remotes"
+        ])
+    );
+    let agent_node = graph["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| node["kind"] == "agent")
+        .expect("at least one agent node");
+    assert_eq!(
+        agent_node["meta"]["permissions"]["networkEnforcement"], "advisory",
+        "the graph must not claim sandbox-level network isolation"
+    );
 }

@@ -31,6 +31,23 @@ do not change what it is allowed to do:
 - custom role text is not a security sandbox; treat it like any other prompt to an
   agent you trust.
 
+Permissions come from the **policy engine**, not from instructions. See
+[Policies](policies.md) for the model; the security-relevant summary:
+
+- policies are project-local orchestration controls, not OS-level virtualization;
+  Factory does not sandbox the agent process, its filesystem calls, or its network;
+- the Factory safety invariants always apply regardless of configuration:
+  `.factory/**` and `.git/**` stay unwritable, dangerous Git operations (push,
+  force push, branch deletion, reset, remote modification) stay denied, and the
+  Integration Engine keeps exclusive control of integration branches;
+- network `deny` is advisory everywhere — Factory records and states the boundary
+  but cannot restrict a launched process's network on current platforms;
+- environment policies filter the child process environment before launch (allow
+  lists, deny lists, deny-wins), and denied values are redacted from captured
+  session output; secret values are never logged or persisted;
+- tasks that cannot legally execute are blocked before an agent process starts, and
+  policy violations fail an attempt without consuming the normal retry budget.
+
 ## Agent Console
 
 The Agent Console is not a general shell. It reads a known Factory-managed
@@ -46,13 +63,15 @@ command execution through the dashboard API is not supported.
 ## Process permissions
 
 External coding agents run with the OS permissions of the user who started Factory.
-Depending on the agent, they may access files outside the project, inherited
-environment variables, the network, and other user-readable locations. Use only agents
-you trust.
+Depending on the agent, they may access files outside the project, the network, and
+other user-readable locations. Use only agents you trust.
 
 Factory doesn't manage model-provider credentials. Agents are external CLIs that you
-install and authenticate. They inherit Factory's environment, plus any variables in
-their `.factory/config.toml` entry.
+install and authenticate. By default they inherit Factory's environment, plus any
+variables in their `.factory/config.toml` entry; when a role or agent policy filters
+or denies environment variables, Factory replaces the child environment with the
+computed set instead of inheriting, and denied values are redacted from recorded
+output. See [Policies — environment](policies.md#environment-and-secrets).
 
 PTY sessions run with the same OS permissions as Factory. A PTY is an interaction
 mechanism, not a sandbox.

@@ -8,6 +8,7 @@ license.workspace = true
 factory-types = { workspace = true }
 factory-agent = { workspace = true }
 factory-context = { workspace = true }
+factory-policy = { workspace = true }
 factory-db = { workspace = true }
 factory-git = { workspace = true }
 thiserror = { workspace = true }

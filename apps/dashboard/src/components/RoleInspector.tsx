@@ -4,10 +4,21 @@ import {
   createRole,
   removeRoleAssignment,
   setPreferredAssignment,
+  setRolePolicy,
   updateRole,
 } from "../api";
-import type { RoleInfo } from "../types";
+import type { RoleInfo, RolePolicyPreset } from "../types";
+import { PolicySummary } from "./PolicySummary";
 import { RoleForm } from "./RoleForm";
+
+const POLICY_PRESETS: { value: RolePolicyPreset | ""; label: string }[] = [
+  { value: "", label: "Default (permissive)" },
+  { value: "read_only", label: "Read-only" },
+  { value: "implementation", label: "Implementation" },
+  { value: "documentation", label: "Documentation" },
+  { value: "review", label: "Review" },
+  { value: "custom", label: "Custom" },
+];
 
 function Row({ label, children }: { label: string; children: React.ReactNode }) {
   return (
@@ -59,6 +70,7 @@ export function RoleInspector({
     description: string;
     executionClass: RoleInfo["executionClass"];
     instructions: string;
+    policyPreset: RolePolicyPreset | null;
   }) => {
     setBusy(true);
     setError(null);
@@ -68,6 +80,7 @@ export function RoleInspector({
         description: value.description,
         executionClass: value.executionClass,
         instructions: value.instructions,
+        policyPreset: value.policyPreset ?? undefined,
       });
       setEditing(false);
       await onChanged();
@@ -92,7 +105,14 @@ export function RoleInspector({
           <RoleForm
             mode="edit"
             agents={agents}
-            initial={role}
+            initial={{
+              id: role.id,
+              name: role.name,
+              description: role.description,
+              executionClass: role.executionClass,
+              instructions: role.instructions,
+              policyPreset: (role.policyPreset as RolePolicyPreset | null | undefined) ?? null,
+            }}
             error={error}
             submitLabel="Save role"
             onSubmit={(value) => void saveDefinition(value)}
@@ -191,6 +211,38 @@ export function RoleInspector({
           )}
         </div>
 
+        <section
+          className="policy-section role-policy-editor"
+          aria-label={`Policy for ${role.name}`}
+        >
+          <h4>Permissions</h4>
+          <p className="policy-distinction-note">
+            Instructions say what this role should do; the policy says what Factory permits.
+          </p>
+          <div className="role-policy-select">
+            <label htmlFor={`role-policy-${role.id}`}>Policy preset</label>
+            <select
+              id={`role-policy-${role.id}`}
+              className="net-select"
+              value={role.policyPreset ?? ""}
+              disabled={busy}
+              onChange={(event) => {
+                const value = event.target.value;
+                void act(() =>
+                  setRolePolicy(role.id, value === "" ? null : (value as RolePolicyPreset))
+                );
+              }}
+            >
+              {POLICY_PRESETS.map((preset) => (
+                <option key={preset.value} value={preset.value}>
+                  {preset.label}
+                </option>
+              ))}
+            </select>
+          </div>
+          <PolicySummary permissions={role.permissions} />
+        </section>
+
         {role.kind === "custom" && (
           <div className="role-definition-actions">
             <button className="button" onClick={() => setEditing(true)}>
@@ -210,6 +262,8 @@ export function RoleInspector({
                     preferredAgent:
                       role.assignments.find((assignment) => assignment.preferred)?.agent ??
                       undefined,
+                    policyPreset:
+                      (role.policyPreset as RolePolicyPreset | null | undefined) ?? undefined,
                   })
                 )
               }

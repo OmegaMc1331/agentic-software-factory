@@ -5,9 +5,10 @@ import {
   createRole,
   removeRoleAssignment,
   setPreferredAssignment,
+  setRolePolicy,
   updateRole,
 } from "../api";
-import type { RoleInfo } from "../types";
+import type { PolicyView, RoleInfo } from "../types";
 import { RoleInspector } from "./RoleInspector";
 
 vi.mock("../api", () => ({
@@ -15,8 +16,31 @@ vi.mock("../api", () => ({
   createRole: vi.fn(),
   removeRoleAssignment: vi.fn(),
   setPreferredAssignment: vi.fn(),
+  setRolePolicy: vi.fn(),
   updateRole: vi.fn(),
 }));
+
+function permissions(overrides: Partial<PolicyView> = {}): PolicyView {
+  return {
+    source: "role:database_engineer",
+    permissive: false,
+    filesystemMode: "restricted",
+    readScopes: ["**"],
+    writeScopes: ["migrations/**"],
+    denyWriteScopes: [],
+    commandsMode: "restricted",
+    commandsAllow: ["git"],
+    commandsDeny: ["bash"],
+    network: "allow",
+    networkEnforcement: "advisory",
+    environmentMode: "filtered",
+    environmentAllowed: ["PATH"],
+    environmentDenied: [],
+    gitAllowed: ["read", "commit_in_task_worktree"],
+    gitDenied: ["push", "force_push", "delete_branch", "reset_branch", "modify_remotes"],
+    ...overrides,
+  };
+}
 
 function customRole(overrides: Partial<RoleInfo> = {}): RoleInfo {
   return {
@@ -53,6 +77,7 @@ beforeEach(() => {
   vi.mocked(createRole).mockReset().mockResolvedValue(customRole());
   vi.mocked(removeRoleAssignment).mockReset().mockResolvedValue(customRole());
   vi.mocked(setPreferredAssignment).mockReset().mockResolvedValue(customRole());
+  vi.mocked(setRolePolicy).mockReset().mockResolvedValue(customRole());
   vi.mocked(updateRole).mockReset().mockResolvedValue(customRole());
 });
 
@@ -203,5 +228,70 @@ describe("Role inspector", () => {
 
     expect(await screen.findByRole("alert")).toBeTruthy();
     expect(screen.getByText(/already assigned/)).toBeTruthy();
+  });
+
+  it("shows the effective permissions with write scopes and the advisory network mode", () => {
+    render(
+      <RoleInspector
+        role={customRole({
+          permissions: permissions(),
+          policyPreset: "custom",
+        })}
+        agents={agents}
+        onClose={vi.fn()}
+        onChanged={vi.fn()}
+        onDelete={vi.fn()}
+      />
+    );
+
+    expect(screen.getByText(/write: migrations\/\*\*/)).toBeTruthy();
+    expect(screen.getByText("Task worktree only")).toBeTruthy();
+    expect(screen.getByText(/advisory — not process-enforced/)).toBeTruthy();
+    expect(
+      screen.getByText(
+        /Instructions say what this role should do; the policy says what Factory permits/
+      )
+    ).toBeTruthy();
+  });
+
+  it("edits the role's policy preset through the policy endpoint", async () => {
+    const onChanged = vi.fn();
+    render(
+      <RoleInspector
+        role={customRole({ permissions: permissions(), policyPreset: "custom" })}
+        agents={agents}
+        onClose={vi.fn()}
+        onChanged={onChanged}
+        onDelete={vi.fn()}
+      />
+    );
+
+    fireEvent.change(screen.getByLabelText("Policy preset"), {
+      target: { value: "read_only" },
+    });
+
+    await waitFor(() =>
+      expect(setRolePolicy).toHaveBeenCalledWith("database_engineer", "read_only")
+    );
+    await waitFor(() => expect(onChanged).toHaveBeenCalled());
+  });
+
+  it("clearing the preset sends null so the role returns to permissive defaults", async () => {
+    const onChanged = vi.fn();
+    render(
+      <RoleInspector
+        role={customRole({ permissions: permissions(), policyPreset: "custom" })}
+        agents={agents}
+        onClose={vi.fn()}
+        onChanged={onChanged}
+        onDelete={vi.fn()}
+      />
+    );
+
+    fireEvent.change(screen.getByLabelText("Policy preset"), {
+      target: { value: "" },
+    });
+
+    await waitFor(() => expect(setRolePolicy).toHaveBeenCalledWith("database_engineer", null));
   });
 });

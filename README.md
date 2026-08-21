@@ -117,6 +117,25 @@ create custom roles with their own instructions from Agent Graph, and each workf
 selects the team of roles and agents that may participate. See
 [docs/roles.md](docs/roles.md) for the full guide.
 
+## Policies
+
+Role instructions say what an agent should do; a **policy** says what Factory
+permits it to do. Project-local policies in `.factory/config.toml` control
+filesystem read/write scopes, command allow/deny lists, Git operations,
+network (advisory), and which environment variables reach the agent process.
+Policies apply per role and per agent, deny rules win, and Factory's own safety
+invariants (protected `.factory` state, no push/force-push from task agents,
+Integration Engine authority) always apply. Tasks that cannot legally execute are
+blocked before anything runs, without consuming retries. See
+[docs/policies.md](docs/policies.md).
+
+```toml
+[policies.roles.worker.filesystem]
+read = ["**"]
+write = ["src/**", "tests/**"]
+deny_write = [".github/**"]
+```
+
 ## Dashboard
 
 Agent Graph is the primary operating interface:
@@ -148,6 +167,7 @@ The local API is bound to `127.0.0.1`:
 | POST   | `/api/roles`                  | Create a custom role                              |
 | PUT    | `/api/roles/:id`              | Update a custom role definition                   |
 | DELETE | `/api/roles/:id`              | Delete an unused custom role                      |
+| PUT    | `/api/roles/:id/policy`       | Set or clear a role's policy preset               |
 | POST   | `/api/roles/:id/assignments`  | Assign an agent to a role                         |
 | GET    | `/api/graph`                  | Agents, workflows, tasks, and semantic links     |
 | GET    | `/api/graph/workspace`        | Saved visual layout and custom topology          |
@@ -169,24 +189,25 @@ Agent Graph → local API → Factory Core → Planner → task DAG
 
 **Plan** asks the selected Planner for structured tasks and dependencies without
 changing the repository; tasks may target specific roles from the workflow's team.
-**Start** validates the team, Git repository, and DAG, then
-runs ready tasks sequentially. A task completes only after structured Reviewer
-approval; process exit alone is not completion. Worker failures and change requests
-retry up to three total attempts. Every invocation is an `AgentSession` that records
-the role and agent that ran.
+**Start** validates the team, Git repository, DAG, and each task's effective policy,
+then runs ready tasks in isolated worktrees. A task completes only after structured
+Reviewer approval; process exit alone is not completion. Worker failures and change
+requests retry up to three total attempts; policy blocks never consume retries.
+Every invocation is an `AgentSession` that records the role and agent that ran, plus
+which policy applied.
 
 All state lives in `.factory/`:
 
 ```text
 .factory/
   db.sqlite3          runs, tasks, attempts, and agent sessions
-  config.toml         agents and role assignments
+  config.toml         agents, role assignments, and policies
   graph.json          saved positions, visual nodes, and custom links
   worktrees/t<id>/    one git worktree per task
 ```
 
-Not implemented: parallel scheduling, plan editing, automatic branch integration, or
-remote/cloud execution.
+Not implemented: OS-level sandboxing (policies are orchestration controls, not
+virtualization) or remote/cloud execution.
 
 ## Development
 

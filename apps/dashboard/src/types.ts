@@ -193,9 +193,39 @@ export interface ConfigData {
 
 export type ExecutionClass = "planning" | "execution" | "review" | "advisory" | "post_process";
 
+/** Policy preset names a role can select (what Factory permits, not instructions). */
+export type RolePolicyPreset =
+  "read_only" | "implementation" | "documentation" | "review" | "custom";
+
 export interface RoleAssignmentInfo {
   agent: string;
   preferred: boolean;
+}
+
+/**
+ * Effective policy of a role or agent, resolved by Factory Core. This is the
+ * single policy view: the same resolution drives execution, validation,
+ * session audit, and this display.
+ */
+export interface PolicyView {
+  source: string;
+  /** True when no policy is configured: legacy permissive mode. */
+  permissive: boolean;
+  filesystemMode: string;
+  readScopes: string[];
+  writeScopes: string[];
+  denyWriteScopes: string[];
+  commandsMode: string;
+  commandsAllow: string[];
+  commandsDeny: string[];
+  network: string;
+  /** Always "advisory": Factory cannot sandbox a launched process's network. */
+  networkEnforcement: string;
+  environmentMode: string;
+  environmentAllowed: string[];
+  environmentDenied: string[];
+  gitAllowed: string[];
+  gitDenied: string[];
 }
 
 export interface RoleInfo {
@@ -207,6 +237,10 @@ export interface RoleInfo {
   executionClass: ExecutionClass;
   assignments: RoleAssignmentInfo[];
   available: boolean;
+  /** Effective permissions (always present in API responses). */
+  permissions?: PolicyView;
+  /** Configured policy preset, when set (null = no preset / permissive). */
+  policyPreset?: string | null;
 }
 
 export const PIPELINE_ROLE_IDS = ["planner", "worker", "reviewer"] as const;
@@ -238,6 +272,7 @@ export interface AgentStatusInfo {
   resolutionTarget?: string | null;
   resolutionKind?: string | null;
   pathEntriesChecked?: number;
+  permissions?: PolicyView;
 }
 
 export type GraphNodeKind = "agent" | "role" | "run" | "task" | "group" | "note";
@@ -257,6 +292,7 @@ export interface AgentMeta {
   resolutionTarget?: string | null;
   resolutionKind?: string | null;
   pathEntriesChecked?: number;
+  permissions?: PolicyView;
   roles: string[];
 }
 
@@ -282,6 +318,8 @@ export interface RoleMeta {
   executionClass: ExecutionClass;
   assignments: RoleAssignmentInfo[];
   available: boolean;
+  permissions?: PolicyView;
+  policyPreset?: string | null;
 }
 
 export interface RunMeta {
@@ -418,6 +456,15 @@ export interface GraphWorkspace {
   warning?: string;
 }
 
+/** Which policy applied to an automated session (no secret values). */
+export interface SessionPolicyAudit {
+  source: string;
+  filesystem: string;
+  network: string;
+  environment: string;
+  writeScopes: string[];
+}
+
 export interface AgentSession {
   id: number;
   runId: number | null;
@@ -435,6 +482,7 @@ export interface AgentSession {
   durationMs: number | null;
   stdout: string | null;
   stderr: string | null;
+  policyAudit?: SessionPolicyAudit | null;
   workingDirectory: string;
   interactive: boolean;
 }

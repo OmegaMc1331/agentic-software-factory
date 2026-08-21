@@ -234,6 +234,7 @@ describe("Add Node menu", () => {
       instructions: expect.stringContaining("Purpose: collect and summarize"),
       agents: ["codex", "claude"],
       preferredAgent: "codex",
+      policyPreset: null,
     });
   });
 

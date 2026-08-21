@@ -144,6 +144,7 @@ pub fn router(state: SharedState) -> Router {
             delete(remove_role_assignment),
         )
         .route("/api/roles/:id/preferred", put(set_preferred_assignment))
+        .route("/api/roles/:id/policy", put(put_role_policy))
         .route("/api/graph", get(get_graph))
         .route(
             "/api/graph/workspace",
@@ -507,6 +508,10 @@ struct CreateRoleRequest {
     agents: Vec<String>,
     #[serde(default)]
     preferred_agent: Option<String>,
+    /// Optional policy preset for the new role (`read_only`, `implementation`,
+    /// `documentation`, `review`, or `custom`).
+    #[serde(default)]
+    policy_preset: Option<String>,
 }
 
 async fn create_role(
@@ -562,6 +567,10 @@ async fn create_role(
             preferred: preferred_agent == Some(agent.as_str()),
         });
     }
+    if let Some(preset_name) = request.policy_preset.as_deref() {
+        let preset = parse_policy_preset(preset_name)?;
+        config.policies.role_mut(&id).preset = Some(preset);
+    }
     save_config(&state, &config)?;
     Ok((StatusCode::CREATED, Json(role_info(&config, &id)?)))
 }
@@ -574,6 +583,9 @@ struct UpdateRoleRequest {
     execution_class: factory_core::ExecutionClass,
     #[serde(default)]
     instructions: String,
+    /// When present, replaces the role's policy preset (null clears it).
+    #[serde(default)]
+    policy_preset: Option<String>,
 }
 
 async fn update_role(
@@ -604,6 +616,12 @@ async fn update_role(
         instructions: request.instructions.trim().to_string(),
         agent: None,
     };
+    // Absent preset leaves the policy untouched (clearing goes through
+    // PUT /api/roles/:id/policy, which distinguishes null from absent).
+    if let Some(preset_name) = request.policy_preset.as_deref() {
+        let preset = parse_policy_preset(preset_name)?;
+        config.policies.role_mut(&id).preset = Some(preset);
+    }
     save_config(&state, &config)?;
     Ok(Json(role_info(&config, &id)?))
 }
@@ -637,6 +655,8 @@ async fn delete_role(
     config
         .role_assignments
         .retain(|assignment| assignment.role != id);
+    // A deleted role must not keep a policy scope around.
+    config.policies.roles.remove(&id);
     save_config(&state, &config)?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -748,6 +768,69 @@ async fn set_preferred_assignment(
             StatusCode::NOT_FOUND,
             format!("agent '{}' is not assigned to role '{id}'", request.agent),
         ));
+    }
+    save_config(&state, &config)?;
+    Ok(Json(role_info(&config, &id)?))
+}
+
+/// Parses a policy preset name accepted by the dashboard. `null` is handled by
+/// the caller (it clears the preset).
+fn parse_policy_preset(value: &str) -> Result<factory_policy::PolicyPreset, ApiError> {
+    factory_policy::PolicyPreset::parse(value).ok_or_else(|| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "unknown policy preset '{value}' (expected read_only, implementation, \
+                 documentation, review, or custom)"
+            ),
+        )
+    })
+}
+
+/// Sets (or clears) a role's policy preset. Works for core and custom roles:
+/// the policy says what Factory permits the role to do, which is orthogonal to
+/// the role's instructions. Clearing a preset only removes the preset; any
+/// explicitly configured dimensions stay untouched.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RolePolicyRequest {
+    preset: Option<String>,
+}
+
+async fn put_role_policy(
+    State(state): State<SharedState>,
+    UrlPath(id): UrlPath<String>,
+    body: Result<Json<RolePolicyRequest>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<factory_core::RoleInfo>, ApiError> {
+    let request = body
+        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "invalid JSON body"))?
+        .0;
+    let mut config = load_config(&state)?;
+    if config.role_infos().iter().all(|role| role.id != id) {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            format!("role '{id}' not found"),
+        ));
+    }
+    match request.preset.as_deref() {
+        Some(name) => {
+            let preset = parse_policy_preset(name)?;
+            config.policies.role_mut(&id).preset = Some(preset);
+        }
+        None => {
+            let mut now_empty = false;
+            if let Some(scope) = config.policies.roles.get_mut(&id) {
+                scope.preset = None;
+                now_empty = scope.filesystem.is_none()
+                    && scope.commands.is_none()
+                    && scope.network.is_none()
+                    && scope.environment.is_none()
+                    && scope.git.is_none();
+            }
+            if now_empty {
+                config.policies.roles.remove(&id);
+            }
+        }
     }
     save_config(&state, &config)?;
     Ok(Json(role_info(&config, &id)?))
@@ -1084,6 +1167,7 @@ fn build_graph(state: &SharedState) -> Result<GraphResponse, ApiError> {
                 "resolutionKind": agent.resolution_kind,
                 "pathEntriesChecked": agent.path_entries_checked,
                 "roles": roles_for_agent.get(&agent.name).cloned().unwrap_or_default(),
+                "permissions": agent.permissions,
             }),
         });
     }
@@ -1112,6 +1196,8 @@ fn build_graph(state: &SharedState) -> Result<GraphResponse, ApiError> {
                 "executionClass": role.execution_class,
                 "assignments": role.assignments,
                 "available": role.available,
+                "permissions": role.permissions,
+                "policyPreset": role.policy_preset,
             }),
         });
         for assignment in &role.assignments {

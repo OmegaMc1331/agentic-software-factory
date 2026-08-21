@@ -5,6 +5,7 @@ use factory_agent::{
     runtime_path_entries, AgentCapabilities, AgentConfig, AgentError, AgentKind, AgentRequest,
     AgentStatus, CommandAgent, PromptTransport, MISSION_PLACEHOLDER,
 };
+use factory_policy::{EffectivePolicy, PoliciesConfig};
 use factory_types::WorkflowTeam;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -56,6 +57,9 @@ pub struct Config {
     /// serde defaults keep the engine enabled with the standard budgets.
     #[serde(default)]
     pub context: factory_context::ContextConfig,
+    /// Project-local policies (`[policies.roles.<id>]` / `[policies.agents.<name>]`).
+    #[serde(default)]
+    pub policies: PoliciesConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -280,6 +284,7 @@ impl Config {
         self.role_assignments
             .sort_by(|a, b| (&a.role, &a.agent).cmp(&(&b.role, &b.agent)));
         self.context.normalize();
+        // Policies carry no legacy form to rewrite; validation covers them.
         changed
     }
 
@@ -310,6 +315,31 @@ impl Config {
         RoleCatalog::build(&self.roles)
     }
 
+    /// The single policy resolution entry point: baseline → role scope → agent
+    /// scope. Used by execution, validation, audit, and the dashboard; the
+    /// logic itself lives in `factory-policy`.
+    pub fn effective_policy(&self, role: &str, agent: &str) -> EffectivePolicy {
+        self.policies.effective(role, agent)
+    }
+
+    /// Role-level effective policy (baseline + role scope), shown in the Role
+    /// Inspector.
+    pub fn effective_role_policy(&self, role: &str) -> EffectivePolicy {
+        self.policies.effective_for_role(role)
+    }
+
+    /// Agent-level effective policy (baseline + agent scope), shown in the
+    /// Agent Inspector.
+    pub fn effective_agent_policy(&self, agent: &str) -> EffectivePolicy {
+        self.policies.effective_for_agent(agent)
+    }
+
+    /// Whether any policy is configured (used to visibly mark legacy configs
+    /// as permissive in the UI).
+    pub fn policies_configured(&self) -> bool {
+        !self.policies.is_empty()
+    }
+
     pub fn assignments_for(&self, role: &str) -> Vec<&RoleAssignment> {
         self.role_assignments
             .iter()
@@ -335,6 +365,12 @@ impl Config {
         for definition in catalog.list() {
             let assignments = self.assignments_for(&definition.id);
             let available = !assignments.is_empty();
+            let permissions = self.effective_role_policy(&definition.id).view();
+            let policy_preset = self
+                .policies
+                .role(&definition.id)
+                .and_then(|scope| scope.preset)
+                .map(|preset| preset.as_str().to_string());
             infos.push(RoleInfo {
                 id: definition.id.clone(),
                 name: definition.name.clone(),
@@ -350,6 +386,8 @@ impl Config {
                     })
                     .collect(),
                 available,
+                permissions,
+                policy_preset,
             });
         }
         infos
@@ -367,6 +405,9 @@ impl Config {
         }
         if let Err(error) = self.context.validate() {
             return Err(error.to_string());
+        }
+        if let Err(error) = self.policies.validate() {
+            return Err(format!("invalid policy configuration: {error}"));
         }
         for (id, entry) in &self.roles {
             if !valid_name(id) {
@@ -709,6 +750,30 @@ kind = \"claude_code\"
 command = \"claude\"
 args = [\"-p\"]
 
+[policies.roles.planner]
+preset = \"read_only\"
+
+[policies.roles.architect]
+preset = \"read_only\"
+
+[policies.roles.researcher]
+preset = \"read_only\"
+
+[policies.roles.reviewer]
+preset = \"read_only\"
+
+[policies.roles.security_auditor]
+preset = \"read_only\"
+
+[policies.roles.worker]
+preset = \"implementation\"
+
+[policies.roles.test_engineer]
+preset = \"implementation\"
+
+[policies.roles.documentation_writer]
+preset = \"documentation\"
+
 [[role_assignments]]
 role = \"planner\"
 agent = \"codex\"
@@ -775,6 +840,7 @@ impl Agents {
             });
             let resolution = agent.resolve_executable();
             let resolution_error = resolution.as_ref().err().map(|error| error.to_string());
+            let permissions = self.config.effective_agent_policy(name).view();
             let mut info = AgentInfo {
                 name: name.clone(),
                 command: format_command(&entry.command, &args),
@@ -790,6 +856,7 @@ impl Agents {
                 resolution_target: None,
                 resolution_kind: None,
                 path_entries_checked: runtime_path_entries(),
+                permissions,
             };
             match resolution {
                 Ok(resolved) => {
@@ -983,6 +1050,9 @@ pub struct AgentInfo {
     pub resolution_target: Option<String>,
     pub resolution_kind: Option<String>,
     pub path_entries_checked: usize,
+    /// Agent-level permissions (Factory invariants + agent restrictions).
+    /// The same agent may be further restricted per role at execution time.
+    pub permissions: factory_policy::PolicyView,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -1003,6 +1073,12 @@ pub struct RoleInfo {
     pub execution_class: String,
     pub assignments: Vec<RoleAssignmentInfo>,
     pub available: bool,
+    /// Effective role-level permissions (Factory invariants + role policy).
+    pub permissions: factory_policy::PolicyView,
+    /// The configured preset for this role's policy, when one is set. `None`
+    /// means no preset (permissive legacy default or fully explicit policy).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy_preset: Option<String>,
 }
 
 fn format_command(command: &str, args: &[String]) -> String {
@@ -1279,6 +1355,62 @@ mod tests {
         assert_eq!(
             config.runtime.max_parallel_tasks,
             DEFAULT_MAX_PARALLEL_TASKS
+        );
+        // New projects ship policy presets for the core roles.
+        assert!(config.policies_configured());
+        assert_eq!(
+            config
+                .effective_role_policy("planner")
+                .filesystem
+                .mode_name(),
+            "read_only"
+        );
+        assert_eq!(
+            config
+                .effective_role_policy("worker")
+                .filesystem
+                .mode_name(),
+            "open"
+        );
+        assert!(config
+            .effective_role_policy("worker")
+            .filesystem
+            .write_allowed("src/main.rs"));
+        assert!(!config
+            .effective_role_policy("worker")
+            .filesystem
+            .write_allowed(".factory/config.toml"));
+    }
+
+    #[test]
+    fn missing_policies_stay_legacy_permissive() {
+        let config: Config = toml::from_str(
+            r#"
+[agents.codex]
+command = "codex"
+
+[[role_assignments]]
+role = "planner"
+agent = "codex"
+
+[[role_assignments]]
+role = "worker"
+agent = "codex"
+
+[[role_assignments]]
+role = "reviewer"
+agent = "codex"
+"#,
+        )
+        .unwrap();
+        assert!(config.validate().is_ok());
+        assert!(!config.policies_configured());
+        let policy = config.effective_policy("worker", "codex");
+        assert!(policy.permissive, "existing projects resolve permissively");
+        assert!(policy.filesystem.write_allowed("anything"));
+        assert_eq!(
+            policy.commands.mode,
+            factory_policy::CommandsMode::Unrestricted
         );
     }
 

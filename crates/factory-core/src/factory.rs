@@ -50,6 +50,16 @@ pub enum FactoryError {
     InvalidTeam(String),
     #[error("task #{0} reached the retry limit of {MAX_TASK_ATTEMPTS} attempts: {1}")]
     RetryLimit(i64, String),
+    /// A task cannot legally execute under its effective policy. Raised before
+    /// an agent process is started; policy failures never consume task
+    /// retries.
+    #[error("policy blocked: {0}")]
+    PolicyBlocked(String),
+    /// An attempt tripped the effective policy (wrote outside scopes, ran a
+    /// denied command). The attempt is failed and the run stops; a violation
+    /// is not a transient execution failure and is never auto-retried.
+    #[error("policy violation: {0}")]
+    PolicyViolation(String),
     #[error("planning failed: {0}")]
     Plan(#[from] PlanError),
     #[error("agent process failed: {0}")]
@@ -347,7 +357,10 @@ impl Factory {
             .db
             .get_run(run_id)?
             .ok_or(FactoryError::RunNotFound(run_id))?;
-        if run.status != RunStatus::Planned {
+        // A blocked run can be started again: policy blocks leave the run
+        // stopped with its tasks untouched, and starting re-validates the
+        // (possibly fixed) configuration from scratch.
+        if !matches!(run.status, RunStatus::Planned | RunStatus::Blocked) {
             return Err(FactoryError::InvalidRunState(
                 run_id,
                 run.status.as_str().to_string(),
@@ -389,9 +402,147 @@ impl Factory {
                 self.agents.command_agent_for(&role, agent)?;
             }
         }
+        let catalog = self.agents.config().catalog();
+        self.validate_run_policies_run(run_id, &tasks, &team, &catalog)?;
         Repo::detect_bounded(&self.root, &self.root)?;
         self.db.set_run_status(run_id, RunStatus::Active)?;
         Ok(team)
+    }
+
+    /// Pre-execution policy gate for starting (or retrying) a workflow. A task
+    /// that cannot legally execute under *any* of its assigned agents' effective
+    /// policies blocks the workflow with a useful reason, before any agent
+    /// process is launched. Policy failures never consume task retries.
+    fn validate_run_policies_run(
+        &self,
+        run_id: i64,
+        tasks: &[Task],
+        team: &WorkflowTeam,
+        catalog: &RoleCatalog,
+    ) -> Result<(), FactoryError> {
+        let mut blockers: Vec<String> = Vec::new();
+        for task in tasks {
+            let role = task.role.as_deref().unwrap_or(roles::WORKER);
+            let operation = roles::resolve_task_operation(task, catalog);
+            let agents = team.agents_for_role(role);
+            if agents.is_empty() {
+                continue;
+            }
+            let any_allowed = agents.iter().any(|agent| {
+                let policy = self.agents.config().effective_policy(role, agent);
+                factory_policy::validate_executable(&policy, operation.as_str()).is_ok()
+            });
+            if !any_allowed {
+                let policy = self.agents.config().effective_role_policy(role);
+                let reason = factory_policy::validate_executable(&policy, operation.as_str())
+                    .err()
+                    .unwrap_or_else(|| "no assigned agent allows this task".to_string());
+                blockers.push(format!(
+                    "task #{id} ({title}) with role '{role}' cannot perform operation \
+                     '{op}': {reason} (allowed writes: {writes})",
+                    id = task.id,
+                    title = task.title,
+                    op = operation.as_str(),
+                    writes = describe_policy_scopes(self.agents.config(), role),
+                ));
+            }
+        }
+        if blockers.is_empty() {
+            return Ok(());
+        }
+        self.db.set_run_status(run_id, RunStatus::Blocked)?;
+        Err(FactoryError::PolicyBlocked(blockers.join("; ")))
+    }
+
+    /// Selects an agent from the pool that can legally execute the task under
+    /// its own effective policy. Prefers the capacity-aware selection; when
+    /// that agent is policy-blocked, the next pool candidate (round-robin from
+    /// `index`) is tried. Returns `None` when no assigned agent can legally
+    /// run the task.
+    fn select_agent_for_task(
+        &self,
+        pool: &[String],
+        index: usize,
+        capacity: &AgentCapacity,
+        role: &str,
+        operation: TaskOperation,
+    ) -> Option<String> {
+        if pool.is_empty() {
+            return None;
+        }
+        let preferred = roles::select_agent_with_capacity(pool, index, capacity);
+        if let Some(candidate) = preferred {
+            let policy = self.agents.config().effective_policy(role, candidate);
+            if factory_policy::validate_executable(&policy, operation.as_str()).is_ok() {
+                return Some(candidate.clone());
+            }
+        }
+        (0..pool.len()).find_map(|offset| {
+            let candidate = &pool[(index + offset) % pool.len()];
+            let policy = self.agents.config().effective_policy(role, candidate);
+            factory_policy::validate_executable(&policy, operation.as_str())
+                .ok()
+                .map(|_| candidate.clone())
+        })
+    }
+
+    /// Post-hoc evidence enforcement: files changed by an attempt must fall
+    /// inside the session's effective write scopes, and reported commands
+    /// inside the command policy. Legacy (policy-less) sessions are never
+    /// affected: only explicitly configured restrictions are enforced.
+    fn enforce_evidence_policy(
+        &self,
+        role: &str,
+        agent: &str,
+        evidence: &TaskEvidence,
+    ) -> Result<(), FactoryError> {
+        let policy = self.agents.config().effective_policy(role, agent);
+        if policy.permissive {
+            return Ok(());
+        }
+        let write_violations = policy.filesystem.write_violations(&evidence.changed_files);
+        if !write_violations.is_empty() {
+            return Err(FactoryError::PolicyViolation(format!(
+                "the {role} agent changed files outside the allowed write scopes: {} \
+                 (allowed writes: {})",
+                write_violations.join(", "),
+                describe_policy_scopes(self.agents.config(), role)
+            )));
+        }
+        let command_violations = policy.commands.violations(&evidence.commands);
+        if !command_violations.is_empty() {
+            return Err(FactoryError::PolicyViolation(format!(
+                "the {role} agent reported commands outside the command policy: {}",
+                command_violations.join(", ")
+            )));
+        }
+        Ok(())
+    }
+
+    /// Error for a task whose assigned agents are all policy-blocked for the
+    /// operation (or missing entirely).
+    fn no_executable_agent_error(
+        &self,
+        task: &Task,
+        role: &str,
+        pool: &[String],
+        operation: TaskOperation,
+    ) -> FactoryError {
+        if pool.is_empty() {
+            return FactoryError::TaskRoleUnavailable(task.id, role.to_string());
+        }
+        let policy = self.agents.config().effective_role_policy(role);
+        let reason = factory_policy::validate_executable(&policy, operation.as_str())
+            .err()
+            .unwrap_or_else(|| "no assigned agent allows this task".to_string());
+        FactoryError::PolicyBlocked(format!(
+            "task #{id} ({title}) with role '{role}' cannot perform operation '{op}' \
+             under any assigned agent: {reason} (allowed writes: {writes})",
+            id = task.id,
+            title = task.title,
+            op = operation.as_str(),
+            writes = describe_policy_scopes(self.agents.config(), role),
+        ))
     }
 
     /// Replaces the team of a workflow that has not started yet.
@@ -512,6 +663,11 @@ impl Factory {
             .config()
             .validate_team(&team)
             .map_err(FactoryError::InvalidTeam)?;
+        // Re-check the policy gate: a retry must never start a task that still
+        // cannot legally execute (no retry is consumed by a policy block).
+        let tasks = self.db.list_tasks(task.run_id)?;
+        let catalog = self.agents.config().catalog();
+        self.validate_run_policies_run(task.run_id, &tasks, &team, &catalog)?;
         self.mark_task(task_id, TaskState::Ready)?;
         self.db.set_run_status(task.run_id, RunStatus::Active)?;
         Ok(task.run_id)
@@ -600,10 +756,11 @@ impl Factory {
                 .unwrap_or_else(|| roles::WORKER.to_string());
             let worker_pool = team.agents_for_role(&role).to_vec();
             let worker_index = self.db.count_task_attempts(task.run_id)?;
-            let worker_name =
-                roles::select_agent_with_capacity(&worker_pool, worker_index, &self.capacity)
-                    .ok_or_else(|| FactoryError::TaskRoleUnavailable(task.id, role.clone()))?
-                    .clone();
+            let worker_name = self
+                .select_agent_for_task(&worker_pool, worker_index, &self.capacity, &role, operation)
+                .ok_or_else(|| {
+                    self.no_executable_agent_error(&task, &role, &worker_pool, operation)
+                })?;
             let worker = self.agents.command_agent_for(&role, &worker_name)?;
             let _worker_load = self.capacity.acquire(worker.name());
             let attempt = self.db.create_task_attempt(
@@ -619,6 +776,7 @@ impl Factory {
             let upstream = self.upstream_artifacts(&task)?;
             let repository_context =
                 self.repository_context(&task, operation, &worktree, &base_sha, &[], &upstream);
+            let worker_policy = self.agents.config().effective_policy(&role, &worker_name);
             let worker_instruction = build_mission(&MissionContext {
                 role: role_definition,
                 operation,
@@ -629,6 +787,7 @@ impl Factory {
                 previous_feedback: previous_feedback.as_ref(),
                 review_input: None,
                 final_review: false,
+                policy: Some(&worker_policy),
             });
             let worker_run = self.invoke_with_agent(
                 worker,
@@ -650,6 +809,27 @@ impl Factory {
                 &task,
                 worker_run.as_ref().ok().map(|run| &run.result),
             )?;
+
+            // Post-hoc policy enforcement: any file written outside the
+            // session's effective write scopes (or a denied command) fails the
+            // attempt without consuming a normal retry.
+            if let Err(policy_error) = self.enforce_evidence_policy(&role, &worker_name, &evidence)
+            {
+                self.db.finish_task_attempt(
+                    attempt.id,
+                    AttemptStatus::Failed,
+                    worker_run
+                        .as_ref()
+                        .ok()
+                        .and_then(|run| run.result.exit_code),
+                    evidence.commit_sha.as_deref(),
+                    Some(&format!("blocked by policy: {policy_error}")),
+                    Some(&evidence),
+                    None,
+                )?;
+                self.mark_task(task_id, TaskState::Failed)?;
+                return Err(policy_error);
+            }
 
             let worker_run = match worker_run {
                 Ok(run) if run.result.cancelled => {
@@ -746,6 +926,10 @@ impl Factory {
                 .get(roles::REVIEWER)
                 .cloned()
                 .unwrap_or_else(|| roles::core_role(roles::REVIEWER).expect("core reviewer"));
+            let reviewer_policy = self
+                .agents
+                .config()
+                .effective_policy(roles::REVIEWER, &reviewer_name);
             let review_instruction = build_mission(&MissionContext {
                 role: &reviewer_role,
                 operation: TaskOperation::Review,
@@ -762,6 +946,7 @@ impl Factory {
                     diff: evidence.diff_patch.clone().unwrap_or_default(),
                 }),
                 final_review: true,
+                policy: Some(&reviewer_policy),
             });
             let review_run = self.invoke_with_agent(
                 reviewer,
@@ -913,9 +1098,11 @@ impl Factory {
                 .unwrap_or_else(|| roles::WORKER.to_string());
             let pool = team.agents_for_role(&role).to_vec();
             let index = self.db.count_task_attempts(task.run_id)?;
-            let agent_name = roles::select_agent_with_capacity(&pool, index, &self.capacity)
-                .ok_or_else(|| FactoryError::TaskRoleUnavailable(task.id, role.clone()))?
-                .clone();
+            let agent_name = self
+                .select_agent_for_task(&pool, index, &self.capacity, &role, TaskOperation::Advisory)
+                .ok_or_else(|| {
+                    self.no_executable_agent_error(&task, &role, &pool, TaskOperation::Advisory)
+                })?;
             let agent = self.agents.command_agent_for(&role, &agent_name)?;
             let _advisory_load = self.capacity.acquire(agent.name());
             let attempt = self.db.create_task_attempt(
@@ -937,6 +1124,7 @@ impl Factory {
                 &[],
                 &upstream,
             );
+            let advisory_policy = self.agents.config().effective_policy(&role, &agent_name);
             let instruction = build_mission(&MissionContext {
                 role: role_definition,
                 operation: TaskOperation::Advisory,
@@ -947,6 +1135,7 @@ impl Factory {
                 previous_feedback: None,
                 review_input: None,
                 final_review: false,
+                policy: Some(&advisory_policy),
             });
             let agent_run = self.invoke_with_agent(
                 agent,
@@ -968,6 +1157,20 @@ impl Factory {
                 &task,
                 agent_run.as_ref().ok().map(|run| &run.result),
             )?;
+
+            if let Err(policy_error) = self.enforce_evidence_policy(&role, &agent_name, &evidence) {
+                self.db.finish_task_attempt(
+                    attempt.id,
+                    AttemptStatus::Failed,
+                    agent_run.as_ref().ok().and_then(|run| run.result.exit_code),
+                    evidence.commit_sha.as_deref(),
+                    Some(&format!("blocked by policy: {policy_error}")),
+                    Some(&evidence),
+                    None,
+                )?;
+                self.mark_task(task_id, TaskState::Failed)?;
+                return Err(policy_error);
+            }
 
             match agent_run {
                 Ok(run) if run.result.cancelled => {
@@ -1084,9 +1287,11 @@ impl Factory {
             .unwrap_or_else(|| roles::REVIEWER.to_string());
         let pool = team.agents_for_role(&role).to_vec();
         let index = self.db.count_task_attempts(task.run_id)?;
-        let reviewer_name = roles::select_agent_with_capacity(&pool, index, &self.capacity)
-            .ok_or_else(|| FactoryError::TaskRoleUnavailable(task.id, role.clone()))?
-            .clone();
+        let reviewer_name = self
+            .select_agent_for_task(&pool, index, &self.capacity, &role, TaskOperation::Review)
+            .ok_or_else(|| {
+                self.no_executable_agent_error(&task, &role, &pool, TaskOperation::Review)
+            })?;
         let reviewer = self.agents.command_agent_for(&role, &reviewer_name)?;
         let _reviewer_load = self.capacity.acquire(reviewer.name());
 
@@ -1130,6 +1335,7 @@ impl Factory {
                 &review_input.evidence.changed_files,
                 &upstream,
             );
+            let review_policy = self.agents.config().effective_policy(&role, &reviewer_name);
             let instruction = build_mission(&MissionContext {
                 role: role_definition,
                 operation: TaskOperation::Review,
@@ -1140,6 +1346,7 @@ impl Factory {
                 previous_feedback: None,
                 review_input: Some(&review_input),
                 final_review: false,
+                policy: Some(&review_policy),
             });
             let review_run = self.invoke_with_agent(
                 reviewer.clone(),
@@ -1161,6 +1368,26 @@ impl Factory {
                 &task,
                 review_run.as_ref().ok().map(|run| &run.result),
             )?;
+            // A review role may only inspect: any write outside the policy is
+            // a violation, and review roles never commit production work.
+            if let Err(policy_error) =
+                self.enforce_evidence_policy(&role, &reviewer_name, &evidence)
+            {
+                self.db.finish_task_attempt(
+                    attempt.id,
+                    AttemptStatus::Failed,
+                    review_run
+                        .as_ref()
+                        .ok()
+                        .and_then(|run| run.result.exit_code),
+                    evidence.commit_sha.as_deref(),
+                    Some(&format!("blocked by policy: {policy_error}")),
+                    Some(&evidence),
+                    None,
+                )?;
+                self.mark_task(task_id, TaskState::Failed)?;
+                return Err(policy_error);
+            }
             let review_exit_code = review_run
                 .as_ref()
                 .ok()
@@ -1457,6 +1684,35 @@ impl Factory {
         cancel: &AtomicBool,
     ) -> Result<Invocation, FactoryError> {
         let started = chrono::Utc::now().to_rfc3339();
+        // Resolve the one effective policy for this session (baseline → role →
+        // agent). The same policy drives environment filtering, audit, and the
+        // post-hoc evidence checks; there is no second permission model.
+        let policy = self
+            .agents
+            .config()
+            .effective_policy(scope.role, agent.name());
+        let policy_audit = factory_types::SessionPolicyAudit {
+            source: policy.source.clone(),
+            filesystem: policy.filesystem.mode_name().to_string(),
+            network: if policy.network.allowed() {
+                "allow"
+            } else {
+                "deny"
+            }
+            .to_string(),
+            environment: policy.environment.mode().to_string(),
+            write_scopes: policy.filesystem.effective_write_scopes(),
+        };
+        // Environment filtering before process launch: when the policy filters
+        // or denies variables, the child receives exactly the computed set
+        // instead of Factory's whole environment. Denied values are withheld
+        // and treated as secrets that must never reach logs.
+        let needs_clear = policy.environment.filtered || !policy.environment.denied.is_empty();
+        let mut secrets =
+            factory_policy::secrets_from_denied(std::env::vars(), &policy.environment.denied);
+        for value in agent.config().env.values() {
+            secrets.add(value, 4);
+        }
         let session = self.db.insert_agent_session(&AgentSession {
             id: 0,
             run_id: scope.run_id,
@@ -1474,22 +1730,29 @@ impl Factory {
             duration_ms: None,
             stdout: Some(String::new()),
             stderr: Some(String::new()),
+            policy_audit: Some(policy_audit),
         })?;
-        let request = AgentRequest::new(mission, scope.working_dir);
+        let mut request = AgentRequest::new(mission, scope.working_dir);
+        if needs_clear {
+            request.env = policy.environment.environment(std::env::vars());
+            request.env_deny = policy.environment.denied.clone();
+            request.clear_env = true;
+        }
         let timer = Instant::now();
         let mut output_error = None;
         let result = agent.run_observed(&request, cancel, |stream, chunk| {
             if output_error.is_some() {
                 return;
             }
+            let chunk = secrets.redact(chunk);
             let update = match stream {
                 OutputStream::Stdout => {
                     self.db
-                        .append_agent_session_output(session.id, Some(chunk), None)
+                        .append_agent_session_output(session.id, Some(&chunk), None)
                 }
                 OutputStream::Stderr => {
                     self.db
-                        .append_agent_session_output(session.id, None, Some(chunk))
+                        .append_agent_session_output(session.id, None, Some(&chunk))
                 }
             };
             if let Err(error) = update {
@@ -2054,6 +2317,18 @@ fn collect_evidence(
     })
 }
 
+fn describe_policy_scopes(config: &crate::config::Config, role: &str) -> String {
+    let scopes = config
+        .effective_role_policy(role)
+        .filesystem
+        .effective_write_scopes();
+    if scopes.is_empty() {
+        "none".to_string()
+    } else {
+        scopes.join(", ")
+    }
+}
+
 fn default_artifact_content(output: &str) -> String {
     serde_json::json!({ "summary": tail(output, 4_000) }).to_string()
 }
@@ -2247,6 +2522,7 @@ mod tests {
             previous_feedback: None,
             review_input: None,
             final_review: false,
+            policy: None,
         });
         assert!(mission.contains("ROLE\nWorker — "));
         assert!(mission.contains("WORKFLOW OBJECTIVE\nobjective"));
@@ -2269,6 +2545,7 @@ mod tests {
             previous_feedback: Some(&review),
             review_input: None,
             final_review: false,
+            policy: None,
         });
         assert!(retry.contains("CONTEXT\nPrevious review requested changes:\nmissing test"));
         assert!(retry.contains("- add a regression test"));

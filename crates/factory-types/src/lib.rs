@@ -23,6 +23,6 @@ pub use plans::{
     ReplanRequest, TaskRef,
 };
 pub use run::{Run, RunStatus};
-pub use session::{AgentSession, AgentSessionMode};
+pub use session::{AgentSession, AgentSessionMode, SessionPolicyAudit};
 pub use task::{Task, TaskState};
 pub use team::WorkflowTeam;

@@ -1,5 +1,13 @@
 import { useId, useState } from "react";
-import type { ExecutionClass } from "../types";
+import type { ExecutionClass, RolePolicyPreset } from "../types";
+
+const POLICY_PRESETS: { value: RolePolicyPreset | ""; label: string }[] = [
+  { value: "implementation", label: "Implementation — task-worktree write" },
+  { value: "read_only", label: "Read-only" },
+  { value: "review", label: "Review — read-only" },
+  { value: "documentation", label: "Documentation — README/docs write" },
+  { value: "custom", label: "Custom — defined in config.toml" },
+];
 
 function roleSlug(name: string): string {
   return (
@@ -20,6 +28,7 @@ export interface RoleFormValue {
   instructions: string;
   agents: string[];
   preferredAgent: string | null;
+  policyPreset: RolePolicyPreset | null;
 }
 
 export interface RoleFormInitial {
@@ -28,6 +37,7 @@ export interface RoleFormInitial {
   description?: string;
   executionClass?: ExecutionClass;
   instructions?: string;
+  policyPreset?: RolePolicyPreset | null;
 }
 
 const EXECUTION_CLASSES: { value: ExecutionClass; label: string }[] = [
@@ -125,6 +135,9 @@ export function RoleForm({
   const [instructions, setInstructions] = useState(initial?.instructions ?? "");
   const [selectedAgents, setSelectedAgents] = useState<string[]>([]);
   const [preferredAgent, setPreferredAgent] = useState<string | null>(null);
+  const [policyPreset, setPolicyPreset] = useState<RolePolicyPreset | null>(
+    initial?.policyPreset ?? null
+  );
   const [validationError, setValidationError] = useState<string | null>(null);
 
   const applyTemplate = (nextTemplateId: string) => {
@@ -164,6 +177,7 @@ export function RoleForm({
       instructions: instructions.trim(),
       agents: mode === "create" ? selectedAgents : [],
       preferredAgent: mode === "create" ? preferredAgent : null,
+      policyPreset,
     });
   };
 
@@ -244,6 +258,28 @@ export function RoleForm({
           onChange={(event) => setInstructions(event.target.value)}
           placeholder="Purpose, responsibilities, boundaries and expected output"
         />
+      </label>
+      <label>
+        <span>Policy preset</span>
+        <select
+          value={policyPreset ?? ""}
+          onChange={(event) =>
+            setPolicyPreset(
+              event.target.value === "" ? null : (event.target.value as RolePolicyPreset)
+            )
+          }
+          aria-describedby="role-policy-hint"
+        >
+          <option value="">Default (permissive)</option>
+          {POLICY_PRESETS.map((preset) => (
+            <option key={preset.value} value={preset.value}>
+              {preset.label}
+            </option>
+          ))}
+        </select>
+        <small className="role-form-hint" id="role-policy-hint">
+          The policy is what Factory enforces; the instructions above only guide the agent.
+        </small>
       </label>
       {mode === "create" && (
         <fieldset className="role-form-agents">
