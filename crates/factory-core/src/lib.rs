@@ -1,6 +1,7 @@
 pub mod capacity;
 pub mod config;
 pub mod factory;
+pub mod github;
 pub mod mission;
 pub mod planner;
 pub mod roles;

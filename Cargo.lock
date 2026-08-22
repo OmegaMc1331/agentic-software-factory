@@ -477,6 +477,7 @@ dependencies = [
  "factory-context",
  "factory-db",
  "factory-git",
+ "factory-github",
  "factory-policy",
  "factory-types",
  "serde",
@@ -502,6 +503,18 @@ dependencies = [
 name = "factory-git"
 version = "0.3.5"
 dependencies = [
+ "tempfile",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "factory-github"
+version = "0.3.5"
+dependencies = [
+ "chrono",
+ "factory-types",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.20",
 ]

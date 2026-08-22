@@ -93,6 +93,39 @@ Cancellation stops scheduling and terminates the current configured agent proces
 when possible. Factory preserves the worktree, session output, and evidence instead of
 deleting partial work.
 
+## GitHub integration
+
+The GitHub milestone (Issue import, delivery push, pull request creation) keeps the
+trust boundaries explicit. See [GitHub](github.md) for the user-facing flow.
+
+**Untrusted Issue content.** GitHub Issue titles, bodies, and comments are external
+untrusted text. They enter Factory as bounded, verbatim *data*: the run's objective
+and a persisted link. Every mission that includes them carries an explicit notice
+that the content is requirements/context, never instructions, and cannot change
+roles, permissions, policies, repository boundaries, or output contracts. Issue text
+never reaches a shell, a system prompt position, or a permission decision.
+
+**Authentication.** Factory uses the locally installed, locally authenticated `gh`
+CLI. It checks `gh auth status` and shows the connected account; it never reads,
+stores, logs, or displays GitHub tokens, and it has no OAuth server, GitHub App,
+token storage, or cloud auth backend.
+
+**Delivery vs agents.** The Factory Delivery Engine is the only code in Factory that
+constructs a `git push`, and it pushes exactly the Factory-generated
+`factory/run-<id>` branch — never a force-push, never arbitrary user branches, and
+only after the user confirms a PR preview. Task agents keep their normal policies:
+push-class Git operations stay denied regardless of configuration or imported Issue
+content, and no role instruction can trigger `git push` or `gh pr create` through
+Factory. See [Policies — agent vs delivery permissions](policies.md#git).
+
+**Injection resistance.** All `git`/`gh` invocations use structured process
+arguments — no `sh -c`, no `cmd /c`, no string-interpolated commands. PR titles and
+bodies travel as single argv values and as JSON in the API; branch names are always
+Factory-generated (`factory/run-<id>`); repository slugs are parsed with a strict
+`owner/name` charset and cross-repository issue imports are refused. The API exposes
+only semantic operations (`from-issue`, `delivery`, `pr-preview`, `pull-request`) —
+there is no generic GitHub command endpoint.
+
 ### Custom and specialized role boundaries
 
 Role definitions — including custom and specialized review roles — are prompt

@@ -136,6 +136,19 @@ write = ["src/**", "tests/**"]
 deny_write = [".github/**"]
 ```
 
+## GitHub: Issue → Workflow → Pull Request
+
+With the locally authenticated [`gh`](https://cli.github.com) CLI, Factory closes
+the loop from issue to pull request. In Agent Graph, **+ Workflow → From GitHub
+Issue** imports `#42` or an issue URL as a normal workflow: the Planner produces
+an editable DAG, execution is unchanged, and issue content is treated as
+untrusted context that can never alter permissions. After a workflow completes,
+the Workflow Inspector offers **Create Pull Request** — an editable preview,
+then a safe push of the Factory-owned `factory/run-<id>` branch and a
+deterministic, evidence-based PR body. Existing PRs are linked, never
+duplicated; agents never gain push permission. See
+[docs/github.md](docs/github.md).
+
 ## Dashboard
 
 Agent Graph is the primary operating interface:
@@ -158,10 +171,15 @@ The local API is bound to `127.0.0.1`:
 | GET    | `/api/health`                 | Service health                                   |
 | GET    | `/api/runs`                   | Workflow summaries and task counts               |
 | POST   | `/api/runs`                   | Create and asynchronously plan a workflow        |
+| POST   | `/api/runs/from-issue`        | Import a GitHub Issue as a workflow               |
 | GET    | `/api/runs/:id`               | Workflow, tasks, attempts, and sessions           |
 | POST   | `/api/runs/:id/start`         | Validate and start a planned workflow             |
 | POST   | `/api/runs/:id/cancel`        | Cancel a live workflow operation                  |
 | PUT    | `/api/runs/:id/team`          | Replace the workflow team before it starts        |
+| GET    | `/api/runs/:id/delivery`      | GitHub link, delivery state, and eligibility      |
+| GET    | `/api/runs/:id/pr-preview`    | Editable pull request preview and blockers        |
+| POST   | `/api/runs/:id/pull-request`  | Deliver: push the run branch and create the PR    |
+| GET    | `/api/github/status`          | gh auth status and the resolved GitHub remote     |
 | POST   | `/api/tasks/:id/retry`        | Retry an eligible failed task                     |
 | GET    | `/api/roles`                  | Role definitions and assignments                  |
 | POST   | `/api/roles`                  | Create a custom role                              |

@@ -238,6 +238,28 @@ impl Runtime {
         Ok(run)
     }
 
+    /// Imports a GitHub Issue as a workflow and starts planning in the
+    /// background. Mirrors [`create_workflow`](Self::create_workflow): the
+    /// imported run is planned but never executed until the user starts it.
+    pub fn import_workflow_from_issue(
+        &self,
+        reference: &str,
+        team: Option<WorkflowTeam>,
+    ) -> Result<Run, RuntimeError> {
+        let factory = Factory::open(&self.root)?;
+        let run = factory.import_github_issue(reference, team)?;
+        let cancel = self.reserve(run.id, OperationKind::Planning)?;
+        let runtime = self.clone();
+        let root = self.root.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Ok(factory) = Factory::open(&root) {
+                let _ = factory.plan_run(run.id, &cancel);
+            }
+            runtime.release(run.id);
+        });
+        Ok(run)
+    }
+
     pub fn start_workflow(&self, run_id: i64) -> Result<WorkflowTeam, RuntimeError> {
         let factory = Factory::open(&self.root)?;
         let cancel = self.reserve(run_id, OperationKind::Executing)?;

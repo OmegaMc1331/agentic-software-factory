@@ -1,6 +1,15 @@
 import { Handle, Position, type Node, type NodeProps } from "@xyflow/react";
 import type { AgentActivity, GraphNode as GraphNodeData } from "../types";
-import { agentMeta, operationStage, roleMeta, runMeta, STAGE_META, taskMeta } from "../types";
+import {
+  agentMeta,
+  githubIssueMeta,
+  githubPrMeta,
+  operationStage,
+  roleMeta,
+  runMeta,
+  STAGE_META,
+  taskMeta,
+} from "../types";
 import { STATE_META } from "../state";
 import { truncate } from "../layout";
 
@@ -121,6 +130,32 @@ export function GraphNode({ data, selected }: NodeProps<FactoryFlowNode>) {
             </span>
           )}
         </small>
+      </div>
+    );
+  }
+
+  if (node.kind === "github_issue") {
+    const meta = githubIssueMeta(node);
+    return (
+      <div className={classes} aria-label={`GitHub issue ${meta.number}, ${meta.title}`}>
+        <Handles kind={node.kind} />
+        <span className="graph-node-kicker">GitHub Issue</span>
+        <strong>#{meta.number}</strong>
+        <span>{truncate(meta.title, 26)}</span>
+        <small>{meta.state === "closed" ? "closed" : "open"}</small>
+      </div>
+    );
+  }
+
+  if (node.kind === "github_pr") {
+    const meta = githubPrMeta(node);
+    return (
+      <div className={classes} aria-label={`Pull request ${meta.number}, ${meta.state}`}>
+        <Handles kind={node.kind} />
+        <span className="graph-node-kicker">Pull Request</span>
+        <strong>#{meta.number}</strong>
+        <span>{meta.state}</span>
+        {meta.isDraft && <small>draft</small>}
       </div>
     );
   }

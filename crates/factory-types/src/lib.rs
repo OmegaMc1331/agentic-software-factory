@@ -1,5 +1,6 @@
 pub mod artifact;
 pub mod attempt;
+pub mod github;
 pub mod plan;
 pub mod plan_edit;
 pub mod plans;
@@ -13,6 +14,7 @@ pub use attempt::{
     AttemptStatus, ReviewDecision, ReviewFinding, ReviewResult, ReviewSeverity, SpecializedReview,
     TaskAttempt, TaskEvidence,
 };
+pub use github::{DeliveryState, GitHubDelivery, GitHubIssueLink, IssueComment, PullRequestInfo};
 pub use plan::{Plan, PlannedTask};
 pub use plan_edit::{
     is_immutable, mutable_scope, resolve_patch, resolve_replan, PlanApplyOutcome, PlanState,

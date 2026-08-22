@@ -4,6 +4,8 @@ import type { GraphEdge, GraphNode, RoleArtifact, RoleMeta, RunIntegration } fro
 import {
   agentMeta,
   agentResolutionStatusLabel,
+  githubIssueMeta,
+  githubPrMeta,
   isImplementationOperation,
   isTaskIntegratedIds,
   operationStage,
@@ -345,6 +347,38 @@ export function NodeInspector({
           <button className="button" onClick={() => onRetry(meta.taskId)}>
             Retry task
           </button>
+        )}
+      </>
+    );
+  } else if (node.kind === "github_issue") {
+    const meta = githubIssueMeta(node);
+    details = (
+      <>
+        <Row label="Repository">{meta.repository}</Row>
+        <Row label="State">{meta.state === "closed" ? "closed" : "open"}</Row>
+        <Row label="Author">{meta.author || "unknown"}</Row>
+        {meta.labels.length > 0 && <Row label="Labels">{meta.labels.join(", ")}</Row>}
+        <Row label="Effect">
+          External source: imported as untrusted context for workflow #{meta.runId}
+        </Row>
+        {meta.url && (
+          <a className="inspector-link" href={meta.url} target="_blank" rel="noreferrer">
+            Open on GitHub
+          </a>
+        )}
+      </>
+    );
+  } else if (node.kind === "github_pr") {
+    const meta = githubPrMeta(node);
+    details = (
+      <>
+        <Row label="Repository">{`workflow #${meta.runId} delivery`}</Row>
+        <Row label="State">{meta.state}</Row>
+        {meta.isDraft && <Row label="Draft">yes</Row>}
+        {meta.url && (
+          <a className="inspector-link" href={meta.url} target="_blank" rel="noreferrer">
+            Open on GitHub
+          </a>
         )}
       </>
     );

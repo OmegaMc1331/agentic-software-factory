@@ -275,9 +275,19 @@ export interface AgentStatusInfo {
   permissions?: PolicyView;
 }
 
-export type GraphNodeKind = "agent" | "role" | "run" | "task" | "group" | "note";
+export type GraphNodeKind =
+  "agent" | "role" | "run" | "task" | "group" | "note" | "github_issue" | "github_pr";
 export type GraphEdgeKind =
-  "binds" | "plans" | "works" | "reviews" | "contains" | "depends" | "custom" | "membership";
+  | "binds"
+  | "plans"
+  | "works"
+  | "reviews"
+  | "contains"
+  | "depends"
+  | "custom"
+  | "membership"
+  | "originates"
+  | "delivers";
 
 export interface AgentMeta {
   command: string;
@@ -330,6 +340,126 @@ export interface RunMeta {
   team: WorkflowTeam | null;
   createdAt: string;
   counts: TaskCounts;
+  /** GitHub origin, when the workflow was imported from an Issue. */
+  github?: {
+    issueNumber: number;
+    issueUrl: string;
+    issueTitle: string;
+    repository: string;
+  } | null;
+  /** Delivery snapshot, when a delivery record exists. */
+  delivery?: {
+    state: string;
+    prNumber: number | null;
+    prUrl: string | null;
+  } | null;
+}
+
+// --- GitHub -----------------------------------------------------------------
+
+export type DeliveryState =
+  "not_ready" | "ready" | "pushing" | "creating_pr" | "published" | "failed";
+
+export interface GitHubIssueLink {
+  provider: string;
+  repository: string;
+  issueNumber: number;
+  issueUrl: string;
+  issueTitle: string;
+  issueBody: string;
+  issueState: string;
+  issueAuthor: string;
+  issueLabels: string[];
+  issueComments: { author: string; body: string }[];
+  importedAt: string;
+}
+
+export interface PullRequestInfo {
+  number: number;
+  url: string;
+  state: string;
+  isDraft: boolean;
+}
+
+export interface GitHubRepoStatus {
+  repository: string;
+  remote: string;
+  url: string;
+  defaultBranch: string | null;
+}
+
+export interface GitHubStatus {
+  connected: boolean;
+  user: string | null;
+  authError: string | null;
+  remoteError: string | null;
+  repository: GitHubRepoStatus | null;
+}
+
+export interface DeliveryReport {
+  runId: number;
+  state: DeliveryState;
+  persistedState: DeliveryState;
+  link: GitHubIssueLink | null;
+  repository: GitHubRepoStatus | null;
+  baseBranch: string | null;
+  headBranch: string;
+  integrationHead: string | null;
+  localHead: string | null;
+  pushedHead: string | null;
+  pullRequest: PullRequestInfo | null;
+  error: string | null;
+  eligible: boolean;
+  blockers: string[];
+}
+
+/** The persisted delivery record returned after `Create Pull Request`. */
+export interface GitHubDeliveryRecord {
+  runId: number;
+  state: DeliveryState;
+  repository: string | null;
+  remote: string | null;
+  baseBranch: string | null;
+  headBranch: string;
+  pushedHead: string | null;
+  pullRequest: PullRequestInfo | null;
+  error: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface PrPreview {
+  runId: number;
+  repository: string;
+  base: string;
+  head: string;
+  title: string;
+  body: string;
+  draft: boolean;
+  issueNumber: number | null;
+  issueUrl: string | null;
+  existing: PullRequestInfo | null;
+  eligible: boolean;
+  blockers: string[];
+}
+
+export interface GitHubIssueMeta {
+  runId: number;
+  number: number;
+  repository: string;
+  url: string;
+  title: string;
+  state: string;
+  author: string;
+  labels: string[];
+}
+
+export interface GitHubPrMeta {
+  runId: number;
+  number: number;
+  url: string;
+  state: string;
+  isDraft: boolean;
 }
 
 export type AttemptStatus =
@@ -403,7 +533,15 @@ export interface GraphNode {
   id: string;
   kind: GraphNodeKind;
   label: string;
-  meta: AgentMeta | RoleMeta | RunMeta | TaskMeta | GroupMeta | NoteMeta;
+  meta:
+    | AgentMeta
+    | RoleMeta
+    | RunMeta
+    | TaskMeta
+    | GroupMeta
+    | NoteMeta
+    | GitHubIssueMeta
+    | GitHubPrMeta;
 }
 
 export interface GraphEdge {
@@ -501,6 +639,14 @@ export function runMeta(node: GraphNode): RunMeta {
 
 export function taskMeta(node: GraphNode): TaskMeta {
   return node.meta as TaskMeta;
+}
+
+export function githubIssueMeta(node: GraphNode): GitHubIssueMeta {
+  return node.meta as GitHubIssueMeta;
+}
+
+export function githubPrMeta(node: GraphNode): GitHubPrMeta {
+  return node.meta as GitHubPrMeta;
 }
 
 export interface AgentActivity {

@@ -2,9 +2,13 @@ import type {
   AgentSession,
   AgentStatusInfo,
   ConfigData,
+  DeliveryReport,
   ExecutionClass,
+  GitHubDeliveryRecord,
+  GitHubStatus,
   GraphData,
   GraphWorkspace,
+  PrPreview,
   RoleArtifact,
   RoleInfo,
   RolePolicyPreset,
@@ -106,6 +110,39 @@ export function fetchRun(id: number): Promise<RunDetail> {
 
 export function createWorkflow(objective: string, team?: WorkflowTeam): Promise<Run> {
   return post<Run>("/runs", team === undefined ? { objective } : { objective, team });
+}
+
+/** Imports a GitHub Issue as a workflow. Planning starts; execution does not. */
+export function createWorkflowFromIssue(issue: string, team?: WorkflowTeam): Promise<Run> {
+  return post<Run>("/runs/from-issue", team === undefined ? { issue } : { issue, team });
+}
+
+// --- GitHub delivery ---------------------------------------------------------
+
+/** `gh auth status` + remote detection. Semantic read only. */
+export function fetchGithubStatus(): Promise<GitHubStatus> {
+  return get<GitHubStatus>("/github/status");
+}
+
+export function fetchDelivery(runId: number): Promise<DeliveryReport> {
+  return get<DeliveryReport>(`/runs/${runId}/delivery`);
+}
+
+/** The editable pull request preview shown before creation. */
+export function fetchPrPreview(runId: number): Promise<PrPreview> {
+  return get<PrPreview>(`/runs/${runId}/pr-preview`);
+}
+
+/**
+ * The Factory-owned delivery action: pushes `factory/run-<id>` and creates
+ * (or links an existing) pull request. Titles and bodies are passed as JSON
+ * values, never interpolated into commands.
+ */
+export function createPullRequest(
+  runId: number,
+  request: { title?: string; body?: string; draft?: boolean }
+): Promise<GitHubDeliveryRecord> {
+  return post<GitHubDeliveryRecord>(`/runs/${runId}/pull-request`, request);
 }
 
 export function updateWorkflowTeam(runId: number, team: WorkflowTeam): Promise<WorkflowTeam> {

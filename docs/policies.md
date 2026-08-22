@@ -122,6 +122,23 @@ Factory safety invariants: declaring them in `allow` has no effect. The Integrat
 Engine remains the only component that advances Factory-owned integration branches;
 task agents cannot bypass it.
 
+#### Agent permissions vs Factory delivery permissions
+
+These are two deliberately separate systems:
+
+- **Agent permissions** (this document) govern what task agents may do. They
+  always deny push-class Git operations, regardless of configuration, role
+  instructions, or imported GitHub Issue content.
+- **Factory delivery permissions** govern the one explicit user action that
+  publishes a completed workflow. The delivery engine in `factory-github` is the
+  only code in Factory that constructs a `git push` — it pushes exactly the
+  Factory-generated `factory/run-<id>` branch, never force, never arbitrary user
+  branches — and calls `gh pr create` only after the user confirms the preview.
+
+GitHub Delivery existing does not weaken any agent policy, and no custom role
+instruction can trigger `git push` or `gh pr create` through Factory. See
+[GitHub](github.md) for the delivery flow and its security model.
+
 ### Network
 
 ```toml

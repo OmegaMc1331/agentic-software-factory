@@ -18,6 +18,7 @@ factory-git = { path = "crates/factory-git" }
 factory-core = { path = "crates/factory-core" }
 factory-api = { path = "crates/factory-api" }
 factory-runtime = { path = "crates/factory-runtime" }
+factory-github = { path = "crates/factory-github" }
 
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }

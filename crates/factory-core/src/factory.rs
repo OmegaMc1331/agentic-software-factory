@@ -6,9 +6,9 @@ use factory_agent::{AgentError, AgentRequest, AgentResult, CommandAgent, OutputS
 use factory_db::{FactoryDb, Reconciliation};
 use factory_git::{Repo, WorktreeInfo};
 use factory_types::{
-    AgentSession, AgentSessionMode, AttemptStatus, ReviewDecision, ReviewResult, RoleArtifact, Run,
-    RunStatus, SpecializedReview, Task, TaskAttempt, TaskEvidence, TaskOperation, TaskState,
-    WorkflowTeam,
+    AgentSession, AgentSessionMode, AttemptStatus, DeliveryState, GitHubDelivery, GitHubIssueLink,
+    ReviewDecision, ReviewResult, RoleArtifact, Run, RunStatus, SpecializedReview, Task,
+    TaskAttempt, TaskEvidence, TaskOperation, TaskState, WorkflowTeam,
 };
 use thiserror::Error;
 
@@ -72,6 +72,10 @@ pub enum FactoryError {
     Db(#[from] factory_db::DbError),
     #[error("git error: {0}")]
     Git(#[from] factory_git::GitError),
+    #[error("GitHub error: {0}")]
+    GitHub(#[from] factory_github::GitHubError),
+    #[error("delivery not allowed: {0}")]
+    NotDeliverable(String),
     #[error("task {0} is not ready to run")]
     NotReady(i64),
     #[error("objective must not be empty")]
@@ -295,9 +299,15 @@ impl Factory {
         let allowed_roles: std::collections::HashSet<String> =
             available_roles.iter().cloned().collect();
         let planner_roles = crate::planner::planners_catalog(&catalog, &available_roles);
+        let untrusted_notice = self.untrusted_issue_notice(run_id)?;
         let mut rejection: Option<String> = None;
         for attempt in 0..crate::planner::MAX_ATTEMPTS {
-            let instruction = planner_mission(&run.objective, &planner_roles, rejection.as_deref());
+            let instruction = planner_mission(
+                &run.objective,
+                &planner_roles,
+                rejection.as_deref(),
+                untrusted_notice.as_deref(),
+            );
             let invocation = self.invoke_with_agent(
                 planner.clone(),
                 InvocationScope {
@@ -776,12 +786,14 @@ impl Factory {
             let upstream = self.upstream_artifacts(&task)?;
             let repository_context =
                 self.repository_context(&task, operation, &worktree, &base_sha, &[], &upstream);
+            let untrusted_notice = self.untrusted_issue_notice(task.run_id)?;
             let worker_policy = self.agents.config().effective_policy(&role, &worker_name);
             let worker_instruction = build_mission(&MissionContext {
                 role: role_definition,
                 operation,
                 task: &task,
                 run_objective: &run.objective,
+                untrusted_context: untrusted_notice.as_deref(),
                 upstream_artifacts: &upstream,
                 repository_context: Some(&repository_context),
                 previous_feedback: previous_feedback.as_ref(),
@@ -935,6 +947,7 @@ impl Factory {
                 operation: TaskOperation::Review,
                 task: &task,
                 run_objective: &run.objective,
+                untrusted_context: untrusted_notice.as_deref(),
                 upstream_artifacts: &upstream,
                 repository_context: Some(&repository_context),
                 previous_feedback: None,
@@ -1125,11 +1138,13 @@ impl Factory {
                 &upstream,
             );
             let advisory_policy = self.agents.config().effective_policy(&role, &agent_name);
+            let untrusted_notice = self.untrusted_issue_notice(task.run_id)?;
             let instruction = build_mission(&MissionContext {
                 role: role_definition,
                 operation: TaskOperation::Advisory,
                 task: &task,
                 run_objective: &run.objective,
+                untrusted_context: untrusted_notice.as_deref(),
                 upstream_artifacts: &upstream,
                 repository_context: Some(&repository_context),
                 previous_feedback: None,
@@ -1336,11 +1351,13 @@ impl Factory {
                 &upstream,
             );
             let review_policy = self.agents.config().effective_policy(&role, &reviewer_name);
+            let untrusted_notice = self.untrusted_issue_notice(task.run_id)?;
             let instruction = build_mission(&MissionContext {
                 role: role_definition,
                 operation: TaskOperation::Review,
                 task: &task,
                 run_objective: &run.objective,
+                untrusted_context: untrusted_notice.as_deref(),
                 upstream_artifacts: &upstream,
                 repository_context: Some(&repository_context),
                 previous_feedback: None,
@@ -2093,6 +2110,335 @@ impl Factory {
     pub fn list_worktrees(&self) -> Result<Vec<WorktreeInfo>, FactoryError> {
         Ok(Repo::detect_bounded(&self.root, &self.root)?.list_worktrees()?)
     }
+
+    // --- GitHub linkage and delivery ----------------------------------------
+
+    /// The notice marking a run's objective as containing untrusted imported
+    /// Issue content, rendered into Planner and task missions.
+    fn untrusted_issue_notice(&self, run_id: i64) -> Result<Option<String>, FactoryError> {
+        Ok(self
+            .db
+            .get_run_github_link(run_id)?
+            .map(|link| crate::github::untrusted_issue_notice(&link)))
+    }
+
+    /// The GitHub Issue a run was imported from, when it has one.
+    pub fn github_link(&self, run_id: i64) -> Result<Option<GitHubIssueLink>, FactoryError> {
+        Ok(self.db.get_run_github_link(run_id)?)
+    }
+
+    /// `gh auth status` + remote detection for the dashboard's connection
+    /// display. Tokens are never read or displayed.
+    pub fn github_status(&self) -> crate::github::GitHubStatus {
+        let mut status = crate::github::GitHubStatus {
+            connected: false,
+            user: None,
+            auth_error: None,
+            remote_error: None,
+            repository: None,
+        };
+        match self.github_remote() {
+            Ok(remote) => {
+                status.repository = Some(crate::github::GitHubRepoStatus {
+                    repository: remote.repository.clone(),
+                    remote: remote.remote.clone(),
+                    url: remote.web_url(),
+                    default_branch: remote.default_branch.clone(),
+                });
+            }
+            Err(error) => status.remote_error = Some(error.to_string()),
+        }
+        match factory_github::GhCli::discovered().auth_status() {
+            Ok(auth) => {
+                status.connected = true;
+                status.user = auth.user;
+            }
+            Err(error) => status.auth_error = Some(error.to_string()),
+        }
+        status
+    }
+
+    /// The project's GitHub remote, resolved only from Git remotes.
+    pub fn github_remote(&self) -> Result<factory_github::GitHubRemote, FactoryError> {
+        Repo::detect_bounded(&self.root, &self.root)?;
+        Ok(factory_github::remote::detect(&self.root)?)
+    }
+
+    /// Imports a GitHub Issue as a new workflow. The issue becomes the run's
+    /// objective (bounded, verbatim) and is persisted as an untrusted link;
+    /// nothing executes until the user starts the workflow. Authentication
+    /// and repository resolution failures return actionable errors.
+    pub fn import_github_issue(
+        &self,
+        reference: &str,
+        team: Option<WorkflowTeam>,
+    ) -> Result<Run, FactoryError> {
+        let issue_ref = factory_github::IssueRef::parse(reference)?;
+        let remote = self.github_remote()?;
+        if let Some(repository) = &issue_ref.repository {
+            if *repository != remote.repository {
+                return Err(factory_github::GitHubError::RemoteParse(format!(
+                    "the issue belongs to '{repository}' but this project tracks '{}'; Factory \
+                     only imports issues from the project's own GitHub remote",
+                    remote.repository
+                ))
+                .into());
+            }
+        }
+        let gh = factory_github::GhCli::discovered();
+        gh.auth_status()?;
+        let issue = gh.view_issue(&remote.repository, issue_ref.number)?;
+        let objective = factory_github::objective_from_issue(&issue);
+        let run = self.begin_run(&objective, team)?;
+        let link = factory_github::issue_link(
+            &issue,
+            &remote.repository,
+            &remote.issue_url(issue.number),
+            &chrono::Utc::now().to_rfc3339(),
+        );
+        self.db.set_run_github_link(run.id, &link)?;
+        self.db
+            .get_run(run.id)?
+            .ok_or(FactoryError::RunNotFound(run.id))
+    }
+
+    /// The delivery report for a run: persisted metadata, effective state,
+    /// and eligibility with concrete blockers.
+    pub fn delivery_report(
+        &self,
+        run_id: i64,
+    ) -> Result<crate::github::DeliveryReport, FactoryError> {
+        let run = self
+            .db
+            .get_run(run_id)?
+            .ok_or(FactoryError::RunNotFound(run_id))?;
+        let link = self.db.get_run_github_link(run_id)?;
+        let delivery = self.db.get_or_create_delivery(run_id)?;
+        let integration_head = self.db.get_run_integration(run_id)?;
+        let local_head = Repo::detect_bounded(&self.root, &self.root)
+            .ok()
+            .and_then(|repo| {
+                repo.resolve_ref(&delivery.head_branch)
+                    .ok()
+                    .filter(|sha| !sha.is_empty())
+            });
+        let eligibility = crate::github::delivery_eligibility(
+            &run,
+            integration_head.as_deref(),
+            local_head.as_deref(),
+        );
+        let repository = self
+            .github_remote()
+            .ok()
+            .map(|remote| crate::github::GitHubRepoStatus {
+                repository: remote.repository.clone(),
+                remote: remote.remote.clone(),
+                url: remote.web_url(),
+                default_branch: remote.default_branch.clone(),
+            });
+        Ok(crate::github::DeliveryReport {
+            run_id,
+            state: crate::github::effective_delivery_state(&delivery, eligibility.ready),
+            persisted_state: delivery.state,
+            link,
+            repository,
+            base_branch: delivery
+                .base_branch
+                .clone()
+                .or_else(|| self.github_remote().ok().and_then(|r| r.default_branch)),
+            head_branch: delivery.head_branch.clone(),
+            integration_head,
+            local_head,
+            pushed_head: delivery.pushed_head,
+            pull_request: delivery.pull_request,
+            error: delivery.error,
+            eligible: eligibility.ready,
+            blockers: eligibility.blockers,
+        })
+    }
+
+    /// The editable pull request preview for a completed run.
+    pub fn pull_request_preview(
+        &self,
+        run_id: i64,
+    ) -> Result<crate::github::PrPreview, FactoryError> {
+        let run = self
+            .db
+            .get_run(run_id)?
+            .ok_or(FactoryError::RunNotFound(run_id))?;
+        let link = self.db.get_run_github_link(run_id)?;
+        let delivery = self.db.get_or_create_delivery(run_id)?;
+        let integration_head = self.db.get_run_integration(run_id)?;
+        let repo = Repo::detect_bounded(&self.root, &self.root)?;
+        let local_head = repo
+            .resolve_ref(&delivery.head_branch)
+            .ok()
+            .filter(|sha| !sha.is_empty());
+        let eligibility = crate::github::delivery_eligibility(
+            &run,
+            integration_head.as_deref(),
+            local_head.as_deref(),
+        );
+        let remote = self.github_remote()?;
+        let base = remote
+            .default_branch
+            .clone()
+            .unwrap_or_else(|| "main".to_string());
+        let tasks = self.db.list_tasks(run_id)?;
+        let attempts = self.db.list_task_attempts(run_id)?;
+        let mut evidence = crate::github::pr_evidence(&run, &tasks, &attempts);
+        evidence.issue_number = link.as_ref().map(|link| link.issue_number);
+        let issue_title = link.as_ref().map(|link| link.issue_title.clone());
+        // Best-effort duplicate detection; creation re-checks authoritatively.
+        let existing = factory_github::GhCli::discovered()
+            .list_pull_requests(&remote.repository, &delivery.head_branch)
+            .ok()
+            .and_then(|prs| prs.into_iter().max_by_key(|pr| pr.number));
+        Ok(crate::github::PrPreview {
+            run_id,
+            repository: remote.repository.clone(),
+            base,
+            head: delivery.head_branch.clone(),
+            title: factory_github::default_pr_title(&run.objective, issue_title.as_deref()),
+            body: factory_github::build_pr_body(&evidence),
+            draft: false,
+            issue_number: evidence.issue_number,
+            issue_url: link.as_ref().map(|link| link.issue_url.clone()),
+            existing,
+            eligible: eligibility.ready,
+            blockers: eligibility.blockers,
+        })
+    }
+
+    /// Delivers a completed workflow: pushes its `factory/run-<id>` branch to
+    /// the project remote and creates (or links an existing) pull request.
+    ///
+    /// This is the only Factory-owned push path. Agents never reach it: the
+    /// Policy Engine independently denies push-class git operations for task
+    /// agents, and only this explicit user action runs here.
+    pub fn create_pull_request(
+        &self,
+        run_id: i64,
+        title: Option<&str>,
+        body: Option<&str>,
+        draft: bool,
+    ) -> Result<GitHubDelivery, FactoryError> {
+        let run = self
+            .db
+            .get_run(run_id)?
+            .ok_or(FactoryError::RunNotFound(run_id))?;
+        let mut delivery = self.db.get_or_create_delivery(run_id)?;
+        // An existing PR is shown and linked, never duplicated.
+        if delivery.pull_request.is_some() {
+            return Ok(delivery);
+        }
+        let integration_head = self.db.get_run_integration(run_id)?;
+        let repo = Repo::detect_bounded(&self.root, &self.root)?;
+        let local_head = repo
+            .resolve_ref(&delivery.head_branch)
+            .ok()
+            .filter(|sha| !sha.is_empty());
+        // Eligibility covers completion, integration head, and branch drift;
+        // each failure names its blocker.
+        let eligibility = crate::github::delivery_eligibility(
+            &run,
+            integration_head.as_deref(),
+            local_head.as_deref(),
+        );
+        if !eligibility.ready {
+            return Err(FactoryError::NotDeliverable(
+                eligibility.blockers.join("; "),
+            ));
+        }
+        let integration_head =
+            integration_head.expect("eligibility guarantees an integration head");
+        let remote = self.github_remote()?;
+        let base = remote
+            .default_branch
+            .clone()
+            .unwrap_or_else(|| "main".to_string());
+        // From here on, every failure is recorded on the delivery record.
+        match factory_github::remote_branch_exists(&self.root, &remote.remote, &base) {
+            Ok(true) => {}
+            Ok(false) => {
+                return self.fail_delivery(
+                    delivery,
+                    factory_github::GitHubError::BaseBranchUnavailable(base),
+                )
+            }
+            Err(error) => return self.fail_delivery(delivery, error),
+        }
+        let tasks = self.db.list_tasks(run_id)?;
+        let attempts = self.db.list_task_attempts(run_id)?;
+        let link = self.db.get_run_github_link(run_id)?;
+        let mut evidence = crate::github::pr_evidence(&run, &tasks, &attempts);
+        evidence.issue_number = link.as_ref().map(|link| link.issue_number);
+        let issue_title = link.as_ref().map(|link| link.issue_title.clone());
+        let default_title =
+            factory_github::default_pr_title(&run.objective, issue_title.as_deref());
+        let title = title.map(str::trim).filter(|t| !t.is_empty());
+        let body = body.map(str::trim).filter(|b| !b.is_empty());
+        let final_title = title.map(str::to_string).unwrap_or(default_title);
+        let final_body = body
+            .map(str::to_string)
+            .unwrap_or_else(|| factory_github::build_pr_body(&evidence));
+
+        delivery.state = DeliveryState::Pushing;
+        delivery.repository = Some(remote.repository.clone());
+        delivery.remote = Some(remote.remote.clone());
+        delivery.base_branch = Some(base.clone());
+        delivery.error = None;
+        self.db.set_delivery(&delivery)?;
+        if let Err(error) =
+            factory_github::push_branch(&self.root, &remote.remote, &delivery.head_branch)
+        {
+            return self.fail_delivery(delivery, error);
+        }
+
+        delivery.state = DeliveryState::CreatingPr;
+        self.db.set_delivery(&delivery)?;
+        let gh = factory_github::GhCli::discovered();
+        let outcome = match factory_github::create_or_link_pull_request(
+            &gh,
+            &remote.repository,
+            &base,
+            &delivery.head_branch,
+            &final_title,
+            &final_body,
+            draft,
+        ) {
+            Ok(outcome) => outcome,
+            Err(error) => return self.fail_delivery(delivery, error),
+        };
+        let mut pull_request = match &outcome {
+            factory_github::DeliveryOutcome::Created(pr) => pr.clone(),
+            factory_github::DeliveryOutcome::LinkedExisting(pr) => pr.clone(),
+        };
+        // `gh pr create` reports only a URL, so the requested draft flag is
+        // what Factory records for freshly created PRs; linked existing PRs
+        // keep the state GitHub reported.
+        if matches!(outcome, factory_github::DeliveryOutcome::Created(_)) {
+            pull_request.is_draft = draft;
+        }
+        delivery.pull_request = Some(pull_request);
+        delivery.pushed_head = Some(integration_head);
+        delivery.state = DeliveryState::Published;
+        delivery.error = None;
+        self.db.set_delivery(&delivery)?;
+        Ok(delivery)
+    }
+
+    /// Records a failed delivery attempt and converts the error.
+    fn fail_delivery(
+        &self,
+        mut delivery: GitHubDelivery,
+        error: factory_github::GitHubError,
+    ) -> Result<GitHubDelivery, FactoryError> {
+        delivery.state = DeliveryState::Failed;
+        delivery.error = Some(error.to_string());
+        let _ = self.db.set_delivery(&delivery);
+        Err(FactoryError::GitHub(error))
+    }
 }
 
 // --- Workflow stage --------------------------------------------------------
@@ -2517,6 +2863,7 @@ mod tests {
             operation: TaskOperation::Implement,
             task: &task,
             run_objective: "objective",
+            untrusted_context: None,
             upstream_artifacts: &[],
             repository_context: None,
             previous_feedback: None,
@@ -2540,6 +2887,7 @@ mod tests {
             operation: TaskOperation::Implement,
             task: &task,
             run_objective: "objective",
+            untrusted_context: None,
             upstream_artifacts: &[],
             repository_context: None,
             previous_feedback: Some(&review),

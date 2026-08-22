@@ -117,8 +117,12 @@ impl From<RuntimeError> for ApiError {
                 | factory_core::FactoryError::NotReady(_)
                 | factory_core::FactoryError::Agent(_)
                 | factory_core::FactoryError::AgentProcess(_)
-                | factory_core::FactoryError::Git(_),
+                | factory_core::FactoryError::Git(_)
+                | factory_core::FactoryError::GitHub(_),
             ) => StatusCode::BAD_REQUEST,
+            RuntimeError::Factory(factory_core::FactoryError::NotDeliverable(_)) => {
+                StatusCode::CONFLICT
+            }
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
         ApiError::new(status, error.to_string())
@@ -129,9 +133,13 @@ pub fn router(state: SharedState) -> Router {
     Router::new()
         .route("/api/health", get(health))
         .route("/api/runs", get(list_runs).post(create_run))
+        .route("/api/runs/from-issue", post(create_run_from_issue))
         .route("/api/runs/:id", get(get_run))
         .route("/api/runs/:id/start", post(start_run))
         .route("/api/runs/:id/cancel", post(cancel_run))
+        .route("/api/runs/:id/delivery", get(run_delivery))
+        .route("/api/runs/:id/pr-preview", get(run_pr_preview))
+        .route("/api/runs/:id/pull-request", post(create_pull_request))
         .route("/api/tasks/:id/retry", post(retry_task))
         .route("/api/runs/:id/team", put(put_run_team))
         .route("/api/runs/:id/artifacts", get(run_artifacts))
@@ -150,6 +158,7 @@ pub fn router(state: SharedState) -> Router {
             "/api/graph/workspace",
             get(get_graph_workspace).put(put_graph_workspace),
         )
+        .route("/api/github/status", get(github_status))
         .route("/api/agents", get(get_agents))
         .route(
             "/api/agents/:agent/sessions",
@@ -229,6 +238,123 @@ async fn create_run(
         .runtime
         .create_workflow(&request.objective, request.team)?;
     Ok((StatusCode::ACCEPTED, Json(run)))
+}
+
+// --- GitHub linkage and delivery -------------------------------------------
+
+/// `gh auth status` + remote detection for the dashboard connection chip.
+/// Semantic read: no GitHub mutation happens here.
+async fn github_status(
+    State(state): State<SharedState>,
+) -> Result<Json<factory_core::github::GitHubStatus>, ApiError> {
+    let root = state.root.clone();
+    let status = tokio::task::spawn_blocking(
+        move || -> Result<factory_core::github::GitHubStatus, ApiError> {
+            let factory = factory_core::Factory::open(&root).map_err(|error| {
+                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+            })?;
+            Ok(factory.github_status())
+        },
+    )
+    .await
+    .map_err(|error| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))??;
+    Ok(Json(status))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateRunFromIssueRequest {
+    /// `#42`, `42`, or a GitHub issue URL.
+    issue: String,
+    #[serde(default)]
+    team: Option<WorkflowTeam>,
+}
+
+/// Imports a GitHub Issue as a workflow. The run is planned in the background;
+/// nothing executes until the user explicitly starts it.
+async fn create_run_from_issue(
+    State(state): State<SharedState>,
+    body: Result<Json<CreateRunFromIssueRequest>, axum::extract::rejection::JsonRejection>,
+) -> Result<(StatusCode, Json<factory_types::Run>), ApiError> {
+    let request = body
+        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "invalid JSON body"))?
+        .0;
+    let run = state
+        .runtime
+        .import_workflow_from_issue(&request.issue, request.team)?;
+    Ok((StatusCode::ACCEPTED, Json(run)))
+}
+
+async fn run_delivery(
+    State(state): State<SharedState>,
+    UrlPath(id): UrlPath<i64>,
+) -> Result<Json<factory_core::github::DeliveryReport>, ApiError> {
+    let report = run_delivery_operation(state, move |factory| factory.delivery_report(id)).await?;
+    Ok(Json(report))
+}
+
+async fn run_pr_preview(
+    State(state): State<SharedState>,
+    UrlPath(id): UrlPath<i64>,
+) -> Result<Json<factory_core::github::PrPreview>, ApiError> {
+    let preview =
+        run_delivery_operation(state, move |factory| factory.pull_request_preview(id)).await?;
+    Ok(Json(preview))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreatePullRequestRequest {
+    /// Overrides the derived title (issue title / objective first line).
+    #[serde(default)]
+    title: Option<String>,
+    /// Overrides the deterministic evidence-based body.
+    #[serde(default)]
+    body: Option<String>,
+    /// Factory's documented default is a normal (non-draft) pull request.
+    #[serde(default)]
+    draft: bool,
+}
+
+/// The single Factory-owned delivery action: push `factory/run-<id>` and
+/// create (or link) its pull request. This endpoint is semantic — there is no
+/// generic GitHub command passthrough.
+async fn create_pull_request(
+    State(state): State<SharedState>,
+    UrlPath(id): UrlPath<i64>,
+    body: Result<Json<CreatePullRequestRequest>, axum::extract::rejection::JsonRejection>,
+) -> Result<(StatusCode, Json<factory_types::GitHubDelivery>), ApiError> {
+    let request = body
+        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "invalid JSON body"))?
+        .0;
+    let delivery = run_delivery_operation(state, move |factory| {
+        factory.create_pull_request(
+            id,
+            request.title.as_deref(),
+            request.body.as_deref(),
+            request.draft,
+        )
+    })
+    .await?;
+    Ok((StatusCode::CREATED, Json(delivery)))
+}
+
+/// Runs a blocking delivery operation against a freshly opened Factory.
+/// `RuntimeError`'s status mapping covers not-found, not-deliverable, and the
+/// actionable GitHub errors.
+async fn run_delivery_operation<T, F>(state: SharedState, operation: F) -> Result<T, ApiError>
+where
+    T: Send + 'static,
+    F: FnOnce(factory_core::Factory) -> Result<T, factory_core::FactoryError> + Send + 'static,
+{
+    let root = state.root.clone();
+    tokio::task::spawn_blocking(move || {
+        let factory = factory_core::Factory::open(&root).map_err(RuntimeError::from)?;
+        operation(factory).map_err(RuntimeError::from)
+    })
+    .await
+    .map_err(|error| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+    .map_err(ApiError::from)
 }
 
 async fn start_run(
@@ -1220,6 +1346,8 @@ fn build_graph(state: &SharedState) -> Result<GraphResponse, ApiError> {
         let tasks = db.list_tasks(run.id)?;
         let attempts = db.list_task_attempts(run.id)?;
         let sessions = db.list_agent_sessions(Some(run.id))?;
+        let github_link = db.get_run_github_link(run.id).ok().flatten();
+        let delivery = db.get_delivery(run.id).ok().flatten();
         let latest_attempts: HashMap<i64, factory_types::TaskAttempt> =
             attempts
                 .into_iter()
@@ -1240,8 +1368,72 @@ fn build_graph(state: &SharedState) -> Result<GraphResponse, ApiError> {
                 "team": run.team,
                 "createdAt": run.created_at,
                 "counts": TaskCounts::from_tasks(&tasks),
+                "github": github_link.as_ref().map(|link| json!({
+                    "issueNumber": link.issue_number,
+                    "issueUrl": link.issue_url,
+                    "issueTitle": link.issue_title,
+                    "repository": link.repository,
+                })),
+                "delivery": delivery.as_ref().map(|delivery| json!({
+                    "state": delivery.state.as_str(),
+                    "prNumber": delivery.pull_request.as_ref().map(|pr| pr.number),
+                    "prUrl": delivery.pull_request.as_ref().map(|pr| pr.url.clone()),
+                })),
             }),
         });
+
+        // Compact external-source nodes: the imported Issue before the run,
+        // and the delivered pull request after it.
+        if let Some(link) = &github_link {
+            nodes.push(GraphNode {
+                id: format!("github_issue:{}", run.id),
+                kind: "github_issue".into(),
+                label: format!("#{} {}", link.issue_number, link.issue_title),
+                meta: json!({
+                    "runId": run.id,
+                    "number": link.issue_number,
+                    "repository": link.repository,
+                    "url": link.issue_url,
+                    "title": link.issue_title,
+                    "state": link.issue_state,
+                    "author": link.issue_author,
+                    "labels": link.issue_labels,
+                }),
+            });
+            edges.push(GraphEdge {
+                id: format!("originates:{}", run.id),
+                source: format!("github_issue:{}", run.id),
+                target: format!("run:{}", run.id),
+                kind: "originates".into(),
+                editable: false,
+                semantic: "system".into(),
+            });
+        }
+        if let Some(pr) = delivery
+            .as_ref()
+            .and_then(|delivery| delivery.pull_request.as_ref())
+        {
+            nodes.push(GraphNode {
+                id: format!("github_pr:{}", run.id),
+                kind: "github_pr".into(),
+                label: format!("PR #{}", pr.number),
+                meta: json!({
+                    "runId": run.id,
+                    "number": pr.number,
+                    "url": pr.url,
+                    "state": pr.state,
+                    "isDraft": pr.is_draft,
+                }),
+            });
+            edges.push(GraphEdge {
+                id: format!("delivers:{}", run.id),
+                source: format!("run:{}", run.id),
+                target: format!("github_pr:{}", run.id),
+                kind: "delivers".into(),
+                editable: false,
+                semantic: "system".into(),
+            });
+        }
 
         if let Some(planner) = &run.planner_agent {
             let planner_assigned = config.as_ref().is_some_and(|config| {

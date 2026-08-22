@@ -5,6 +5,7 @@ import {
   cancelWorkflow,
   createRole,
   createWorkflow,
+  createWorkflowFromIssue,
   deleteRole,
   fetchConfig,
   fetchGraph,
@@ -171,6 +172,9 @@ export function NetworkView() {
         if (node.kind === "role") {
           return showRoles;
         }
+        if (node.kind === "github_issue" || node.kind === "github_pr") {
+          return runFilter === null || Number(node.id.split(":")[1]) === runFilter;
+        }
         return true;
       }),
     [effectiveShowTasks, merged, runFilter, showRoles]
@@ -282,6 +286,30 @@ export function NetworkView() {
       setOperationError(null);
       try {
         const run = await createWorkflow(objective, team);
+        const nodeId = `run:${run.id}`;
+        const nextWorkspace = {
+          ...workspace,
+          nodes: { ...workspace.nodes, [nodeId]: freePosition() },
+        };
+        await persistWorkspace(nextWorkspace);
+        setAddOpen(false);
+        setInitialAddKind(null);
+        setSelectedNodeId(nodeId);
+        setPositionRevision((value) => value + 1);
+        reloadGraph();
+      } catch (reason) {
+        setOperationError((reason as Error).message);
+      }
+    },
+    [freePosition, persistWorkspace, reloadGraph, workspace]
+  );
+
+  const createWorkflowFromIssueNode = useCallback(
+    async (issue: string, team: WorkflowTeam) => {
+      if (!workspace) return;
+      setOperationError(null);
+      try {
+        const run = await createWorkflowFromIssue(issue, team);
         const nodeId = `run:${run.id}`;
         const nextWorkspace = {
           ...workspace,
@@ -626,6 +654,7 @@ export function NetworkView() {
             setInitialAddKind(null);
           }}
           onCreateWorkflow={(objective, team) => void createWorkflowNode(objective, team)}
+          onCreateWorkflowFromIssue={(issue, team) => void createWorkflowFromIssueNode(issue, team)}
           onCreateAgent={createAgent}
           onCreateRole={(value) => void createRoleNode(value)}
           onAssignCoreRole={(roleId, agent) => void assignCoreRole(roleId, agent)}

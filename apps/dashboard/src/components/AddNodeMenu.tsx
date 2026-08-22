@@ -1,8 +1,10 @@
 import { useEffect, useRef, useState } from "react";
+import { fetchGithubStatus } from "../api";
 import type {
   AgentEntry,
   AgentKind,
   ConfigData,
+  GitHubStatus,
   PromptTransport,
   RoleInfo,
   WorkflowTeam,
@@ -12,6 +14,7 @@ import { RoleForm, type RoleFormValue } from "./RoleForm";
 
 type AddKind = "workflow" | "agent" | "role" | "group" | "note";
 type RoleMode = "core" | "custom";
+type WorkflowSource = "objective" | "github";
 const AGENT_PRESETS: Record<
   Exclude<AgentKind, "custom">,
   { label: string; name: string; command: string; args: string[] }
@@ -59,6 +62,7 @@ export function AddNodeMenu({
   initialKind,
   onClose,
   onCreateWorkflow,
+  onCreateWorkflowFromIssue,
   onCreateAgent,
   onCreateRole,
   onAssignCoreRole,
@@ -71,6 +75,7 @@ export function AddNodeMenu({
   initialKind?: AddKind | null;
   onClose: () => void;
   onCreateWorkflow: (objective: string, team: WorkflowTeam) => void;
+  onCreateWorkflowFromIssue: (issue: string, team: WorkflowTeam) => void;
   onCreateAgent: (name: string, entry: AgentEntry) => void;
   onCreateRole: (value: RoleFormValue) => void;
   onAssignCoreRole: (roleId: string, agent: string) => void;
@@ -90,6 +95,9 @@ export function AddNodeMenu({
   const [coreRoleAgent, setCoreRoleAgent] = useState("");
   const [text, setText] = useState("");
   const [objective, setObjective] = useState("");
+  const [workflowSource, setWorkflowSource] = useState<WorkflowSource>("objective");
+  const [issueReference, setIssueReference] = useState("");
+  const [githubStatus, setGithubStatus] = useState<GitHubStatus | null>(null);
   const [teamPlanner, setTeamPlanner] = useState("");
   const [teamWorkers, setTeamWorkers] = useState<string[]>([]);
   const [teamReviewers, setTeamReviewers] = useState<string[]>([]);
@@ -126,6 +134,29 @@ export function AddNodeMenu({
     setTeamReviewers(preferredRoleAgents(byId.get("reviewer")));
     setTeamAdditional({});
   }, [kind, open, roles]);
+
+  useEffect(() => {
+    if (!open || kind !== "workflow" || workflowSource !== "github" || githubStatus) return;
+    fetchGithubStatus()
+      .then((status) => setGithubStatus(status))
+      .catch((reason: Error) =>
+        setGithubStatus({
+          connected: false,
+          user: null,
+          authError: (reason as Error).message,
+          remoteError: null,
+          repository: null,
+        })
+      );
+  }, [githubStatus, kind, open, workflowSource]);
+
+  useEffect(() => {
+    if (!open) {
+      setGithubStatus(null);
+      setWorkflowSource("objective");
+      setIssueReference("");
+    }
+  }, [open]);
 
   if (!open) return null;
   const agents = Object.keys(config.agents).sort();
@@ -169,8 +200,12 @@ export function AddNodeMenu({
   const submit = (event: React.FormEvent) => {
     event.preventDefault();
     if (kind === "workflow") {
-      if (!objective.trim()) {
+      if (workflowSource === "objective" && !objective.trim()) {
         setValidationError("Describe what the Factory should build.");
+        return;
+      }
+      if (workflowSource === "github" && !issueReference.trim()) {
+        setValidationError("Provide an issue number (#42) or a GitHub issue URL.");
         return;
       }
       if (!workflowReady) {
@@ -181,12 +216,17 @@ export function AddNodeMenu({
       const additional = Object.fromEntries(
         Object.entries(teamAdditional).filter(([, selected]) => selected.length > 0)
       );
-      onCreateWorkflow(objective.trim(), {
+      const team: WorkflowTeam = {
         planner: teamPlanner,
         workers: teamWorkers,
         reviewers: teamReviewers,
         additional,
-      });
+      };
+      if (workflowSource === "github") {
+        onCreateWorkflowFromIssue(issueReference.trim(), team);
+      } else {
+        onCreateWorkflow(objective.trim(), team);
+      }
     } else if (kind === "agent") {
       const parsedEnvironment = parseEnvironment(environmentText);
       if (parsedEnvironment.error) {
@@ -263,20 +303,75 @@ export function AddNodeMenu({
         <form className="add-node-form" onSubmit={submit}>
           {kind === "workflow" && (
             <>
-              <label>
-                <span>What should the Factory build?</span>
-                <textarea
-                  rows={5}
-                  value={objective}
-                  onChange={(event) => {
-                    setObjective(event.target.value);
-                    setValidationError(null);
-                  }}
-                  placeholder="Implement authentication with email login and password reset."
-                  required
-                  autoFocus
-                />
-              </label>
+              <div className="workflow-source" role="tablist" aria-label="Workflow source">
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={workflowSource === "objective"}
+                  className={workflowSource === "objective" ? "is-active" : ""}
+                  onClick={() => setWorkflowSource("objective")}
+                >
+                  From objective
+                </button>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={workflowSource === "github"}
+                  className={workflowSource === "github" ? "is-active" : ""}
+                  onClick={() => setWorkflowSource("github")}
+                >
+                  From GitHub Issue
+                </button>
+              </div>
+              {workflowSource === "objective" ? (
+                <label>
+                  <span>What should the Factory build?</span>
+                  <textarea
+                    rows={5}
+                    value={objective}
+                    onChange={(event) => {
+                      setObjective(event.target.value);
+                      setValidationError(null);
+                    }}
+                    placeholder="Implement authentication with email login and password reset."
+                    required
+                    autoFocus
+                  />
+                </label>
+              ) : (
+                <>
+                  <label>
+                    <span>GitHub Issue</span>
+                    <input
+                      value={issueReference}
+                      onChange={(event) => {
+                        setIssueReference(event.target.value);
+                        setValidationError(null);
+                      }}
+                      placeholder="#42 or https://github.com/owner/repo/issues/42"
+                      autoFocus
+                    />
+                  </label>
+                  {githubStatus === null ? (
+                    <p className="inline-note">Checking the GitHub CLI…</p>
+                  ) : githubStatus.connected && githubStatus.repository ? (
+                    <p className="inline-note">
+                      GitHub — connected as {githubStatus.user ?? "unknown user"} ·{" "}
+                      {githubStatus.repository.repository}
+                    </p>
+                  ) : (
+                    <p className="inline-note">
+                      {githubStatus.authError ??
+                        githubStatus.remoteError ??
+                        "GitHub is not connected."}
+                    </p>
+                  )}
+                  <p className="inline-note">
+                    The issue body is imported as untrusted context; the workflow still needs an
+                    explicit Start before anything runs.
+                  </p>
+                </>
+              )}
               <div className="workflow-team">
                 <span className="workflow-team-title">Team</span>
                 <label>

@@ -1,7 +1,29 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { fetchGithubStatus } from "../api";
 import type { ConfigData, RoleInfo } from "../types";
 import { AddNodeMenu } from "./AddNodeMenu";
+
+vi.mock("../api", () => ({
+  fetchGithubStatus: vi.fn(),
+}));
+
+const githubStatus = {
+  connected: true,
+  user: "octocat",
+  authError: null,
+  remoteError: null,
+  repository: {
+    repository: "OmegaMc1331/example",
+    remote: "origin",
+    url: "https://github.com/OmegaMc1331/example",
+    defaultBranch: "main",
+  },
+};
+
+beforeEach(() => {
+  vi.mocked(fetchGithubStatus).mockReset().mockResolvedValue(githubStatus);
+});
 
 afterEach(cleanup);
 
@@ -52,6 +74,7 @@ describe("Add Node menu", () => {
         error={null}
         onClose={vi.fn()}
         onCreateWorkflow={onCreateWorkflow}
+        onCreateWorkflowFromIssue={vi.fn()}
         onCreateAgent={vi.fn()}
         onCreateRole={vi.fn()}
         onAssignCoreRole={vi.fn()}
@@ -85,6 +108,7 @@ describe("Add Node menu", () => {
         error={null}
         onClose={vi.fn()}
         onCreateWorkflow={vi.fn()}
+        onCreateWorkflowFromIssue={vi.fn()}
         onCreateAgent={vi.fn()}
         onCreateRole={vi.fn()}
         onAssignCoreRole={vi.fn()}
@@ -113,6 +137,7 @@ describe("Add Node menu", () => {
         error={null}
         onClose={vi.fn()}
         onCreateWorkflow={onCreateWorkflow}
+        onCreateWorkflowFromIssue={vi.fn()}
         onCreateAgent={vi.fn()}
         onCreateRole={vi.fn()}
         onAssignCoreRole={vi.fn()}
@@ -146,6 +171,7 @@ describe("Add Node menu", () => {
         error={null}
         onClose={vi.fn()}
         onCreateWorkflow={vi.fn()}
+        onCreateWorkflowFromIssue={vi.fn()}
         onCreateAgent={onCreateAgent}
         onCreateRole={vi.fn()}
         onAssignCoreRole={vi.fn()}
@@ -176,6 +202,7 @@ describe("Add Node menu", () => {
         error={null}
         onClose={vi.fn()}
         onCreateWorkflow={vi.fn()}
+        onCreateWorkflowFromIssue={vi.fn()}
         onCreateAgent={onCreateAgent}
         onCreateRole={vi.fn()}
         onAssignCoreRole={vi.fn()}
@@ -209,6 +236,7 @@ describe("Add Node menu", () => {
         error={null}
         onClose={vi.fn()}
         onCreateWorkflow={vi.fn()}
+        onCreateWorkflowFromIssue={vi.fn()}
         onCreateAgent={vi.fn()}
         onCreateRole={onCreateRole}
         onAssignCoreRole={vi.fn()}
@@ -238,6 +266,96 @@ describe("Add Node menu", () => {
     });
   });
 
+  it("creates a workflow from a GitHub Issue reference with the selected team", async () => {
+    const onCreateWorkflowFromIssue = vi.fn();
+    render(
+      <AddNodeMenu
+        open
+        initialKind="workflow"
+        config={config}
+        roles={pipelineRoles}
+        error={null}
+        onClose={vi.fn()}
+        onCreateWorkflow={vi.fn()}
+        onCreateWorkflowFromIssue={onCreateWorkflowFromIssue}
+        onCreateAgent={vi.fn()}
+        onCreateRole={vi.fn()}
+        onAssignCoreRole={vi.fn()}
+        onCreateVisual={vi.fn()}
+      />
+    );
+
+    fireEvent.click(screen.getByRole("tab", { name: "From GitHub Issue" }));
+    await waitFor(() => expect(screen.getByText(/connected as octocat/)).toBeTruthy());
+    fireEvent.change(screen.getByLabelText("GitHub Issue"), {
+      target: { value: "#42" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Plan" }));
+
+    expect(onCreateWorkflowFromIssue).toHaveBeenCalledWith(
+      "#42",
+      expect.objectContaining({
+        planner: "codex",
+        workers: ["claude"],
+        reviewers: ["codex"],
+      })
+    );
+  });
+
+  it("requires an issue reference before planning a GitHub workflow", async () => {
+    render(
+      <AddNodeMenu
+        open
+        initialKind="workflow"
+        config={config}
+        roles={pipelineRoles}
+        error={null}
+        onClose={vi.fn()}
+        onCreateWorkflow={vi.fn()}
+        onCreateWorkflowFromIssue={vi.fn()}
+        onCreateAgent={vi.fn()}
+        onCreateRole={vi.fn()}
+        onAssignCoreRole={vi.fn()}
+        onCreateVisual={vi.fn()}
+      />
+    );
+
+    fireEvent.click(screen.getByRole("tab", { name: "From GitHub Issue" }));
+    await waitFor(() => expect(screen.getByText(/connected as octocat/)).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: "Plan" }));
+
+    expect(screen.getByText("Provide an issue number (#42) or a GitHub issue URL.")).toBeTruthy();
+  });
+
+  it("shows the actionable auth error when the GitHub CLI is not authenticated", async () => {
+    vi.mocked(fetchGithubStatus).mockResolvedValue({
+      connected: false,
+      user: null,
+      authError: "GitHub authentication required. Run `gh auth login` in a terminal, then retry.",
+      remoteError: null,
+      repository: githubStatus.repository,
+    });
+    render(
+      <AddNodeMenu
+        open
+        initialKind="workflow"
+        config={config}
+        roles={pipelineRoles}
+        error={null}
+        onClose={vi.fn()}
+        onCreateWorkflow={vi.fn()}
+        onCreateWorkflowFromIssue={vi.fn()}
+        onCreateAgent={vi.fn()}
+        onCreateRole={vi.fn()}
+        onAssignCoreRole={vi.fn()}
+        onCreateVisual={vi.fn()}
+      />
+    );
+
+    fireEvent.click(screen.getByRole("tab", { name: "From GitHub Issue" }));
+    await waitFor(() => expect(screen.getByText(/GitHub authentication required/)).toBeTruthy());
+  });
+
   it("assigns an agent to a dormant optional core role", () => {
     const onAssignCoreRole = vi.fn();
     render(
@@ -249,6 +367,7 @@ describe("Add Node menu", () => {
         error={null}
         onClose={vi.fn()}
         onCreateWorkflow={vi.fn()}
+        onCreateWorkflowFromIssue={vi.fn()}
         onCreateAgent={vi.fn()}
         onCreateRole={vi.fn()}
         onAssignCoreRole={onAssignCoreRole}

@@ -4,10 +4,10 @@ pub use error::DbError;
 
 use chrono::Utc;
 use factory_types::{
-    resolve_patch, resolve_replan, AgentSession, AgentSessionMode, AttemptStatus, Plan,
-    PlanApplyOutcome, PlanPatch, PlanRevisionRecord, PlanRevisionSource, PlanSnapshot, PlanState,
-    ReplanRequest, ResolvedPlan, ReviewResult, RoleArtifact, Run, RunStatus, Task, TaskAttempt,
-    TaskEvidence, TaskOperation, TaskState,
+    resolve_patch, resolve_replan, AgentSession, AgentSessionMode, AttemptStatus, GitHubDelivery,
+    GitHubIssueLink, Plan, PlanApplyOutcome, PlanPatch, PlanRevisionRecord, PlanRevisionSource,
+    PlanSnapshot, PlanState, ReplanRequest, ResolvedPlan, ReviewResult, RoleArtifact, Run,
+    RunStatus, Task, TaskAttempt, TaskEvidence, TaskOperation, TaskState,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashMap;
@@ -866,6 +866,212 @@ impl FactoryDb {
         Ok(artifacts)
     }
 
+    // --- GitHub linkage and delivery ---------------------------------------
+
+    /// Persists the imported GitHub Issue a run was created from. The content
+    /// is stored verbatim (bounded at import) as untrusted context for
+    /// traceability; it is never interpreted as instructions.
+    pub fn set_run_github_link(&self, run_id: i64, link: &GitHubIssueLink) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO github_links
+                 (run_id, provider, repository, issue_number, issue_url, issue_title,
+                  issue_body, issue_state, issue_author, issue_labels, issue_comments, imported_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+             ON CONFLICT(run_id) DO UPDATE SET
+                 provider = excluded.provider,
+                 repository = excluded.repository,
+                 issue_number = excluded.issue_number,
+                 issue_url = excluded.issue_url,
+                 issue_title = excluded.issue_title,
+                 issue_body = excluded.issue_body,
+                 issue_state = excluded.issue_state,
+                 issue_author = excluded.issue_author,
+                 issue_labels = excluded.issue_labels,
+                 issue_comments = excluded.issue_comments,
+                 imported_at = excluded.imported_at",
+            params![
+                run_id,
+                link.provider,
+                link.repository,
+                link.issue_number,
+                link.issue_url,
+                link.issue_title,
+                link.issue_body,
+                link.issue_state,
+                link.issue_author,
+                serde_json::to_string(&link.issue_labels)?,
+                serde_json::to_string(&link.issue_comments)?,
+                link.imported_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The GitHub Issue a run was imported from, when it has one.
+    pub fn get_run_github_link(&self, run_id: i64) -> Result<Option<GitHubIssueLink>> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT provider, repository, issue_number, issue_url, issue_title,
+                        issue_body, issue_state, issue_author, issue_labels, issue_comments, imported_at
+                 FROM github_links WHERE run_id = ?1",
+                params![run_id],
+                |row| {
+                    Ok(RawGithubLink {
+                        provider: row.get(0)?,
+                        repository: row.get(1)?,
+                        issue_number: row.get(2)?,
+                        issue_url: row.get(3)?,
+                        issue_title: row.get(4)?,
+                        issue_body: row.get(5)?,
+                        issue_state: row.get(6)?,
+                        issue_author: row.get(7)?,
+                        issue_labels: row.get(8)?,
+                        issue_comments: row.get(9)?,
+                        imported_at: row.get(10)?,
+                    })
+                },
+            )
+            .optional()?;
+        row.map(|raw| raw.into_link().map_err(DbError::Json))
+            .transpose()
+    }
+
+    /// The delivery record for a run, creating a fresh `not_ready` row when
+    /// none exists yet.
+    pub fn get_or_create_delivery(&self, run_id: i64) -> Result<GitHubDelivery> {
+        if let Some(existing) = self.get_delivery(run_id)? {
+            return Ok(existing);
+        }
+        let delivery = GitHubDelivery::initial(run_id, &now());
+        self.conn.execute(
+            "INSERT INTO github_deliveries
+                 (run_id, state, repository, remote, base_branch, head_branch,
+                  pushed_head, pr_number, pr_url, pr_state, pr_is_draft, error, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            params![
+                delivery.run_id,
+                delivery.state.as_str(),
+                delivery.repository,
+                delivery.remote,
+                delivery.base_branch,
+                delivery.head_branch,
+                delivery.pushed_head,
+                None::<i64>,
+                None::<String>,
+                None::<String>,
+                None::<i64>,
+                delivery.error,
+                delivery.created_at,
+                delivery.updated_at
+            ],
+        )?;
+        Ok(delivery)
+    }
+
+    /// The persisted delivery state of a run, when a record exists.
+    pub fn get_delivery(&self, run_id: i64) -> Result<Option<GitHubDelivery>> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT run_id, state, repository, remote, base_branch, head_branch, pushed_head,
+                        pr_number, pr_url, pr_state, pr_is_draft, error, created_at, updated_at
+                 FROM github_deliveries WHERE run_id = ?1",
+                params![run_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, Option<i64>>(7)?,
+                        row.get::<_, Option<String>>(8)?,
+                        row.get::<_, Option<String>>(9)?,
+                        row.get::<_, Option<i64>>(10)?,
+                        row.get::<_, Option<String>>(11)?,
+                        row.get::<_, String>(12)?,
+                        row.get::<_, String>(13)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((
+            run_id,
+            state,
+            repository,
+            remote,
+            base_branch,
+            head_branch,
+            pushed_head,
+            pr_number,
+            pr_url,
+            pr_state,
+            pr_is_draft,
+            error,
+            created_at,
+            updated_at,
+        )) = row
+        else {
+            return Ok(None);
+        };
+        let pull_request = match (pr_number, pr_url.clone()) {
+            (Some(number), Some(url)) => Some(factory_types::PullRequestInfo {
+                number,
+                url,
+                state: pr_state.unwrap_or_else(|| "OPEN".to_string()),
+                is_draft: pr_is_draft.unwrap_or(0) != 0,
+            }),
+            _ => None,
+        };
+        Ok(Some(GitHubDelivery {
+            run_id,
+            state: state.parse().map_err(|message| {
+                DbError::Corrupt(format!("delivery state for run {run_id}: {message}"))
+            })?,
+            repository,
+            remote,
+            base_branch,
+            head_branch,
+            pushed_head,
+            pull_request,
+            error,
+            created_at,
+            updated_at,
+        }))
+    }
+
+    /// Persists the full delivery record (state, PR metadata, pushed head).
+    pub fn set_delivery(&self, delivery: &GitHubDelivery) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE github_deliveries
+             SET state = ?1, repository = ?2, remote = ?3, base_branch = ?4,
+                 pushed_head = ?5, pr_number = ?6, pr_url = ?7, pr_state = ?8,
+                 pr_is_draft = ?9, error = ?10, updated_at = ?11
+             WHERE run_id = ?12",
+            params![
+                delivery.state.as_str(),
+                delivery.repository,
+                delivery.remote,
+                delivery.base_branch,
+                delivery.pushed_head,
+                delivery.pull_request.as_ref().map(|pr| pr.number),
+                delivery.pull_request.as_ref().map(|pr| pr.url.clone()),
+                delivery.pull_request.as_ref().map(|pr| pr.state.clone()),
+                delivery.pull_request.as_ref().map(|pr| pr.is_draft as i64),
+                delivery.error,
+                now(),
+                delivery.run_id
+            ],
+        )?;
+        if changed == 0 {
+            return Err(DbError::NotFound("github delivery"));
+        }
+        Ok(())
+    }
+
     pub fn reconcile_interrupted(&self) -> Result<Reconciliation> {
         let timestamp = now();
         let sessions = self.conn.execute(
@@ -930,6 +1136,40 @@ fn build_run(r: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
         created_at: r.get(4)?,
         updated_at: r.get(5)?,
     })
+}
+
+/// Raw `github_links` row; JSON columns are decoded in [`Self::into_link`]
+/// where errors can surface as [`DbError::Json`].
+struct RawGithubLink {
+    provider: String,
+    repository: String,
+    issue_number: i64,
+    issue_url: String,
+    issue_title: String,
+    issue_body: String,
+    issue_state: String,
+    issue_author: String,
+    issue_labels: String,
+    issue_comments: String,
+    imported_at: String,
+}
+
+impl RawGithubLink {
+    fn into_link(self) -> std::result::Result<GitHubIssueLink, serde_json::Error> {
+        Ok(GitHubIssueLink {
+            provider: self.provider,
+            repository: self.repository,
+            issue_number: self.issue_number,
+            issue_url: self.issue_url,
+            issue_title: self.issue_title,
+            issue_body: self.issue_body,
+            issue_state: self.issue_state,
+            issue_author: self.issue_author,
+            issue_labels: serde_json::from_str(&self.issue_labels)?,
+            issue_comments: serde_json::from_str(&self.issue_comments)?,
+            imported_at: self.imported_at,
+        })
+    }
 }
 
 fn build_task(r: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
@@ -1483,9 +1723,48 @@ CREATE INDEX idx_plan_revisions_run ON plan_revisions(run_id, revision);
 /// secret values.
 const V11_SCHEMA: &str = "ALTER TABLE agent_sessions ADD COLUMN policy_audit TEXT;";
 
+/// GitHub integration: the imported Issue a run was seeded from (untrusted
+/// external context, persisted so the workflow survives GitHub outages), and
+/// the delivery record that prevents duplicate pull requests across restarts.
+const V12_SCHEMA: &str = "
+CREATE TABLE github_links (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER NOT NULL UNIQUE REFERENCES runs(id) ON DELETE CASCADE,
+    provider TEXT NOT NULL,
+    repository TEXT NOT NULL,
+    issue_number INTEGER NOT NULL,
+    issue_url TEXT,
+    issue_title TEXT NOT NULL,
+    issue_body TEXT NOT NULL,
+    issue_state TEXT,
+    issue_author TEXT,
+    issue_labels TEXT NOT NULL DEFAULT '[]',
+    issue_comments TEXT NOT NULL DEFAULT '[]',
+    imported_at TEXT NOT NULL
+);
+CREATE TABLE github_deliveries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER NOT NULL UNIQUE REFERENCES runs(id) ON DELETE CASCADE,
+    state TEXT NOT NULL DEFAULT 'not_ready',
+    repository TEXT,
+    remote TEXT,
+    base_branch TEXT,
+    head_branch TEXT NOT NULL,
+    pushed_head TEXT,
+    pr_number INTEGER,
+    pr_url TEXT,
+    pr_state TEXT,
+    pr_is_draft INTEGER,
+    error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX idx_github_links_issue ON github_links(repository, issue_number);
+";
+
 const MIGRATIONS: &[&str] = &[
     V1_SCHEMA, V2_SCHEMA, V3_SCHEMA, V4_SCHEMA, V5_SCHEMA, V6_SCHEMA, V7_SCHEMA, V8_SCHEMA,
-    V9_SCHEMA, V10_SCHEMA, V11_SCHEMA,
+    V9_SCHEMA, V10_SCHEMA, V11_SCHEMA, V12_SCHEMA,
 ];
 
 fn migrate(conn: &mut Connection) -> Result<()> {
@@ -1537,14 +1816,14 @@ mod tests {
         let path = dir.path().join("test.db");
         let db = FactoryDb::open(&path).unwrap();
         let versions = schema_versions(&path);
-        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
         db.create_run("objective", Some("codex")).unwrap();
         drop(db);
 
         let db = FactoryDb::open(&path).unwrap();
         assert_eq!(
             schema_versions(&path),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
         );
         db.list_runs().unwrap();
     }
@@ -1572,7 +1851,7 @@ mod tests {
         let db = FactoryDb::open(&path).unwrap();
         assert_eq!(
             schema_versions(&path),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
         );
         let run = db.get_run(1).unwrap().unwrap();
         assert_eq!(run.objective, "legacy");
@@ -1630,7 +1909,7 @@ mod tests {
         // opening records versions 6 and 7 exactly once
         assert_eq!(
             schema_versions(&path),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
         );
         let tasks = db.list_tasks(1).unwrap();
         let operation_of = |title: &str| {
@@ -2477,5 +2756,67 @@ mod tests {
             db.get_run(run.id).unwrap().unwrap().status,
             RunStatus::Failed
         );
+    }
+
+    #[test]
+    fn github_links_and_deliveries_round_trip() {
+        use factory_types::{DeliveryState, GitHubIssueLink, IssueComment, PullRequestInfo};
+
+        let dir = TempDir::new().unwrap();
+        let db = FactoryDb::open(&dir.path().join("test.db")).unwrap();
+        let run = db.create_run("Resolve GitHub Issue #42", None).unwrap();
+
+        let link = GitHubIssueLink {
+            provider: "github".into(),
+            repository: "octocat/example".into(),
+            issue_number: 42,
+            issue_url: "https://github.com/octocat/example/issues/42".into(),
+            issue_title: "Fix refresh token race".into(),
+            issue_body: "Tokens rotate.".into(),
+            issue_state: "open".into(),
+            issue_author: "octocat".into(),
+            issue_labels: vec!["bug".into()],
+            issue_comments: vec![IssueComment {
+                author: "reviewer".into(),
+                body: "Also mobile.".into(),
+            }],
+            imported_at: "2026-08-21T10:00:00Z".into(),
+        };
+        db.set_run_github_link(run.id, &link).unwrap();
+        assert_eq!(db.get_run_github_link(run.id).unwrap().unwrap(), link);
+        assert!(db.get_run_github_link(999999).unwrap().is_none());
+
+        let delivery = db.get_or_create_delivery(run.id).unwrap();
+        assert_eq!(delivery.state, DeliveryState::NotReady);
+        assert_eq!(delivery.head_branch, format!("factory/run-{}", run.id));
+        let updated = factory_types::GitHubDelivery {
+            state: DeliveryState::Published,
+            repository: Some("octocat/example".into()),
+            remote: Some("origin".into()),
+            base_branch: Some("main".into()),
+            pull_request: Some(PullRequestInfo {
+                number: 58,
+                url: "https://github.com/octocat/example/pull/58".into(),
+                state: "OPEN".into(),
+                is_draft: true,
+            }),
+            pushed_head: Some("abc123".into()),
+            error: None,
+            ..delivery.clone()
+        };
+        db.set_delivery(&updated).unwrap();
+        let persisted = db.get_delivery(run.id).unwrap().unwrap();
+        assert_eq!(persisted.state, updated.state);
+        assert_eq!(persisted.repository, updated.repository);
+        assert_eq!(persisted.base_branch, updated.base_branch);
+        assert_eq!(persisted.pushed_head, updated.pushed_head);
+        assert_eq!(persisted.pull_request, updated.pull_request);
+        assert!(
+            persisted.updated_at > delivery.updated_at,
+            "updated_at bumps"
+        );
+        assert!(db.get_delivery(999999).unwrap().is_none());
+        // get_or_create returns the persisted record, never a reset one.
+        assert_eq!(db.get_or_create_delivery(run.id).unwrap(), persisted);
     }
 }

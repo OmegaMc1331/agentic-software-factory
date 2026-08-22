@@ -31,6 +31,10 @@ pub struct MissionContext<'a> {
     pub operation: TaskOperation,
     pub task: &'a Task,
     pub run_objective: &'a str,
+    /// Rendered notice marking the objective as containing untrusted external
+    /// content (an imported GitHub Issue). Rendered before the objective so
+    /// the trust boundary is explicit; the notice never changes permissions.
+    pub untrusted_context: Option<&'a str>,
     pub upstream_artifacts: &'a [RoleArtifact],
     /// Rendered `REPOSITORY CONTEXT` section produced by the repository
     /// context engine, when enabled and non-empty. Absent (or empty) renders
@@ -69,6 +73,10 @@ pub fn build_mission(context: &MissionContext<'_>) -> String {
         context.role.description,
         context.role.instructions.trim()
     ));
+
+    if let Some(notice) = context.untrusted_context {
+        mission.push_str(&format!("\nUNTRUSTED EXTERNAL CONTEXT\n{notice}\n"));
+    }
 
     mission.push_str(&format!(
         "\nWORKFLOW OBJECTIVE\n{}\n",
@@ -531,6 +539,7 @@ mod tests {
             operation: TaskOperation::Advisory,
             task: &task("Research auth", Some(roles::RESEARCHER)),
             run_objective: "Authenticate users",
+            untrusted_context: None,
             upstream_artifacts: &[],
             repository_context: None,
             previous_feedback: None,
@@ -571,6 +580,7 @@ mod tests {
             operation: TaskOperation::Review,
             task: &task("Audit auth", Some(roles::SECURITY_AUDITOR)),
             run_objective: "Authenticate users",
+            untrusted_context: None,
             upstream_artifacts: &[],
             repository_context: None,
             previous_feedback: None,
@@ -662,6 +672,7 @@ preset = "documentation"
             operation: TaskOperation::PostProcess,
             task: &task("T", None),
             run_objective: "o",
+            untrusted_context: None,
             upstream_artifacts: &[],
             repository_context: None,
             previous_feedback: None,
@@ -681,6 +692,7 @@ preset = "documentation"
             operation: TaskOperation::PostProcess,
             task: &task("T", None),
             run_objective: "o",
+            untrusted_context: None,
             upstream_artifacts: &[],
             repository_context: None,
             previous_feedback: None,
@@ -727,6 +739,7 @@ preset = "documentation"
                 operation,
                 task: &task("T", None),
                 run_objective: "o",
+                untrusted_context: None,
                 upstream_artifacts: &[],
                 repository_context: None,
                 previous_feedback: None,

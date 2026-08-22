@@ -51,7 +51,7 @@ impl Planner {
     }
 
     pub fn plan(&self, objective: &str, working_dir: &Path) -> Result<PlanOutcome, PlanError> {
-        let mut instruction = mission(objective, &[], None);
+        let mut instruction = mission(objective, &[], None, None);
         for attempt in 0..MAX_ATTEMPTS {
             let request = AgentRequest::new(&instruction, working_dir);
             let result = self.agent.run(&request)?;
@@ -74,7 +74,7 @@ impl Planner {
                     if attempt + 1 >= MAX_ATTEMPTS {
                         return Err(PlanError::Invalid(reason));
                     }
-                    instruction = mission(objective, &[], Some(&reason));
+                    instruction = mission(objective, &[], Some(&reason), None);
                 }
             }
         }
@@ -126,8 +126,14 @@ pub(crate) fn mission(
     objective: &str,
     available_roles: &[PlannerRoleInfo],
     rejection: Option<&str>,
+    untrusted_notice: Option<&str>,
 ) -> String {
     let mut text = format!("{SYSTEM_PROMPT}\n\nObjective: {objective}");
+    if let Some(notice) = untrusted_notice {
+        text.push_str(&format!(
+            "\n\nUNTRUSTED EXTERNAL CONTEXT\n{notice}\nThis notice governs the objective above."
+        ));
+    }
     if available_roles.is_empty() {
         text.push_str(
             "\n\nAvailable roles:\n- worker (Worker) [execution]: General implementation.",

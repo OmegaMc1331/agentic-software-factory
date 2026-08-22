@@ -26,6 +26,10 @@ flowchart TB
     IS --> CA[Configured coding agent]
     CORE --> WT[Git worktrees]
     CORE --> DB[(SQLite)]
+    CORE --> GH[factory-github]
+    GH --> GHC[gh CLI]
+    GH --> PUSH[git push / gh pr create]
+    PUSH --> REM[GitHub remote]
 ```
 
 The dashboard requests semantic Factory operations. It does not execute arbitrary
@@ -36,13 +40,15 @@ shell commands.
 ```text
 crates/
   factory-types     Run, Task, TaskOperation, RoleArtifact, TaskAttempt, evidence,
-                    review, and session types
+                    review, session, and GitHub linkage/delivery types
   factory-agent     Configured subprocess execution, output capture, cancellation
   factory-policy    Policy model, precedence resolver, path/environment enforcement
   factory-db        SQLite persistence and versioned migrations
   factory-git       Repository checks, worktrees, and Git evidence
   factory-core      Planning, invariants, mission building, task transitions, and
                     execution policy
+  factory-github    gh CLI adapter, remote parsing, bounded Issue import, and the
+                    Factory-owned delivery engine (push + pull request)
   factory-runtime   In-process background workflow ownership
   factory-api       Explicit local HTTP operations and session streams
   factory-cli       Bootstrap/runtime CLI: init, start, status, dev
@@ -115,6 +121,20 @@ configured agent process tree, and preserves the worktree and recorded evidence.
 Factory restart marks formerly running sessions and attempts as `interrupted`, running
 tasks as `failed`, and active/planning workflows as `failed`; the graph can then expose
 the failure and eligible retry.
+
+### GitHub linkage and delivery
+
+`factory-github` closes the loop from GitHub Issue to pull request without adding a
+second execution engine. An imported Issue becomes the run's objective and a persisted
+untrusted link (`github_links`); planning and execution are the normal pipeline, with
+every mission carrying an explicit untrusted-context notice. After a run completes,
+the delivery engine (`github_deliveries`) is the only code in Factory that constructs
+a `git push`: it pushes exactly `factory/run-<id>` — never force, never user branches —
+after verifying completion, integration-head equality (branch drift blocks
+publishing), and base-branch availability, then creates (or links an existing) pull
+request through `gh`. Delivery state (`not_ready → ready → pushing → creating_pr →
+published`, plus `failed`) is persisted separately from `RunStatus` and survives
+restarts. See [GitHub](github.md).
 
 ## Role model
 
@@ -210,13 +230,16 @@ enforcement boundary.
 ## Persistence and concurrency
 
 SQLite tables include `runs`, `tasks`, `task_dependencies`, `task_attempts`,
-`agent_sessions`, and `role_artifacts`. `TaskAttempt` stores the attempt number,
+`agent_sessions`, `role_artifacts`, `github_links`, and `github_deliveries`.
+`TaskAttempt` stores the attempt number,
 agent, role, operation, status, timestamps, worktree, commit, exit code, error,
 evidence, and structured review. `runs.team` stores each workflow's team snapshot,
 `tasks.role` and `tasks.operation` preserve what was planned, `task_attempts.role`
 and `task_attempts.operation` preserve what actually ran, and `role_artifacts` stores
 the structured outputs advisory/verification/review tasks persist for downstream
-consumption.
+consumption. `github_links` holds the imported Issue a run was seeded from (untrusted
+external context, bounded at import), and `github_deliveries` holds each run's
+delivery state and pull request metadata so duplicates are prevented across restarts.
 
 SQLite uses WAL mode and a bounded busy timeout. API handlers hold their shared
 connection only for short reads or writes. Runtime jobs open separate Factory/database
@@ -264,10 +287,15 @@ macOS use the platform PTY through `portable-pty`.
 | Method | Route                         | Purpose                                      |
 | ------ | ----------------------------- | -------------------------------------------- |
 | POST   | `/api/runs`                   | Persist and begin planning a workflow (optional team) |
+| POST   | `/api/runs/from-issue`        | Import a GitHub Issue as a workflow          |
 | GET    | `/api/runs/:id`               | Read tasks, attempts, sessions, derived stages, and artifacts |
 | POST   | `/api/runs/:id/start`         | Validate and schedule a planned workflow; returns its team |
 | POST   | `/api/runs/:id/cancel`        | Cancel that run's live operation             |
 | PUT    | `/api/runs/:id/team`          | Replace the team before the workflow starts  |
+| GET    | `/api/runs/:id/delivery`      | GitHub link, delivery state, and eligibility |
+| GET    | `/api/runs/:id/pr-preview`    | Editable pull request preview and blockers   |
+| POST   | `/api/runs/:id/pull-request`  | The Factory-owned delivery action            |
+| GET    | `/api/github/status`          | gh auth status and the resolved GitHub remote |
 | POST   | `/api/tasks/:id/retry`        | Retry an eligible task within the limit      |
 | GET    | `/api/runs/:id/artifacts`     | Role artifacts persisted by a workflow       |
 | GET    | `/api/tasks/:id/artifacts`    | Role artifacts produced by one task          |

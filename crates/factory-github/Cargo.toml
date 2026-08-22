@@ -1,22 +1,15 @@
 [package]
-name = "factory-core"
+name = "factory-github"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
 factory-types = { workspace = true }
-factory-agent = { workspace = true }
-factory-context = { workspace = true }
-factory-policy = { workspace = true }
-factory-db = { workspace = true }
-factory-git = { workspace = true }
-factory-github = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
-toml = "0.8"
 
 [dev-dependencies]
 tempfile = "3"

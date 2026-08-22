@@ -39,6 +39,8 @@ const EDGE_REST: Record<GraphEdgeKind, number> = {
   depends: 105,
   custom: 190,
   membership: 130,
+  originates: 150,
+  delivers: 150,
 };
 
 const ANCHOR: Record<GraphNodeKind, number> = {
@@ -48,6 +50,8 @@ const ANCHOR: Record<GraphNodeKind, number> = {
   task: 0.05,
   group: 0.04,
   note: 0.05,
+  github_issue: 0.06,
+  github_pr: 0.06,
 };
 
 const ITERATIONS = 180;
@@ -75,6 +79,10 @@ function nodeSize(node: GraphNode): { width: number; height: number } {
       return { width: 230, height: 150 };
     case "note":
       return { width: 154, height: 72 };
+    case "github_issue":
+      return { width: Math.max(150, Math.min(220, node.label.length * 6 + 40)), height: 54 };
+    case "github_pr":
+      return { width: 128, height: 54 };
   }
 }
 
@@ -90,6 +98,9 @@ export function jitter(id: string, spread = 1): number {
 function runIdOf(node: GraphNode): number {
   if (node.kind === "run") return Number(node.id.slice("run:".length)) || 0;
   if (node.kind === "task") return taskMeta(node).runId;
+  if (node.kind === "github_issue" || node.kind === "github_pr") {
+    return Number(node.id.split(":")[1]) || 0;
+  }
   return 0;
 }
 
@@ -166,6 +177,28 @@ function homes(nodes: GraphNode[], edges: GraphEdge[]): Map<string, { x: number;
       x: runHome.x + Math.cos(angle) * TASK_FAN_RADIUS + jitter(node.id) * 20,
       y: runHome.y + Math.sin(angle) * TASK_FAN_RADIUS + jitter(node.id, 5) * 20,
     });
+  }
+
+  // Compact external GitHub nodes hug their run: the imported Issue sits
+  // above the workflow it seeded, the delivered PR beside it.
+  for (const node of nodes) {
+    if (node.kind !== "github_issue" && node.kind !== "github_pr") continue;
+    const runHome = runLookup.get(`run:${runIdOf(node)}`);
+    if (!runHome) {
+      result.set(node.id, { x: jitter(node.id) * 90, y: 60 + jitter(node.id, 4) * 20 });
+      continue;
+    }
+    if (node.kind === "github_issue") {
+      result.set(node.id, {
+        x: runHome.x - 12 + jitter(node.id) * 24,
+        y: runHome.y - 128 + jitter(node.id, 2) * 12,
+      });
+    } else {
+      result.set(node.id, {
+        x: runHome.x + 158 + jitter(node.id) * 20,
+        y: runHome.y - 128 + jitter(node.id, 2) * 12,
+      });
+    }
   }
 
   const groups = nodes.filter((node) => node.kind === "group");

@@ -1995,6 +1995,146 @@ code {
   font-weight: 500;
 }
 
+/* --- GitHub source, delivery, and PR preview ------------------------------- */
+
+.graph-node--github_issue,
+.graph-node--github_pr {
+  padding: 8px 12px;
+  border-radius: 10px;
+  border-color: #6b7d94;
+  background: rgba(28, 36, 49, 0.85);
+}
+
+.graph-node--github_issue {
+  border-color: #3f5a80;
+}
+
+.graph-node--github_pr {
+  border-color: #6d28d9;
+}
+
+.workflow-github-source a,
+.workflow-delivery .button,
+.inspector-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.workflow-github-source a,
+.inspector-link {
+  color: #7b9bd2;
+  margin-left: 6px;
+  font-size: 11px;
+  text-decoration: underline;
+}
+
+.workflow-delivery {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px solid #2a3342;
+  border-radius: 10px;
+  background: rgba(20, 25, 34, 0.55);
+}
+
+.workflow-delivery h4 {
+  margin: 0 0 6px;
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.workflow-delivery-repo {
+  margin: 4px 0 0;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.workflow-delivery-blockers {
+  margin: 8px 0 0;
+  padding-left: 16px;
+  color: #e5908f;
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.workflow-pr-form {
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.workflow-pr-form h4 {
+  margin: 0;
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.workflow-pr-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 11px;
+}
+
+.workflow-pr-form label span {
+  color: var(--text-muted);
+  font-size: 10px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.workflow-pr-form input[type="text"],
+.workflow-pr-form input:not([type]),
+.workflow-pr-form textarea {
+  width: 100%;
+  padding: 6px 8px;
+  border-radius: 6px;
+  border: 1px solid #2a3342;
+  background: rgba(12, 15, 21, 0.8);
+  color: var(--text);
+  font-family: var(--font-mono, monospace);
+  font-size: 11px;
+}
+
+.workflow-pr-form textarea {
+  min-height: 140px;
+  resize: vertical;
+}
+
+.workflow-pr-form .workflow-team-check {
+  flex-direction: row;
+  align-items: center;
+  gap: 7px;
+}
+
+.workflow-source {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.workflow-source button {
+  flex: 1;
+  padding: 7px 9px;
+  border-radius: 8px;
+  border: 1px solid #2a3342;
+  background: rgba(20, 25, 34, 0.55);
+  color: var(--text-muted);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.workflow-source button.is-active {
+  border-color: #7b9bd2;
+  color: var(--text);
+  background: rgba(123, 155, 210, 0.12);
+}
+
 .workflow-team-editor {
   display: flex;
   flex-direction: column;
