@@ -1,4 +1,5 @@
 import type {
+  AgentPerformanceDetail,
   AgentSession,
   AgentStatusInfo,
   ConfigData,
@@ -8,6 +9,8 @@ import type {
   GitHubStatus,
   GraphData,
   GraphWorkspace,
+  PerformanceFilters,
+  PerformanceOverview,
   PrPreview,
   RoleArtifact,
   RoleInfo,
@@ -294,4 +297,31 @@ export function agentTerminalSocketUrl(id: number): string {
 export function progress(counts: { completed: number; total: number }): number {
   if (counts.total === 0) return 0;
   return counts.completed / counts.total;
+}
+
+// --- Performance evaluation --------------------------------------------------
+
+export function fetchPerformanceOverview(
+  filters: PerformanceFilters = {}
+): Promise<PerformanceOverview> {
+  return get<PerformanceOverview>(`/performance/agents${performanceQuery(filters)}`);
+}
+
+export function fetchAgentPerformance(
+  agent: string,
+  filters: PerformanceFilters = {}
+): Promise<AgentPerformanceDetail> {
+  return get<AgentPerformanceDetail>(
+    `/performance/agents/${encodeURIComponent(agent)}${performanceQuery(filters)}`
+  );
+}
+
+function performanceQuery(filters: PerformanceFilters): string {
+  const params = new URLSearchParams();
+  for (const key of ["window", "role", "operation", "language"] as const) {
+    const value = filters[key];
+    if (value) params.set(key, value);
+  }
+  const query = params.toString();
+  return query ? `?${query}` : "";
 }

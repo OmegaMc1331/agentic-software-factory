@@ -1,0 +1,15 @@
+[package]
+name = "factory-eval"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+factory-types = { workspace = true }
+factory-db = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+rusqlite = "0.31"

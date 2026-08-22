@@ -53,7 +53,7 @@ pub struct ApiError {
 }
 
 impl ApiError {
-    fn new(status: StatusCode, message: impl Into<String>) -> Self {
+    pub(crate) fn new(status: StatusCode, message: impl Into<String>) -> Self {
         ApiError {
             status,
             message: message.into(),
@@ -160,6 +160,14 @@ pub fn router(state: SharedState) -> Router {
         )
         .route("/api/github/status", get(github_status))
         .route("/api/agents", get(get_agents))
+        .route(
+            "/api/performance/agents",
+            get(crate::performance::list_agent_performance),
+        )
+        .route(
+            "/api/performance/agents/:agent",
+            get(crate::performance::get_agent_performance),
+        )
         .route(
             "/api/agents/:agent/sessions",
             get(list_agent_sessions).post(start_interactive_session),

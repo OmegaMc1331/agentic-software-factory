@@ -706,3 +706,126 @@ export function agentActivity(
   }
   return { runId, taskId };
 }
+
+// --- Performance evaluation --------------------------------------------------
+
+export type PerformanceWindowKey = "all_time" | "last_30_days" | "last_7_days";
+
+export interface RateStats {
+  successes: number;
+  total: number;
+  rate: number | null;
+  intervalLow: number | null;
+  intervalHigh: number | null;
+  reliable: boolean;
+}
+
+export interface DurationStats {
+  samples: number;
+  medianMs: number | null;
+  p95Ms: number | null;
+  approximateSamples: number;
+  reliable: boolean;
+}
+
+export interface OutcomeCounts {
+  approved: number;
+  firstPassApproved: number;
+  changesRequested: number;
+  agentFailed: number;
+  integrationConflict: number;
+  cancelled: number;
+  interrupted: number;
+  policyBlocked: number;
+  configurationError: number;
+  inProgress: number;
+}
+
+export interface IntegrationStats {
+  clean: number;
+  rebased: number;
+  conflict: number;
+  cleanRate: RateStats;
+  conflictRate: RateStats;
+}
+
+export interface AgentMetrics {
+  tasksAttempted: number;
+  attempts: number;
+  attemptsPerTask: number | null;
+  avgAttemptsPerSuccessful: number | null;
+  qualifyingTasks: number;
+  outcomeCounts: OutcomeCounts;
+  firstPassApproval: RateStats;
+  eventualApproval: RateStats;
+  requestChanges: RateStats;
+  retryRate: RateStats;
+  terminalFailure: RateStats;
+  executionDuration: DurationStats;
+  reviewDuration: DurationStats;
+  totalDuration: DurationStats;
+  integration: IntegrationStats;
+}
+
+export interface AgentPerformanceSummary {
+  agent: string;
+  metrics: AgentMetrics;
+}
+
+export interface PerformanceBreakdownEntry {
+  dimension: string;
+  key: string;
+  metrics: AgentMetrics;
+}
+
+export interface ReasonCount {
+  reason: string;
+  count: number;
+}
+
+export interface TrendWindow {
+  label: string;
+  firstPass: RateStats;
+  medianExecutionMs: number | null;
+}
+
+export interface TrendComparison {
+  current: TrendWindow;
+  previous: TrendWindow;
+  firstPassDeltaPp: number | null;
+}
+
+export interface TrendSummary {
+  recent10: TrendWindow;
+  recent25: TrendWindow;
+  weekly: TrendComparison | null;
+}
+
+export interface AgentPerformanceDetail {
+  summary: AgentPerformanceSummary;
+  byRole: PerformanceBreakdownEntry[];
+  byOperation: PerformanceBreakdownEntry[];
+  byLanguage: PerformanceBreakdownEntry[];
+  trend: TrendSummary;
+  reworkReasons: ReasonCount[];
+  failureReasons: ReasonCount[];
+}
+
+export interface PerformanceFacets {
+  roles: string[];
+  operations: string[];
+  languages: string[];
+}
+
+export interface PerformanceOverview {
+  window: PerformanceWindowKey;
+  agents: AgentPerformanceSummary[];
+  facets: PerformanceFacets;
+}
+
+export interface PerformanceFilters {
+  window?: string;
+  role?: string;
+  operation?: string;
+  language?: string;
+}

@@ -22,6 +22,7 @@ vi.mock("../api", () => ({
   createRole: vi.fn(),
   createWorkflow: vi.fn(),
   deleteRole: vi.fn(),
+  fetchAgentPerformance: vi.fn().mockRejectedValue(new Error("no history")),
   fetchAgentSessions: vi.fn(),
   fetchConfig: vi.fn(),
   fetchGraph: vi.fn(),

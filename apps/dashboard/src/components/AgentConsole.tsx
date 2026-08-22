@@ -1,12 +1,20 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   agentSessionStreamUrl,
+  fetchAgentPerformance,
   fetchAgentSessions,
   startInteractiveAgentSession,
   stopInteractiveAgentSession,
 } from "../api";
 import { connectionKind } from "../graphWorkspace";
-import type { AgentActivity, AgentMeta, AgentSession, GraphNode } from "../types";
+import { formatAttempts, formatDurationMs, formatRate } from "../performanceFormat";
+import type {
+  AgentActivity,
+  AgentMeta,
+  AgentPerformanceDetail,
+  AgentSession,
+  GraphNode,
+} from "../types";
 import { InteractiveTerminal } from "./InteractiveTerminal";
 
 type AgentTab = "overview" | "console" | "sessions";
@@ -114,6 +122,7 @@ export function AgentConsole({
   const [follow, setFollow] = useState(true);
   const [connectionTarget, setConnectionTarget] = useState("");
   const [startingInteractive, setStartingInteractive] = useState(false);
+  const [performance, setPerformance] = useState<AgentPerformanceDetail | null>(null);
   const outputRef = useRef<HTMLDivElement>(null);
 
   const reloadSessions = useCallback(() => {
@@ -133,6 +142,15 @@ export function AgentConsole({
   useEffect(() => {
     reloadSessions();
   }, [activity?.runId, activity?.taskId, reloadSessions]);
+
+  // Compact performance summary; agents without measured history simply
+  // omit the section (a 404 is expected, not an error).
+  useEffect(() => {
+    setPerformance(null);
+    fetchAgentPerformance(agentName)
+      .then(setPerformance)
+      .catch(() => setPerformance(null));
+  }, [agentName, activity?.runId, activity?.taskId]);
 
   const session = useMemo(
     () => sessions.find((candidate) => candidate.id === selectedSessionId) ?? null,
@@ -270,6 +288,39 @@ export function AgentConsole({
               <dd>{activity?.taskId ? `#${activity.taskId}` : "None"}</dd>
             </div>
           </dl>
+          {performance && performance.summary.metrics.tasksAttempted > 0 && (
+            <div className="agent-performance">
+              <h4>Performance</h4>
+              <dl>
+                <div>
+                  <dt>Tasks</dt>
+                  <dd>{performance.summary.metrics.tasksAttempted}</dd>
+                </div>
+                <div>
+                  <dt>First-pass approval</dt>
+                  <dd>{formatRate(performance.summary.metrics.firstPassApproval)}</dd>
+                </div>
+                <div>
+                  <dt>Median execution</dt>
+                  <dd>
+                    {formatDurationMs(performance.summary.metrics.executionDuration.medianMs)}
+                  </dd>
+                </div>
+                <div>
+                  <dt>Average attempts</dt>
+                  <dd>{formatAttempts(performance.summary.metrics.attemptsPerTask)}</dd>
+                </div>
+              </dl>
+              <button
+                className="button"
+                onClick={() => {
+                  window.location.hash = `#/performance/${encodeURIComponent(agentName)}`;
+                }}
+              >
+                View details
+              </button>
+            </div>
+          )}
           {onConnect && connectionTargets.length > 0 && (
             <div className="inspector-connect">
               <label htmlFor="agent-connection-target">Add supported connection</label>

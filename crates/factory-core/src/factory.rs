@@ -1037,7 +1037,7 @@ impl Factory {
 
             if review.decision == ReviewDecision::Approve {
                 let integrated_sha =
-                    self.integrate_approved_task(&run, &task, &worker_name, &worktree)?;
+                    self.integrate_approved_task(&run, &task, attempt.id, &worker_name, &worktree)?;
                 let commit_sha = integrated_sha.or_else(|| evidence.commit_sha.clone());
                 self.db.finish_task_attempt(
                     attempt.id,
@@ -1970,12 +1970,18 @@ impl Factory {
     ///    diverged, the task worktree is rebased onto it first.
     /// 4. The new head is recorded as the run's integration sha.
     ///
+    /// Every integration attempt (clean fast-forward, stale-base rebase, or
+    /// rebase conflict) is recorded as a durable `integration_outcomes` row so
+    /// the evaluation engine can measure integration quality. A conflict is
+    /// still surfaced as an error exactly as before.
+    ///
     /// Returns the new integration head, or `None` when the task introduced no
     /// commits (nothing was integrated).
     fn integrate_approved_task(
         &self,
         run: &Run,
         task: &Task,
+        attempt_id: i64,
         agent_name: &str,
         worktree: &Path,
     ) -> Result<Option<String>, FactoryError> {
@@ -2005,14 +2011,37 @@ impl Factory {
             return Ok(None);
         }
         if !repo.is_ancestor(&run_head, &head)? {
-            repo.rebase_onto_in(worktree, &run_branch)?;
+            if let Err(error) = repo.rebase_onto_in(worktree, &run_branch) {
+                self.db.record_integration_outcome(
+                    run.id,
+                    task.id,
+                    attempt_id,
+                    agent_name,
+                    factory_types::IntegrationOutcomeKind::Conflict,
+                )?;
+                return Err(error.into());
+            }
             let rebased = repo.head_sha(worktree)?;
             repo.update_ref(&run_branch, &rebased)?;
             self.db.set_run_integration(run.id, Some(&rebased))?;
+            self.db.record_integration_outcome(
+                run.id,
+                task.id,
+                attempt_id,
+                agent_name,
+                factory_types::IntegrationOutcomeKind::Rebased,
+            )?;
             return Ok(Some(rebased));
         }
         repo.update_ref(&run_branch, &head)?;
         self.db.set_run_integration(run.id, Some(&head))?;
+        self.db.record_integration_outcome(
+            run.id,
+            task.id,
+            attempt_id,
+            agent_name,
+            factory_types::IntegrationOutcomeKind::Clean,
+        )?;
         Ok(Some(head))
     }
 

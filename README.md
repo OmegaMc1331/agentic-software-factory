@@ -160,6 +160,9 @@ Agent Graph is the primary operating interface:
 - Select an agent to inspect real workflow sessions or explicitly start its interactive
   console.
 
+The Performance view measures how each agent actually performs from local workflow
+history — first-pass approval, retries, durations, and integration quality, with role,
+operation, and language breakdowns and honest sample sizes ([docs/evaluations.md](docs/evaluations.md)).
 The Runs and Settings views remain available for focused inspection and configuration.
 
 ![Factory Agent Console](docs/assets/dashboard-agent-console.png)
@@ -188,6 +191,8 @@ The local API is bound to `127.0.0.1`:
 | PUT    | `/api/roles/:id/policy`       | Set or clear a role's policy preset               |
 | POST   | `/api/roles/:id/assignments`  | Assign an agent to a role                         |
 | GET    | `/api/graph`                  | Agents, workflows, tasks, and semantic links     |
+| GET    | `/api/performance/agents`     | Measured agent performance summaries             |
+| GET    | `/api/performance/agents/:agent` | Full performance detail for one agent         |
 | GET    | `/api/graph/workspace`        | Saved visual layout and custom topology          |
 | PUT    | `/api/graph/workspace`        | Validate and atomically save the graph workspace |
 | GET    | `/api/agents/:agent/sessions` | Recent persisted sessions for one agent          |

@@ -1,13 +1,14 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { fetchAgentSessions, startInteractiveAgentSession } from "../api";
-import type { AgentSession } from "../types";
+import { fetchAgentPerformance, fetchAgentSessions, startInteractiveAgentSession } from "../api";
+import type { AgentPerformanceDetail, AgentSession } from "../types";
 import { AgentConsole } from "./AgentConsole";
 
 vi.mock("../api", () => ({
   agentSessionStreamUrl: (id: number) => `/api/sessions/${id}/stream`,
   agentTerminalSocketUrl: (id: number) => `/api/sessions/${id}/terminal`,
   fetchAgentSessions: vi.fn(),
+  fetchAgentPerformance: vi.fn(),
   startInteractiveAgentSession: vi.fn(),
   stopInteractiveAgentSession: vi.fn(),
 }));
@@ -74,6 +75,7 @@ function session(overrides: Partial<AgentSession> = {}): AgentSession {
 
 beforeEach(() => {
   vi.mocked(fetchAgentSessions).mockReset();
+  vi.mocked(fetchAgentPerformance).mockReset().mockRejectedValue(new Error("no history"));
   vi.mocked(startInteractiveAgentSession).mockReset();
   FakeEventSource.latest = null;
   vi.stubGlobal("EventSource", FakeEventSource);
@@ -258,5 +260,183 @@ describe("Agent Console", () => {
     });
     fireEvent.click(screen.getByRole("button", { name: "Connect" }));
     expect(onConnect).toHaveBeenCalledWith("agent:opencode");
+  });
+
+  it("shows a compact performance summary on the overview tab when history exists", async () => {
+    vi.mocked(fetchAgentSessions).mockResolvedValue([]);
+    const detail = {
+      summary: {
+        agent: "codex",
+        metrics: {
+          tasksAttempted: 86,
+          attempts: 95,
+          attemptsPerTask: 1.1,
+          avgAttemptsPerSuccessful: 1.12,
+          qualifyingTasks: 86,
+          outcomeCounts: {
+            approved: 84,
+            firstPassApproved: 80,
+            changesRequested: 2,
+            agentFailed: 0,
+            integrationConflict: 0,
+            cancelled: 2,
+            interrupted: 0,
+            policyBlocked: 0,
+            configurationError: 0,
+            inProgress: 0,
+          },
+          firstPassApproval: {
+            successes: 80,
+            total: 86,
+            rate: 80 / 86,
+            intervalLow: 0.84,
+            intervalHigh: 0.97,
+            reliable: true,
+          },
+          eventualApproval: {
+            successes: 84,
+            total: 86,
+            rate: 84 / 86,
+            intervalLow: 0.9,
+            intervalHigh: 0.99,
+            reliable: true,
+          },
+          requestChanges: {
+            successes: 6,
+            total: 86,
+            rate: 0.07,
+            intervalLow: 0,
+            intervalHigh: 1,
+            reliable: true,
+          },
+          retryRate: {
+            successes: 6,
+            total: 86,
+            rate: 0.07,
+            intervalLow: 0,
+            intervalHigh: 1,
+            reliable: true,
+          },
+          terminalFailure: {
+            successes: 0,
+            total: 86,
+            rate: 0,
+            intervalLow: 0,
+            intervalHigh: 0,
+            reliable: true,
+          },
+          executionDuration: {
+            samples: 86,
+            medianMs: 94_000,
+            p95Ms: 200_000,
+            approximateSamples: 0,
+            reliable: true,
+          },
+          reviewDuration: {
+            samples: 84,
+            medianMs: 18_000,
+            p95Ms: 60_000,
+            approximateSamples: 0,
+            reliable: true,
+          },
+          totalDuration: {
+            samples: 86,
+            medianMs: 130_000,
+            p95Ms: 300_000,
+            approximateSamples: 0,
+            reliable: true,
+          },
+          integration: {
+            clean: 82,
+            rebased: 2,
+            conflict: 1,
+            cleanRate: {
+              successes: 82,
+              total: 85,
+              rate: 0.96,
+              intervalLow: 0.9,
+              intervalHigh: 0.99,
+              reliable: true,
+            },
+            conflictRate: {
+              successes: 1,
+              total: 85,
+              rate: 0.01,
+              intervalLow: 0,
+              intervalHigh: 0.06,
+              reliable: true,
+            },
+          },
+        },
+      },
+      byRole: [],
+      byOperation: [],
+      byLanguage: [],
+      trend: {
+        recent10: {
+          label: "Recent 10 tasks",
+          firstPass: {
+            successes: 9,
+            total: 10,
+            rate: 0.9,
+            intervalLow: 0.6,
+            intervalHigh: 0.98,
+            reliable: true,
+          },
+          medianExecutionMs: 90_000,
+        },
+        recent25: {
+          label: "Recent 25 tasks",
+          firstPass: {
+            successes: 22,
+            total: 25,
+            rate: 0.88,
+            intervalLow: 0.7,
+            intervalHigh: 0.96,
+            reliable: true,
+          },
+          medianExecutionMs: 95_000,
+        },
+        weekly: null,
+      },
+      reworkReasons: [],
+      failureReasons: [],
+    } satisfies AgentPerformanceDetail;
+    vi.mocked(fetchAgentPerformance).mockResolvedValue(detail);
+
+    render(
+      <AgentConsole
+        agentName="codex"
+        meta={meta}
+        activity={null}
+        onClose={vi.fn()}
+        onDelete={vi.fn()}
+      />
+    );
+    fireEvent.click(await screen.findByRole("tab", { name: "Overview" }));
+
+    expect(await screen.findByText("Performance")).toBeTruthy();
+    expect(screen.getByText("86")).toBeTruthy();
+    expect(screen.getByText("93%")).toBeTruthy();
+    expect(screen.getByText("1m 34s")).toBeTruthy();
+    expect(screen.getByText("1.10")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "View details" })).toBeTruthy();
+  });
+
+  it("omits the performance section when the agent has no history", async () => {
+    vi.mocked(fetchAgentSessions).mockResolvedValue([]);
+    render(
+      <AgentConsole
+        agentName="codex"
+        meta={meta}
+        activity={null}
+        onClose={vi.fn()}
+        onDelete={vi.fn()}
+      />
+    );
+    fireEvent.click(await screen.findByRole("tab", { name: "Overview" }));
+
+    await waitFor(() => expect(fetchAgentPerformance).toHaveBeenCalled());
+    expect(screen.queryByText("View details")).toBeNull();
   });
 });

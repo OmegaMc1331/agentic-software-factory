@@ -2566,3 +2566,178 @@ code {
   font-size: 10.5px;
   color: var(--text-secondary);
 }
+
+/* --- Performance view ------------------------------------------------------ */
+
+.performance-view {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.performance-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.performance-head h2 {
+  margin: 0 0 4px;
+}
+
+.performance-head p {
+  margin: 0;
+}
+
+.performance-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.performance-filter {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  color: var(--text-muted);
+}
+
+.performance-filter select {
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-raised);
+  color: var(--text);
+  font-size: 13px;
+  min-width: 130px;
+}
+
+.performance-selected {
+  background: var(--bg-inset);
+}
+
+.performance-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  padding: 18px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-raised);
+}
+
+.performance-detail-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.performance-detail-head h3 {
+  margin: 0;
+}
+
+.performance-summary-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 12px;
+  margin: 0;
+}
+
+.performance-summary-grid dt,
+.agent-performance dt,
+.performance-outcomes dt {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  color: var(--text-muted);
+}
+
+.performance-summary-grid dd,
+.agent-performance dd,
+.performance-outcomes dd {
+  margin: 2px 0 0;
+  font-size: 20px;
+  font-weight: 600;
+}
+
+.performance-columns {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 18px;
+  align-items: start;
+}
+
+.performance-detail h4,
+.performance-view h4 {
+  margin: 0 0 8px;
+  font-size: 13px;
+}
+
+.performance-breakdown,
+.performance-trend {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.performance-outcomes dl {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 10px;
+  margin: 0;
+}
+
+.performance-note {
+  margin: 8px 0 0;
+  font-size: 12px;
+}
+
+.performance-reasons ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.performance-reasons li {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 6px 10px;
+  background: var(--bg-inset);
+  border-radius: var(--radius);
+  font-size: 13px;
+}
+
+/* Agent Inspector (Agent Console) compact performance block */
+.agent-performance {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.agent-performance h4 {
+  margin: 0;
+  font-size: 13px;
+}
+
+.agent-performance dl {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px 12px;
+  margin: 0;
+}
+
+.agent-performance .button {
+  align-self: flex-start;
+}

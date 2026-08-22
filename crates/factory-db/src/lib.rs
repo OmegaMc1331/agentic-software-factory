@@ -5,9 +5,10 @@ pub use error::DbError;
 use chrono::Utc;
 use factory_types::{
     resolve_patch, resolve_replan, AgentSession, AgentSessionMode, AttemptStatus, GitHubDelivery,
-    GitHubIssueLink, Plan, PlanApplyOutcome, PlanPatch, PlanRevisionRecord, PlanRevisionSource,
-    PlanSnapshot, PlanState, ReplanRequest, ResolvedPlan, ReviewResult, RoleArtifact, Run,
-    RunStatus, Task, TaskAttempt, TaskEvidence, TaskOperation, TaskState,
+    GitHubIssueLink, IntegrationOutcome, IntegrationOutcomeKind, Plan, PlanApplyOutcome, PlanPatch,
+    PlanRevisionRecord, PlanRevisionSource, PlanSnapshot, PlanState, ReplanRequest, ResolvedPlan,
+    ReviewResult, RoleArtifact, Run, RunStatus, Task, TaskAttempt, TaskEvidence, TaskOperation,
+    TaskState,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashMap;
@@ -1072,6 +1073,101 @@ impl FactoryDb {
         Ok(())
     }
 
+    // --- Evaluation reads ------------------------------------------------------
+
+    /// Every task attempt across all runs, ordered by task then attempt number.
+    /// The evaluation engine derives agent performance from this immutable
+    /// history; no separate event store is kept.
+    pub fn list_task_attempts_all(&self) -> Result<Vec<TaskAttempt>> {
+        let mut statement = self.conn.prepare(
+            "SELECT id, task_id, attempt_number, agent, status, started_at,
+                    finished_at, worktree_path, commit_sha, exit_code, error,
+                    evidence, review, role, operation, source_base
+             FROM task_attempts
+             ORDER BY task_id, attempt_number",
+        )?;
+        let attempts = statement
+            .query_map([], build_attempt)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(attempts)
+    }
+
+    /// Lean `agent_sessions` projection for the evaluation engine: timing and
+    /// identity only, never session output. Only rows attached to a task
+    /// attempt are returned (durations are attributed per attempt).
+    pub fn list_session_durations(&self) -> Result<Vec<SessionDuration>> {
+        let mut statement = self.conn.prepare(
+            "SELECT id, attempt_id, agent, role, operation, mode, status, duration_ms
+             FROM agent_sessions
+             WHERE attempt_id IS NOT NULL
+             ORDER BY id",
+        )?;
+        let rows = statement
+            .query_map([], |r| {
+                Ok(SessionDuration {
+                    id: r.get(0)?,
+                    attempt_id: r.get(1)?,
+                    agent: r.get(2)?,
+                    role: r.get(3)?,
+                    operation: r
+                        .get::<_, Option<String>>(4)?
+                        .and_then(|value| value.parse().ok()),
+                    mode: r
+                        .get::<_, String>(5)?
+                        .parse()
+                        .unwrap_or(AgentSessionMode::Automated),
+                    status: r.get(6)?,
+                    duration_ms: r.get(7).map(|v: Option<i64>| v.map(|v| v as u64))?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Records how one approved attempt landed on the run's integration
+    /// branch. Written for every integration attempt, including conflicts.
+    pub fn record_integration_outcome(
+        &self,
+        run_id: i64,
+        task_id: i64,
+        attempt_id: i64,
+        agent: &str,
+        outcome: IntegrationOutcomeKind,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO integration_outcomes (run_id, task_id, attempt_id, agent, outcome, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![run_id, task_id, attempt_id, agent, outcome.as_str(), now()],
+        )?;
+        Ok(())
+    }
+
+    /// All recorded integration outcomes, oldest first.
+    pub fn list_integration_outcomes(&self) -> Result<Vec<IntegrationOutcome>> {
+        let mut statement = self.conn.prepare(
+            "SELECT id, run_id, task_id, attempt_id, agent, outcome, created_at
+             FROM integration_outcomes
+             ORDER BY id",
+        )?;
+        let rows = statement
+            .query_map([], |r| {
+                Ok(IntegrationOutcome {
+                    id: r.get(0)?,
+                    run_id: r.get(1)?,
+                    task_id: r.get(2)?,
+                    attempt_id: r.get(3)?,
+                    agent: r.get(4)?,
+                    outcome: r
+                        .get::<_, String>(5)?
+                        .parse()
+                        .unwrap_or(IntegrationOutcomeKind::Conflict),
+                    created_at: r.get(6)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn reconcile_interrupted(&self) -> Result<Reconciliation> {
         let timestamp = now();
         let sessions = self.conn.execute(
@@ -1122,6 +1218,20 @@ pub struct Reconciliation {
     /// Integrating tasks reset to awaiting_integration on restart.
     pub requeued_integrations: usize,
     pub runs: usize,
+}
+
+/// Lean `agent_sessions` row used by the evaluation engine to attribute
+/// durations to attempts without loading session output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionDuration {
+    pub id: i64,
+    pub attempt_id: i64,
+    pub agent: String,
+    pub role: String,
+    pub operation: Option<TaskOperation>,
+    pub mode: AgentSessionMode,
+    pub status: String,
+    pub duration_ms: Option<u64>,
 }
 
 fn build_run(r: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
@@ -1762,9 +1872,27 @@ CREATE TABLE github_deliveries (
 CREATE INDEX idx_github_links_issue ON github_links(repository, issue_number);
 ";
 
+/// Evaluation: how each approved attempt landed on the run's integration
+/// branch (`clean` fast-forward, `rebased` from a stale base, or `conflict`).
+/// Integration outcomes are downstream quality signals kept separate from
+/// agent-quality metrics; a conflict is not automatically an agent failure.
+const V13_SCHEMA: &str = "
+CREATE TABLE integration_outcomes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    attempt_id INTEGER NOT NULL REFERENCES task_attempts(id) ON DELETE CASCADE,
+    agent TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX idx_integration_outcomes_task ON integration_outcomes(task_id);
+CREATE INDEX idx_integration_outcomes_attempt ON integration_outcomes(attempt_id);
+";
+
 const MIGRATIONS: &[&str] = &[
     V1_SCHEMA, V2_SCHEMA, V3_SCHEMA, V4_SCHEMA, V5_SCHEMA, V6_SCHEMA, V7_SCHEMA, V8_SCHEMA,
-    V9_SCHEMA, V10_SCHEMA, V11_SCHEMA, V12_SCHEMA,
+    V9_SCHEMA, V10_SCHEMA, V11_SCHEMA, V12_SCHEMA, V13_SCHEMA,
 ];
 
 fn migrate(conn: &mut Connection) -> Result<()> {
@@ -1801,9 +1929,9 @@ fn migrate_schemas(conn: &mut Connection, schemas: &[&str]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use factory_types::{
-        AgentSession, AgentSessionMode, AttemptStatus, Plan, PlanApplyOutcome, PlanMutation,
-        PlanPatch, PlanRevisionSource, PlannedTask, ReplanRequest, ReviewDecision, ReviewResult,
-        RunStatus, TaskEvidence, TaskOperation, TaskRef, TaskState,
+        AgentSession, AgentSessionMode, AttemptStatus, IntegrationOutcomeKind, Plan,
+        PlanApplyOutcome, PlanMutation, PlanPatch, PlanRevisionSource, PlannedTask, ReplanRequest,
+        ReviewDecision, ReviewResult, RunStatus, TaskEvidence, TaskOperation, TaskRef, TaskState,
     };
     use rusqlite::Connection;
     use tempfile::TempDir;
@@ -1816,14 +1944,14 @@ mod tests {
         let path = dir.path().join("test.db");
         let db = FactoryDb::open(&path).unwrap();
         let versions = schema_versions(&path);
-        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
         db.create_run("objective", Some("codex")).unwrap();
         drop(db);
 
         let db = FactoryDb::open(&path).unwrap();
         assert_eq!(
             schema_versions(&path),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
         );
         db.list_runs().unwrap();
     }
@@ -1851,7 +1979,7 @@ mod tests {
         let db = FactoryDb::open(&path).unwrap();
         assert_eq!(
             schema_versions(&path),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
         );
         let run = db.get_run(1).unwrap().unwrap();
         assert_eq!(run.objective, "legacy");
@@ -1909,7 +2037,7 @@ mod tests {
         // opening records versions 6 and 7 exactly once
         assert_eq!(
             schema_versions(&path),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
         );
         let tasks = db.list_tasks(1).unwrap();
         let operation_of = |title: &str| {
@@ -2602,6 +2730,101 @@ mod tests {
             .unwrap();
         assert_eq!(db.count_task_attempts(run.id).unwrap(), 2);
         assert_eq!(db.count_task_attempts(other.id).unwrap(), 1);
+    }
+
+    #[test]
+    fn evaluation_reads_cover_attempts_sessions_and_integration_outcomes() {
+        let dir = TempDir::new().unwrap();
+        let db = FactoryDb::open(&dir.path().join("test.db")).unwrap();
+        let run = db.create_run("objective", Some("codex")).unwrap();
+        let task = db
+            .create_task(
+                run.id,
+                "Task",
+                "objective",
+                &[],
+                TaskState::Completed,
+                0,
+                Some("worker"),
+                Some(TaskOperation::Implement),
+            )
+            .unwrap();
+        let attempt = db
+            .create_task_attempt(
+                task,
+                "worker",
+                Some(TaskOperation::Implement),
+                "opencode",
+                "worktree",
+                None,
+            )
+            .unwrap();
+        db.insert_agent_session(&AgentSession {
+            id: 0,
+            run_id: Some(run.id),
+            task_id: Some(task),
+            attempt_id: Some(attempt.id),
+            role: "worker".into(),
+            operation: Some(TaskOperation::Implement),
+            agent: "opencode".into(),
+            mode: AgentSessionMode::Automated,
+            command: "opencode run".into(),
+            status: "success".into(),
+            started_at: "2026-01-01T00:00:00Z".into(),
+            finished_at: Some("2026-01-01T00:01:00Z".into()),
+            exit_code: Some(0),
+            duration_ms: Some(60_000),
+            stdout: Some("large output".into()),
+            stderr: None,
+            policy_audit: None,
+        })
+        .unwrap();
+        // Unattached planner sessions must not appear in the lean projection.
+        db.insert_agent_session(&AgentSession {
+            id: 0,
+            run_id: Some(run.id),
+            task_id: None,
+            attempt_id: None,
+            role: "planner".into(),
+            operation: Some(TaskOperation::Planning),
+            agent: "codex".into(),
+            mode: AgentSessionMode::Automated,
+            command: "codex exec".into(),
+            status: "success".into(),
+            started_at: "2026-01-01T00:00:00Z".into(),
+            finished_at: Some("2026-01-01T00:00:30Z".into()),
+            exit_code: Some(0),
+            duration_ms: Some(30_000),
+            stdout: None,
+            stderr: None,
+            policy_audit: None,
+        })
+        .unwrap();
+        db.record_integration_outcome(
+            run.id,
+            task,
+            attempt.id,
+            "opencode",
+            IntegrationOutcomeKind::Rebased,
+        )
+        .unwrap();
+
+        let attempts = db.list_task_attempts_all().unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].agent, "opencode");
+        assert_eq!(attempts[0].operation, Some(TaskOperation::Implement));
+
+        let durations = db.list_session_durations().unwrap();
+        assert_eq!(durations.len(), 1, "only attempt-attached sessions");
+        assert_eq!(durations[0].attempt_id, attempt.id);
+        assert_eq!(durations[0].duration_ms, Some(60_000));
+        assert_eq!(durations[0].operation, Some(TaskOperation::Implement));
+
+        let outcomes = db.list_integration_outcomes().unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].agent, "opencode");
+        assert_eq!(outcomes[0].outcome, IntegrationOutcomeKind::Rebased);
+        assert_eq!(outcomes[0].task_id, task);
     }
 
     #[test]

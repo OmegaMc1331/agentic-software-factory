@@ -16,12 +16,14 @@ factory-db = { workspace = true }
 factory-core = { workspace = true }
 factory-runtime = { workspace = true }
 factory-policy = { workspace = true }
+factory-eval = { workspace = true }
 axum = { version = "0.7", features = ["ws"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "sync", "time"] }
 tower-http = { version = "0.5", features = ["fs"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+chrono = { workspace = true }
 rust-embed = { version = "8", features = ["mime-guess"], optional = true }
 tokio-stream = "0.1"
 

@@ -64,6 +64,12 @@ execution also creates a durable `TaskAttempt` containing status, worktree, exit
 evidence, and structured review. Process exit code 0 doesn't complete a task without
 Reviewer approval. The centralized retry limit is `MAX_TASK_ATTEMPTS`.
 
+Every approved-attempt integration (clean fast-forward, stale-base rebase, or rebase
+conflict) is recorded in `integration_outcomes`. The evaluation engine
+(`factory-eval`) derives all agent performance metrics from this durable history via
+the read-only `GET /api/performance/agents` endpoints — see
+[evaluations.md](evaluations.md). Evaluation never influences scheduling.
+
 Agent entries have a small invocation profile: kind, workflow arguments, prompt
 transport, environment, and optional interactive arguments. Automated execution uses
 either a stdin payload or one process argument and never shell interpolation. Treat

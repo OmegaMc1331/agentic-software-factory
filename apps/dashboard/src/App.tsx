@@ -1,18 +1,30 @@
 import { useCallback, useEffect, useState } from "react";
 import { fetchRun, fetchRuns } from "./api";
 import { NetworkView } from "./components/NetworkView";
+import { PerformanceView } from "./components/PerformanceView";
 import { RunDetailView } from "./components/RunDetailView";
 import { RunList } from "./components/RunList";
 import { SettingsView } from "./components/Settings";
 import type { RunDetail, RunSummary } from "./types";
 
 type View =
-  { name: "runs" } | { name: "network" } | { name: "settings" } | { name: "run"; id: number };
+  | { name: "runs" }
+  | { name: "network" }
+  | { name: "performance"; agent: string | null }
+  | { name: "settings" }
+  | { name: "run"; id: number };
 type LoadState = "loading" | "ready" | "error";
 
 function viewFromHash(): View {
   const runMatch = window.location.hash.match(/^#\/runs\/(\d+)$/);
   if (runMatch) return { name: "run", id: Number(runMatch[1]) };
+  const performanceMatch = window.location.hash.match(/^#\/performance(?:\/([^/]+))?$/);
+  if (performanceMatch) {
+    return {
+      name: "performance",
+      agent: performanceMatch[1] ? decodeURIComponent(performanceMatch[1]) : null,
+    };
+  }
   if (window.location.hash.startsWith("#/network")) return { name: "network" };
   if (window.location.hash.startsWith("#/settings")) return { name: "settings" };
   return { name: "runs" };
@@ -21,6 +33,9 @@ function viewFromHash(): View {
 function hashFor(view: View): string {
   if (view.name === "run") return `#/runs/${view.id}`;
   if (view.name === "network") return "#/network";
+  if (view.name === "performance") {
+    return view.agent ? `#/performance/${encodeURIComponent(view.agent)}` : "#/performance";
+  }
   if (view.name === "settings") return "#/settings";
   return "#/";
 }
@@ -49,6 +64,7 @@ function RunsError({ message, onRetry }: { message: string; onRetry: () => void 
 const NAV: { view: View["name"]; label: string }[] = [
   { view: "runs", label: "Runs" },
   { view: "network", label: "Agent Graph" },
+  { view: "performance", label: "Performance" },
   { view: "settings", label: "Settings" },
 ];
 
@@ -124,7 +140,9 @@ export default function App() {
                     ? { name: "runs" }
                     : item.view === "network"
                       ? { name: "network" }
-                      : { name: "settings" }
+                      : item.view === "performance"
+                        ? { name: "performance", agent: null }
+                        : { name: "settings" }
                 )
               }
             >
@@ -137,6 +155,8 @@ export default function App() {
       <main className={view.name === "network" ? "content content--wide" : "content"}>
         {view.name === "network" ? (
           <NetworkView />
+        ) : view.name === "performance" ? (
+          <PerformanceView key={view.agent ?? ""} initialAgent={view.agent} />
         ) : view.name === "settings" ? (
           <SettingsView />
         ) : (

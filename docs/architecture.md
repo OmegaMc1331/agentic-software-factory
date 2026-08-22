@@ -50,6 +50,7 @@ crates/
   factory-github    gh CLI adapter, remote parsing, bounded Issue import, and the
                     Factory-owned delivery engine (push + pull request)
   factory-runtime   In-process background workflow ownership
+  factory-eval      Read-only agent performance measurement from workflow history
   factory-api       Explicit local HTTP operations and session streams
   factory-cli       Bootstrap/runtime CLI: init, start, status, dev
 apps/
@@ -58,6 +59,13 @@ apps/
 
 Dependencies point toward `factory-types`. The CLI and API use Factory Core; the API
 also owns one `factory-runtime` instance for background operations.
+
+## Evaluation
+
+`factory-eval` measures agent performance (first-pass approval, retries,
+durations, integration quality, …) by deriving metrics from the immutable
+workflow history — it observes only and never influences scheduling.
+Definitions and formulas live in [evaluations.md](evaluations.md).
 
 ## Workflow lifecycle
 
