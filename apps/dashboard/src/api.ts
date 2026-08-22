@@ -1,6 +1,8 @@
 import type {
   AgentPerformanceDetail,
   AgentSession,
+  RoutingDecision,
+  RoutingPreview,
   AgentStatusInfo,
   ConfigData,
   DeliveryReport,
@@ -170,6 +172,24 @@ export function fetchRunArtifacts(runId: number): Promise<RoleArtifact[]> {
 
 export function fetchTaskArtifacts(taskId: number): Promise<RoleArtifact[]> {
   return get<RoleArtifact[]>(`/tasks/${taskId}/artifacts`);
+}
+
+// --- Routing ---------------------------------------------------------------
+
+export function fetchRoutingPreview(taskId: number): Promise<RoutingPreview> {
+  return get<RoutingPreview>(`/tasks/${taskId}/routing-preview`);
+}
+
+export function fetchRoutingDecisions(taskId: number): Promise<RoutingDecision[]> {
+  return get<RoutingDecision[]>(`/tasks/${taskId}/routing-decisions`);
+}
+
+/** Pins (`agent`) or clears (`null`) a task's manual routing override. */
+export function setTaskRouting(
+  taskId: number,
+  agent: string | null
+): Promise<{ taskId: number; agentOverride: string | null }> {
+  return put(`/tasks/${taskId}/routing`, { agent });
 }
 
 export function fetchGraph(): Promise<GraphData> {

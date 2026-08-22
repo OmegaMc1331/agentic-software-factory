@@ -7,8 +7,8 @@ use factory_types::{
     resolve_patch, resolve_replan, AgentSession, AgentSessionMode, AttemptStatus, GitHubDelivery,
     GitHubIssueLink, IntegrationOutcome, IntegrationOutcomeKind, Plan, PlanApplyOutcome, PlanPatch,
     PlanRevisionRecord, PlanRevisionSource, PlanSnapshot, PlanState, ReplanRequest, ResolvedPlan,
-    ReviewResult, RoleArtifact, Run, RunStatus, Task, TaskAttempt, TaskEvidence, TaskOperation,
-    TaskState,
+    ReviewResult, RoleArtifact, RoutingCandidateScore, RoutingDecision, Run, RunStatus, Task,
+    TaskAttempt, TaskEvidence, TaskOperation, TaskState,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashMap;
@@ -249,6 +249,7 @@ impl FactoryDb {
                 worktree_path: None,
                 role: task.role.clone(),
                 operation: task.operation,
+                agent_override: None,
                 created_at: ts.clone(),
                 updated_at: ts.clone(),
             })
@@ -315,7 +316,7 @@ impl FactoryDb {
         let row = self
             .conn
             .query_row(
-                "SELECT t.id, t.run_id, t.title, t.objective, t.acceptance_criteria, t.state, t.position, t.worktree_path, t.created_at, t.updated_at, t.role, t.operation
+                "SELECT t.id, t.run_id, t.title, t.objective, t.acceptance_criteria, t.state, t.position, t.worktree_path, t.created_at, t.updated_at, t.role, t.operation, t.agent_override
                  FROM tasks t WHERE t.id = ?1",
                 params![id],
                 build_task,
@@ -330,7 +331,7 @@ impl FactoryDb {
 
     pub fn list_tasks(&self, run_id: i64) -> Result<Vec<Task>> {
         let mut stmt = self.conn.prepare(
-            "SELECT t.id, t.run_id, t.title, t.objective, t.acceptance_criteria, t.state, t.position, t.worktree_path, t.created_at, t.updated_at, t.role, t.operation
+            "SELECT t.id, t.run_id, t.title, t.objective, t.acceptance_criteria, t.state, t.position, t.worktree_path, t.created_at, t.updated_at, t.role, t.operation, t.agent_override
              FROM tasks t WHERE t.run_id = ?1 ORDER BY t.position",
         )?;
         let mut tasks = Vec::new();
@@ -520,6 +521,54 @@ impl FactoryDb {
         Ok(())
     }
 
+    /// Pins (`Some`) or clears (`None`) the manual routing override for a
+    /// task. The pin is honored by every routing mode and re-validated at
+    /// dispatch time.
+    pub fn set_task_agent_override(&self, id: i64, agent: Option<&str>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE tasks SET agent_override = ?1, updated_at = ?2 WHERE id = ?3",
+            params![agent, now(), id],
+        )?;
+        Ok(())
+    }
+
+    /// Persists one routing audit record. `decision.id` is ignored on input
+    /// and set to the inserted row id.
+    pub fn insert_routing_decision(&self, decision: &RoutingDecision) -> Result<RoutingDecision> {
+        let mut decision = decision.clone();
+        let scores = serde_json::to_string(&decision.candidate_scores)?;
+        self.conn.execute(
+            "INSERT INTO routing_decisions (task_id, attempt_id, mode, selected_agent, role, operation, language, candidate_scores, reason, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                decision.task_id,
+                decision.attempt_id,
+                decision.mode,
+                decision.selected_agent,
+                decision.role,
+                decision.operation.map(TaskOperation::as_str),
+                decision.language,
+                scores,
+                decision.reason,
+                decision.created_at,
+            ],
+        )?;
+        decision.id = self.conn.last_insert_rowid();
+        Ok(decision)
+    }
+
+    /// Every routing decision recorded for a task, oldest first.
+    pub fn list_routing_decisions_for_task(&self, task_id: i64) -> Result<Vec<RoutingDecision>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, task_id, attempt_id, mode, selected_agent, role, operation, language, candidate_scores, reason, created_at
+             FROM routing_decisions WHERE task_id = ?1 ORDER BY id",
+        )?;
+        let rows = stmt
+            .query_map(params![task_id], build_routing_decision)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn insert_agent_session(&self, session: &AgentSession) -> Result<AgentSession> {
         let mut session = session.clone();
         self.conn.execute(
@@ -691,6 +740,18 @@ impl FactoryDb {
         Ok(count as usize)
     }
 
+    /// All attempts attributed to one agent across every run. A cheap,
+    /// deterministic observation count used to order cold-start exploration
+    /// (not a quality metric — quality lives in `factory-eval`).
+    pub fn count_agent_attempts(&self, agent: &str) -> Result<u64> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM task_attempts WHERE agent = ?1",
+            params![agent],
+            |row| row.get(0),
+        )?;
+        Ok(count.max(0) as u64)
+    }
+
     pub fn get_task_attempt(&self, id: i64) -> Result<Option<TaskAttempt>> {
         self.conn
             .query_row(
@@ -716,6 +777,24 @@ impl FactoryDb {
         )?;
         let attempts = statement
             .query_map(params![run_id], build_attempt)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(attempts)
+    }
+
+    /// Every attempt of one task, oldest first. Routing uses this to apply
+    /// the retry penalty to agents that already failed or were rejected on
+    /// this specific task.
+    pub fn list_task_attempts_for_task(&self, task_id: i64) -> Result<Vec<TaskAttempt>> {
+        let mut statement = self.conn.prepare(
+            "SELECT a.id, a.task_id, a.attempt_number, a.agent, a.status, a.started_at,
+                    a.finished_at, a.worktree_path, a.commit_sha, a.exit_code, a.error,
+                    a.evidence, a.review, a.role, a.operation, a.source_base
+             FROM task_attempts a
+             WHERE a.task_id = ?1
+             ORDER BY a.attempt_number",
+        )?;
+        let attempts = statement
+            .query_map(params![task_id], build_attempt)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(attempts)
     }
@@ -1299,8 +1378,31 @@ fn build_task(r: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         operation: r
             .get::<_, Option<String>>(11)?
             .and_then(|value| value.parse().ok()),
+        agent_override: r.get(12)?,
         created_at: r.get(8)?,
         updated_at: r.get(9)?,
+    })
+}
+
+fn build_routing_decision(r: &rusqlite::Row<'_>) -> rusqlite::Result<RoutingDecision> {
+    let scores_json: Option<String> = r.get(8)?;
+    let candidate_scores = scores_json
+        .and_then(|json| serde_json::from_str::<Vec<RoutingCandidateScore>>(&json).ok())
+        .unwrap_or_default();
+    Ok(RoutingDecision {
+        id: r.get(0)?,
+        task_id: r.get(1)?,
+        attempt_id: r.get(2)?,
+        mode: r.get(3)?,
+        selected_agent: r.get(4)?,
+        role: r.get(5)?,
+        operation: r
+            .get::<_, Option<String>>(6)?
+            .and_then(|value| value.parse().ok()),
+        language: r.get(7)?,
+        candidate_scores,
+        reason: r.get(9)?,
+        created_at: r.get(10)?,
     })
 }
 
@@ -1342,7 +1444,7 @@ fn load_plan_state(conn: &Connection, run_id: i64) -> Result<PlanState> {
     )?;
 
     let mut stmt = conn.prepare(
-        "SELECT id, run_id, title, objective, acceptance_criteria, state, position, worktree_path, created_at, updated_at, role, operation
+        "SELECT id, run_id, title, objective, acceptance_criteria, state, position, worktree_path, created_at, updated_at, role, operation, agent_override
          FROM tasks WHERE run_id = ?1 ORDER BY position",
     )?;
     let mut tasks: Vec<Task> = stmt
@@ -1531,6 +1633,7 @@ fn apply_resolved(
             worktree_path: None,
             role: rt.role.clone(),
             operation: rt.operation,
+            agent_override: None,
             created_at: ts.clone(),
             updated_at: ts.clone(),
         });
@@ -1890,9 +1993,30 @@ CREATE INDEX idx_integration_outcomes_task ON integration_outcomes(task_id);
 CREATE INDEX idx_integration_outcomes_attempt ON integration_outcomes(attempt_id);
 ";
 
+/// Routing: per-dispatch audit records explaining why an agent was selected,
+/// plus the per-task manual routing override pinned from the Task Inspector.
+const V14_SCHEMA: &str = "
+CREATE TABLE routing_decisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    attempt_id INTEGER REFERENCES task_attempts(id) ON DELETE SET NULL,
+    mode TEXT NOT NULL,
+    selected_agent TEXT NOT NULL,
+    role TEXT,
+    operation TEXT,
+    language TEXT,
+    candidate_scores TEXT,
+    reason TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX idx_routing_decisions_task ON routing_decisions(task_id);
+CREATE INDEX idx_routing_decisions_attempt ON routing_decisions(attempt_id);
+ALTER TABLE tasks ADD COLUMN agent_override TEXT;
+";
+
 const MIGRATIONS: &[&str] = &[
     V1_SCHEMA, V2_SCHEMA, V3_SCHEMA, V4_SCHEMA, V5_SCHEMA, V6_SCHEMA, V7_SCHEMA, V8_SCHEMA,
-    V9_SCHEMA, V10_SCHEMA, V11_SCHEMA, V12_SCHEMA, V13_SCHEMA,
+    V9_SCHEMA, V10_SCHEMA, V11_SCHEMA, V12_SCHEMA, V13_SCHEMA, V14_SCHEMA,
 ];
 
 fn migrate(conn: &mut Connection) -> Result<()> {
@@ -1944,14 +2068,17 @@ mod tests {
         let path = dir.path().join("test.db");
         let db = FactoryDb::open(&path).unwrap();
         let versions = schema_versions(&path);
-        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
+        assert_eq!(
+            versions,
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+        );
         db.create_run("objective", Some("codex")).unwrap();
         drop(db);
 
         let db = FactoryDb::open(&path).unwrap();
         assert_eq!(
             schema_versions(&path),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
         );
         db.list_runs().unwrap();
     }
@@ -1979,7 +2106,7 @@ mod tests {
         let db = FactoryDb::open(&path).unwrap();
         assert_eq!(
             schema_versions(&path),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
         );
         let run = db.get_run(1).unwrap().unwrap();
         assert_eq!(run.objective, "legacy");
@@ -2037,7 +2164,7 @@ mod tests {
         // opening records versions 6 and 7 exactly once
         assert_eq!(
             schema_versions(&path),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
         );
         let tasks = db.list_tasks(1).unwrap();
         let operation_of = |title: &str| {

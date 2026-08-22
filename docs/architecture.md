@@ -188,15 +188,23 @@ Runtime resolution for one execution attempt:
 
 ```text
 task role + task operation → workflow team assignment set for that role
-→ routing policy → selected agent
+→ candidate filtering (policy, availability) → routing mode
+→ selected agent (capacity reserved atomically)
 → AgentSession(role = actual role id, operation)
-→ TaskAttempt(role, operation, agent)
+→ TaskAttempt(role, operation, agent) + RoutingDecision audit record
 ```
 
-Routing is deterministic: the preferred assignment is the default team selection,
-execution attempts cycle the selected agent pool by persisted attempt count, and
-review attempts rotate by attempt number. There is no heuristic or model-based
-routing. Execution stays sequential; the pool topology is parallel-ready.
+Routing is deterministic and local. The default `round_robin` mode keeps the
+historical behavior: the preferred assignment is the default team selection,
+execution attempts cycle the selected agent pool by persisted attempt count,
+and review attempts rotate by attempt number. Projects can opt into the
+`performance` or `manual` modes (`[routing]` in `config.toml`): performance
+mode ranks eligible candidates by a documented score over reliable
+`factory-eval` history (Wilson-bounded quality first, capacity-aware, with
+round-robin fallback when data is thin). Every dispatch persists an
+explainable routing decision. See [routing.md](routing.md). Execution stays
+sequential; the pool topology is parallel-ready and capacity reservations are
+atomic.
 
 ### Operation dispatch
 

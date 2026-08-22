@@ -59,6 +59,7 @@ fn legacy_custom_configuration_keeps_stdin_transport() {
         roles: BTreeMap::new(),
         role_assignments: Vec::new(),
         runtime: Default::default(),
+        routing: Default::default(),
         context: Default::default(),
         policies: Default::default(),
     };
@@ -320,6 +321,7 @@ fn write_atomic_round_trips_configuration() {
             preferred: true,
         }],
         runtime: Default::default(),
+        routing: Default::default(),
         context: Default::default(),
         policies: Default::default(),
     };
@@ -348,6 +350,7 @@ fn validation_rejects_unknown_role_agent() {
             preferred: false,
         }],
         runtime: Default::default(),
+        routing: Default::default(),
         context: Default::default(),
         policies: Default::default(),
     };
@@ -362,6 +365,7 @@ fn validation_rejects_empty_commands_and_invalid_names() {
         roles: BTreeMap::new(),
         role_assignments: Vec::new(),
         runtime: Default::default(),
+        routing: Default::default(),
         context: Default::default(),
         policies: Default::default(),
     };
@@ -373,6 +377,7 @@ fn validation_rejects_empty_commands_and_invalid_names() {
         roles: BTreeMap::new(),
         role_assignments: Vec::new(),
         runtime: Default::default(),
+        routing: Default::default(),
         context: Default::default(),
         policies: Default::default(),
     };

@@ -213,6 +213,17 @@ function AgentDetail({ detail, onClose }: { detail: AgentPerformanceDetail; onCl
         </button>
       </div>
 
+      {detail.routing && (
+        <p
+          className={
+            detail.routing.usedForRouting ? "performance-routing is-used" : "performance-routing"
+          }
+        >
+          <strong>Used for routing:</strong> {detail.routing.usedForRouting ? "Yes" : "No"} —{" "}
+          {detail.routing.note}
+        </p>
+      )}
+
       <dl className="performance-summary-grid">
         <div>
           <dt>Tasks</dt>

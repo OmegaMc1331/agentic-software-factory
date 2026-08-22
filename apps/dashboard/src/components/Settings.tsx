@@ -17,6 +17,7 @@ import {
   type ConfigData,
   type PromptTransport,
   type RoleInfo,
+  type RoutingModeValue,
 } from "../types";
 import { RoleForm, type RoleFormInitial } from "./RoleForm";
 
@@ -238,6 +239,66 @@ export function SettingsView() {
       </div>
       {error && <p className="error">{error}</p>}
       {saved && <p className="settings-saved">{saved}</p>}
+
+      <section className="section">
+        <h3 className="section-title">Routing</h3>
+        <p className="settings-note">
+          How the scheduler picks the agent for each dispatch. Candidate eligibility (role, policy,
+          availability, capacity) always comes before performance; unreliable history falls back to
+          capacity-aware round-robin.
+        </p>
+        {config?.routing && (
+          <div className="settings-routing">
+            <label htmlFor="routing-mode">Mode</label>
+            <select
+              id="routing-mode"
+              value={config.routing.mode}
+              onChange={(event) =>
+                config?.routing &&
+                apply(
+                  {
+                    ...config,
+                    routing: {
+                      mode: event.target.value as RoutingModeValue,
+                      exploration: config.routing.exploration,
+                    },
+                  },
+                  "Routing mode saved."
+                )
+              }
+            >
+              <option value="round_robin">Round-robin (deterministic)</option>
+              <option value="performance">Performance-aware</option>
+              <option value="manual">Manual (preferred / pinned)</option>
+            </select>
+            <label htmlFor="routing-exploration">Exploration</label>
+            <select
+              id="routing-exploration"
+              value={config.routing.exploration ? "enabled" : "disabled"}
+              onChange={(event) =>
+                config?.routing &&
+                apply(
+                  {
+                    ...config,
+                    routing: {
+                      mode: config.routing.mode,
+                      exploration: event.target.value === "enabled",
+                    },
+                  },
+                  "Routing exploration saved."
+                )
+              }
+            >
+              <option value="enabled">Enabled</option>
+              <option value="disabled">Disabled</option>
+            </select>
+            <p className="settings-note">
+              Fallback: capacity-aware round robin. Minimum reliable samples: evaluation defaults
+              (10). Performance metrics come from the local Performance view.
+            </p>
+          </div>
+        )}
+      </section>
 
       <section className="section">
         <h3 className="section-title">Roles</h3>

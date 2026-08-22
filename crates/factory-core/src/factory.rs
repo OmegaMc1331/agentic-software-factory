@@ -2,18 +2,20 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
+use chrono::Utc;
 use factory_agent::{AgentError, AgentRequest, AgentResult, CommandAgent, OutputStream};
 use factory_db::{FactoryDb, Reconciliation};
 use factory_git::{Repo, WorktreeInfo};
 use factory_types::{
     AgentSession, AgentSessionMode, AttemptStatus, DeliveryState, GitHubDelivery, GitHubIssueLink,
-    ReviewDecision, ReviewResult, RoleArtifact, Run, RunStatus, SpecializedReview, Task,
-    TaskAttempt, TaskEvidence, TaskOperation, TaskState, WorkflowTeam,
+    ReviewDecision, ReviewResult, RoleArtifact, RoutingCandidateScore, RoutingDecision,
+    RoutingPreview, Run, RunStatus, SpecializedReview, Task, TaskAttempt, TaskEvidence,
+    TaskOperation, TaskState, WorkflowTeam,
 };
 use thiserror::Error;
 
-use crate::capacity::AgentCapacity;
-use crate::config::{AgentResolutionError, Agents, ConfigError};
+use crate::capacity::{AgentCapacity, LoadGuard};
+use crate::config::{AgentResolutionError, Agents, ConfigError, RoutingConfig};
 use crate::mission::{
     build_mission, parse_advisory_report, parse_producer_report, parse_review,
     parse_specialized_review, review_result_from, MissionContext, ReviewInput,
@@ -24,6 +26,7 @@ use crate::planner::{
     validate_plan_roles, PlanError,
 };
 use crate::roles::{self, RoleCatalog, RoleDefinition};
+use crate::routing::{self, CandidateFacts};
 
 pub const FACTORY_DIR: &str = ".factory";
 pub const MAX_TASK_ATTEMPTS: u32 = 3;
@@ -78,6 +81,8 @@ pub enum FactoryError {
     NotDeliverable(String),
     #[error("task {0} is not ready to run")]
     NotReady(i64),
+    #[error("routing override: {0}")]
+    RoutingOverride(String),
     #[error("objective must not be empty")]
     EmptyObjective,
     #[error("workflow operation was cancelled")]
@@ -116,6 +121,25 @@ pub enum WorkflowResult {
 struct Invocation {
     session_id: i64,
     result: AgentResult,
+}
+
+/// The chosen agent of one dispatch: its name, the reserved capacity slot
+/// (held until the invocation finishes), and the audit record explaining
+/// the choice.
+struct RoutedAgent<'a> {
+    agent: CommandAgent,
+    _guard: LoadGuard<'a>,
+    record: RoutingRecord,
+}
+
+/// Everything a [`RoutingDecision`] row needs except the ids, which are
+/// only known once the attempt exists.
+#[derive(Debug, Clone)]
+struct RoutingRecord {
+    mode: String,
+    language: Option<String>,
+    candidates: Vec<RoutingCandidateScore>,
+    reason: String,
 }
 
 struct InvocationScope<'a> {
@@ -163,6 +187,13 @@ impl Factory {
 
     pub fn agents(&self) -> &Agents {
         &self.agents
+    }
+
+    /// The shared in-flight load tracker used by routing and dispatch. The
+    /// parallel runtime (and tests) can observe and reserve agent slots
+    /// through it; reservations are released when the returned guards drop.
+    pub fn capacity(&self) -> &AgentCapacity {
+        &self.capacity
     }
 
     pub fn begin_run(
@@ -407,6 +438,35 @@ impl Factory {
                 }
             }
         }
+        // Manual routing overrides are validated before start so an invalid
+        // pin blocks with a clear error instead of surfacing mid-run.
+        let catalog_for_overrides = self.agents.config().catalog();
+        for task in &tasks {
+            if let Some(pinned) = &task.agent_override {
+                let role = task.role.as_deref().unwrap_or(roles::WORKER);
+                if !team.agents_for_role(role).contains(pinned) {
+                    return Err(FactoryError::RoutingOverride(format!(
+                        "task #{} pins agent '{}' which is not assigned to role '{}' in this \
+                         workflow's team",
+                        task.id, pinned, role
+                    )));
+                }
+                let operation = roles::resolve_task_operation(task, &catalog_for_overrides);
+                let policy = self.agents.config().effective_policy(role, pinned);
+                if let Err(reason) =
+                    factory_policy::validate_executable(&policy, operation.as_str())
+                {
+                    return Err(FactoryError::RoutingOverride(format!(
+                        "task #{} pins agent '{}' which is policy-ineligible for operation \
+                         '{}': {}",
+                        task.id,
+                        pinned,
+                        operation.as_str(),
+                        reason
+                    )));
+                }
+            }
+        }
         for role in team.roles() {
             for agent in team.agents_for_role(&role) {
                 self.agents.command_agent_for(&role, agent)?;
@@ -493,6 +553,516 @@ impl Factory {
             factory_policy::validate_executable(&policy, operation.as_str())
                 .ok()
                 .map(|_| candidate.clone())
+        })
+    }
+
+    /// Routes one dispatch to an agent under the configured routing mode.
+    ///
+    /// Eligibility is filtered before any scoring: a candidate must belong to
+    /// the role's team pool, pass the Policy Engine for the operation, and be
+    /// resolvable to an installed, automatically invocable agent. Performance
+    /// then ranks only the eligible survivors; it can never resurrect an
+    /// ineligible one. Capacity is reserved atomically (`try_acquire`) in
+    /// performance mode so the Parallel Runtime can never oversubscribe an
+    /// agent's `max_concurrency` between ranking and reservation.
+    #[allow(clippy::too_many_arguments)]
+    fn route_agent_for_attempt(
+        &self,
+        task: &Task,
+        pool: &[String],
+        role: &str,
+        operation: TaskOperation,
+        rotation_index: usize,
+        language: Option<&str>,
+        honor_override: bool,
+    ) -> Result<RoutedAgent<'_>, FactoryError> {
+        let routing_config = self.agents.config().routing;
+        let mode = routing_config.mode;
+        let mode_str = mode.as_str().to_string();
+        let preferred_agent = self
+            .agents
+            .config()
+            .preferred_assignment(role)
+            .map(|assignment| assignment.agent.clone());
+
+        // A pinned agent short-circuits every mode. It still has to pass the
+        // same eligibility gates; an invalid pin blocks the task with a clear
+        // error instead of silently routing around the user's choice. The
+        // built-in final review never honors a pin: the pin selects the
+        // task's own role, not its reviewer.
+        if let Some(pinned) = task.agent_override.clone().filter(|_| honor_override) {
+            if !pool.contains(&pinned) {
+                return Err(FactoryError::RoutingOverride(format!(
+                    "task #{} pins agent '{}' which is not assigned to role '{}' in this \
+                     workflow's team",
+                    task.id, pinned, role
+                )));
+            }
+            let policy = self.agents.config().effective_policy(role, &pinned);
+            if let Err(reason) = factory_policy::validate_executable(&policy, operation.as_str()) {
+                return Err(FactoryError::RoutingOverride(format!(
+                    "task #{} pins agent '{}' which is policy-ineligible for operation '{}': {}",
+                    task.id,
+                    pinned,
+                    operation.as_str(),
+                    reason
+                )));
+            }
+            let agent = self.agents.command_agent_for(role, &pinned)?;
+            let name = agent.name().to_string();
+            let guard = self.capacity.acquire(&name);
+            let candidates = self.round_robin_notes(pool);
+            return Ok(RoutedAgent {
+                agent,
+                _guard: guard,
+                record: RoutingRecord {
+                    mode: mode_str,
+                    language: language.map(str::to_string),
+                    candidates,
+                    reason: routing::reasons::OVERRIDE.to_string(),
+                },
+            });
+        }
+
+        match mode {
+            factory_types::RoutingMode::RoundRobin => self.route_round_robin(
+                task,
+                pool,
+                role,
+                operation,
+                rotation_index,
+                mode_str,
+                language,
+                routing::reasons::ROUND_ROBIN,
+            ),
+            factory_types::RoutingMode::Manual => self.route_manual(
+                task,
+                pool,
+                role,
+                operation,
+                rotation_index,
+                mode_str,
+                language,
+                preferred_agent,
+            ),
+            factory_types::RoutingMode::Performance => self.route_performance(
+                task,
+                pool,
+                role,
+                operation,
+                rotation_index,
+                mode_str,
+                language,
+                preferred_agent,
+                routing_config,
+            ),
+        }
+    }
+
+    fn round_robin_notes(&self, pool: &[String]) -> Vec<RoutingCandidateScore> {
+        pool.iter()
+            .map(|agent| RoutingCandidateScore {
+                agent: agent.clone(),
+                score: None,
+                reliable: false,
+                note: "round-robin selection (no performance scoring)".to_string(),
+            })
+            .collect()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn route_round_robin(
+        &self,
+        task: &Task,
+        pool: &[String],
+        role: &str,
+        operation: TaskOperation,
+        rotation_index: usize,
+        mode_str: String,
+        language: Option<&str>,
+        reason: &'static str,
+    ) -> Result<RoutedAgent<'_>, FactoryError> {
+        let name = self
+            .select_agent_for_task(pool, rotation_index, &self.capacity, role, operation)
+            .ok_or_else(|| self.no_executable_agent_error(task, role, pool, operation))?;
+        let agent = self.agents.command_agent_for(role, &name)?;
+        let name = agent.name().to_string();
+        let guard = self.capacity.acquire(&name);
+        Ok(RoutedAgent {
+            agent,
+            _guard: guard,
+            record: RoutingRecord {
+                mode: mode_str,
+                language: language.map(str::to_string),
+                candidates: self.round_robin_notes(pool),
+                reason: reason.to_string(),
+            },
+        })
+    }
+
+    /// Manual mode: the role's preferred agent when it is eligible and has a
+    /// free slot; otherwise the deterministic capacity-aware selection.
+    #[allow(clippy::too_many_arguments)]
+    fn route_manual(
+        &self,
+        task: &Task,
+        pool: &[String],
+        role: &str,
+        operation: TaskOperation,
+        rotation_index: usize,
+        mode_str: String,
+        language: Option<&str>,
+        preferred_agent: Option<String>,
+    ) -> Result<RoutedAgent<'_>, FactoryError> {
+        if let Some(preferred) = preferred_agent.filter(|agent| pool.contains(agent)) {
+            let policy = self.agents.config().effective_policy(role, &preferred);
+            if factory_policy::validate_executable(&policy, operation.as_str()).is_ok() {
+                let limit = self.agent_concurrency_limit(&preferred);
+                if let Some(guard) = self.capacity.try_acquire(&preferred, limit) {
+                    // Resolving proves the agent is installed and invocable;
+                    // a broken preferred agent falls through to the pool.
+                    if let Ok(agent) = self.agents.command_agent_for(role, &preferred) {
+                        return Ok(RoutedAgent {
+                            agent,
+                            _guard: guard,
+                            record: RoutingRecord {
+                                mode: mode_str,
+                                language: language.map(str::to_string),
+                                candidates: self.round_robin_notes(pool),
+                                reason: routing::reasons::PREFERRED.to_string(),
+                            },
+                        });
+                    }
+                }
+            }
+        }
+        self.route_round_robin(
+            task,
+            pool,
+            role,
+            operation,
+            rotation_index,
+            mode_str,
+            language,
+            routing::reasons::ROUND_ROBIN,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn route_performance(
+        &self,
+        task: &Task,
+        pool: &[String],
+        role: &str,
+        operation: TaskOperation,
+        rotation_index: usize,
+        mode_str: String,
+        language: Option<&str>,
+        preferred_agent: Option<String>,
+        routing_config: RoutingConfig,
+    ) -> Result<RoutedAgent<'_>, FactoryError> {
+        // Agents with a failed or changes-requested attempt on this task get a
+        // small deterministic retry penalty so retries may route elsewhere.
+        let prior_rejections: std::collections::HashSet<String> = self
+            .db
+            .list_task_attempts_for_task(task.id)?
+            .iter()
+            .filter(|attempt| {
+                matches!(
+                    attempt.status,
+                    AttemptStatus::Failed | AttemptStatus::ChangesRequested
+                )
+            })
+            .map(|attempt| attempt.agent.clone())
+            .collect();
+        let now = Utc::now();
+        // Candidate filtering comes first: policy eligibility and automated
+        // resolvability decide who may be ranked at all.
+        let mut facts: Vec<CandidateFacts> = Vec::new();
+        let mut first_resolution_error: Option<FactoryError> = None;
+        for agent in pool {
+            let policy = self.agents.config().effective_policy(role, agent);
+            if factory_policy::validate_executable(&policy, operation.as_str()).is_err() {
+                continue;
+            }
+            if let Err(error) = self.agents.command_agent_for(role, agent) {
+                first_resolution_error.get_or_insert(FactoryError::from(error));
+                continue;
+            }
+            let performance = factory_eval::resolve_performance(
+                &self.db,
+                agent,
+                Some(role),
+                Some(operation),
+                language,
+                now,
+            )?;
+            facts.push(CandidateFacts {
+                agent: agent.clone(),
+                preferred: preferred_agent.as_deref() == Some(agent.as_str()),
+                performance,
+                observed_tasks: self.db.count_agent_attempts(agent)?,
+                inflight: self.capacity.inflight(agent),
+                limit: self.agent_concurrency_limit(agent),
+                prior_rejection: prior_rejections.contains(agent),
+            });
+        }
+        if facts.is_empty() {
+            if let Some(error) = first_resolution_error {
+                return Err(error);
+            }
+            // Nobody survived filtering; surface the same policy diagnostics
+            // the pre-start gate produces.
+            return Err(self.no_executable_agent_error(task, role, pool, operation));
+        }
+
+        let ranked = routing::rank(&facts);
+
+        // Deterministic cold-start exploration: every Nth dispatch goes to
+        // the least-observed unranked candidate so it can gather evidence.
+        if let Some(explorer) = routing::exploration_pick(
+            &facts,
+            &ranked,
+            factory_types::RoutingMode::Performance,
+            routing_config.exploration,
+            rotation_index,
+        ) {
+            let limit = self.agent_concurrency_limit(&explorer);
+            if let Some(guard) = self.capacity.try_acquire(&explorer, limit) {
+                let agent = self.agents.command_agent_for(role, &explorer)?;
+                return Ok(RoutedAgent {
+                    agent,
+                    _guard: guard,
+                    record: RoutingRecord {
+                        mode: mode_str,
+                        language: language.map(str::to_string),
+                        candidates: routing::candidate_scores(&ranked),
+                        reason: routing::reasons::EXPLORATION.to_string(),
+                    },
+                });
+            }
+        }
+
+        // Reserve the best reliable candidate that currently has capacity.
+        // try_acquire re-checks the limit under the capacity lock, so a
+        // ranking computed from a load snapshot is always guarded by the
+        // final reservation.
+        let any_reliable = ranked.iter().any(|candidate| candidate.reliable);
+        if any_reliable {
+            for candidate in ranked.iter().filter(|c| c.reliable && c.free_slots > 0) {
+                let limit = self.agent_concurrency_limit(&candidate.agent);
+                if let Some(guard) = self.capacity.try_acquire(&candidate.agent, limit) {
+                    let agent = self.agents.command_agent_for(role, &candidate.agent)?;
+                    return Ok(RoutedAgent {
+                        agent,
+                        _guard: guard,
+                        record: RoutingRecord {
+                            mode: mode_str,
+                            language: language.map(str::to_string),
+                            candidates: routing::candidate_scores(&ranked),
+                            reason: routing::reasons::SCORED.to_string(),
+                        },
+                    });
+                }
+            }
+            // Every reliable candidate is saturated (or lost a reservation
+            // race): keep the run moving on the deterministic fallback
+            // instead of queueing forever behind the historical favorite.
+            return self.route_round_robin(
+                task,
+                pool,
+                role,
+                operation,
+                rotation_index,
+                mode_str,
+                language,
+                routing::reasons::ALL_SATURATED,
+            );
+        }
+
+        // No candidate has reliable performance data: never rank from thin
+        // samples, fall back to the existing deterministic routing.
+        self.route_round_robin(
+            task,
+            pool,
+            role,
+            operation,
+            rotation_index,
+            mode_str,
+            language,
+            routing::reasons::FALLBACK,
+        )
+    }
+
+    fn agent_concurrency_limit(&self, agent: &str) -> u64 {
+        self.agents
+            .config()
+            .agents
+            .get(agent)
+            .map(|entry| entry.concurrency() as u64)
+            .unwrap_or(1)
+    }
+
+    /// Deterministic language hint for routing: the language of the files the
+    /// task's previous attempts changed (retry attempts), when exactly one
+    /// language is observed. Fresh tasks have no evidence yet and route on
+    /// role+operation alone.
+    fn routing_language(&self, task_id: i64) -> Option<String> {
+        let attempt = self.db.latest_task_attempt(task_id).ok()??;
+        let evidence_files = attempt
+            .evidence
+            .map(|evidence| evidence.changed_files)
+            .unwrap_or_default();
+        let languages = factory_eval::detect_languages(&evidence_files);
+        let sole = languages.iter().next().cloned();
+        (languages.len() == 1).then_some(sole).flatten()
+    }
+
+    fn record_routing_decision(
+        &self,
+        task_id: i64,
+        attempt_id: Option<i64>,
+        role: &str,
+        operation: TaskOperation,
+        routed: &RoutingRecord,
+        selected_agent: &str,
+    ) -> Result<(), FactoryError> {
+        self.db.insert_routing_decision(&RoutingDecision {
+            id: 0,
+            task_id,
+            attempt_id,
+            mode: routed.mode.clone(),
+            selected_agent: selected_agent.to_string(),
+            role: Some(role.to_string()),
+            operation: Some(operation),
+            language: routed.language.clone(),
+            candidate_scores: routed.candidates.clone(),
+            reason: routed.reason.clone(),
+            created_at: Utc::now().to_rfc3339(),
+        })?;
+        Ok(())
+    }
+
+    /// Read-only preview of what the router would do for a task right now.
+    /// Informational only — the real selection happens at dispatch time when
+    /// capacity is reserved.
+    pub fn routing_preview(&self, task_id: i64) -> Result<RoutingPreview, FactoryError> {
+        let task = self
+            .db
+            .get_task(task_id)?
+            .ok_or(FactoryError::TaskNotFound(task_id))?;
+        let run = self
+            .db
+            .get_run(task.run_id)?
+            .ok_or(FactoryError::RunNotFound(task.run_id))?;
+        let team = self.resolve_team(&run)?;
+        let catalog = self.agents.config().catalog();
+        let operation = roles::resolve_task_operation(&task, &catalog);
+        let role = task
+            .role
+            .clone()
+            .unwrap_or_else(|| roles::WORKER.to_string());
+        let pool = team.agents_for_role(&role).to_vec();
+        let language = self.routing_language(task.id);
+        let routing_config = self.agents.config().routing;
+        let now = Utc::now();
+        let preferred_agent = self
+            .agents
+            .config()
+            .preferred_assignment(&role)
+            .map(|assignment| assignment.agent.clone());
+
+        let mut candidates: Vec<RoutingCandidateScore> = Vec::new();
+        let mut best: Option<(String, Option<f64>)> = None;
+        let mut eligible: Vec<CandidateFacts> = Vec::new();
+        for agent in &pool {
+            let policy = self.agents.config().effective_policy(&role, agent);
+            if factory_policy::validate_executable(&policy, operation.as_str()).is_err() {
+                candidates.push(RoutingCandidateScore {
+                    agent: agent.clone(),
+                    score: None,
+                    reliable: false,
+                    note: "policy-ineligible for this operation".to_string(),
+                });
+                continue;
+            }
+            let performance = if routing_config.mode == factory_types::RoutingMode::Performance {
+                factory_eval::resolve_performance(
+                    &self.db,
+                    agent,
+                    Some(&role),
+                    Some(operation),
+                    language.as_deref(),
+                    now,
+                )?
+            } else {
+                None
+            };
+            let facts = CandidateFacts {
+                agent: agent.clone(),
+                preferred: preferred_agent.as_deref() == Some(agent.as_str()),
+                performance,
+                observed_tasks: self.db.count_agent_attempts(agent)?,
+                inflight: self.capacity.inflight(agent),
+                limit: self.agent_concurrency_limit(agent),
+                prior_rejection: false,
+            };
+            eligible.push(facts);
+        }
+        if !eligible.is_empty() {
+            let ranked = routing::rank(&eligible);
+            let pick = routing::exploration_pick(
+                &eligible,
+                &ranked,
+                routing_config.mode,
+                routing_config.exploration,
+                self.db.count_task_attempts(task.run_id)?,
+            );
+            if let Some(explorer) = pick {
+                best = Some((explorer, None));
+            } else {
+                best = ranked
+                    .iter()
+                    .find(|candidate| candidate.reliable && candidate.free_slots > 0)
+                    .or_else(|| ranked.iter().find(|candidate| candidate.reliable))
+                    .map(|candidate| (candidate.agent.clone(), candidate.score));
+            }
+            candidates.extend(routing::candidate_scores(&ranked));
+        }
+        if candidates.is_empty() {
+            candidates = self.round_robin_notes(&pool);
+        }
+
+        let reason = match (&task.agent_override, routing_config.mode, &best) {
+            (Some(_), _, _) => routing::reasons::OVERRIDE.to_string(),
+            (None, factory_types::RoutingMode::Manual, _) => {
+                routing::reasons::PREFERRED.to_string()
+            }
+            (None, factory_types::RoutingMode::RoundRobin, _) => {
+                routing::reasons::ROUND_ROBIN.to_string()
+            }
+            (None, factory_types::RoutingMode::Performance, Some((agent, Some(_)))) => {
+                let _ = agent;
+                routing::reasons::SCORED.to_string()
+            }
+            (None, factory_types::RoutingMode::Performance, Some((_, None))) => {
+                routing::reasons::EXPLORATION.to_string()
+            }
+            (None, factory_types::RoutingMode::Performance, None) => {
+                routing::reasons::FALLBACK.to_string()
+            }
+        };
+
+        Ok(RoutingPreview {
+            mode: routing_config.mode.as_str().to_string(),
+            task_id: task.id,
+            role: Some(role),
+            operation: Some(operation),
+            language,
+            override_agent: task.agent_override.clone(),
+            likely_agent: best.map(|(agent, _)| agent),
+            reason,
+            candidates,
         })
     }
 
@@ -766,13 +1336,20 @@ impl Factory {
                 .unwrap_or_else(|| roles::WORKER.to_string());
             let worker_pool = team.agents_for_role(&role).to_vec();
             let worker_index = self.db.count_task_attempts(task.run_id)?;
-            let worker_name = self
-                .select_agent_for_task(&worker_pool, worker_index, &self.capacity, &role, operation)
-                .ok_or_else(|| {
-                    self.no_executable_agent_error(&task, &role, &worker_pool, operation)
-                })?;
-            let worker = self.agents.command_agent_for(&role, &worker_name)?;
-            let _worker_load = self.capacity.acquire(worker.name());
+            let RoutedAgent {
+                agent: worker,
+                _guard: _worker_load,
+                record: worker_routing,
+            } = self.route_agent_for_attempt(
+                &task,
+                &worker_pool,
+                &role,
+                operation,
+                worker_index,
+                self.routing_language(task_id).as_deref(),
+                true,
+            )?;
+            let worker_name = worker.name().to_string();
             let attempt = self.db.create_task_attempt(
                 task_id,
                 &role,
@@ -780,6 +1357,14 @@ impl Factory {
                 worker.name(),
                 &worktree.to_string_lossy(),
                 Some(&base_sha),
+            )?;
+            self.record_routing_decision(
+                task_id,
+                Some(attempt.id),
+                &role,
+                operation,
+                &worker_routing,
+                &worker_name,
             )?;
             self.mark_task(task_id, TaskState::Running)?;
 
@@ -925,15 +1510,28 @@ impl Factory {
 
             self.db
                 .set_task_attempt_status(attempt.id, AttemptStatus::Reviewing)?;
-            let reviewer_name = roles::select_agent_with_capacity(
+            let RoutedAgent {
+                agent: reviewer,
+                _guard: _reviewer_load,
+                record: reviewer_routing,
+            } = self.route_agent_for_attempt(
+                &task,
                 &team.reviewers,
+                roles::REVIEWER,
+                TaskOperation::Review,
                 attempt.attempt_number.saturating_sub(1) as usize,
-                &self.capacity,
-            )
-            .ok_or_else(|| FactoryError::TaskRoleUnavailable(task.id, "reviewer".into()))?
-            .clone();
-            let reviewer = self.agents.command_agent_for("reviewer", &reviewer_name)?;
-            let _reviewer_load = self.capacity.acquire(reviewer.name());
+                None,
+                false,
+            )?;
+            let reviewer_name = reviewer.name().to_string();
+            self.record_routing_decision(
+                task_id,
+                Some(attempt.id),
+                roles::REVIEWER,
+                TaskOperation::Review,
+                &reviewer_routing,
+                &reviewer_name,
+            )?;
             let reviewer_role = catalog
                 .get(roles::REVIEWER)
                 .cloned()
@@ -1111,13 +1709,20 @@ impl Factory {
                 .unwrap_or_else(|| roles::WORKER.to_string());
             let pool = team.agents_for_role(&role).to_vec();
             let index = self.db.count_task_attempts(task.run_id)?;
-            let agent_name = self
-                .select_agent_for_task(&pool, index, &self.capacity, &role, TaskOperation::Advisory)
-                .ok_or_else(|| {
-                    self.no_executable_agent_error(&task, &role, &pool, TaskOperation::Advisory)
-                })?;
-            let agent = self.agents.command_agent_for(&role, &agent_name)?;
-            let _advisory_load = self.capacity.acquire(agent.name());
+            let RoutedAgent {
+                agent,
+                _guard: _advisory_load,
+                record: advisory_routing,
+            } = self.route_agent_for_attempt(
+                &task,
+                &pool,
+                &role,
+                TaskOperation::Advisory,
+                index,
+                self.routing_language(task_id).as_deref(),
+                true,
+            )?;
+            let agent_name = agent.name().to_string();
             let attempt = self.db.create_task_attempt(
                 task_id,
                 &role,
@@ -1125,6 +1730,14 @@ impl Factory {
                 agent.name(),
                 &worktree.to_string_lossy(),
                 Some(&base_sha),
+            )?;
+            self.record_routing_decision(
+                task_id,
+                Some(attempt.id),
+                &role,
+                TaskOperation::Advisory,
+                &advisory_routing,
+                &agent_name,
             )?;
             self.mark_task(task_id, TaskState::Running)?;
 
@@ -1302,13 +1915,20 @@ impl Factory {
             .unwrap_or_else(|| roles::REVIEWER.to_string());
         let pool = team.agents_for_role(&role).to_vec();
         let index = self.db.count_task_attempts(task.run_id)?;
-        let reviewer_name = self
-            .select_agent_for_task(&pool, index, &self.capacity, &role, TaskOperation::Review)
-            .ok_or_else(|| {
-                self.no_executable_agent_error(&task, &role, &pool, TaskOperation::Review)
-            })?;
-        let reviewer = self.agents.command_agent_for(&role, &reviewer_name)?;
-        let _reviewer_load = self.capacity.acquire(reviewer.name());
+        let RoutedAgent {
+            agent: reviewer,
+            _guard: _reviewer_load,
+            record: reviewer_routing,
+        } = self.route_agent_for_attempt(
+            &task,
+            &pool,
+            &role,
+            TaskOperation::Review,
+            index,
+            self.routing_language(task_id).as_deref(),
+            true,
+        )?;
+        let reviewer_name = reviewer.name().to_string();
 
         loop {
             let task = self
@@ -1336,6 +1956,14 @@ impl Factory {
                 reviewer.name(),
                 &worktree.to_string_lossy(),
                 Some(&base_sha),
+            )?;
+            self.record_routing_decision(
+                task_id,
+                Some(attempt.id),
+                &role,
+                TaskOperation::Review,
+                &reviewer_routing,
+                &reviewer_name,
             )?;
             self.mark_task(task_id, TaskState::Running)?;
 
@@ -2765,6 +3393,7 @@ mod tests {
             worktree_path: None,
             role: None,
             operation: None,
+            agent_override: None,
             created_at: String::new(),
             updated_at: String::new(),
         };
@@ -2784,6 +3413,7 @@ mod tests {
             worktree_path: None,
             role: None,
             operation: Some(operation),
+            agent_override: None,
             created_at: String::new(),
             updated_at: String::new(),
         }
@@ -2883,6 +3513,7 @@ mod tests {
             worktree_path: None,
             role: Some("database_engineer".into()),
             operation: Some(TaskOperation::Implement),
+            agent_override: None,
             created_at: String::new(),
             updated_at: String::new(),
         };

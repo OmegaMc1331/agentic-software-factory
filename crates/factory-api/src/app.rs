@@ -115,6 +115,7 @@ impl From<RuntimeError> for ApiError {
                 | factory_core::FactoryError::RetryLimit(_, _)
                 | factory_core::FactoryError::InvalidTransition(_, _)
                 | factory_core::FactoryError::NotReady(_)
+                | factory_core::FactoryError::RoutingOverride(_)
                 | factory_core::FactoryError::Agent(_)
                 | factory_core::FactoryError::AgentProcess(_)
                 | factory_core::FactoryError::Git(_)
@@ -141,6 +142,18 @@ pub fn router(state: SharedState) -> Router {
         .route("/api/runs/:id/pr-preview", get(run_pr_preview))
         .route("/api/runs/:id/pull-request", post(create_pull_request))
         .route("/api/tasks/:id/retry", post(retry_task))
+        .route(
+            "/api/tasks/:id/routing-preview",
+            get(crate::routing::routing_preview),
+        )
+        .route(
+            "/api/tasks/:id/routing-decisions",
+            get(crate::routing::routing_decisions),
+        )
+        .route(
+            "/api/tasks/:id/routing",
+            put(crate::routing::set_routing_override),
+        )
         .route("/api/runs/:id/team", put(put_run_team))
         .route("/api/runs/:id/artifacts", get(run_artifacts))
         .route("/api/tasks/:id/artifacts", get(task_artifacts))

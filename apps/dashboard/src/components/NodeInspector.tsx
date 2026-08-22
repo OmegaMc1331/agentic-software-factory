@@ -1,6 +1,21 @@
 import { useEffect, useMemo, useState } from "react";
-import { fetchRun, fetchRunArtifacts } from "../api";
-import type { GraphEdge, GraphNode, RoleArtifact, RoleMeta, RunIntegration } from "../types";
+import {
+  fetchRun,
+  fetchRunArtifacts,
+  fetchRoutingDecisions,
+  fetchRoutingPreview,
+  fetchRoles,
+  setTaskRouting,
+} from "../api";
+import type {
+  GraphEdge,
+  GraphNode,
+  RoleArtifact,
+  RoleMeta,
+  RoutingDecision,
+  RoutingPreview,
+  RunIntegration,
+} from "../types";
 import {
   agentMeta,
   agentResolutionStatusLabel,
@@ -89,6 +104,11 @@ export function NodeInspector({
   useEffect(() => setTarget(""), [node?.id]);
   const [runArtifacts, setRunArtifacts] = useState<RoleArtifact[]>([]);
   const [runIntegration, setRunIntegration] = useState<RunIntegration | null>(null);
+  const [routingPreview, setRoutingPreview] = useState<RoutingPreview | null>(null);
+  const [routingDecisions, setRoutingDecisions] = useState<RoutingDecision[]>([]);
+  const [roleAgentsForTask, setRoleAgentsForTask] = useState<string[]>([]);
+  const [routingError, setRoutingError] = useState<string | null>(null);
+  const [routingBusy, setRoutingBusy] = useState(false);
   useEffect(() => {
     if (node?.kind !== "task") return;
     let active = true;
@@ -115,6 +135,50 @@ export function NodeInspector({
   }, [node]);
 
   const selectedTaskId = node?.kind === "task" ? taskMeta(node).taskId : null;
+  const selectedTaskRole = node?.kind === "task" ? (taskMeta(node).role ?? "worker") : null;
+  const reloadRouting = useMemo(
+    () => (taskId: number) => {
+      fetchRoutingPreview(taskId)
+        .then(setRoutingPreview)
+        .catch(() => setRoutingPreview(null));
+      fetchRoutingDecisions(taskId)
+        .then(setRoutingDecisions)
+        .catch(() => setRoutingDecisions([]));
+    },
+    []
+  );
+  useEffect(() => {
+    if (node?.kind !== "task" || !selectedTaskId) {
+      setRoutingPreview(null);
+      setRoutingDecisions([]);
+      setRoleAgentsForTask([]);
+      return;
+    }
+    let active = true;
+    reloadRouting(selectedTaskId);
+    fetchRoles()
+      .then((roles) => {
+        if (!active) return;
+        const role = roles.find((entry) => entry.id === (selectedTaskRole ?? "worker"));
+        setRoleAgentsForTask(role ? role.assignments.map((assignment) => assignment.agent) : []);
+      })
+      .catch(() => {
+        if (active) setRoleAgentsForTask([]);
+      });
+    return () => {
+      active = false;
+    };
+  }, [node, selectedTaskId, selectedTaskRole, reloadRouting]);
+
+  const pinTaskAgent = (agent: string | null) => {
+    if (!selectedTaskId) return;
+    setRoutingBusy(true);
+    setRoutingError(null);
+    setTaskRouting(selectedTaskId, agent)
+      .then(() => reloadRouting(selectedTaskId))
+      .catch((err: Error) => setRoutingError(err.message))
+      .finally(() => setRoutingBusy(false));
+  };
   const selectedTaskDeps = node?.kind === "task" ? taskMeta(node).dependencies : [];
   const { produced, consumed } = useRunArtifactsForTask(
     runArtifacts,
@@ -250,6 +314,94 @@ export function NodeInspector({
         )}
         {executionClass && <Row label="Execution class">{executionClass}</Row>}
         {meta.role ? <Row label="Role">{meta.role}</Row> : <Row label="Role">worker (default)</Row>}
+        <div className="inspector-routing">
+          <span className="inspector-label">Routing</span>
+          <div className="inspector-value">
+            <div className="inspector-row inspector-row--tight">
+              <span className="inspector-label">Mode</span>
+              <span className="inspector-value">{routingPreview?.mode ?? "—"}</span>
+            </div>
+            {["pending", "ready", "blocked", "failed"].includes(meta.state) ? (
+              <div className="inspector-row inspector-row--tight">
+                <span className="inspector-label">Agent</span>
+                <span className="inspector-value">
+                  <select
+                    aria-label="Manual agent override"
+                    value={routingPreview?.overrideAgent ?? ""}
+                    disabled={routingBusy}
+                    onChange={(event) =>
+                      pinTaskAgent(event.target.value === "" ? null : event.target.value)
+                    }
+                  >
+                    <option value="">Automatic</option>
+                    {roleAgentsForTask.map((agent) => (
+                      <option key={agent} value={agent}>
+                        {agent}
+                      </option>
+                    ))}
+                  </select>
+                </span>
+              </div>
+            ) : (
+              routingPreview?.overrideAgent && (
+                <div className="inspector-row inspector-row--tight">
+                  <span className="inspector-label">Agent</span>
+                  <span className="inspector-value">pinned: {routingPreview.overrideAgent}</span>
+                </div>
+              )
+            )}
+            {routingError && <p className="inspector-hint">{routingError}</p>}
+            {routingPreview && (
+              <>
+                <div className="inspector-row inspector-row--tight">
+                  <span className="inspector-label">Likely</span>
+                  <span className="inspector-value">
+                    {routingPreview.likelyAgent ?? "—"}
+                    {routingPreview.overrideAgent ? " (pinned)" : ""}
+                  </span>
+                </div>
+                <div className="inspector-row inspector-row--tight">
+                  <span className="inspector-label">Why</span>
+                  <span className="inspector-value">{routingPreview.reason}</span>
+                </div>
+                {routingPreview.candidates.length > 0 && (
+                  <details className="agent-resolution-details">
+                    <summary>Candidates</summary>
+                    {routingPreview.candidates.map((candidate) => (
+                      <div key={candidate.agent} className="inspector-row inspector-row--tight">
+                        <span className="inspector-label">{candidate.agent}</span>
+                        <span className="inspector-value">
+                          {candidate.score === null
+                            ? `no score — ${candidate.note}`
+                            : `${candidate.score.toFixed(2)} — ${candidate.note}`}
+                        </span>
+                      </div>
+                    ))}
+                  </details>
+                )}
+              </>
+            )}
+            {routingDecisions.length > 0 && (
+              <details className="agent-resolution-details">
+                <summary>Routing decisions ({routingDecisions.length})</summary>
+                {routingDecisions
+                  .slice()
+                  .reverse()
+                  .map((decision) => (
+                    <div key={decision.id} className="inspector-row inspector-row--tight">
+                      <span className="inspector-label">
+                        {decision.role ?? "worker"}
+                        {decision.attemptId ? ` · #${decision.attemptId}` : ""}
+                      </span>
+                      <span className="inspector-value">
+                        {decision.selectedAgent} — {decision.reason}
+                      </span>
+                    </div>
+                  ))}
+              </details>
+            )}
+          </div>
+        </div>
         {attempt && <Row label="Agent">{attempt.agent}</Row>}
         {isTaskIntegratedIds(meta.operation, meta.taskId, runIntegration) ? (
           <Row label="Integration">

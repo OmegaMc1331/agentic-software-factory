@@ -79,6 +79,12 @@ pub struct Task {
     /// older releases; Factory Core derives a compatible default when missing.
     #[serde(default)]
     pub operation: Option<crate::artifact::TaskOperation>,
+    /// The agent pinned by the user for this task (manual routing override).
+    /// Honored by every routing mode; validated against role assignment,
+    /// policies, and availability at dispatch time. `None` lets the router
+    /// choose.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_override: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }

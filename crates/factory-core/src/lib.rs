@@ -5,11 +5,12 @@ pub mod github;
 pub mod mission;
 pub mod planner;
 pub mod roles;
+pub mod routing;
 pub mod workflow;
 
 pub use config::{
     default_config_text, AgentEntry, AgentInfo, AgentResolutionError, Agents, Config, ConfigError,
-    RoleAssignment, RoleAssignmentInfo, RoleDefinitionEntry, RoleInfo,
+    RoleAssignment, RoleAssignmentInfo, RoleDefinitionEntry, RoleInfo, RoutingConfig,
 };
 pub use factory::{
     Factory, FactoryError, MarkOutcome, RunOutcome, WorkflowResult, FACTORY_DIR, MAX_TASK_ATTEMPTS,
@@ -17,6 +18,7 @@ pub use factory::{
 pub use factory_agent::AgentStatus;
 pub use factory_context::ContextConfig;
 pub use factory_policy;
+pub use factory_types::RoutingMode;
 pub use factory_types::WorkflowTeam;
 pub use planner::{parse_plan, validate_plan, PlanError, PlanOutcome, Planner};
 pub use roles::{

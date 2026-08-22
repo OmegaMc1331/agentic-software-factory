@@ -1,10 +1,11 @@
 # Evaluations & agent performance
 
 Factory measures how each configured coding agent actually performs inside
-workflows. This milestone only **observes, measures, compares, and exposes**
-reliable performance data — evaluation never alters task execution. The
-scheduler's deterministic capacity-aware routing is unchanged; a later
-milestone may consume these measurements for intelligent agent routing.
+workflows. Evaluation **observes, measures, compares, and exposes** reliable
+performance data. The default scheduler routing stays deterministic and
+capacity-aware; projects that opt into `[routing] mode = "performance"` let
+the scheduler consume these measurements — through the same read-only
+functions, never re-derived formulas (see [routing.md](routing.md)).
 
 Everything is derived from the immutable workflow history stored locally in
 `.factory` (SQLite). Nothing is sent to any external service, and no
@@ -23,10 +24,12 @@ cost numbers are invented when the underlying CLI does not provide them.
   Attempt history itself is *not* duplicated into any event store.
 - **`factory-api`** exposes two read-only semantic endpoints (below).
 - **Dashboard** adds a Performance view and a compact Agent Inspector block.
-- **Future routing hook**: `factory_eval::performance(db, agent, role,
+- **Routing consumers**: `factory_eval::performance(db, agent, role,
   operation, language, now)` answers the routing question
-  `performance(agent, role, operation, language?)`. Nothing calls it from
-  the scheduler today.
+  `performance(agent, role, operation, language?)`, and
+  `factory_eval::resolve_performance(...)` walks the
+  role/operation/language hierarchy to the most specific *reliable* slice.
+  The performance router calls these; the metric formulas live only here.
 
 ## Data sources
 
@@ -201,18 +204,22 @@ Read-only and semantic; no arbitrary SQL surface:
   attempts) with a "View details" link. Graph nodes themselves stay
   uncluttered; agents without history simply omit the block.
 
-## How this prepares future intelligent routing
+## How evaluation feeds routing
 
 The breakdowns answer, per agent and per slice: is the first-pass rate
-reliable here, at what attempt cost, at what duration? The internal
-`performance(db, agent, role, operation, language, now)` function already
-returns exactly those metrics for any (agent, role, operation, language)
-tuple. A future milestone may let the scheduler consult it — until then,
-routing remains deterministic and capacity-aware, and evaluation cannot
-influence execution decisions.
+reliable here, at what attempt cost, at what duration?
+`performance(db, agent, role, operation, language, now)` returns exactly
+those metrics for any (agent, role, operation, language) tuple, and the
+router consumes them with Wilson-bounded confidence (a slice is used only
+when it meets `MIN_RELIABLE_RATE_SAMPLES`). The agent detail endpoint also
+reports whether each agent's metrics currently feed routing
+(`routing.usedForRouting`), so the Performance view is the single observable
+source of what the router sees.
 
 ## What is intentionally not implemented
 
-Automatic agent routing, LLM-as-judge scoring, downloaded model benchmarks,
-cost optimization, token-based routing, automatic agent disabling,
-agent ranking on tiny samples, cloud telemetry, and single opaque scores.
+LLM-as-judge scoring, downloaded model benchmarks, cost optimization,
+token-based routing, automatic agent disabling, agent ranking on tiny
+samples, cloud telemetry, and single opaque scores. (Deterministic
+performance *routing* is implemented — see [routing.md](routing.md) — but
+only from reliable local history.)

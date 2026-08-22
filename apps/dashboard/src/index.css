@@ -2741,3 +2741,44 @@ code {
 .agent-performance .button {
   align-self: flex-start;
 }
+
+/* --- Routing ---------------------------------------------------------------- */
+
+.performance-routing {
+  margin: 8px 0 0;
+  padding: 6px 10px;
+  border: 1px solid var(--border, #2a2f3a);
+  border-radius: var(--radius);
+  color: var(--muted, #9aa4b2);
+}
+
+.performance-routing.is-used {
+  border-color: var(--accent, #4c8dff);
+  color: inherit;
+}
+
+.inspector-routing {
+  display: grid;
+  grid-template-columns: 130px 1fr;
+  gap: 6px 10px;
+  padding: 8px 0;
+  border-top: 1px solid var(--border, #2a2f3a);
+}
+
+.inspector-routing .inspector-row--tight {
+  display: flex;
+  gap: 8px;
+  justify-content: space-between;
+}
+
+.settings-routing {
+  display: grid;
+  grid-template-columns: 130px 1fr;
+  gap: 8px 10px;
+  align-items: center;
+  max-width: 460px;
+}
+
+.settings-routing .settings-note {
+  grid-column: 1 / -1;
+}

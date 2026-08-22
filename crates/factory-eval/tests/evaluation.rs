@@ -1050,3 +1050,89 @@ fn evaluate_agent_returns_none_for_unknown_agents() {
     let detail = evaluate_agent(&builder.db, "ghost", &query(), now).unwrap();
     assert!(detail.is_none());
 }
+
+#[test]
+fn resolve_performance_walks_the_hierarchy_to_reliability() {
+    let (mut builder, _dir) = HistoryBuilder::new();
+    let now = Utc::now();
+
+    // Reliable Rust-specific history (n = 12) for codex...
+    for _ in 0..12 {
+        builder.task(
+            "worker",
+            TaskOperation::Implement,
+            &[AttemptSpec::by("codex", AttemptStatus::Approved)],
+            now - Duration::days(1),
+            &["src/main.rs"],
+        );
+    }
+    // ...plus mediocre broader history that must NOT be used while the Rust
+    // slice is reliable.
+    for _ in 0..10 {
+        builder.task(
+            "worker",
+            TaskOperation::Implement,
+            &[AttemptSpec::by("codex", AttemptStatus::Failed)
+                .error("agent process exited with code 1.")],
+            now - Duration::days(2),
+            &["src/app.ts"],
+        );
+    }
+    // opencode has only a thin Rust slice (n = 3): too small to rank.
+    for _ in 0..3 {
+        builder.task(
+            "worker",
+            TaskOperation::Implement,
+            &[AttemptSpec::by("opencode", AttemptStatus::Approved)],
+            now - Duration::days(1),
+            &["src/main.rs"],
+        );
+    }
+
+    let codex = factory_eval::resolve_performance(
+        &builder.db,
+        "codex",
+        Some("worker"),
+        Some(TaskOperation::Implement),
+        Some("rust"),
+        now,
+    )
+    .unwrap()
+    .expect("codex has a reliable slice");
+    assert_eq!(
+        codex.level,
+        factory_eval::PerformanceSliceLevel::RoleOperationLanguage
+    );
+    assert_eq!(codex.sample_count(), 12);
+    assert_eq!(codex.metrics.eventual_approval.rate, Some(1.0));
+
+    // Without a language hint the same agent resolves at role+operation,
+    // where the mediocre broader sample dominates.
+    let codex_broad = factory_eval::resolve_performance(
+        &builder.db,
+        "codex",
+        Some("worker"),
+        Some(TaskOperation::Implement),
+        None,
+        now,
+    )
+    .unwrap()
+    .expect("reliable broader slice");
+    assert_eq!(
+        codex_broad.level,
+        factory_eval::PerformanceSliceLevel::RoleOperation
+    );
+    assert_eq!(codex_broad.sample_count(), 22);
+
+    // A tiny slice never counts: opencode stays unresolved at every level.
+    assert!(factory_eval::resolve_performance(
+        &builder.db,
+        "opencode",
+        Some("worker"),
+        Some(TaskOperation::Implement),
+        Some("rust"),
+        now,
+    )
+    .unwrap()
+    .is_none());
+}

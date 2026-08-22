@@ -13,7 +13,7 @@ const WILSON_Z: f64 = 1.96;
 /// A proportion with its 95% Wilson confidence interval. `total == 0` yields
 /// `None` rate/interval; `reliable` requires
 /// [`MIN_RELIABLE_RATE_SAMPLES`] samples.
-#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RateStats {
     pub successes: u64,

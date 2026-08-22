@@ -111,6 +111,7 @@ export interface Task {
   worktreePath: string | null;
   role: string | null;
   operation: TaskOperation | null;
+  agentOverride?: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -185,13 +186,71 @@ export interface RoleAssignmentEntry {
   preferred?: boolean;
 }
 
+export interface RoutingConfigData {
+  mode: RoutingModeValue;
+  exploration: boolean;
+}
+
 export interface ConfigData {
   agents: Record<string, AgentEntry>;
   roles: Record<string, RoleDefinitionEntry>;
   role_assignments: RoleAssignmentEntry[];
+  routing?: RoutingConfigData;
 }
 
 export type ExecutionClass = "planning" | "execution" | "review" | "advisory" | "post_process";
+
+// --- Routing ------------------------------------------------------------------
+
+export type RoutingModeValue = "round_robin" | "performance" | "manual";
+
+export const ROUTING_MODE_LABELS: Record<RoutingModeValue, string> = {
+  round_robin: "Round-robin (deterministic)",
+  performance: "Performance-aware",
+  manual: "Manual (preferred / pinned)",
+};
+
+export interface RoutingCandidateScore {
+  agent: string;
+  score: number | null;
+  reliable: boolean;
+  note: string;
+}
+
+/** What the router would do for a task right now (informational). */
+export interface RoutingPreview {
+  mode: RoutingModeValue;
+  taskId: number;
+  role: string | null;
+  operation: TaskOperation | null;
+  language: string | null;
+  overrideAgent: string | null;
+  likelyAgent: string | null;
+  reason: string;
+  candidates: RoutingCandidateScore[];
+}
+
+/** Durable audit record of one dispatch. */
+export interface RoutingDecision {
+  id: number;
+  taskId: number;
+  attemptId: number | null;
+  mode: string;
+  selectedAgent: string;
+  role: string | null;
+  operation: TaskOperation | null;
+  language: string | null;
+  candidateScores: RoutingCandidateScore[];
+  reason: string;
+  createdAt: string;
+}
+
+/** Whether an agent's metrics currently feed routing (Performance view). */
+export interface RoutingUsage {
+  mode: string;
+  usedForRouting: boolean;
+  note: string;
+}
 
 /** Policy preset names a role can select (what Factory permits, not instructions). */
 export type RolePolicyPreset =
@@ -809,6 +868,7 @@ export interface AgentPerformanceDetail {
   trend: TrendSummary;
   reworkReasons: ReasonCount[];
   failureReasons: ReasonCount[];
+  routing?: RoutingUsage;
 }
 
 export interface PerformanceFacets {

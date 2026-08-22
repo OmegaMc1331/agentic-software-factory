@@ -29,6 +29,30 @@ impl AgentCapacity {
         }
     }
 
+    /// Atomically reserves one of the agent's `limit` slots: the in-flight
+    /// check and the increment happen under the same lock, so two concurrent
+    /// dispatches can never both observe the final free slot and oversubscribe
+    /// it. Returns `None` (without touching the count) when the agent is at
+    /// its limit. Performance routing reserves through this so a ranking
+    /// computed from a load snapshot is always guarded by the final
+    /// reservation.
+    pub fn try_acquire(&self, agent: &str, limit: u64) -> Option<LoadGuard<'_>> {
+        if limit == 0 {
+            return None;
+        }
+        let mut load = self.load.lock().ok()?;
+        let current = load.get(agent).copied().unwrap_or(0);
+        if current >= limit {
+            return None;
+        }
+        *load.entry(agent.to_string()).or_insert(0) += 1;
+        Some(LoadGuard {
+            capacity: self,
+            agent: agent.to_string(),
+            active: true,
+        })
+    }
+
     pub fn release(&self, agent: &str) {
         self.adjust(agent, 0);
     }
@@ -173,5 +197,50 @@ mod tests {
         capacity.release("ghost");
         capacity.release("ghost");
         assert_eq!(capacity.inflight("ghost"), 0);
+    }
+
+    #[test]
+    fn try_acquire_respects_the_limit() {
+        let capacity = AgentCapacity::new();
+        let first = capacity.try_acquire("limited", 2);
+        let second = capacity.try_acquire("limited", 2);
+        assert!(first.is_some() && second.is_some());
+        assert!(capacity.try_acquire("limited", 2).is_none());
+        drop(second);
+        assert!(capacity.try_acquire("limited", 2).is_some());
+    }
+
+    #[test]
+    fn try_acquire_with_zero_limit_never_reserves() {
+        let capacity = AgentCapacity::new();
+        assert!(capacity.try_acquire("zero", 0).is_none());
+        assert_eq!(capacity.inflight("zero"), 0);
+    }
+
+    #[test]
+    fn concurrent_try_acquire_never_oversubscribes() {
+        let capacity = std::sync::Arc::new(AgentCapacity::new());
+        let successes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let capacity = std::sync::Arc::clone(&capacity);
+            let successes = std::sync::Arc::clone(&successes);
+            handles.push(std::thread::spawn(move || {
+                if let Some(_guard) = capacity.try_acquire("racy", 4) {
+                    successes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    // Hold the slot briefly so other threads contend.
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        assert_eq!(
+            successes.load(std::sync::atomic::Ordering::SeqCst),
+            4,
+            "exactly the limit may be reserved, no matter how many threads race"
+        );
+        assert_eq!(capacity.inflight("racy"), 0);
     }
 }

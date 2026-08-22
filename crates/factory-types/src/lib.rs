@@ -5,6 +5,7 @@ pub mod integration;
 pub mod plan;
 pub mod plan_edit;
 pub mod plans;
+pub mod routing;
 pub mod run;
 pub mod session;
 pub mod task;
@@ -26,6 +27,7 @@ pub use plans::{
     PlanDiagnostic, PlanMutation, PlanPatch, PlanRevisionRecord, PlanRevisionSource, PlanSnapshot,
     ReplanRequest, TaskRef,
 };
+pub use routing::{RoutingCandidateScore, RoutingDecision, RoutingMode, RoutingPreview};
 pub use run::{Run, RunStatus};
 pub use session::{AgentSession, AgentSessionMode, SessionPolicyAudit};
 pub use task::{Task, TaskState};

@@ -163,6 +163,14 @@ Agent Graph is the primary operating interface:
 The Performance view measures how each agent actually performs from local workflow
 history — first-pass approval, retries, durations, and integration quality, with role,
 operation, and language breakdowns and honest sample sizes ([docs/evaluations.md](docs/evaluations.md)).
+
+Routing stays deterministic and local. The default round-robin behavior is unchanged;
+opting into `[routing] mode = "performance"` ranks eligible agents by a documented
+confidence-aware score over that measured history (capacity- and policy-aware, with a
+round-robin fallback when data is thin), and every dispatch records an explainable
+routing decision. Tasks can also be pinned to a specific agent from the Task Inspector
+([docs/routing.md](docs/routing.md)).
+
 The Runs and Settings views remain available for focused inspection and configuration.
 
 ![Factory Agent Console](docs/assets/dashboard-agent-console.png)

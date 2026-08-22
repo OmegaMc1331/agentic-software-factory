@@ -221,6 +221,107 @@ pub fn performance(
     Ok(evaluate_agent(db, agent, &query, now)?.map(|detail| detail.summary.metrics))
 }
 
+/// Which slice of an agent's history a resolved performance value came from.
+/// Ordered from most specific to least specific; see [`resolve_performance`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PerformanceSliceLevel {
+    RoleOperationLanguage,
+    RoleOperation,
+    Role,
+    Global,
+}
+
+impl PerformanceSliceLevel {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PerformanceSliceLevel::RoleOperationLanguage => "role+operation+language",
+            PerformanceSliceLevel::RoleOperation => "role+operation",
+            PerformanceSliceLevel::Role => "role",
+            PerformanceSliceLevel::Global => "global",
+        }
+    }
+}
+
+/// A reliable performance slice for one agent: the metrics plus the hierarchy
+/// level they were resolved from.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedPerformance {
+    pub level: PerformanceSliceLevel,
+    pub metrics: AgentMetrics,
+}
+
+impl ResolvedPerformance {
+    /// Quality rate denominators (qualifying tasks) back every quality rate,
+    /// so this is the sample size a routing decision was based on.
+    pub fn sample_count(&self) -> u64 {
+        self.metrics.qualifying_tasks
+    }
+}
+
+/// Resolves an agent's performance from the most specific reliable slice of
+/// its history, falling back through the hierarchy:
+///
+/// ```text
+/// agent + role + operation + language   (when a language is known)
+/// agent + role + operation
+/// agent + role
+/// agent (global)
+/// ```
+///
+/// A slice is used only when its quality rates meet the evaluation
+/// reliability requirement (`MIN_RELIABLE_RATE_SAMPLES` qualifying samples),
+/// so tiny highly-specific samples never mask large reliable broader ones.
+/// Returns `None` when no level has reliable data — the caller must treat the
+/// agent as unranked rather than guessing. This is the single performance
+/// entry point the scheduler uses; it reuses `evaluate_agent` so no metric
+/// formula is duplicated in routing.
+pub fn resolve_performance(
+    db: &FactoryDb,
+    agent: &str,
+    role: Option<&str>,
+    operation: Option<TaskOperation>,
+    language: Option<&str>,
+    now: DateTime<Utc>,
+) -> Result<Option<ResolvedPerformance>, DbError> {
+    /// One hierarchy step: the level plus the filters that select it.
+    type Level<'a> = (
+        PerformanceSliceLevel,
+        Option<&'a str>,
+        Option<TaskOperation>,
+        Option<&'a str>,
+    );
+    let mut levels: Vec<Level> = Vec::new();
+    if let (Some(_), Some(role), Some(operation)) = (language, role, operation) {
+        levels.push((
+            PerformanceSliceLevel::RoleOperationLanguage,
+            Some(role),
+            Some(operation),
+            language,
+        ));
+    }
+    if let (Some(role), Some(operation)) = (role, operation) {
+        levels.push((
+            PerformanceSliceLevel::RoleOperation,
+            Some(role),
+            Some(operation),
+            None,
+        ));
+    }
+    if let Some(role) = role {
+        levels.push((PerformanceSliceLevel::Role, Some(role), None, None));
+    }
+    levels.push((PerformanceSliceLevel::Global, None, None, None));
+    for (level, role, operation, language) in levels {
+        if let Some(metrics) = performance(db, agent, role, operation, language, now)? {
+            if metrics.eventual_approval.reliable {
+                return Ok(Some(ResolvedPerformance { level, metrics }));
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// Convenience for callers that want "now" semantics.
 pub fn evaluate_now(db: &FactoryDb, query: &PerformanceQuery) -> Result<EvaluationReport, DbError> {
     evaluate(db, query, Utc::now())

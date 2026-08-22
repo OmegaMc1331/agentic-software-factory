@@ -8,8 +8,8 @@ use axum::http::StatusCode;
 use axum::Json;
 use chrono::Utc;
 use factory_eval::{
-    evaluate, evaluate_agent, AgentPerformanceDetail, AgentPerformanceSummary, PerformanceFacets,
-    PerformanceQuery, PerformanceWindow,
+    evaluate, evaluate_agent, AgentMetrics, AgentPerformanceDetail, AgentPerformanceSummary,
+    PerformanceFacets, PerformanceQuery, PerformanceWindow, MIN_RELIABLE_RATE_SAMPLES,
 };
 use factory_types::TaskOperation;
 use serde::Deserialize;
@@ -76,21 +76,65 @@ pub(crate) async fn list_agent_performance(
     }))
 }
 
+/// Whether (and how) an agent's measured performance currently feeds the
+/// routing scheduler. Displayed in the Performance view next to the metrics.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RoutingUsage {
+    /// The configured routing mode (`round_robin`, `performance`, `manual`).
+    mode: String,
+    /// Whether these metrics can influence dispatch right now.
+    used_for_routing: bool,
+    /// Why: reliable slice or insufficient sample size, with the threshold.
+    note: String,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AgentPerformanceDetailResponse {
+    #[serde(flatten)]
+    detail: AgentPerformanceDetail,
+    routing: RoutingUsage,
+}
+
+fn routing_usage(state: &SharedState, metrics: &AgentMetrics) -> RoutingUsage {
+    let mode = factory_core::Config::load(&state.root)
+        .map(|config| config.routing.mode.as_str().to_string())
+        .unwrap_or_else(|_| "round_robin".to_string());
+    let used = mode == "performance";
+    let qualifying = metrics.qualifying_tasks;
+    let reliable = metrics.eventual_approval.reliable;
+    let note = if reliable {
+        format!("Reliable quality slice (n={qualifying}) — eligible for performance routing.")
+    } else {
+        format!(
+            "Insufficient samples (n={qualifying} of {MIN_RELIABLE_RATE_SAMPLES}) — excluded \
+             from performance ranking until reliable."
+        )
+    };
+    RoutingUsage {
+        mode,
+        used_for_routing: used,
+        note,
+    }
+}
+
 /// `GET /api/performance/agents/:agent` — full detail with breakdowns,
-/// trends, and reasons. 404 when the agent has no attributed task history.
+/// trends, and reasons, plus whether the metrics currently feed routing.
+/// 404 when the agent has no attributed task history.
 pub(crate) async fn get_agent_performance(
     State(state): State<SharedState>,
     UrlPath(agent): UrlPath<String>,
     Query(params): Query<PerformanceQueryParams>,
-) -> Result<Json<AgentPerformanceDetail>, ApiError> {
+) -> Result<Json<AgentPerformanceDetailResponse>, ApiError> {
     let query = parse_query(params)?;
     let db = state.db.lock().expect("db mutex poisoned");
-    evaluate_agent(&db, &agent, &query, Utc::now())?
-        .map(Json)
-        .ok_or_else(|| {
-            ApiError::new(
-                StatusCode::NOT_FOUND,
-                format!("no performance data for agent '{agent}'"),
-            )
-        })
+    let detail = evaluate_agent(&db, &agent, &query, Utc::now())?.ok_or_else(|| {
+        ApiError::new(
+            StatusCode::NOT_FOUND,
+            format!("no performance data for agent '{agent}'"),
+        )
+    })?;
+    let routing = routing_usage(&state, &detail.summary.metrics);
+    Ok(Json(AgentPerformanceDetailResponse { detail, routing }))
 }

@@ -526,6 +526,7 @@ mod tests {
             worktree_path: None,
             role: role.map(str::to_string),
             operation: None,
+            agent_override: None,
             created_at: String::new(),
             updated_at: String::new(),
         }

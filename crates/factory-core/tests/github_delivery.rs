@@ -675,6 +675,7 @@ fn missions_mark_imported_issue_content_as_untrusted() {
         worktree_path: None,
         role: None,
         operation: None,
+        agent_override: None,
         created_at: String::new(),
         updated_at: String::new(),
     };

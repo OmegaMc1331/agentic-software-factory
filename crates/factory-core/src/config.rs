@@ -6,7 +6,7 @@ use factory_agent::{
     AgentStatus, CommandAgent, PromptTransport, MISSION_PLACEHOLDER,
 };
 use factory_policy::{EffectivePolicy, PoliciesConfig};
-use factory_types::WorkflowTeam;
+use factory_types::{RoutingMode, WorkflowTeam};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -43,6 +43,34 @@ impl Default for RuntimeConfig {
     }
 }
 
+/// Agent routing configuration (`[routing]` in `config.toml`). Absent in
+/// older configs, so the serde default keeps the historical round-robin
+/// behavior — existing projects must never change routing just by upgrading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoutingConfig {
+    /// How the scheduler selects the agent for a dispatch.
+    #[serde(default)]
+    pub mode: RoutingMode,
+    /// Whether performance routing may occasionally dispatch to an
+    /// under-sampled eligible candidate so it can gather reliable history
+    /// (deterministic every-Nth-dispatch rule; see `factory_core::routing`).
+    #[serde(default = "default_exploration")]
+    pub exploration: bool,
+}
+
+fn default_exploration() -> bool {
+    true
+}
+
+impl Default for RoutingConfig {
+    fn default() -> Self {
+        Self {
+            mode: RoutingMode::RoundRobin,
+            exploration: true,
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
@@ -53,6 +81,10 @@ pub struct Config {
     pub role_assignments: Vec<RoleAssignment>,
     #[serde(default)]
     pub runtime: RuntimeConfig,
+    /// Agent routing mode and tunables. Absent in older configs, so the
+    /// serde default preserves the historical round-robin routing.
+    #[serde(default)]
+    pub routing: RoutingConfig,
     /// Repository context engine tunables. Absent in older configs, so the
     /// serde defaults keep the engine enabled with the standard budgets.
     #[serde(default)]
@@ -719,6 +751,17 @@ pub fn default_config_text() -> String {
 # How many tasks of a run may execute concurrently (1..=32). Integration
 # stays serialized per run regardless of this value.
 max_parallel_tasks = 4
+
+[routing]
+# How the scheduler picks the agent for a dispatch:
+#   round_robin  — least-loaded pool member, round-robin ties (the default)
+#   performance  — deterministic score from reliable factory-eval history,
+#                  falling back to round_robin when data is insufficient
+#   manual       — the task's pinned agent, else the role's preferred agent
+mode = \"round_robin\"
+# Whether performance routing occasionally dispatches to under-sampled
+# eligible candidates so they can gather reliable history.
+exploration = true
 
 [context]
 # Repository context engine: injects a bounded, ranked REPOSITORY CONTEXT

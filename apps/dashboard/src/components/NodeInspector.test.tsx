@@ -1,6 +1,12 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { fetchRun, fetchRunArtifacts } from "../api";
+import {
+  fetchRoles,
+  fetchRoutingDecisions,
+  fetchRoutingPreview,
+  fetchRun,
+  fetchRunArtifacts,
+} from "../api";
 import type { GraphEdge, GraphNode } from "../types";
 import { NodeInspector } from "./NodeInspector";
 
@@ -8,6 +14,10 @@ vi.mock("../api", () => ({
   fetchRunArtifacts: vi.fn(),
   fetchTaskArtifacts: vi.fn(),
   fetchRun: vi.fn(),
+  fetchRoutingPreview: vi.fn(),
+  fetchRoutingDecisions: vi.fn(),
+  fetchRoles: vi.fn(),
+  setTaskRouting: vi.fn(),
 }));
 
 const roleNode: GraphNode = {
@@ -75,6 +85,11 @@ const taskNode: GraphNode = {
 
 beforeEach(() => {
   vi.mocked(fetchRunArtifacts).mockReset();
+  vi.mocked(fetchRoutingPreview)
+    .mockReset()
+    .mockRejectedValue(new Error("routing preview unavailable"));
+  vi.mocked(fetchRoutingDecisions).mockReset().mockResolvedValue([]);
+  vi.mocked(fetchRoles).mockReset().mockResolvedValue([]);
   vi.mocked(fetchRun)
     .mockReset()
     .mockResolvedValue({
@@ -126,6 +141,63 @@ describe("Node Inspector (role-aware task)", () => {
     expect(screen.getByText("#8")).toBeTruthy(); // dependency
     expect(screen.getByText(/token appears in query string/)).toBeTruthy();
     expect(screen.getByText("none (no repository changes required)")).toBeTruthy();
+  });
+
+  it("shows the routing preview and manual agent override for ready tasks", async () => {
+    vi.mocked(fetchRunArtifacts).mockResolvedValue([]);
+    vi.mocked(fetchRoles).mockResolvedValue([
+      {
+        id: "security_auditor",
+        name: "Security Auditor",
+        kind: "core",
+        description: "",
+        instructions: "",
+        executionClass: "review",
+        assignments: [{ agent: "claude", preferred: true }],
+        available: true,
+      },
+    ]);
+    vi.mocked(fetchRoutingPreview).mockResolvedValue({
+      mode: "performance",
+      taskId: 9,
+      role: "security_auditor",
+      operation: "review",
+      language: null,
+      overrideAgent: null,
+      likelyAgent: "claude",
+      reason: "Highest reliable routing score with available capacity.",
+      candidates: [
+        { agent: "claude", score: 0.89, reliable: true, note: "role+operation slice, n=12" },
+        { agent: "codex", score: null, reliable: false, note: "insufficient data (n=3 of 10)" },
+      ],
+    });
+    // The override selector only appears while the task has not started.
+    const readyTask: GraphNode = {
+      ...taskNode,
+      meta: { ...taskNode.meta, state: "ready" },
+    };
+    const nodesById = new Map<string, GraphNode>([[readyTask.id, readyTask]]);
+    render(
+      <NodeInspector
+        node={readyTask}
+        edge={null as GraphEdge | null}
+        nodesById={nodesById}
+        onClose={vi.fn()}
+        onDelete={vi.fn()}
+        onConnect={vi.fn()}
+      />
+    );
+
+    expect(await screen.findByText("Routing")).toBeTruthy();
+    expect(await screen.findByText("performance")).toBeTruthy();
+    expect(await screen.findByText(/Highest reliable routing score/)).toBeTruthy();
+    // The override selector offers Automatic plus the role's assigned agents.
+    const override = await screen.findByLabelText("Manual agent override");
+    expect(override).toBeTruthy();
+    const options = Array.from(override.querySelectorAll("option")).map(
+      (option) => option.textContent
+    );
+    expect(options).toEqual(["Automatic", "claude"]);
   });
 
   it("lists produced and consumed artifacts from the run artifact set", async () => {

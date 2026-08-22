@@ -109,6 +109,13 @@ visual-only. Role routing tests live in
 `cargo test -p factory-core --test role_routing`; role API tests in
 `cargo test -p factory-api --test roles_api`.
 
+Agent routing lives in `factory-core/src/routing.rs` (pure scoring) and
+`Factory::route_agent_for_attempt` (filtering, reservation, audit). Routing
+scenarios run in `cargo test -p factory-core --test routing`; the routing API
+in `cargo test -p factory-api --test routing_api`; the performance-hierarchy
+resolver in `cargo test -p factory-eval`. All routing tests use synthetic
+history and fake shell agents. See [routing.md](routing.md).
+
 The Agent Console consumes persisted session data. Automated sessions use the
 session-scoped SSE route. Interactive sessions are started for a configured agent,
 owned by `factory-runtime`, and connected through a session-scoped WebSocket to a

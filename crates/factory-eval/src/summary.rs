@@ -31,7 +31,7 @@ pub struct OutcomeCounts {
 
 /// Downstream integration quality for an agent's approved work. These are
 /// separate signals: a rebase conflict is not counted as an agent failure.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IntegrationStats {
     /// Integrations that landed with a clean fast-forward.
