@@ -6,6 +6,7 @@ import {
   fetchPrPreview,
   fetchRoles,
   fetchRun,
+  saveRunAsRecipe,
   updateWorkflowTeam,
 } from "../api";
 import type { DeliveryReport, GraphNode, RoleInfo, RunDetail, RunMeta } from "../types";
@@ -13,6 +14,7 @@ import { WorkflowInspector } from "./WorkflowInspector";
 
 vi.mock("../api", () => ({
   fetchRoles: vi.fn(),
+  saveRunAsRecipe: vi.fn(),
   fetchRun: vi.fn(),
   updateWorkflowTeam: vi.fn(),
   fetchDelivery: vi.fn(),
@@ -173,6 +175,19 @@ const deliveryReady: DeliveryReport = {
 
 beforeEach(() => {
   vi.mocked(fetchRun).mockReset().mockResolvedValue(detail);
+  vi.mocked(saveRunAsRecipe)
+    .mockReset()
+    .mockResolvedValue({
+      id: "saved_recipe",
+      name: "Saved Recipe",
+      description: "",
+      roles: ["planner", "worker", "reviewer"],
+      routing: "project_default",
+      maxParallelTasks: null,
+      policyPresets: {},
+      plannerGuidance: "",
+      builtin: false,
+    });
   vi.mocked(fetchRoles).mockReset().mockResolvedValue(roles);
   vi.mocked(updateWorkflowTeam).mockReset().mockResolvedValue(team);
   vi.mocked(fetchDelivery).mockReset().mockResolvedValue(deliveryNotReady);
@@ -494,5 +509,79 @@ describe("Workflow inspector", () => {
     expect(screen.queryByRole("button", { name: "Create Pull Request" })).toBeNull();
     expect(fetchPrPreview).not.toHaveBeenCalled();
     expect(createPullRequest).not.toHaveBeenCalled();
+  });
+
+  it("shows No Recipe for runs created before recipes existed", async () => {
+    render(
+      <WorkflowInspector
+        node={node}
+        onClose={vi.fn()}
+        onStart={vi.fn()}
+        onCancel={vi.fn()}
+        onRetry={vi.fn()}
+      />
+    );
+
+    expect(await screen.findByText("No Recipe")).toBeTruthy();
+  });
+
+  it("displays the immutable recipe snapshot with its settings", async () => {
+    vi.mocked(fetchRun).mockResolvedValue({
+      ...detail,
+      run: {
+        ...detail.run,
+        recipe: {
+          id: "security",
+          name: "Security Sensitive",
+          roles: ["planner", "worker", "security_auditor", "reviewer"],
+          routing: "round_robin",
+          maxParallelTasks: 2,
+          policyPresets: {},
+          plannerGuidance: "",
+        },
+      },
+    });
+    render(
+      <WorkflowInspector
+        node={node}
+        onClose={vi.fn()}
+        onStart={vi.fn()}
+        onCancel={vi.fn()}
+        onRetry={vi.fn()}
+      />
+    );
+
+    expect(await screen.findByText("Security Sensitive")).toBeTruthy();
+    expect(screen.getByText(/Routing: Round-robin/)).toBeTruthy();
+    expect(screen.getByText(/parallelism 2/)).toBeTruthy();
+    expect(screen.getByText(/4 selected roles/)).toBeTruthy();
+  });
+
+  it("saves a planned workflow's configuration as a recipe", async () => {
+    render(
+      <WorkflowInspector
+        node={node}
+        onClose={vi.fn()}
+        onStart={vi.fn()}
+        onCancel={vi.fn()}
+        onRetry={vi.fn()}
+      />
+    );
+
+    fireEvent.click(await screen.findByRole("button", { name: "Save as Recipe" }));
+    fireEvent.change(screen.getByLabelText("Recipe name"), {
+      target: { value: "Auth Workflow Recipe" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save recipe" }));
+
+    await waitFor(() =>
+      expect(saveRunAsRecipe).toHaveBeenCalledWith(12, {
+        name: "Auth Workflow Recipe",
+        description: "",
+      })
+    );
+    expect(await screen.findByText(/Saved "Saved Recipe" as a custom recipe/)).toBeTruthy();
+    // The save captured configuration only — no DAG or history involved.
+    expect(saveRunAsRecipe).toHaveBeenCalledTimes(1);
   });
 });

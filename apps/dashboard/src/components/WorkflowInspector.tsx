@@ -5,6 +5,7 @@ import {
   fetchPrPreview,
   fetchRoles,
   fetchRun,
+  saveRunAsRecipe,
   updateWorkflowTeam,
 } from "../api";
 import type {
@@ -16,12 +17,20 @@ import type {
   Task,
   WorkflowTeam,
 } from "../types";
-import { isTaskIntegrated, PIPELINE_ROLE_IDS, roleAgents, runMeta } from "../types";
+import {
+  isTaskIntegrated,
+  NO_RECIPE_LABEL,
+  PIPELINE_ROLE_IDS,
+  RECIPE_ROUTING_LABELS,
+  roleAgents,
+  runMeta,
+} from "../types";
 import { ArtifactList } from "./ArtifactList";
 
 type WorkflowTab = "overview" | "tasks" | "activity";
 
 const TEAM_EDITABLE_STATUSES = ["planning", "planned", "blocked"];
+const SAVE_RECIPE_STATUSES = ["planning", "planned", "blocked"];
 
 const DELIVERY_STATE_LABELS: Record<string, string> = {
   not_ready: "Not published",
@@ -94,6 +103,11 @@ export function WorkflowInspector({
     eligible: boolean;
     blockers: string[];
   } | null>(null);
+  const [saveRecipeForm, setSaveRecipeForm] = useState<{
+    name: string;
+    description: string;
+  } | null>(null);
+  const [saveRecipeNote, setSaveRecipeNote] = useState<string | null>(null);
 
   const loadDetail = useCallback(() => {
     fetchRun(meta.runId)
@@ -138,7 +152,9 @@ export function WorkflowInspector({
 
   const status = detail?.run.status ?? meta.status;
   const team = detail?.run.team ?? meta.team;
+  const recipe = detail?.run.recipe ?? meta.recipe ?? null;
   const teamEditable = TEAM_EDITABLE_STATUSES.includes(status);
+  const canSaveRecipe = SAVE_RECIPE_STATUSES.includes(status);
 
   // Delivery metadata is fetched on mount and whenever the workflow status
   // settles; it is persisted, so it also survives reloads.
@@ -283,6 +299,25 @@ export function WorkflowInspector({
       });
   };
 
+  const submitSaveRecipe = () => {
+    if (!saveRecipeForm || !saveRecipeForm.name.trim()) return;
+    setBusy(true);
+    setError(null);
+    saveRunAsRecipe(meta.runId, {
+      name: saveRecipeForm.name.trim(),
+      description: saveRecipeForm.description.trim(),
+    })
+      .then((saved) => {
+        setBusy(false);
+        setSaveRecipeForm(null);
+        setSaveRecipeNote(`Saved "${saved.name}" as a custom recipe (Settings → Recipes).`);
+      })
+      .catch((reason: Error) => {
+        setError((reason as Error).message);
+        setBusy(false);
+      });
+  };
+
   const roleById = useMemo(() => new Map((roles ?? []).map((role) => [role.id, role])), [roles]);
   const agentsForRole = useCallback(
     (id: string): string[] => {
@@ -354,6 +389,25 @@ export function WorkflowInspector({
                 </dd>
               </div>
             )}
+            <div>
+              <dt>Recipe</dt>
+              <dd>
+                {recipe ? (
+                  <>
+                    <strong>{recipe.name}</strong>
+                    <p className="workflow-recipe-meta">
+                      Routing: {RECIPE_ROUTING_LABELS[recipe.routing]}
+                      {recipe.maxParallelTasks ? ` · parallelism ${recipe.maxParallelTasks}` : ""}
+                      {recipe.roles.length > 0
+                        ? ` · ${recipe.roles.length} selected role${recipe.roles.length === 1 ? "" : "s"}`
+                        : ""}
+                    </p>
+                  </>
+                ) : (
+                  NO_RECIPE_LABEL
+                )}
+              </dd>
+            </div>
             <div>
               <dt>Team</dt>
               <dd className="workflow-team-summary">
@@ -692,30 +746,96 @@ export function WorkflowInspector({
             </div>
           ) : (
             <div className="workflow-actions">
-              {status === "planned" && (
-                <button className="button button-primary" onClick={start} disabled={busy}>
-                  Start
-                </button>
-              )}
-              {teamEditable && (
-                <button className="button" onClick={openTeamEditor} disabled={busy}>
-                  Edit team
-                </button>
-              )}
-              {status === "active" && (
-                <p className="inline-note">The team is locked while the workflow is active.</p>
-              )}
-              {["planning", "active"].includes(status) && (
-                <button
-                  className="button inspector-delete"
-                  onClick={() =>
-                    window.confirm("Cancel this workflow and stop its current agent session?") &&
-                    void act(() => onCancel(meta.runId))
-                  }
-                  disabled={busy}
-                >
-                  Cancel
-                </button>
+              {saveRecipeForm ? (
+                <div className="workflow-save-recipe">
+                  <label>
+                    <span>Recipe name</span>
+                    <input
+                      value={saveRecipeForm.name}
+                      onChange={(event) =>
+                        setSaveRecipeForm({ ...saveRecipeForm, name: event.target.value })
+                      }
+                      autoFocus
+                    />
+                  </label>
+                  <label>
+                    <span>Description</span>
+                    <input
+                      value={saveRecipeForm.description}
+                      onChange={(event) =>
+                        setSaveRecipeForm({
+                          ...saveRecipeForm,
+                          description: event.target.value,
+                        })
+                      }
+                    />
+                  </label>
+                  <p className="inline-note">
+                    Saves the reusable configuration only — roles, routing, concurrency, policy
+                    presets, and Planner guidance. Never the tasks or history.
+                  </p>
+                  <div className="workflow-actions">
+                    <button
+                      className="button button-primary"
+                      onClick={submitSaveRecipe}
+                      disabled={busy || !saveRecipeForm.name.trim()}
+                    >
+                      Save recipe
+                    </button>
+                    <button
+                      className="button"
+                      onClick={() => setSaveRecipeForm(null)}
+                      disabled={busy}
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <>
+                  {saveRecipeNote && <p className="inline-note">{saveRecipeNote}</p>}
+                  {canSaveRecipe && (
+                    <button
+                      className="button"
+                      onClick={() => {
+                        setSaveRecipeNote(null);
+                        setSaveRecipeForm({
+                          name: recipe ? `${recipe.name} (copy)` : "My Recipe",
+                          description: "",
+                        });
+                      }}
+                      disabled={busy}
+                    >
+                      Save as Recipe
+                    </button>
+                  )}
+                  {status === "planned" && (
+                    <button className="button button-primary" onClick={start} disabled={busy}>
+                      Start
+                    </button>
+                  )}
+                  {teamEditable && (
+                    <button className="button" onClick={openTeamEditor} disabled={busy}>
+                      Edit team
+                    </button>
+                  )}
+                  {status === "active" && (
+                    <p className="inline-note">The team is locked while the workflow is active.</p>
+                  )}
+                  {["planning", "active"].includes(status) && (
+                    <button
+                      className="button inspector-delete"
+                      onClick={() =>
+                        window.confirm(
+                          "Cancel this workflow and stop its current agent session?"
+                        ) && void act(() => onCancel(meta.runId))
+                      }
+                      disabled={busy}
+                    >
+                      Cancel
+                    </button>
+                  )}
+                </>
               )}
             </div>
           )}

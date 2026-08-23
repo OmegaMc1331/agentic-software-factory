@@ -58,7 +58,7 @@ impl FactoryDb {
         let row = self
             .conn
             .query_row(
-                "SELECT id, objective, status, planner_agent, created_at, updated_at, team, plan_revision
+                "SELECT id, objective, status, planner_agent, created_at, updated_at, team, plan_revision, recipe
                  FROM runs WHERE id = ?1",
                 params![id],
                 build_run,
@@ -69,7 +69,7 @@ impl FactoryDb {
 
     pub fn list_runs(&self) -> Result<Vec<Run>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, objective, status, planner_agent, created_at, updated_at, team, plan_revision
+            "SELECT id, objective, status, planner_agent, created_at, updated_at, team, plan_revision, recipe
              FROM runs ORDER BY id DESC",
         )?;
         let rows = stmt
@@ -94,6 +94,20 @@ impl FactoryDb {
         let changed = self.conn.execute(
             "UPDATE runs SET team = ?1, updated_at = ?2 WHERE id = ?3",
             params![team, now(), id],
+        )?;
+        if changed == 0 {
+            return Err(DbError::NotFound("run"));
+        }
+        Ok(())
+    }
+
+    /// Persists the immutable recipe snapshot on a run. Written once at
+    /// creation; never updated afterwards.
+    pub fn set_run_recipe(&self, id: i64, recipe: &factory_types::RecipeSnapshot) -> Result<()> {
+        let recipe = serde_json::to_string(recipe)?;
+        let changed = self.conn.execute(
+            "UPDATE runs SET recipe = ?1, updated_at = ?2 WHERE id = ?3",
+            params![recipe, now(), id],
         )?;
         if changed == 0 {
             return Err(DbError::NotFound("run"));
@@ -1315,6 +1329,7 @@ pub struct SessionDuration {
 
 fn build_run(r: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
     let team: Option<String> = r.get(6)?;
+    let recipe: Option<String> = r.get(8)?;
     Ok(Run {
         id: r.get(0)?,
         objective: r.get(1)?,
@@ -1322,6 +1337,7 @@ fn build_run(r: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
         planner_agent: r.get(3)?,
         team: team.and_then(|value| serde_json::from_str(&value).ok()),
         plan_revision: r.get(7)?,
+        recipe: recipe.and_then(|value| serde_json::from_str(&value).ok()),
         created_at: r.get(4)?,
         updated_at: r.get(5)?,
     })
@@ -2014,9 +2030,15 @@ CREATE INDEX idx_routing_decisions_attempt ON routing_decisions(attempt_id);
 ALTER TABLE tasks ADD COLUMN agent_override TEXT;
 ";
 
+/// Recipes: the immutable snapshot of the recipe a run was created from
+/// (selected roles, routing/concurrency preferences, policy preset
+/// references, Planner guidance). Stored as JSON next to `team`; editing or
+/// deleting the source recipe never mutates existing runs.
+const V15_SCHEMA: &str = "ALTER TABLE runs ADD COLUMN recipe TEXT;";
+
 const MIGRATIONS: &[&str] = &[
     V1_SCHEMA, V2_SCHEMA, V3_SCHEMA, V4_SCHEMA, V5_SCHEMA, V6_SCHEMA, V7_SCHEMA, V8_SCHEMA,
-    V9_SCHEMA, V10_SCHEMA, V11_SCHEMA, V12_SCHEMA, V13_SCHEMA, V14_SCHEMA,
+    V9_SCHEMA, V10_SCHEMA, V11_SCHEMA, V12_SCHEMA, V13_SCHEMA, V14_SCHEMA, V15_SCHEMA,
 ];
 
 fn migrate(conn: &mut Connection) -> Result<()> {
@@ -2070,7 +2092,7 @@ mod tests {
         let versions = schema_versions(&path);
         assert_eq!(
             versions,
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
         );
         db.create_run("objective", Some("codex")).unwrap();
         drop(db);
@@ -2078,7 +2100,7 @@ mod tests {
         let db = FactoryDb::open(&path).unwrap();
         assert_eq!(
             schema_versions(&path),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
         );
         db.list_runs().unwrap();
     }
@@ -2106,7 +2128,7 @@ mod tests {
         let db = FactoryDb::open(&path).unwrap();
         assert_eq!(
             schema_versions(&path),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
         );
         let run = db.get_run(1).unwrap().unwrap();
         assert_eq!(run.objective, "legacy");
@@ -2164,7 +2186,7 @@ mod tests {
         // opening records versions 6 and 7 exactly once
         assert_eq!(
             schema_versions(&path),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
         );
         let tasks = db.list_tasks(1).unwrap();
         let operation_of = |title: &str| {
@@ -2816,6 +2838,39 @@ mod tests {
             .unwrap()
             .iter()
             .any(|listed| listed.team.is_some()));
+    }
+
+    #[test]
+    fn persists_run_recipe_snapshot_and_keeps_old_runs_without_one() {
+        let dir = TempDir::new().unwrap();
+        let db = FactoryDb::open(&dir.path().join("test.db")).unwrap();
+        let run = db.create_run("objective", Some("codex")).unwrap();
+        // Runs created before recipes exist deserialize with no snapshot.
+        assert!(db.get_run(run.id).unwrap().unwrap().recipe.is_none());
+
+        let snapshot = factory_types::RecipeSnapshot {
+            id: "security".into(),
+            name: "Security Sensitive".into(),
+            roles: vec!["planner".into(), "worker".into(), "security_auditor".into()],
+            routing: factory_types::RecipeRouting::RoundRobin,
+            max_parallel_tasks: Some(2),
+            policy_presets: std::collections::BTreeMap::from([(
+                "worker".to_string(),
+                "implementation".to_string(),
+            )]),
+            planner_guidance: "Keep the plan proportional.".into(),
+            github: None,
+        };
+        db.set_run_recipe(run.id, &snapshot).unwrap();
+        assert_eq!(db.get_run(run.id).unwrap().unwrap().recipe, Some(snapshot));
+        assert!(db
+            .list_runs()
+            .unwrap()
+            .iter()
+            .any(|listed| listed.recipe.is_some()));
+        // Another run stays untouched.
+        let other = db.create_run("other", Some("codex")).unwrap();
+        assert!(db.get_run(other.id).unwrap().unwrap().recipe.is_none());
     }
 
     #[test]

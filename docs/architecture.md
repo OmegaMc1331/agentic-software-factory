@@ -74,6 +74,14 @@ A new workflow is persisted as `planning` before the Planner starts. Planning is
 tasks and dependencies. The workflow then becomes `planned`, and repository work does
 not begin until **Start** is selected.
 
+A workflow may be created from a **recipe** — reusable configuration (selected roles,
+routing/concurrency defaults, policy preset references, bounded Planner guidance).
+The recipe pre-fills the team, its routing preference overrides the project default
+for that run, its policy presets narrow the effective policies, and an immutable
+snapshot is stored on the run; later recipe edits never mutate existing workflows.
+Recipes never contain the DAG — the Planner generates it. See
+[Recipes](recipes.md).
+
 ```text
 planning → planned → active → completed
                     │       ├→ failed
@@ -243,6 +251,12 @@ Permissions sections. Permission logic is never duplicated in the runtime, API, 
 frontend. See [Policies](policies.md) for the model, presets, and the precise
 enforcement boundary.
 
+Workflow recipes (`factory-core/src/recipes.rs`) apply policy presets through the
+same resolver as one extra **only-narrowing** layer —
+`PoliciesConfig::effective_restricted(role, agent, recipe_preset_scope)` — so a
+recipe can restrict what a run's roles may do but can never widen the Policy
+Engine's decision. See [Recipes](recipes.md).
+
 ## Persistence and concurrency
 
 SQLite tables include `runs`, `tasks`, `task_dependencies`, `task_attempts`,
@@ -250,7 +264,9 @@ SQLite tables include `runs`, `tasks`, `task_dependencies`, `task_attempts`,
 `TaskAttempt` stores the attempt number,
 agent, role, operation, status, timestamps, worktree, commit, exit code, error,
 evidence, and structured review. `runs.team` stores each workflow's team snapshot,
-`tasks.role` and `tasks.operation` preserve what was planned, `task_attempts.role`
+`runs.recipe` stores the immutable recipe snapshot a workflow was created from
+(configuration only — roles, routing, concurrency, policy presets, guidance —
+never tasks or history), `tasks.role` and `tasks.operation` preserve what was planned, `task_attempts.role`
 and `task_attempts.operation` preserve what actually ran, and `role_artifacts` stores
 the structured outputs advisory/verification/review tasks persist for downstream
 consumption. `github_links` holds the imported Issue a run was seeded from (untrusted

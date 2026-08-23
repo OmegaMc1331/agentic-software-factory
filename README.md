@@ -149,6 +149,20 @@ deterministic, evidence-based PR body. Existing PRs are linked, never
 duplicated; agents never gain push permission. See
 [docs/github.md](docs/github.md).
 
+## Recipes
+
+Recipes are reusable workflow **configuration** — selected roles, routing and
+concurrency defaults, policy preset references, and bounded Planner guidance.
+A recipe never stores the task DAG: the Planner still generates every plan
+from the objective, so recipes stay adaptive (the Security Sensitive recipe
+plus a trivial CSS fix may still produce just Worker → review). Six built-ins
+ship read-only (Standard, Thorough, Security Sensitive, Bug Fix, Documentation,
+Custom); custom recipes live in `.factory/recipes.toml` and are managed from
+Settings. `+ Workflow` (objective and GitHub Issue) pre-fills the team from a
+recipe, every run stores an immutable snapshot of the applied configuration,
+and planned workflows offer **Save as Recipe** — configuration only, never
+tasks or history. See [docs/recipes.md](docs/recipes.md).
+
 ## Dashboard
 
 Agent Graph is the primary operating interface:
@@ -187,6 +201,11 @@ The local API is bound to `127.0.0.1`:
 | POST   | `/api/runs/:id/start`         | Validate and start a planned workflow             |
 | POST   | `/api/runs/:id/cancel`        | Cancel a live workflow operation                  |
 | PUT    | `/api/runs/:id/team`          | Replace the workflow team before it starts        |
+| POST   | `/api/runs/:id/recipe`        | Save the run's configuration as a custom recipe   |
+| GET    | `/api/recipes`                | Built-in and custom workflow recipes              |
+| POST   | `/api/recipes`                | Create a custom recipe (validated atomically)     |
+| PUT    | `/api/recipes/:id`            | Update a custom recipe (built-ins are read-only)  |
+| DELETE | `/api/recipes/:id`            | Delete a custom recipe                            |
 | GET    | `/api/runs/:id/delivery`      | GitHub link, delivery state, and eligibility      |
 | GET    | `/api/runs/:id/pr-preview`    | Editable pull request preview and blockers        |
 | POST   | `/api/runs/:id/pull-request`  | Deliver: push the run branch and create the PR    |

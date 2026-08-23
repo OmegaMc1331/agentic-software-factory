@@ -8,6 +8,7 @@ import {
   fetchGraph,
   fetchGraphWorkspace,
   fetchRoles,
+  fetchRecipes,
   removeRoleAssignment,
   saveConfig,
   saveGraphWorkspace,
@@ -28,6 +29,7 @@ vi.mock("../api", () => ({
   fetchGraph: vi.fn(),
   fetchGraphWorkspace: vi.fn(),
   fetchRoles: vi.fn(),
+  fetchRecipes: vi.fn(),
   fetchRunArtifacts: vi.fn().mockResolvedValue([]),
   fetchTaskArtifacts: vi.fn().mockResolvedValue([]),
   removeRoleAssignment: vi.fn(),
@@ -178,6 +180,7 @@ beforeEach(() => {
   vi.mocked(fetchGraph).mockReset().mockResolvedValue(graph);
   vi.mocked(fetchGraphWorkspace).mockReset().mockResolvedValue(workspace);
   vi.mocked(fetchRoles).mockReset().mockResolvedValue(roles);
+  vi.mocked(fetchRecipes).mockReset().mockResolvedValue([]);
   vi.mocked(fetchConfig)
     .mockReset()
     .mockResolvedValue({

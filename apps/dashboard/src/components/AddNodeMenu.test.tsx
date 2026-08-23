@@ -71,6 +71,7 @@ describe("Add Node menu", () => {
         open
         config={config}
         roles={pipelineRoles}
+        recipes={[]}
         error={null}
         onClose={vi.fn()}
         onCreateWorkflow={onCreateWorkflow}
@@ -105,6 +106,7 @@ describe("Add Node menu", () => {
         initialKind="workflow"
         config={{ agents: {}, roles: {}, role_assignments: [] }}
         roles={pipelineRoles.map((entry) => (entry.id === "planner" ? role("planner", []) : entry))}
+        recipes={[]}
         error={null}
         onClose={vi.fn()}
         onCreateWorkflow={vi.fn()}
@@ -134,6 +136,7 @@ describe("Add Node menu", () => {
         initialKind="workflow"
         config={config}
         roles={roles}
+        recipes={[]}
         error={null}
         onClose={vi.fn()}
         onCreateWorkflow={onCreateWorkflow}
@@ -168,6 +171,7 @@ describe("Add Node menu", () => {
         open
         config={{ agents: {}, roles: {}, role_assignments: [] }}
         roles={[]}
+        recipes={[]}
         error={null}
         onClose={vi.fn()}
         onCreateWorkflow={vi.fn()}
@@ -199,6 +203,7 @@ describe("Add Node menu", () => {
         initialKind="agent"
         config={{ agents: {}, roles: {}, role_assignments: [] }}
         roles={[]}
+        recipes={[]}
         error={null}
         onClose={vi.fn()}
         onCreateWorkflow={vi.fn()}
@@ -233,6 +238,7 @@ describe("Add Node menu", () => {
         initialKind="role"
         config={config}
         roles={pipelineRoles}
+        recipes={[]}
         error={null}
         onClose={vi.fn()}
         onCreateWorkflow={vi.fn()}
@@ -274,6 +280,7 @@ describe("Add Node menu", () => {
         initialKind="workflow"
         config={config}
         roles={pipelineRoles}
+        recipes={[]}
         error={null}
         onClose={vi.fn()}
         onCreateWorkflow={vi.fn()}
@@ -309,6 +316,7 @@ describe("Add Node menu", () => {
         initialKind="workflow"
         config={config}
         roles={pipelineRoles}
+        recipes={[]}
         error={null}
         onClose={vi.fn()}
         onCreateWorkflow={vi.fn()}
@@ -341,6 +349,7 @@ describe("Add Node menu", () => {
         initialKind="workflow"
         config={config}
         roles={pipelineRoles}
+        recipes={[]}
         error={null}
         onClose={vi.fn()}
         onCreateWorkflow={vi.fn()}
@@ -364,6 +373,7 @@ describe("Add Node menu", () => {
         initialKind="role"
         config={config}
         roles={[...pipelineRoles, role("researcher", [])]}
+        recipes={[]}
         error={null}
         onClose={vi.fn()}
         onCreateWorkflow={vi.fn()}
@@ -383,5 +393,109 @@ describe("Add Node menu", () => {
     fireEvent.click(screen.getByRole("button", { name: "Assign" }));
 
     expect(onAssignCoreRole).toHaveBeenCalledWith("researcher", "codex");
+  });
+
+  it("pre-fills the team from a selected recipe and passes the recipe id", () => {
+    const onCreateWorkflow = vi.fn();
+    const roles: RoleInfo[] = [
+      ...pipelineRoles,
+      role("security_auditor", ["gemini"], { preferred: "gemini" }),
+      role("test_engineer", ["claude"], { preferred: "claude" }),
+    ];
+    const recipes = [
+      {
+        id: "security",
+        name: "Security Sensitive",
+        description: "Security-relevant work.",
+        roles: ["planner", "worker", "test_engineer", "security_auditor", "reviewer"],
+        routing: "project_default" as const,
+        maxParallelTasks: 2,
+        policyPresets: {},
+        plannerGuidance: "Treat the objective as security-sensitive.",
+        builtin: true,
+      },
+    ];
+    render(
+      <AddNodeMenu
+        open
+        initialKind="workflow"
+        config={config}
+        roles={roles}
+        recipes={recipes}
+        error={null}
+        onClose={vi.fn()}
+        onCreateWorkflow={onCreateWorkflow}
+        onCreateWorkflowFromIssue={vi.fn()}
+        onCreateAgent={vi.fn()}
+        onCreateRole={vi.fn()}
+        onAssignCoreRole={vi.fn()}
+        onCreateVisual={vi.fn()}
+      />
+    );
+
+    fireEvent.change(screen.getByLabelText("What should the Factory build?"), {
+      target: { value: "Add secure password reset" },
+    });
+    fireEvent.change(screen.getByLabelText("Recipe"), { target: { value: "security" } });
+    expect(screen.getByText("Security-relevant work.")).toBeTruthy();
+
+    // The recipe's roles pre-fill the (still editable) team selections.
+    expect((screen.getByLabelText("gemini") as HTMLInputElement).checked).toBe(true);
+    fireEvent.click(screen.getByRole("button", { name: "Plan" }));
+
+    expect(onCreateWorkflow).toHaveBeenCalledWith(
+      "Add secure password reset",
+      expect.objectContaining({
+        planner: "codex",
+        workers: ["claude"],
+        reviewers: ["codex"],
+        additional: { security_auditor: ["gemini"], test_engineer: ["claude"] },
+      }),
+      "security"
+    );
+  });
+
+  it("keeps manual setup when no recipe is selected", () => {
+    const onCreateWorkflow = vi.fn();
+    render(
+      <AddNodeMenu
+        open
+        initialKind="workflow"
+        config={config}
+        roles={pipelineRoles}
+        recipes={[
+          {
+            id: "standard",
+            name: "Standard Development",
+            description: "",
+            roles: ["planner", "worker", "reviewer"],
+            routing: "project_default" as const,
+            maxParallelTasks: 4,
+            policyPresets: {},
+            plannerGuidance: "",
+            builtin: true,
+          },
+        ]}
+        error={null}
+        onClose={vi.fn()}
+        onCreateWorkflow={onCreateWorkflow}
+        onCreateWorkflowFromIssue={vi.fn()}
+        onCreateAgent={vi.fn()}
+        onCreateRole={vi.fn()}
+        onAssignCoreRole={vi.fn()}
+        onCreateVisual={vi.fn()}
+      />
+    );
+
+    fireEvent.change(screen.getByLabelText("What should the Factory build?"), {
+      target: { value: "Small fix" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Plan" }));
+
+    expect(onCreateWorkflow).toHaveBeenCalledWith(
+      "Small fix",
+      expect.objectContaining({ planner: "codex" })
+    );
+    expect(onCreateWorkflow.mock.calls[0].length).toBe(2);
   });
 });

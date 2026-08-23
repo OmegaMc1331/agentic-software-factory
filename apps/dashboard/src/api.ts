@@ -14,6 +14,8 @@ import type {
   PerformanceFilters,
   PerformanceOverview,
   PrPreview,
+  Recipe,
+  RecipeRoutingValue,
   RoleArtifact,
   RoleInfo,
   RolePolicyPreset,
@@ -113,13 +115,70 @@ export function fetchRun(id: number): Promise<RunDetail> {
   return get<RunDetail>(`/runs/${id}`);
 }
 
-export function createWorkflow(objective: string, team?: WorkflowTeam): Promise<Run> {
-  return post<Run>("/runs", team === undefined ? { objective } : { objective, team });
+export function createWorkflow(
+  objective: string,
+  team?: WorkflowTeam,
+  recipe?: string
+): Promise<Run> {
+  const body: Record<string, unknown> = { objective };
+  if (team !== undefined) body.team = team;
+  if (recipe !== undefined) body.recipe = recipe;
+  return post<Run>("/runs", body);
 }
 
 /** Imports a GitHub Issue as a workflow. Planning starts; execution does not. */
-export function createWorkflowFromIssue(issue: string, team?: WorkflowTeam): Promise<Run> {
-  return post<Run>("/runs/from-issue", team === undefined ? { issue } : { issue, team });
+export function createWorkflowFromIssue(
+  issue: string,
+  team?: WorkflowTeam,
+  recipe?: string
+): Promise<Run> {
+  const body: Record<string, unknown> = { issue };
+  if (team !== undefined) body.team = team;
+  if (recipe !== undefined) body.recipe = recipe;
+  return post<Run>("/runs/from-issue", body);
+}
+
+// --- Recipes -------------------------------------------------------------------
+
+/** The editable recipe form shared by create/update and the Settings editor. */
+export interface RecipeSaveRequest {
+  id?: string;
+  name: string;
+  description?: string;
+  roles?: string[];
+  routing?: RecipeRoutingValue;
+  maxParallelTasks?: number | null;
+  policyPresets?: Record<string, string>;
+  plannerGuidance?: string;
+  github?: { draft: boolean } | null;
+}
+
+export function fetchRecipes(): Promise<Recipe[]> {
+  return get<Recipe[]>("/recipes");
+}
+
+export function createRecipe(request: RecipeSaveRequest): Promise<Recipe> {
+  return post<Recipe>("/recipes", request);
+}
+
+export function updateRecipe(id: string, request: RecipeSaveRequest): Promise<Recipe> {
+  return put<Recipe>(`/recipes/${encodeURIComponent(id)}`, request);
+}
+
+export function deleteRecipe(id: string): Promise<void> {
+  return remove(`/recipes/${encodeURIComponent(id)}`);
+}
+
+/**
+ * "Save as Recipe": derives a reusable recipe from a workflow's current
+ * configuration (roles, routing, concurrency, policy presets, guidance).
+ * Tasks, DAG edges, attempts, and sessions are never copied.
+ */
+export function saveRunAsRecipe(
+  runId: number,
+  request: { name: string; description?: string; id?: string }
+): Promise<Recipe> {
+  return post<Recipe>(`/runs/${runId}/recipe`, request);
 }
 
 // --- GitHub delivery ---------------------------------------------------------

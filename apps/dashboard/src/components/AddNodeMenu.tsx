@@ -6,6 +6,7 @@ import type {
   ConfigData,
   GitHubStatus,
   PromptTransport,
+  Recipe,
   RoleInfo,
   WorkflowTeam,
 } from "../types";
@@ -58,6 +59,7 @@ export function AddNodeMenu({
   open,
   config,
   roles,
+  recipes,
   error,
   initialKind,
   onClose,
@@ -71,11 +73,12 @@ export function AddNodeMenu({
   open: boolean;
   config: ConfigData;
   roles: RoleInfo[];
+  recipes: Recipe[];
   error: string | null;
   initialKind?: AddKind | null;
   onClose: () => void;
-  onCreateWorkflow: (objective: string, team: WorkflowTeam) => void;
-  onCreateWorkflowFromIssue: (issue: string, team: WorkflowTeam) => void;
+  onCreateWorkflow: (objective: string, team: WorkflowTeam, recipe?: string) => void;
+  onCreateWorkflowFromIssue: (issue: string, team: WorkflowTeam, recipe?: string) => void;
   onCreateAgent: (name: string, entry: AgentEntry) => void;
   onCreateRole: (value: RoleFormValue) => void;
   onAssignCoreRole: (roleId: string, agent: string) => void;
@@ -98,6 +101,7 @@ export function AddNodeMenu({
   const [workflowSource, setWorkflowSource] = useState<WorkflowSource>("objective");
   const [issueReference, setIssueReference] = useState("");
   const [githubStatus, setGithubStatus] = useState<GitHubStatus | null>(null);
+  const [recipeId, setRecipeId] = useState("");
   const [teamPlanner, setTeamPlanner] = useState("");
   const [teamWorkers, setTeamWorkers] = useState<string[]>([]);
   const [teamReviewers, setTeamReviewers] = useState<string[]>([]);
@@ -114,6 +118,7 @@ export function AddNodeMenu({
       setRoleMode(null);
       setCoreRoleDraft(null);
       setValidationError(null);
+      setRecipeId("");
     }
   }, [initialKind, open]);
 
@@ -134,6 +139,33 @@ export function AddNodeMenu({
     setTeamReviewers(preferredRoleAgents(byId.get("reviewer")));
     setTeamAdditional({});
   }, [kind, open, roles]);
+
+  // Selecting a recipe pre-fills the team from its selected roles; the user
+  // can still customize everything before planning.
+  const applyRecipe = (id: string) => {
+    setRecipeId(id);
+    setValidationError(null);
+    const recipe = recipes.find((candidate) => candidate.id === id);
+    const byId = new Map(roles.map((role) => [role.id, role]));
+    if (!recipe || recipe.roles.length === 0) {
+      setTeamPlanner(preferredRoleAgents(byId.get("planner"))[0] ?? "");
+      setTeamWorkers(preferredRoleAgents(byId.get("worker")));
+      setTeamReviewers(preferredRoleAgents(byId.get("reviewer")));
+      setTeamAdditional({});
+      return;
+    }
+    const inRecipe = (roleId: string) => recipe.roles.includes(roleId);
+    setTeamPlanner(inRecipe("planner") ? (preferredRoleAgents(byId.get("planner"))[0] ?? "") : "");
+    setTeamWorkers(inRecipe("worker") ? preferredRoleAgents(byId.get("worker")) : []);
+    setTeamReviewers(inRecipe("reviewer") ? preferredRoleAgents(byId.get("reviewer")) : []);
+    const additional: Record<string, string[]> = {};
+    for (const roleId of recipe.roles) {
+      if (PIPELINE_ROLE_IDS.includes(roleId as (typeof PIPELINE_ROLE_IDS)[number])) continue;
+      const preferred = preferredRoleAgents(byId.get(roleId));
+      if (preferred.length > 0) additional[roleId] = [preferred[0]];
+    }
+    setTeamAdditional(additional);
+  };
 
   useEffect(() => {
     if (!open || kind !== "workflow" || workflowSource !== "github" || githubStatus) return;
@@ -222,8 +254,12 @@ export function AddNodeMenu({
         reviewers: teamReviewers,
         additional,
       };
+      const recipe = recipeId || undefined;
       if (workflowSource === "github") {
-        onCreateWorkflowFromIssue(issueReference.trim(), team);
+        if (recipe) onCreateWorkflowFromIssue(issueReference.trim(), team, recipe);
+        else onCreateWorkflowFromIssue(issueReference.trim(), team);
+      } else if (recipe) {
+        onCreateWorkflow(objective.trim(), team, recipe);
       } else {
         onCreateWorkflow(objective.trim(), team);
       }
@@ -372,6 +408,31 @@ export function AddNodeMenu({
                   </p>
                 </>
               )}
+              <div className="workflow-recipe">
+                <label>
+                  <span>Recipe</span>
+                  <select value={recipeId} onChange={(event) => applyRecipe(event.target.value)}>
+                    <option value="">No recipe (manual setup)</option>
+                    {recipes.map((recipe) => (
+                      <option key={recipe.id} value={recipe.id}>
+                        {recipe.name}
+                        {recipe.builtin ? "" : " · custom"}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                {recipeId &&
+                  (() => {
+                    const recipe = recipes.find((candidate) => candidate.id === recipeId);
+                    if (!recipe) return null;
+                    return (
+                      <p className="inline-note">
+                        {recipe.description ||
+                          "Pre-fills the team and workflow defaults; the Planner still adapts the plan to the objective."}
+                      </p>
+                    );
+                  })()}
+              </div>
               <div className="workflow-team">
                 <span className="workflow-team-title">Team</span>
                 <label>

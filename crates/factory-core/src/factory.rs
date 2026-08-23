@@ -8,9 +8,9 @@ use factory_db::{FactoryDb, Reconciliation};
 use factory_git::{Repo, WorktreeInfo};
 use factory_types::{
     AgentSession, AgentSessionMode, AttemptStatus, DeliveryState, GitHubDelivery, GitHubIssueLink,
-    ReviewDecision, ReviewResult, RoleArtifact, RoutingCandidateScore, RoutingDecision,
-    RoutingPreview, Run, RunStatus, SpecializedReview, Task, TaskAttempt, TaskEvidence,
-    TaskOperation, TaskState, WorkflowTeam,
+    Recipe, RecipeRouting, RecipeSnapshot, ReviewDecision, ReviewResult, RoleArtifact,
+    RoutingCandidateScore, RoutingDecision, RoutingPreview, Run, RunStatus, SpecializedReview,
+    Task, TaskAttempt, TaskEvidence, TaskOperation, TaskState, WorkflowTeam,
 };
 use thiserror::Error;
 
@@ -23,8 +23,9 @@ use crate::mission::{
 };
 use crate::planner::{
     mission as planner_mission, normalize_plan, normalize_plan_with_operations, parse_plan,
-    validate_plan_roles, PlanError,
+    validate_plan_roles, PlanError, PlannerRecipeContext,
 };
+use crate::recipes::{self, RecipeCatalog, RecipeError};
 use crate::roles::{self, RoleCatalog, RoleDefinition};
 use crate::routing::{self, CandidateFacts};
 
@@ -51,6 +52,8 @@ pub enum FactoryError {
     TaskRoleUnavailable(i64, String),
     #[error("invalid workflow team: {0}")]
     InvalidTeam(String),
+    #[error("recipe error: {0}")]
+    Recipe(#[from] RecipeError),
     #[error("task #{0} reached the retry limit of {MAX_TASK_ATTEMPTS} attempts: {1}")]
     RetryLimit(i64, String),
     /// A task cannot legally execute under its effective policy. Raised before
@@ -201,31 +204,73 @@ impl Factory {
         objective: &str,
         team: Option<WorkflowTeam>,
     ) -> Result<Run, FactoryError> {
+        self.begin_run_with_recipe(objective, team, None)
+    }
+
+    /// Creates a workflow, optionally from a recipe. The recipe's roles
+    /// pre-fill the team (the caller may still pass an explicit team), and an
+    /// immutable snapshot of the applied recipe configuration is persisted on
+    /// the run — later recipe edits never mutate it.
+    pub fn begin_run_with_recipe(
+        &self,
+        objective: &str,
+        team: Option<WorkflowTeam>,
+        recipe: Option<&RecipeSnapshot>,
+    ) -> Result<Run, FactoryError> {
         let objective = objective.trim();
         if objective.is_empty() {
             return Err(FactoryError::EmptyObjective);
         }
-        let team = self.resolve_new_team(team)?;
+        if let Some(recipe) = recipe {
+            self.validate_recipe_roles_available(recipe)?;
+        }
+        let team = self.resolve_new_team(team, recipe)?;
         let planner = self.agents.command_agent_for("planner", &team.planner)?;
         let run =
             self.db
                 .create_run_with_status(objective, Some(planner.name()), RunStatus::Planning)?;
         self.db.set_run_team(run.id, &team)?;
+        if let Some(recipe) = recipe {
+            self.db.set_run_recipe(run.id, recipe)?;
+        }
         self.db
             .get_run(run.id)?
             .ok_or(FactoryError::RunNotFound(run.id))
     }
 
-    fn resolve_new_team(&self, team: Option<WorkflowTeam>) -> Result<WorkflowTeam, FactoryError> {
+    /// A recipe may only use roles the project can actually resolve: every
+    /// selected role needs at least one assignment. Unavailable roles produce
+    /// a clear error — they are never silently replaced (e.g. by Worker).
+    fn validate_recipe_roles_available(&self, recipe: &RecipeSnapshot) -> Result<(), FactoryError> {
+        for role in &recipe.roles {
+            if self.agents.config().assignments_for(role).is_empty() {
+                return Err(FactoryError::InvalidTeam(format!(
+                    "Recipe '{}' requires role '{role}' but no agent is assigned to it. Assign \
+                     one in Settings or pick a different recipe.",
+                    recipe.name
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn resolve_new_team(
+        &self,
+        team: Option<WorkflowTeam>,
+        recipe: Option<&RecipeSnapshot>,
+    ) -> Result<WorkflowTeam, FactoryError> {
         let (team, complete) = match team {
             Some(team) => (team, true),
-            None => (
-                self.agents
-                    .config()
-                    .initial_team()
-                    .map_err(FactoryError::InvalidTeam)?,
-                false,
-            ),
+            None => match recipe.filter(|recipe| !recipe.roles.is_empty()) {
+                Some(recipe) => (self.team_from_recipe(recipe)?, false),
+                None => (
+                    self.agents
+                        .config()
+                        .initial_team()
+                        .map_err(FactoryError::InvalidTeam)?,
+                    false,
+                ),
+            },
         };
         let validation = if complete {
             self.agents.config().validate_team(&team)
@@ -233,6 +278,48 @@ impl Factory {
             self.agents.config().validate_partial_team(&team)
         };
         validation.map_err(FactoryError::InvalidTeam)?;
+        Ok(team)
+    }
+
+    /// The team a recipe pre-fills: the preferred assignment of each pipeline
+    /// role, plus every additional role the recipe selects. Roles with no
+    /// assignment were already rejected by
+    /// [`validate_recipe_roles_available`](Self::validate_recipe_roles_available).
+    fn team_from_recipe(&self, recipe: &RecipeSnapshot) -> Result<WorkflowTeam, FactoryError> {
+        let config = self.agents.config();
+        let preferred = |role: &str| -> Option<String> {
+            config
+                .preferred_assignment(role)
+                .map(|assignment| assignment.agent.clone())
+        };
+        let planner = preferred(roles::PLANNER).ok_or_else(|| {
+            FactoryError::InvalidTeam(
+                "No agent is assigned to the planner role. Configure one from the dashboard."
+                    .to_string(),
+            )
+        })?;
+        let mut team = WorkflowTeam {
+            planner,
+            workers: preferred(roles::WORKER)
+                .map(|agent| vec![agent])
+                .unwrap_or_default(),
+            reviewers: preferred(roles::REVIEWER)
+                .map(|agent| vec![agent])
+                .unwrap_or_default(),
+            additional: std::collections::BTreeMap::new(),
+        };
+        for role in &recipe.roles {
+            if roles::is_pipeline_role(role) {
+                continue;
+            }
+            let agent = preferred(role).ok_or_else(|| {
+                FactoryError::InvalidTeam(format!(
+                    "Recipe '{}' requires role '{role}' but no agent is assigned to it.",
+                    recipe.name
+                ))
+            })?;
+            team.additional.insert(role.clone(), vec![agent]);
+        }
         Ok(team)
     }
 
@@ -299,6 +386,133 @@ impl Factory {
         self.plan_run(run.id, &AtomicBool::new(false))
     }
 
+    /// The project recipe catalog: built-in recipes plus the custom recipes
+    /// from `.factory/recipes.toml`.
+    pub fn recipes(&self) -> Result<RecipeCatalog, FactoryError> {
+        Ok(RecipeCatalog::load(&self.root)?)
+    }
+
+    /// Resolves a recipe id from the catalog into a validated, immutable
+    /// snapshot. Fails with a clear error when the recipe is unknown or one
+    /// of its roles has no assigned agent.
+    pub fn recipe_snapshot(&self, id: &str) -> Result<RecipeSnapshot, FactoryError> {
+        let catalog = self.recipes()?;
+        let recipe = catalog
+            .get(id)
+            .ok_or_else(|| FactoryError::Recipe(RecipeError::NotFound(id.to_string())))?;
+        let snapshot = recipe.snapshot();
+        self.validate_recipe_roles_available(&snapshot)?;
+        Ok(snapshot)
+    }
+
+    /// Validates an inline recipe definition (an unsaved recipe submitted
+    /// with the workflow) and snapshots it the same way a catalog recipe is
+    /// snapshotted.
+    pub fn recipe_snapshot_from_definition(
+        &self,
+        recipe: &Recipe,
+    ) -> Result<RecipeSnapshot, FactoryError> {
+        recipes::validate_recipe(recipe, self.agents.config(), false)
+            .map_err(FactoryError::InvalidTeam)?;
+        let snapshot = recipe.snapshot();
+        self.validate_recipe_roles_available(&snapshot)?;
+        Ok(snapshot)
+    }
+
+    /// Derives a reusable recipe from a run's current configuration: the
+    /// team's roles, the applied recipe's routing/concurrency/guidance, and
+    /// the project's per-role policy presets. Configuration only — never
+    /// tasks, DAG edges, attempts, sessions, or Git state ("Save as Recipe",
+    /// not "Clone Workflow"). `id`, `name`, and `description` are left for
+    /// the caller to fill.
+    pub fn recipe_from_run(&self, run_id: i64) -> Result<Recipe, FactoryError> {
+        let run = self
+            .db
+            .get_run(run_id)?
+            .ok_or(FactoryError::RunNotFound(run_id))?;
+        let team = self.resolve_team(&run)?;
+        let config = self.agents.config();
+        let mut policy_presets = std::collections::BTreeMap::new();
+        for role in team.roles() {
+            if let Some(preset) = config.policies.role(&role).and_then(|scope| scope.preset) {
+                policy_presets.insert(role.clone(), preset.as_str().to_string());
+            }
+        }
+        let (routing, max_parallel_tasks, planner_guidance) = match &run.recipe {
+            Some(snapshot) => (
+                snapshot.routing,
+                snapshot.max_parallel_tasks,
+                snapshot.planner_guidance.clone(),
+            ),
+            None => (
+                RecipeRouting::ProjectDefault,
+                Some(config.runtime.max_parallel_tasks),
+                String::new(),
+            ),
+        };
+        Ok(Recipe {
+            id: String::new(),
+            name: String::new(),
+            description: String::new(),
+            roles: team.roles(),
+            routing,
+            max_parallel_tasks,
+            policy_presets,
+            planner_guidance,
+            github: None,
+            builtin: false,
+        })
+    }
+
+    /// The recipe snapshot persisted on a run, when it has one.
+    pub fn run_recipe(&self, run_id: i64) -> Result<Option<RecipeSnapshot>, FactoryError> {
+        Ok(self.db.get_run(run_id)?.and_then(|run| run.recipe))
+    }
+
+    /// The run's effective task-concurrency preference: the recipe
+    /// snapshot's bounded preference when set, else the project `[runtime]`
+    /// value. The parallel scheduler treats this as its per-run width bound.
+    pub fn run_max_parallel_tasks(&self, run_id: i64) -> Result<usize, FactoryError> {
+        let project_default = self.agents.max_parallel_tasks();
+        Ok(self
+            .run_recipe(run_id)?
+            .map(|recipe| recipe.effective_max_parallel_tasks(project_default))
+            .unwrap_or(project_default))
+    }
+
+    /// The effective policy for a dispatch under a run's recipe snapshot.
+    /// The recipe's policy presets apply as one extra only-narrowing layer:
+    /// the Policy Engine (baseline invariants, role and agent scopes) stays
+    /// authoritative and a recipe can never widen it.
+    fn policy_with_recipe(
+        &self,
+        recipe: Option<&RecipeSnapshot>,
+        role: &str,
+        agent: &str,
+    ) -> factory_policy::EffectivePolicy {
+        let restriction =
+            recipe.and_then(|snapshot| recipes::snapshot_policy_restriction(snapshot, role));
+        self.agents
+            .config()
+            .policies
+            .effective_restricted(role, agent, restriction.as_ref())
+    }
+
+    /// Role-level variant of [`policy_with_recipe`](Self::policy_with_recipe)
+    /// used for diagnostics.
+    fn role_policy_with_recipe(
+        &self,
+        recipe: Option<&RecipeSnapshot>,
+        role: &str,
+    ) -> factory_policy::EffectivePolicy {
+        let restriction =
+            recipe.and_then(|snapshot| recipes::snapshot_policy_restriction(snapshot, role));
+        self.agents
+            .config()
+            .policies
+            .effective_for_role_restricted(role, restriction.as_ref())
+    }
+
     pub fn plan_run(&self, run_id: i64, cancel: &AtomicBool) -> Result<RunOutcome, FactoryError> {
         let result = self.plan_run_inner(run_id, cancel);
         if result.is_err() {
@@ -331,6 +545,12 @@ impl Factory {
             available_roles.iter().cloned().collect();
         let planner_roles = crate::planner::planners_catalog(&catalog, &available_roles);
         let untrusted_notice = self.untrusted_issue_notice(run_id)?;
+        // Recipe guidance is bounded background context for the Planner; it
+        // never overrides the schema, role rules, policies, or the objective.
+        let recipe_context = run.recipe.as_ref().map(|snapshot| PlannerRecipeContext {
+            name: snapshot.name.clone(),
+            guidance: snapshot.planner_guidance.clone(),
+        });
         let mut rejection: Option<String> = None;
         for attempt in 0..crate::planner::MAX_ATTEMPTS {
             let instruction = planner_mission(
@@ -338,6 +558,7 @@ impl Factory {
                 &planner_roles,
                 rejection.as_deref(),
                 untrusted_notice.as_deref(),
+                recipe_context.as_ref(),
             );
             let invocation = self.invoke_with_agent(
                 planner.clone(),
@@ -452,7 +673,7 @@ impl Factory {
                     )));
                 }
                 let operation = roles::resolve_task_operation(task, &catalog_for_overrides);
-                let policy = self.agents.config().effective_policy(role, pinned);
+                let policy = self.policy_with_recipe(run.recipe.as_ref(), role, pinned);
                 if let Err(reason) =
                     factory_policy::validate_executable(&policy, operation.as_str())
                 {
@@ -473,7 +694,7 @@ impl Factory {
             }
         }
         let catalog = self.agents.config().catalog();
-        self.validate_run_policies_run(run_id, &tasks, &team, &catalog)?;
+        self.validate_run_policies_run(run_id, &tasks, &team, &catalog, run.recipe.as_ref())?;
         Repo::detect_bounded(&self.root, &self.root)?;
         self.db.set_run_status(run_id, RunStatus::Active)?;
         Ok(team)
@@ -482,13 +703,16 @@ impl Factory {
     /// Pre-execution policy gate for starting (or retrying) a workflow. A task
     /// that cannot legally execute under *any* of its assigned agents' effective
     /// policies blocks the workflow with a useful reason, before any agent
-    /// process is launched. Policy failures never consume task retries.
+    /// process is launched. Policy failures never consume task retries. The
+    /// run's recipe snapshot narrows the effective policies when it carries
+    /// policy presets for a role.
     fn validate_run_policies_run(
         &self,
         run_id: i64,
         tasks: &[Task],
         team: &WorkflowTeam,
         catalog: &RoleCatalog,
+        recipe: Option<&RecipeSnapshot>,
     ) -> Result<(), FactoryError> {
         let mut blockers: Vec<String> = Vec::new();
         for task in tasks {
@@ -499,11 +723,11 @@ impl Factory {
                 continue;
             }
             let any_allowed = agents.iter().any(|agent| {
-                let policy = self.agents.config().effective_policy(role, agent);
+                let policy = self.policy_with_recipe(recipe, role, agent);
                 factory_policy::validate_executable(&policy, operation.as_str()).is_ok()
             });
             if !any_allowed {
-                let policy = self.agents.config().effective_role_policy(role);
+                let policy = self.role_policy_with_recipe(recipe, role);
                 let reason = factory_policy::validate_executable(&policy, operation.as_str())
                     .err()
                     .unwrap_or_else(|| "no assigned agent allows this task".to_string());
@@ -536,27 +760,31 @@ impl Factory {
         capacity: &AgentCapacity,
         role: &str,
         operation: TaskOperation,
+        recipe: Option<&RecipeSnapshot>,
     ) -> Option<String> {
         if pool.is_empty() {
             return None;
         }
         let preferred = roles::select_agent_with_capacity(pool, index, capacity);
         if let Some(candidate) = preferred {
-            let policy = self.agents.config().effective_policy(role, candidate);
+            let policy = self.policy_with_recipe(recipe, role, candidate);
             if factory_policy::validate_executable(&policy, operation.as_str()).is_ok() {
                 return Some(candidate.clone());
             }
         }
         (0..pool.len()).find_map(|offset| {
             let candidate = &pool[(index + offset) % pool.len()];
-            let policy = self.agents.config().effective_policy(role, candidate);
+            let policy = self.policy_with_recipe(recipe, role, candidate);
             factory_policy::validate_executable(&policy, operation.as_str())
                 .ok()
                 .map(|_| candidate.clone())
         })
     }
 
-    /// Routes one dispatch to an agent under the configured routing mode.
+    /// Routes one dispatch to an agent. The mode comes from the run's recipe
+    /// snapshot when it pins one, else the project `[routing]` configuration;
+    /// the routing engine itself (candidate filtering, performance scoring,
+    /// capacity, policies, overrides) stays authoritative either way.
     ///
     /// Eligibility is filtered before any scoring: a candidate must belong to
     /// the role's team pool, pass the Policy Engine for the operation, and be
@@ -577,7 +805,11 @@ impl Factory {
         honor_override: bool,
     ) -> Result<RoutedAgent<'_>, FactoryError> {
         let routing_config = self.agents.config().routing;
-        let mode = routing_config.mode;
+        let recipe = self.run_recipe(task.run_id)?;
+        let mode = recipe
+            .as_ref()
+            .map(|snapshot| snapshot.routing.resolve(routing_config.mode))
+            .unwrap_or(routing_config.mode);
         let mode_str = mode.as_str().to_string();
         let preferred_agent = self
             .agents
@@ -598,7 +830,7 @@ impl Factory {
                     task.id, pinned, role
                 )));
             }
-            let policy = self.agents.config().effective_policy(role, &pinned);
+            let policy = self.policy_with_recipe(recipe.as_ref(), role, &pinned);
             if let Err(reason) = factory_policy::validate_executable(&policy, operation.as_str()) {
                 return Err(FactoryError::RoutingOverride(format!(
                     "task #{} pins agent '{}' which is policy-ineligible for operation '{}': {}",
@@ -634,6 +866,7 @@ impl Factory {
                 mode_str,
                 language,
                 routing::reasons::ROUND_ROBIN,
+                recipe.as_ref(),
             ),
             factory_types::RoutingMode::Manual => self.route_manual(
                 task,
@@ -644,6 +877,7 @@ impl Factory {
                 mode_str,
                 language,
                 preferred_agent,
+                recipe.as_ref(),
             ),
             factory_types::RoutingMode::Performance => self.route_performance(
                 task,
@@ -655,6 +889,7 @@ impl Factory {
                 language,
                 preferred_agent,
                 routing_config,
+                recipe.as_ref(),
             ),
         }
     }
@@ -681,10 +916,18 @@ impl Factory {
         mode_str: String,
         language: Option<&str>,
         reason: &'static str,
+        recipe: Option<&RecipeSnapshot>,
     ) -> Result<RoutedAgent<'_>, FactoryError> {
         let name = self
-            .select_agent_for_task(pool, rotation_index, &self.capacity, role, operation)
-            .ok_or_else(|| self.no_executable_agent_error(task, role, pool, operation))?;
+            .select_agent_for_task(
+                pool,
+                rotation_index,
+                &self.capacity,
+                role,
+                operation,
+                recipe,
+            )
+            .ok_or_else(|| self.no_executable_agent_error(task, role, pool, operation, recipe))?;
         let agent = self.agents.command_agent_for(role, &name)?;
         let name = agent.name().to_string();
         let guard = self.capacity.acquire(&name);
@@ -713,9 +956,10 @@ impl Factory {
         mode_str: String,
         language: Option<&str>,
         preferred_agent: Option<String>,
+        recipe: Option<&RecipeSnapshot>,
     ) -> Result<RoutedAgent<'_>, FactoryError> {
         if let Some(preferred) = preferred_agent.filter(|agent| pool.contains(agent)) {
-            let policy = self.agents.config().effective_policy(role, &preferred);
+            let policy = self.policy_with_recipe(recipe, role, &preferred);
             if factory_policy::validate_executable(&policy, operation.as_str()).is_ok() {
                 let limit = self.agent_concurrency_limit(&preferred);
                 if let Some(guard) = self.capacity.try_acquire(&preferred, limit) {
@@ -745,6 +989,7 @@ impl Factory {
             mode_str,
             language,
             routing::reasons::ROUND_ROBIN,
+            recipe,
         )
     }
 
@@ -760,6 +1005,7 @@ impl Factory {
         language: Option<&str>,
         preferred_agent: Option<String>,
         routing_config: RoutingConfig,
+        recipe: Option<&RecipeSnapshot>,
     ) -> Result<RoutedAgent<'_>, FactoryError> {
         // Agents with a failed or changes-requested attempt on this task get a
         // small deterministic retry penalty so retries may route elsewhere.
@@ -781,7 +1027,7 @@ impl Factory {
         let mut facts: Vec<CandidateFacts> = Vec::new();
         let mut first_resolution_error: Option<FactoryError> = None;
         for agent in pool {
-            let policy = self.agents.config().effective_policy(role, agent);
+            let policy = self.policy_with_recipe(recipe, role, agent);
             if factory_policy::validate_executable(&policy, operation.as_str()).is_err() {
                 continue;
             }
@@ -813,7 +1059,7 @@ impl Factory {
             }
             // Nobody survived filtering; surface the same policy diagnostics
             // the pre-start gate produces.
-            return Err(self.no_executable_agent_error(task, role, pool, operation));
+            return Err(self.no_executable_agent_error(task, role, pool, operation, recipe));
         }
 
         let ranked = routing::rank(&facts);
@@ -877,6 +1123,7 @@ impl Factory {
                 mode_str,
                 language,
                 routing::reasons::ALL_SATURATED,
+                recipe,
             );
         }
 
@@ -891,6 +1138,7 @@ impl Factory {
             mode_str,
             language,
             routing::reasons::FALLBACK,
+            recipe,
         )
     }
 
@@ -965,6 +1213,14 @@ impl Factory {
         let pool = team.agents_for_role(&role).to_vec();
         let language = self.routing_language(task.id);
         let routing_config = self.agents.config().routing;
+        // The run's recipe may pin the routing mode; project_default keeps
+        // whatever the project configured.
+        let mode = run
+            .recipe
+            .as_ref()
+            .map(|snapshot| snapshot.routing.resolve(routing_config.mode))
+            .unwrap_or(routing_config.mode);
+        let recipe = run.recipe.as_ref();
         let now = Utc::now();
         let preferred_agent = self
             .agents
@@ -976,7 +1232,7 @@ impl Factory {
         let mut best: Option<(String, Option<f64>)> = None;
         let mut eligible: Vec<CandidateFacts> = Vec::new();
         for agent in &pool {
-            let policy = self.agents.config().effective_policy(&role, agent);
+            let policy = self.policy_with_recipe(recipe, &role, agent);
             if factory_policy::validate_executable(&policy, operation.as_str()).is_err() {
                 candidates.push(RoutingCandidateScore {
                     agent: agent.clone(),
@@ -986,7 +1242,7 @@ impl Factory {
                 });
                 continue;
             }
-            let performance = if routing_config.mode == factory_types::RoutingMode::Performance {
+            let performance = if mode == factory_types::RoutingMode::Performance {
                 factory_eval::resolve_performance(
                     &self.db,
                     agent,
@@ -1014,7 +1270,7 @@ impl Factory {
             let pick = routing::exploration_pick(
                 &eligible,
                 &ranked,
-                routing_config.mode,
+                mode,
                 routing_config.exploration,
                 self.db.count_task_attempts(task.run_id)?,
             );
@@ -1033,7 +1289,7 @@ impl Factory {
             candidates = self.round_robin_notes(&pool);
         }
 
-        let reason = match (&task.agent_override, routing_config.mode, &best) {
+        let reason = match (&task.agent_override, mode, &best) {
             (Some(_), _, _) => routing::reasons::OVERRIDE.to_string(),
             (None, factory_types::RoutingMode::Manual, _) => {
                 routing::reasons::PREFERRED.to_string()
@@ -1054,7 +1310,7 @@ impl Factory {
         };
 
         Ok(RoutingPreview {
-            mode: routing_config.mode.as_str().to_string(),
+            mode: mode.as_str().to_string(),
             task_id: task.id,
             role: Some(role),
             operation: Some(operation),
@@ -1069,14 +1325,17 @@ impl Factory {
     /// Post-hoc evidence enforcement: files changed by an attempt must fall
     /// inside the session's effective write scopes, and reported commands
     /// inside the command policy. Legacy (policy-less) sessions are never
-    /// affected: only explicitly configured restrictions are enforced.
+    /// affected: only explicitly configured restrictions are enforced. The
+    /// run's recipe snapshot narrows the scopes when it carries a preset for
+    /// the role.
     fn enforce_evidence_policy(
         &self,
+        recipe: Option<&RecipeSnapshot>,
         role: &str,
         agent: &str,
         evidence: &TaskEvidence,
     ) -> Result<(), FactoryError> {
-        let policy = self.agents.config().effective_policy(role, agent);
+        let policy = self.policy_with_recipe(recipe, role, agent);
         if policy.permissive {
             return Ok(());
         }
@@ -1107,11 +1366,12 @@ impl Factory {
         role: &str,
         pool: &[String],
         operation: TaskOperation,
+        recipe: Option<&RecipeSnapshot>,
     ) -> FactoryError {
         if pool.is_empty() {
             return FactoryError::TaskRoleUnavailable(task.id, role.to_string());
         }
-        let policy = self.agents.config().effective_role_policy(role);
+        let policy = self.role_policy_with_recipe(recipe, role);
         let reason = factory_policy::validate_executable(&policy, operation.as_str())
             .err()
             .unwrap_or_else(|| "no assigned agent allows this task".to_string());
@@ -1247,7 +1507,7 @@ impl Factory {
         // cannot legally execute (no retry is consumed by a policy block).
         let tasks = self.db.list_tasks(task.run_id)?;
         let catalog = self.agents.config().catalog();
-        self.validate_run_policies_run(task.run_id, &tasks, &team, &catalog)?;
+        self.validate_run_policies_run(task.run_id, &tasks, &team, &catalog, run.recipe.as_ref())?;
         self.mark_task(task_id, TaskState::Ready)?;
         self.db.set_run_status(task.run_id, RunStatus::Active)?;
         Ok(task.run_id)
@@ -1410,7 +1670,8 @@ impl Factory {
             // Post-hoc policy enforcement: any file written outside the
             // session's effective write scopes (or a denied command) fails the
             // attempt without consuming a normal retry.
-            if let Err(policy_error) = self.enforce_evidence_policy(&role, &worker_name, &evidence)
+            if let Err(policy_error) =
+                self.enforce_evidence_policy(run.recipe.as_ref(), &role, &worker_name, &evidence)
             {
                 self.db.finish_task_attempt(
                     attempt.id,
@@ -1786,7 +2047,9 @@ impl Factory {
                 agent_run.as_ref().ok().map(|run| &run.result),
             )?;
 
-            if let Err(policy_error) = self.enforce_evidence_policy(&role, &agent_name, &evidence) {
+            if let Err(policy_error) =
+                self.enforce_evidence_policy(run.recipe.as_ref(), &role, &agent_name, &evidence)
+            {
                 self.db.finish_task_attempt(
                     attempt.id,
                     AttemptStatus::Failed,
@@ -2016,7 +2279,7 @@ impl Factory {
             // A review role may only inspect: any write outside the policy is
             // a violation, and review roles never commit production work.
             if let Err(policy_error) =
-                self.enforce_evidence_policy(&role, &reviewer_name, &evidence)
+                self.enforce_evidence_policy(run.recipe.as_ref(), &role, &reviewer_name, &evidence)
             {
                 self.db.finish_task_attempt(
                     attempt.id,
@@ -2330,12 +2593,14 @@ impl Factory {
     ) -> Result<Invocation, FactoryError> {
         let started = chrono::Utc::now().to_rfc3339();
         // Resolve the one effective policy for this session (baseline → role →
-        // agent). The same policy drives environment filtering, audit, and the
-        // post-hoc evidence checks; there is no second permission model.
-        let policy = self
-            .agents
-            .config()
-            .effective_policy(scope.role, agent.name());
+        // agent, narrowed by the run's recipe preset when one applies). The
+        // same policy drives environment filtering, audit, and the post-hoc
+        // evidence checks; there is no second permission model.
+        let recipe = scope
+            .run_id
+            .and_then(|run_id| self.db.get_run(run_id).ok().flatten())
+            .and_then(|run| run.recipe);
+        let policy = self.policy_with_recipe(recipe.as_ref(), scope.role, agent.name());
         let policy_audit = factory_types::SessionPolicyAudit {
             source: policy.source.clone(),
             filesystem: policy.filesystem.mode_name().to_string(),
@@ -2824,11 +3089,14 @@ impl Factory {
     /// Imports a GitHub Issue as a new workflow. The issue becomes the run's
     /// objective (bounded, verbatim) and is persisted as an untrusted link;
     /// nothing executes until the user starts the workflow. Authentication
-    /// and repository resolution failures return actionable errors.
+    /// and repository resolution failures return actionable errors. Recipes
+    /// apply exactly like for objective-created workflows — same catalog,
+    /// same snapshot, no separate GitHub recipe system.
     pub fn import_github_issue(
         &self,
         reference: &str,
         team: Option<WorkflowTeam>,
+        recipe: Option<&RecipeSnapshot>,
     ) -> Result<Run, FactoryError> {
         let issue_ref = factory_github::IssueRef::parse(reference)?;
         let remote = self.github_remote()?;
@@ -2846,7 +3114,7 @@ impl Factory {
         gh.auth_status()?;
         let issue = gh.view_issue(&remote.repository, issue_ref.number)?;
         let objective = factory_github::objective_from_issue(&issue);
-        let run = self.begin_run(&objective, team)?;
+        let run = self.begin_run_with_recipe(&objective, team, recipe)?;
         let link = factory_github::issue_link(
             &issue,
             &remote.repository,
@@ -2951,6 +3219,14 @@ impl Factory {
             .list_pull_requests(&remote.repository, &delivery.head_branch)
             .ok()
             .and_then(|prs| prs.into_iter().max_by_key(|pr| pr.number));
+        // The recipe's GitHub delivery default (when the run has one) seeds
+        // the draft checkbox; the user can still change it before creating.
+        let draft = run
+            .recipe
+            .as_ref()
+            .and_then(|recipe| recipe.github)
+            .map(|github| github.draft)
+            .unwrap_or(false);
         Ok(crate::github::PrPreview {
             run_id,
             repository: remote.repository.clone(),
@@ -2958,7 +3234,7 @@ impl Factory {
             head: delivery.head_branch.clone(),
             title: factory_github::default_pr_title(&run.objective, issue_title.as_deref()),
             body: factory_github::build_pr_body(&evidence),
-            draft: false,
+            draft,
             issue_number: evidence.issue_number,
             issue_url: link.as_ref().map(|link| link.issue_url.clone()),
             existing,
@@ -3461,6 +3737,7 @@ mod tests {
             planner_agent: None,
             team: None,
             plan_revision: 1,
+            recipe: None,
             created_at: String::new(),
             updated_at: String::new(),
         };

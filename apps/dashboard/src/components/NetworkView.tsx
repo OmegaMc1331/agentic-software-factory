@@ -10,6 +10,7 @@ import {
   fetchConfig,
   fetchGraph,
   fetchGraphWorkspace,
+  fetchRecipes,
   fetchRoles,
   removeRoleAssignment,
   retryTask,
@@ -31,6 +32,7 @@ import type {
   GraphEdge,
   GraphNode,
   GraphWorkspace,
+  Recipe,
   RoleInfo,
   TaskState,
   WorkflowTeam,
@@ -80,6 +82,7 @@ export function NetworkView() {
   const [workspace, setWorkspace] = useState<GraphWorkspace | null>(null);
   const [config, setConfig] = useState<ConfigData | null>(null);
   const [roles, setRoles] = useState<RoleInfo[] | null>(null);
+  const [recipes, setRecipes] = useState<Recipe[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [operationError, setOperationError] = useState<string | null>(null);
   const [pollError, setPollError] = useState<string | null>(null);
@@ -98,12 +101,13 @@ export function NetworkView() {
   const layoutCache = useRef<{ key: string; layout: NetworkLayout } | null>(null);
 
   const reload = useCallback(() => {
-    Promise.all([fetchGraph(), fetchGraphWorkspace(), fetchConfig(), fetchRoles()])
-      .then(([nextData, nextWorkspace, nextConfig, nextRoles]) => {
+    Promise.all([fetchGraph(), fetchGraphWorkspace(), fetchConfig(), fetchRoles(), fetchRecipes()])
+      .then(([nextData, nextWorkspace, nextConfig, nextRoles, nextRecipes]) => {
         setData(nextData);
         setWorkspace(nextWorkspace);
         setConfig(nextConfig);
         setRoles(nextRoles);
+        setRecipes(nextRecipes);
         setError(null);
         if (nextWorkspace.warning) setOperationError(nextWorkspace.warning);
       })
@@ -281,11 +285,13 @@ export function NetworkView() {
   );
 
   const createWorkflowNode = useCallback(
-    async (objective: string, team: WorkflowTeam) => {
+    async (objective: string, team: WorkflowTeam, recipe?: string) => {
       if (!workspace) return;
       setOperationError(null);
       try {
-        const run = await createWorkflow(objective, team);
+        const run = recipe
+          ? await createWorkflow(objective, team, recipe)
+          : await createWorkflow(objective, team);
         const nodeId = `run:${run.id}`;
         const nextWorkspace = {
           ...workspace,
@@ -305,11 +311,13 @@ export function NetworkView() {
   );
 
   const createWorkflowFromIssueNode = useCallback(
-    async (issue: string, team: WorkflowTeam) => {
+    async (issue: string, team: WorkflowTeam, recipe?: string) => {
       if (!workspace) return;
       setOperationError(null);
       try {
-        const run = await createWorkflowFromIssue(issue, team);
+        const run = recipe
+          ? await createWorkflowFromIssue(issue, team, recipe)
+          : await createWorkflowFromIssue(issue, team);
         const nodeId = `run:${run.id}`;
         const nextWorkspace = {
           ...workspace,
@@ -647,14 +655,19 @@ export function NetworkView() {
           open={addOpen}
           config={config}
           roles={roles}
+          recipes={recipes}
           error={operationError}
           initialKind={initialAddKind}
           onClose={() => {
             setAddOpen(false);
             setInitialAddKind(null);
           }}
-          onCreateWorkflow={(objective, team) => void createWorkflowNode(objective, team)}
-          onCreateWorkflowFromIssue={(issue, team) => void createWorkflowFromIssueNode(issue, team)}
+          onCreateWorkflow={(objective, team, recipe) =>
+            void createWorkflowNode(objective, team, recipe)
+          }
+          onCreateWorkflowFromIssue={(issue, team, recipe) =>
+            void createWorkflowFromIssueNode(issue, team, recipe)
+          }
           onCreateAgent={createAgent}
           onCreateRole={(value) => void createRoleNode(value)}
           onAssignCoreRole={(roleId, agent) => void assignCoreRole(roleId, agent)}

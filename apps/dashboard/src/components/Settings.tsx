@@ -1,13 +1,17 @@
 import { useCallback, useEffect, useState } from "react";
 import {
   addRoleAssignment,
+  createRecipe,
+  deleteRecipe,
   deleteRole,
   fetchAgents,
   fetchConfig,
+  fetchRecipes,
   fetchRoles,
   removeRoleAssignment,
   saveConfig,
   setPreferredAssignment,
+  updateRecipe,
   updateRole,
 } from "../api";
 import {
@@ -16,9 +20,12 @@ import {
   type AgentStatusInfo,
   type ConfigData,
   type PromptTransport,
+  type Recipe,
   type RoleInfo,
   type RoutingModeValue,
 } from "../types";
+import { RECIPE_ROUTING_LABELS } from "../types";
+import { RecipeForm } from "./RecipeForm";
 import { RoleForm, type RoleFormInitial } from "./RoleForm";
 
 const PRESETS: Record<
@@ -110,20 +117,27 @@ export function SettingsView() {
   const [config, setConfig] = useState<ConfigData | null>(null);
   const [available, setAvailable] = useState<Record<string, AgentStatusInfo>>({});
   const [roles, setRoles] = useState<RoleInfo[]>([]);
+  const [recipes, setRecipes] = useState<Recipe[]>([]);
   const [draft, setDraft] = useState<Draft | null>(null);
   const [editingRole, setEditingRole] = useState<RoleInfo | null>(null);
   const [roleSelection, setRoleSelection] = useState<Record<string, string>>({});
+  const [recipeEditor, setRecipeEditor] = useState<{
+    mode: "create" | "edit";
+    id: string | null;
+    duplicateOf: Recipe | null;
+  } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState<string | null>(null);
 
   const reload = useCallback(() => {
     setError(null);
     setSaved(null);
-    Promise.all([fetchConfig(), fetchAgents(), fetchRoles()])
-      .then(([nextConfig, list, nextRoles]) => {
+    Promise.all([fetchConfig(), fetchAgents(), fetchRoles(), fetchRecipes()])
+      .then(([nextConfig, list, nextRoles, nextRecipes]) => {
         setConfig(nextConfig);
         setAvailable(Object.fromEntries(list.map((agent) => [agent.name, agent])));
         setRoles(nextRoles);
+        setRecipes(nextRecipes);
         setEditingRole((current) =>
           current ? (nextRoles.find((role) => role.id === current.id) ?? null) : null
         );
@@ -464,6 +478,146 @@ export function SettingsView() {
           />
         </section>
       )}
+
+      <section className="section">
+        <div className="settings-section-head">
+          <h3 className="section-title">Recipes</h3>
+          {!recipeEditor && (
+            <button
+              className="button"
+              onClick={() => setRecipeEditor({ mode: "create", id: null, duplicateOf: null })}
+            >
+              New recipe
+            </button>
+          )}
+        </div>
+        <p className="settings-note">
+          Reusable workflow configuration: roles, routing, parallelism, policy presets, and Planner
+          guidance. A recipe never stores tasks — the Planner still builds each plan from the
+          objective. Custom recipes live in <code>.factory/recipes.toml</code>; built-ins are
+          read-only but can be duplicated.
+        </p>
+        {recipeEditor ? (
+          <RecipeForm
+            mode={recipeEditor.mode}
+            roles={roles}
+            initial={
+              recipeEditor.duplicateOf
+                ? {
+                    name: `${recipeEditor.duplicateOf.name} (copy)`,
+                    description: recipeEditor.duplicateOf.description,
+                    roles: recipeEditor.duplicateOf.roles,
+                    routing: recipeEditor.duplicateOf.routing,
+                    maxParallelTasks: recipeEditor.duplicateOf.maxParallelTasks,
+                    policyPresets: recipeEditor.duplicateOf.policyPresets,
+                    plannerGuidance: recipeEditor.duplicateOf.plannerGuidance,
+                  }
+                : recipeEditor.mode === "edit"
+                  ? (() => {
+                      const recipe = recipes.find((candidate) => candidate.id === recipeEditor.id);
+                      return recipe
+                        ? {
+                            name: recipe.name,
+                            description: recipe.description,
+                            roles: recipe.roles,
+                            routing: recipe.routing,
+                            maxParallelTasks: recipe.maxParallelTasks,
+                            policyPresets: recipe.policyPresets,
+                            plannerGuidance: recipe.plannerGuidance,
+                          }
+                        : undefined;
+                    })()
+                  : undefined
+            }
+            error={error}
+            submitLabel={recipeEditor.mode === "edit" ? "Save recipe" : "Create recipe"}
+            onSubmit={(value) => {
+              setError(null);
+              const done = () => {
+                setRecipeEditor(null);
+                setSaved(`Saved the ${value.name} recipe.`);
+                reload();
+              };
+              const failed = (err: Error) => setError(err.message);
+              if (recipeEditor.mode === "edit" && recipeEditor.id) {
+                updateRecipe(recipeEditor.id, value).then(done).catch(failed);
+              } else {
+                createRecipe(value).then(done).catch(failed);
+              }
+            }}
+            onCancel={() => setRecipeEditor(null)}
+          />
+        ) : (
+          <div className="settings-roles">
+            {recipes.map((recipe) => (
+              <article key={recipe.id} className="settings-role">
+                <div className="settings-role-head">
+                  <strong>{recipe.name}</strong>
+                  <span className="muted">
+                    {recipe.builtin ? "Built-in · read-only" : "Custom"} ·{" "}
+                    {RECIPE_ROUTING_LABELS[recipe.routing]}
+                    {recipe.maxParallelTasks ? ` · parallelism ${recipe.maxParallelTasks}` : ""}
+                  </span>
+                </div>
+                {recipe.description && <p className="settings-note">{recipe.description}</p>}
+                <div className="settings-role-agents">
+                  {recipe.roles.length === 0 ? (
+                    <span className="muted">No pre-selected roles</span>
+                  ) : (
+                    recipe.roles.map((roleId) => (
+                      <span key={roleId} className="settings-role-chip">
+                        {roles.find((role) => role.id === roleId)?.name ?? roleId}
+                      </span>
+                    ))
+                  )}
+                </div>
+                <div className="settings-role-actions">
+                  <span className="settings-actions">
+                    <button
+                      className="button"
+                      aria-label={`Duplicate ${recipe.name}`}
+                      onClick={() =>
+                        setRecipeEditor({
+                          mode: "create",
+                          id: null,
+                          duplicateOf: recipe,
+                        })
+                      }
+                    >
+                      Duplicate
+                    </button>
+                    {!recipe.builtin && (
+                      <>
+                        <button
+                          className="button"
+                          aria-label={`Edit ${recipe.name} recipe`}
+                          onClick={() =>
+                            setRecipeEditor({ mode: "edit", id: recipe.id, duplicateOf: null })
+                          }
+                        >
+                          Edit
+                        </button>
+                        <button
+                          className="button"
+                          onClick={() => {
+                            if (!window.confirm(`Delete the ${recipe.name} recipe?`)) return;
+                            runRoleOperation(
+                              () => deleteRecipe(recipe.id),
+                              `Deleted the ${recipe.name} recipe.`
+                            );
+                          }}
+                        >
+                          Delete
+                        </button>
+                      </>
+                    )}
+                  </span>
+                </div>
+              </article>
+            ))}
+          </div>
+        )}
+      </section>
 
       <section className="section">
         <div className="settings-section-head">

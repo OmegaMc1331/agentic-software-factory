@@ -1,6 +1,13 @@
 import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { fetchAgents, fetchConfig, fetchGraph, fetchGraphWorkspace, fetchRoles } from "../api";
+import {
+  fetchAgents,
+  fetchConfig,
+  fetchGraph,
+  fetchGraphWorkspace,
+  fetchRecipes,
+  fetchRoles,
+} from "../api";
 import { NetworkView } from "./NetworkView";
 import { SettingsView } from "./Settings";
 
@@ -10,6 +17,7 @@ vi.mock("../api", () => ({
   fetchGraph: vi.fn(),
   fetchGraphWorkspace: vi.fn(),
   fetchRoles: vi.fn(),
+  fetchRecipes: vi.fn(),
   saveConfig: vi.fn(),
   saveGraphWorkspace: vi.fn(),
 }));
@@ -20,6 +28,7 @@ beforeEach(() => {
   vi.mocked(fetchGraph).mockReset();
   vi.mocked(fetchGraphWorkspace).mockReset();
   vi.mocked(fetchRoles).mockReset();
+  vi.mocked(fetchRecipes).mockReset().mockResolvedValue([]);
   vi.mocked(fetchGraphWorkspace).mockResolvedValue({
     version: 1,
     nodes: {},

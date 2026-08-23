@@ -89,12 +89,68 @@ export interface WorkflowTeam {
   additional: Record<string, string[]>;
 }
 
+// --- Recipes ------------------------------------------------------------------
+
+/**
+ * The routing selection a recipe may make. `project_default` keeps whatever
+ * the project's `[routing]` mode is; recipes can never select `manual`.
+ */
+export type RecipeRoutingValue = "project_default" | "round_robin" | "performance";
+
+export const RECIPE_ROUTING_LABELS: Record<RecipeRoutingValue, string> = {
+  project_default: "Project default",
+  round_robin: "Round-robin",
+  performance: "Performance-aware",
+};
+
+/** Optional GitHub delivery defaults a recipe carries. */
+export interface RecipeDelivery {
+  draft: boolean;
+}
+
+/**
+ * A reusable workflow configuration: how Factory should approach work. A
+ * recipe never contains tasks or DAG edges — the Planner generates the plan
+ * from the objective.
+ */
+export interface Recipe {
+  id: string;
+  name: string;
+  description: string;
+  roles: string[];
+  routing: RecipeRoutingValue;
+  maxParallelTasks: number | null;
+  policyPresets: Record<string, string>;
+  plannerGuidance: string;
+  github?: RecipeDelivery | null;
+  builtin: boolean;
+}
+
+/**
+ * The immutable recipe snapshot persisted on a run at creation time. Later
+ * recipe edits never change existing workflows.
+ */
+export interface RecipeSnapshot {
+  id: string;
+  name: string;
+  roles: string[];
+  routing: RecipeRoutingValue;
+  maxParallelTasks: number | null;
+  policyPresets: Record<string, string>;
+  plannerGuidance: string;
+  github?: RecipeDelivery | null;
+}
+
+/** What a run created before recipes existed displays in the inspector. */
+export const NO_RECIPE_LABEL = "No Recipe";
+
 export interface Run {
   id: number;
   objective: string;
   status: string;
   plannerAgent: string | null;
   team: WorkflowTeam | null;
+  recipe?: RecipeSnapshot | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -397,6 +453,7 @@ export interface RunMeta {
   status: string;
   plannerAgent: string | null;
   team: WorkflowTeam | null;
+  recipe?: RecipeSnapshot | null;
   createdAt: string;
   counts: TaskCounts;
   /** GitHub origin, when the workflow was imported from an Issue. */

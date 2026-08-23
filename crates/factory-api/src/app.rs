@@ -14,7 +14,9 @@ use axum::{Json, Router};
 use factory_core::{Agents, Config, ConfigError, RoleAssignment};
 use factory_db::FactoryDb;
 use factory_runtime::{Runtime, RuntimeError, TerminalSubscription};
-use factory_types::{AgentSessionMode, WorkflowTeam};
+use factory_types::{
+    AgentSessionMode, Recipe, RecipeDelivery, RecipeRouting, RecipeSnapshot, WorkflowTeam,
+};
 use serde::Deserialize;
 use serde_json::json;
 use tokio_stream::wrappers::ReceiverStream;
@@ -105,6 +107,10 @@ impl From<RuntimeError> for ApiError {
             | RuntimeError::Factory(factory_core::FactoryError::TaskNotFound(_)) => {
                 StatusCode::NOT_FOUND
             }
+            RuntimeError::Factory(factory_core::FactoryError::Recipe(
+                factory_core::RecipeError::NotFound(_),
+            )) => StatusCode::NOT_FOUND,
+            RuntimeError::Factory(factory_core::FactoryError::Recipe(_)) => StatusCode::BAD_REQUEST,
             RuntimeError::Factory(
                 factory_core::FactoryError::EmptyObjective
                 | factory_core::FactoryError::InvalidRunState(_, _)
@@ -125,6 +131,21 @@ impl From<RuntimeError> for ApiError {
                 StatusCode::CONFLICT
             }
             _ => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        ApiError::new(status, error.to_string())
+    }
+}
+
+impl From<factory_core::RecipeError> for ApiError {
+    fn from(error: factory_core::RecipeError) -> Self {
+        let status = if error.is_invalid() {
+            if matches!(error, factory_core::RecipeError::NotFound(_)) {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::BAD_REQUEST
+            }
+        } else {
+            StatusCode::INTERNAL_SERVER_ERROR
         };
         ApiError::new(status, error.to_string())
     }
@@ -156,7 +177,10 @@ pub fn router(state: SharedState) -> Router {
         )
         .route("/api/runs/:id/team", put(put_run_team))
         .route("/api/runs/:id/artifacts", get(run_artifacts))
+        .route("/api/runs/:id/recipe", post(save_run_as_recipe))
         .route("/api/tasks/:id/artifacts", get(task_artifacts))
+        .route("/api/recipes", get(list_recipes).post(create_recipe))
+        .route("/api/recipes/:id", put(update_recipe).delete(delete_recipe))
         .route("/api/roles", get(list_roles).post(create_role))
         .route("/api/roles/:id", put(update_role).delete(delete_role))
         .route("/api/roles/:id/assignments", post(add_role_assignment))
@@ -246,6 +270,85 @@ struct CreateRunRequest {
     objective: String,
     #[serde(default)]
     team: Option<WorkflowTeam>,
+    /// A recipe id (from the catalog) or an inline recipe definition whose
+    /// resolved configuration is snapshotted onto the run.
+    #[serde(default)]
+    recipe: Option<RecipeSelection>,
+}
+
+/// A workflow's recipe selection: either a catalog id or a full definition.
+/// Untagged so `{"recipe": "security"}` and `{"recipe": {...}}` both parse.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RecipeSelection {
+    Id(String),
+    Definition(RecipeDefinitionBody),
+}
+
+/// The editable recipe form shared by creation, updates, and inline workflow
+/// selection. Never includes task/DAG/history fields — a recipe is
+/// configuration only.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RecipeDefinitionBody {
+    #[serde(default)]
+    id: Option<String>,
+    name: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    roles: Vec<String>,
+    #[serde(default)]
+    routing: RecipeRouting,
+    #[serde(default)]
+    max_parallel_tasks: Option<usize>,
+    #[serde(default)]
+    policy_presets: BTreeMap<String, String>,
+    #[serde(default)]
+    planner_guidance: String,
+    #[serde(default)]
+    github: Option<RecipeDelivery>,
+}
+
+impl RecipeDefinitionBody {
+    fn into_recipe(self) -> Result<Recipe, ApiError> {
+        let id = self
+            .id
+            .filter(|id| !id.trim().is_empty())
+            .unwrap_or_else(|| factory_core::slugify(&self.name));
+        Ok(Recipe {
+            id,
+            name: self.name,
+            description: self.description,
+            roles: self.roles,
+            routing: self.routing,
+            max_parallel_tasks: self.max_parallel_tasks,
+            policy_presets: self.policy_presets,
+            planner_guidance: self.planner_guidance,
+            github: self.github,
+            builtin: false,
+        })
+    }
+}
+
+/// Resolves the recipe selection into an immutable snapshot. Catalog ids are
+/// validated against the project's role assignments; inline definitions are
+/// validated like custom recipes. `None` passes through unchanged.
+fn resolve_recipe_selection(
+    state: &SharedState,
+    selection: Option<RecipeSelection>,
+) -> Result<Option<RecipeSnapshot>, ApiError> {
+    let Some(selection) = selection else {
+        return Ok(None);
+    };
+    let factory = factory_core::Factory::open(&state.root).map_err(RuntimeError::from)?;
+    let snapshot = match selection {
+        RecipeSelection::Id(id) => factory.recipe_snapshot(&id).map_err(RuntimeError::from)?,
+        RecipeSelection::Definition(body) => factory
+            .recipe_snapshot_from_definition(&body.into_recipe()?)
+            .map_err(RuntimeError::from)?,
+    };
+    Ok(Some(snapshot))
 }
 
 async fn create_run(
@@ -255,9 +358,11 @@ async fn create_run(
     let request = body
         .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "invalid JSON body"))?
         .0;
-    let run = state
-        .runtime
-        .create_workflow(&request.objective, request.team)?;
+    let recipe = resolve_recipe_selection(&state, request.recipe)?;
+    let run =
+        state
+            .runtime
+            .create_workflow_with_recipe(&request.objective, request.team, recipe)?;
     Ok((StatusCode::ACCEPTED, Json(run)))
 }
 
@@ -289,6 +394,10 @@ struct CreateRunFromIssueRequest {
     issue: String,
     #[serde(default)]
     team: Option<WorkflowTeam>,
+    /// A recipe id or inline definition, applied exactly like for
+    /// objective-created workflows.
+    #[serde(default)]
+    recipe: Option<RecipeSelection>,
 }
 
 /// Imports a GitHub Issue as a workflow. The run is planned in the background;
@@ -300,9 +409,12 @@ async fn create_run_from_issue(
     let request = body
         .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "invalid JSON body"))?
         .0;
-    let run = state
-        .runtime
-        .import_workflow_from_issue(&request.issue, request.team)?;
+    let recipe = resolve_recipe_selection(&state, request.recipe)?;
+    let run = state.runtime.import_workflow_from_issue_with_recipe(
+        &request.issue,
+        request.team,
+        recipe,
+    )?;
     Ok((StatusCode::ACCEPTED, Json(run)))
 }
 
@@ -934,6 +1046,98 @@ fn parse_policy_preset(value: &str) -> Result<factory_policy::PolicyPreset, ApiE
     })
 }
 
+// --- Recipes -----------------------------------------------------------------
+
+async fn list_recipes(State(state): State<SharedState>) -> Result<Json<Vec<Recipe>>, ApiError> {
+    let catalog = factory_core::recipes::RecipeCatalog::load(&state.root)?;
+    Ok(Json(catalog.list().into_iter().cloned().collect()))
+}
+
+async fn create_recipe(
+    State(state): State<SharedState>,
+    body: Result<Json<RecipeDefinitionBody>, axum::extract::rejection::JsonRejection>,
+) -> Result<(StatusCode, Json<Recipe>), ApiError> {
+    let request = body
+        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "invalid JSON body"))?
+        .0;
+    let recipe = request.into_recipe()?;
+    let config = Config::load(&state.root)?;
+    let recipe = factory_core::recipes::create_recipe(&state.root, &config, recipe)?;
+    Ok((StatusCode::CREATED, Json(recipe)))
+}
+
+async fn update_recipe(
+    State(state): State<SharedState>,
+    UrlPath(id): UrlPath<String>,
+    body: Result<Json<RecipeDefinitionBody>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<Recipe>, ApiError> {
+    let request = body
+        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "invalid JSON body"))?
+        .0;
+    let mut recipe = request.into_recipe()?;
+    // Ids are stable; the path id wins over whatever the body carries.
+    recipe.id = id.clone();
+    let config = Config::load(&state.root)?;
+    let recipe = factory_core::recipes::update_recipe(&state.root, &config, &id, recipe)?;
+    Ok(Json(recipe))
+}
+
+async fn delete_recipe(
+    State(state): State<SharedState>,
+    UrlPath(id): UrlPath<String>,
+) -> Result<StatusCode, ApiError> {
+    let config = Config::load(&state.root)?;
+    factory_core::recipes::delete_recipe(&state.root, &config, &id)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SaveRunRecipeRequest {
+    name: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    id: Option<String>,
+}
+
+/// "Save as Recipe": derives a reusable recipe from a workflow's current
+/// configuration (roles, routing, concurrency, policy presets, Planner
+/// guidance) and stores it as a custom recipe. Tasks, DAG edges, attempts,
+/// sessions, and Git state are never copied — this is not "Clone Workflow".
+async fn save_run_as_recipe(
+    State(state): State<SharedState>,
+    UrlPath(id): UrlPath<i64>,
+    body: Result<Json<SaveRunRecipeRequest>, axum::extract::rejection::JsonRejection>,
+) -> Result<(StatusCode, Json<Recipe>), ApiError> {
+    let request = body
+        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "invalid JSON body"))?
+        .0;
+    let root = state.root.clone();
+    let run_id = id;
+    let name = request.name.trim().to_string();
+    let description = request.description.trim().to_string();
+    let requested_id = request.id;
+    let recipe = tokio::task::spawn_blocking(move || -> Result<Recipe, ApiError> {
+        let factory = factory_core::Factory::open(&root).map_err(RuntimeError::from)?;
+        let mut derived = factory
+            .recipe_from_run(run_id)
+            .map_err(RuntimeError::from)?;
+        derived.id = requested_id
+            .filter(|id| !id.trim().is_empty())
+            .unwrap_or_else(|| factory_core::slugify(&name));
+        derived.name = name;
+        derived.description = description;
+        let config = factory.agents().config().clone();
+        Ok(factory_core::recipes::create_recipe(
+            &root, &config, derived,
+        )?)
+    })
+    .await
+    .map_err(|error| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))??;
+    Ok((StatusCode::CREATED, Json(recipe)))
+}
+
 /// Sets (or clears) a role's policy preset. Works for core and custom roles:
 /// the policy says what Factory permits the role to do, which is orthogonal to
 /// the role's instructions. Clearing a preset only removes the preset; any
@@ -1387,6 +1591,7 @@ fn build_graph(state: &SharedState) -> Result<GraphResponse, ApiError> {
                 "status": run.status.as_str(),
                 "plannerAgent": run.planner_agent,
                 "team": run.team,
+                "recipe": run.recipe,
                 "createdAt": run.created_at,
                 "counts": TaskCounts::from_tasks(&tasks),
                 "github": github_link.as_ref().map(|link| json!({

@@ -301,7 +301,7 @@ async fn delivery_endpoints_report_ineligibility_and_unknown_runs() {
     let app = factory_api::router(state);
     let run = factory_core::Factory::open(dir.path())
         .unwrap()
-        .import_github_issue("#42", None)
+        .import_github_issue("#42", None, None)
         .unwrap();
 
     let response = app
@@ -379,7 +379,7 @@ async fn graph_exposes_compact_github_issue_and_pr_nodes() {
     let (dir, state) = fixture();
     let app = factory_api::router(state);
     let factory = factory_core::Factory::open(dir.path()).unwrap();
-    let run = factory.import_github_issue("#42", None).unwrap();
+    let run = factory.import_github_issue("#42", None, None).unwrap();
 
     let response = app
         .oneshot(

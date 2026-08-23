@@ -93,23 +93,66 @@ impl PoliciesConfig {
     /// the single resolution entry point used by execution, validation, audit,
     /// and the dashboard.
     pub fn effective(&self, role_id: &str, agent_name: &str) -> EffectivePolicy {
-        let permissive = self.role(role_id).is_none() && self.agent(agent_name).is_none();
-        let source = match (self.role(role_id), self.agent(agent_name)) {
+        self.effective_inner(role_id, agent_name, None)
+    }
+
+    /// Resolves the effective policy for a running (role, agent) pair with one
+    /// extra only-narrowing restriction layer — the policy preset a workflow's
+    /// recipe snapshot records for the role. The restriction can only remove
+    /// access (allow lists intersect, deny lists union); it can never widen
+    /// what the Policy Engine already permits.
+    pub fn effective_restricted(
+        &self,
+        role_id: &str,
+        agent_name: &str,
+        restriction: Option<&PolicyScope>,
+    ) -> EffectivePolicy {
+        self.effective_inner(role_id, agent_name, restriction)
+    }
+
+    /// Role-level effective policy narrowed by a recipe restriction.
+    pub fn effective_for_role_restricted(
+        &self,
+        role_id: &str,
+        restriction: Option<&PolicyScope>,
+    ) -> EffectivePolicy {
+        self.effective_inner(role_id, "", restriction)
+    }
+
+    fn effective_inner(
+        &self,
+        role_id: &str,
+        agent_name: &str,
+        restriction: Option<&PolicyScope>,
+    ) -> EffectivePolicy {
+        let permissive = restriction.is_none()
+            && self.role(role_id).is_none()
+            && self.agent(agent_name).is_none();
+        let mut source = match (self.role(role_id), self.agent(agent_name)) {
             (Some(_), Some(_)) => format!("role:{role_id} + agent:{agent_name}"),
             (Some(_), None) => format!("role:{role_id}"),
             (None, Some(_)) => format!("agent:{agent_name}"),
             (None, None) => "default".to_string(),
         };
+        if restriction.is_some() {
+            source.push_str(" + recipe");
+        }
         let role = merged_scope(self.role(role_id));
         let agent = merged_scope(self.agent(agent_name));
+        let restriction = merged_scope(restriction);
         EffectivePolicy {
             source,
             permissive,
-            filesystem: EffectiveFilesystem::resolve(role.as_ref(), agent.as_ref()),
-            commands: EffectiveCommands::resolve(role.as_ref(), agent.as_ref()),
-            network: EffectiveNetwork::resolve(role.as_ref(), agent.as_ref()),
-            environment: EffectiveEnvironment::resolve(role.as_ref(), agent.as_ref()),
-            git: EffectiveGit::resolve(role.as_ref(), agent.as_ref()),
+            filesystem: EffectiveFilesystem::resolve(role.as_ref(), agent.as_ref())
+                .restrict("recipe", restriction.as_ref()),
+            commands: EffectiveCommands::resolve(role.as_ref(), agent.as_ref())
+                .restrict(restriction.as_ref()),
+            network: EffectiveNetwork::resolve(role.as_ref(), agent.as_ref())
+                .restrict(restriction.as_ref()),
+            environment: EffectiveEnvironment::resolve(role.as_ref(), agent.as_ref())
+                .restrict(restriction.as_ref()),
+            git: EffectiveGit::resolve(role.as_ref(), agent.as_ref())
+                .restrict(restriction.as_ref()),
         }
     }
 }
@@ -190,6 +233,13 @@ impl PolicyPreset {
             "custom" => Some(PolicyPreset::Custom),
             _ => None,
         }
+    }
+
+    /// The concrete scope this preset expands to. Public so other layers
+    /// (workflow recipes) can apply a named preset as an additional
+    /// only-narrowing restriction; the Policy Engine stays authoritative.
+    pub fn scope(self) -> PolicyScope {
+        self.defaults()
     }
 
     fn defaults(self) -> PolicyScope {
@@ -462,12 +512,14 @@ pub struct EffectivePolicy {
 #[derive(Debug, Clone)]
 pub struct EffectiveFilesystem {
     read_scopes: Vec<String>,
-    /// Present only when the agent scope restricts reads further.
-    read_agent: Option<Vec<String>>,
+    /// Extra only-narrowing read allow lists, one per restricting layer
+    /// (`agent`, `recipe`). A path must match every layer to be readable.
+    read_layers: Vec<(&'static str, Vec<String>)>,
     write_scopes: Vec<String>,
-    /// Present only when the agent scope restricts writes further. An empty
-    /// list means "nothing writable".
-    write_agent: Option<Vec<String>>,
+    /// Extra only-narrowing write allow lists, one per restricting layer. An
+    /// empty layer means "nothing writable". A path must match every layer to
+    /// be writable.
+    write_layers: Vec<(&'static str, Vec<String>)>,
     deny_scopes: Vec<String>,
 }
 
@@ -475,9 +527,9 @@ impl Default for EffectiveFilesystem {
     fn default() -> Self {
         Self {
             read_scopes: vec!["**".to_string()],
-            read_agent: None,
+            read_layers: Vec::new(),
             write_scopes: vec!["**".to_string()],
-            write_agent: None,
+            write_layers: Vec::new(),
             deny_scopes: factory_filesystem_baseline_deny(),
         }
     }
@@ -485,6 +537,18 @@ impl Default for EffectiveFilesystem {
 
 fn factory_filesystem_baseline_deny() -> Vec<String> {
     baseline_deny_write()
+}
+
+/// Heuristic overlap check between two write-scope globs: two scopes share at
+/// least one plausible path when either is the catch-all `**`, they are
+/// equal, or one scope's directory prefix contains the other's.
+fn scopes_overlap(a: &str, b: &str) -> bool {
+    if a == "**" || b == "**" || a == b {
+        return true;
+    }
+    let a_dir = a.strip_suffix("**").unwrap_or(a);
+    let b_dir = b.strip_suffix("**").unwrap_or(b);
+    a_dir.starts_with(b_dir) || b_dir.starts_with(a_dir)
 }
 
 impl EffectiveFilesystem {
@@ -499,21 +563,39 @@ impl EffectiveFilesystem {
         }
         if let Some(agent_fs) = agent.and_then(|scope| scope.filesystem.as_ref()) {
             if !agent_fs.read.is_empty() {
-                fs.read_agent = Some(agent_fs.read.clone());
+                fs.read_layers.push(("agent", agent_fs.read.clone()));
             }
-            fs.write_agent = Some(agent_fs.write.clone());
+            fs.write_layers.push(("agent", agent_fs.write.clone()));
             fs.deny_scopes.extend(agent_fs.deny_write.iter().cloned());
         }
         fs
+    }
+
+    /// Applies one more only-narrowing restriction layer. The layer may only
+    /// remove access: reads/writes must additionally fall inside its allow
+    /// lists, and its denies always win.
+    fn restrict(mut self, label: &'static str, restriction: Option<&PolicyScope>) -> Self {
+        let Some(restriction) = restriction else {
+            return self;
+        };
+        if let Some(filesystem) = restriction.filesystem.as_ref() {
+            if !filesystem.read.is_empty() {
+                self.read_layers.push((label, filesystem.read.clone()));
+            }
+            self.write_layers.push((label, filesystem.write.clone()));
+            self.deny_scopes
+                .extend(filesystem.deny_write.iter().cloned());
+        }
+        self
     }
 
     /// Whether a repository path may be read.
     pub fn read_allowed(&self, repo_relative: &str) -> bool {
         self.in_allowed(repo_relative, &self.read_scopes)
             && self
-                .read_agent
-                .as_ref()
-                .is_none_or(|scopes| self.in_allowed(repo_relative, scopes))
+                .read_layers
+                .iter()
+                .all(|(_, scopes)| self.in_allowed(repo_relative, scopes))
             && !self.in_denied(repo_relative)
     }
 
@@ -521,9 +603,9 @@ impl EffectiveFilesystem {
     pub fn write_allowed(&self, repo_relative: &str) -> bool {
         self.in_allowed(repo_relative, &self.write_scopes)
             && self
-                .write_agent
-                .as_ref()
-                .is_none_or(|scopes| self.in_allowed(repo_relative, scopes))
+                .write_layers
+                .iter()
+                .all(|(_, scopes)| self.in_allowed(repo_relative, scopes))
             && !self.in_denied(repo_relative)
     }
 
@@ -555,10 +637,23 @@ impl EffectiveFilesystem {
         if self.write_scopes.is_empty() {
             return true;
         }
-        match &self.write_agent {
-            Some(scopes) => scopes.is_empty(),
-            None => false,
+        if self
+            .write_layers
+            .iter()
+            .any(|(_, scopes)| scopes.is_empty())
+        {
+            return true;
         }
+        // A write is only possible when some base scope plausibly overlaps a
+        // scope in every restricting layer (disjoint lists like `src/**` and
+        // `README.md, docs/**` permit nothing). This is a heuristic for the
+        // pre-start gate; exact enforcement stays per-path in `write_allowed`.
+        let write_possible = self.write_scopes.iter().any(|base| {
+            self.write_layers
+                .iter()
+                .all(|(_, scopes)| scopes.iter().any(|scope| scopes_overlap(base, scope)))
+        });
+        !write_possible
     }
 
     /// `open` (writes anywhere), `restricted` (explicit write scopes), or
@@ -578,19 +673,19 @@ impl EffectiveFilesystem {
         &self.read_scopes
     }
 
-    /// The scopes listed in session audit and the UI, including the agent
-    /// restriction when one applies.
+    /// The scopes listed in session audit and the UI, including the
+    /// restricting layers (agent, recipe) where one applies.
     pub fn effective_write_scopes(&self) -> Vec<String> {
-        match &self.write_agent {
-            Some(scopes) if !scopes.is_empty() => {
-                let mut combined = self.write_scopes.clone();
-                for scope in scopes {
-                    combined.push(format!("(agent) {scope}"));
-                }
-                combined
+        let mut combined = self.write_scopes.clone();
+        for (label, scopes) in &self.write_layers {
+            if scopes.is_empty() {
+                continue;
             }
-            _ => self.write_scopes.clone(),
+            for scope in scopes {
+                combined.push(format!("({label}) {scope}"));
+            }
         }
+        combined
     }
 
     pub fn deny_scopes(&self) -> &[String] {
@@ -665,6 +760,38 @@ impl EffectiveCommands {
             mode = CommandsMode::Denied;
         }
         Self { mode, allow, deny }
+    }
+
+    /// Applies one more only-narrowing restriction layer (recipe preset).
+    fn restrict(mut self, restriction: Option<&PolicyScope>) -> Self {
+        let Some(scope) = restriction else {
+            return self;
+        };
+        let Some(commands) = scope.commands.as_ref() else {
+            return self;
+        };
+        self.mode = self.mode.max(commands.mode);
+        if commands.mode == CommandsMode::Restricted && !commands.allow.is_empty() {
+            self.allow = if self.allow.is_empty() {
+                commands.allow.clone()
+            } else {
+                self.allow
+                    .iter()
+                    .filter(|candidate| {
+                        commands
+                            .allow
+                            .iter()
+                            .any(|other| other.eq_ignore_ascii_case(candidate))
+                    })
+                    .cloned()
+                    .collect()
+            };
+        }
+        self.deny.extend(commands.deny.iter().cloned());
+        if self.mode == CommandsMode::Restricted && self.allow.is_empty() {
+            self.mode = CommandsMode::Denied;
+        }
+        self
     }
 
     /// Whether running `command` is permitted. The command's executable (its
@@ -772,6 +899,20 @@ impl EffectiveNetwork {
         Self { mode }
     }
 
+    /// Applies one more only-narrowing restriction layer (recipe preset).
+    fn restrict(self, restriction: Option<&PolicyScope>) -> Self {
+        let denies = restriction
+            .and_then(|scope| scope.network.as_ref())
+            .map(|network| network.mode == NetworkMode::Deny)
+            .unwrap_or(false);
+        if denies {
+            return Self {
+                mode: NetworkMode::Deny,
+            };
+        }
+        self
+    }
+
     pub fn allowed(&self) -> bool {
         self.mode == NetworkMode::Allow
     }
@@ -822,6 +963,36 @@ impl EffectiveEnvironment {
             allowed,
             denied,
         }
+    }
+
+    /// Applies one more only-narrowing restriction layer (recipe preset),
+    /// mirroring the intersection semantics of the resolver.
+    fn restrict(mut self, restriction: Option<&PolicyScope>) -> Self {
+        let Some(scope) = restriction else {
+            return self;
+        };
+        let Some(environment) = scope.environment.as_ref() else {
+            return self;
+        };
+        if !environment.allow.is_empty() {
+            self.allowed = if self.allowed.is_empty() {
+                environment.allow.clone()
+            } else {
+                self.allowed
+                    .iter()
+                    .filter(|candidate| {
+                        environment
+                            .allow
+                            .iter()
+                            .any(|other| other.eq_ignore_ascii_case(candidate))
+                    })
+                    .cloned()
+                    .collect()
+            };
+            self.filtered = !self.allowed.is_empty();
+        }
+        self.denied.extend(environment.deny.iter().cloned());
+        self
     }
 
     /// Whether inheritance filtering applies (vs. full inheritance).
@@ -899,6 +1070,32 @@ impl EffectiveGit {
                 .collect();
         }
         Self { allowed }
+    }
+
+    /// Applies one more only-narrowing restriction layer (recipe preset):
+    /// allowed = declared ∩ current, dangerous operations dropped regardless.
+    fn restrict(mut self, restriction: Option<&PolicyScope>) -> Self {
+        let Some(scope) = restriction else {
+            return self;
+        };
+        let Some(git) = scope.git.as_ref() else {
+            return self;
+        };
+        if git.allow.is_empty() {
+            return self;
+        }
+        let declared: BTreeSet<GitOperation> = git
+            .allow
+            .iter()
+            .filter_map(|name| GitOperation::parse(name))
+            .collect();
+        self.allowed = self
+            .allowed
+            .intersection(&declared)
+            .filter(|operation| !operation.is_dangerous())
+            .copied()
+            .collect();
+        self
     }
 
     pub fn allows(&self, operation: GitOperation) -> bool {
@@ -1495,5 +1692,93 @@ write = ["README.md", "docs/**"]
         let view = restricted.effective("doc_writer", "claude").view();
         assert_eq!(view.filesystem_mode, "restricted");
         assert_eq!(view.write_scopes, vec!["README.md", "docs/**"]);
+    }
+
+    // --- Recipe restriction layer ------------------------------------------
+
+    #[test]
+    fn recipe_restriction_narrows_a_permissive_role() {
+        let config = PoliciesConfig::default();
+        let read_only = PolicyPreset::ReadOnly.scope();
+        let policy = config.effective_restricted("worker", "codex", Some(&read_only));
+        assert!(!policy.permissive);
+        assert!(policy.filesystem.read_only());
+        assert!(!policy.filesystem.write_allowed("src/main.rs"));
+        assert!(validate_executable(&policy, "implement").is_err());
+    }
+
+    #[test]
+    fn recipe_restriction_cannot_elevate_a_read_only_role() {
+        let config = config(
+            r#"
+[policies.roles.reviewer]
+preset = "read_only"
+"#,
+        );
+        let implementation = PolicyPreset::Implementation.scope();
+        let policy = config.effective_restricted("reviewer", "claude", Some(&implementation));
+        assert!(
+            policy.filesystem.read_only(),
+            "the recipe preset may not widen the role's read-only scopes"
+        );
+        assert!(!policy.filesystem.write_allowed("src/main.rs"));
+        assert!(validate_executable(&policy, "implement").is_err());
+    }
+
+    #[test]
+    fn recipe_restriction_intersects_scoped_writes() {
+        let config = config(
+            r#"
+[policies.roles.worker.filesystem]
+write = ["src/**", "tests/**"]
+"#,
+        );
+        let documentation = PolicyPreset::Documentation.scope();
+        let policy = config.effective_restricted("worker", "codex", Some(&documentation));
+        assert!(!policy.filesystem.write_allowed("src/main.rs"));
+        assert!(!policy.filesystem.write_allowed("tests/unit.rs"));
+        assert!(!policy.filesystem.write_allowed("README.md"));
+        assert!(policy.filesystem.read_only());
+        assert!(policy
+            .filesystem
+            .effective_write_scopes()
+            .contains(&"(recipe) README.md".to_string()));
+        // Without the restriction the same role writes source freely.
+        let plain = config.effective("worker", "codex");
+        assert!(plain.filesystem.write_allowed("src/main.rs"));
+    }
+
+    #[test]
+    fn recipe_restriction_narrows_commands_and_keeps_invariants() {
+        let config = PoliciesConfig::default();
+        let documentation = PolicyPreset::Documentation.scope();
+        let policy = config.effective_restricted("worker", "codex", Some(&documentation));
+        assert_eq!(policy.commands.mode, CommandsMode::Restricted);
+        assert!(policy.commands.allowed("git status"));
+        assert!(!policy.commands.allowed("cargo test"));
+        assert!(!policy.commands.allowed("bash -c anything"));
+        // Git invariants survive the extra layer.
+        assert!(!policy.git.allows(GitOperation::Push));
+        assert!(policy.git.allows(GitOperation::Read));
+    }
+
+    #[test]
+    fn recipe_restriction_composes_with_agent_scope() {
+        let config = config(
+            r#"
+[policies.roles.worker.filesystem]
+write = ["src/**", "tests/**"]
+
+[policies.agents.codex.filesystem]
+write = ["src/**"]
+"#,
+        );
+        let documentation = PolicyPreset::Documentation.scope();
+        let policy = config.effective_restricted("worker", "codex", Some(&documentation));
+        assert!(policy.filesystem.read_only());
+        assert!(policy.source.ends_with("+ recipe"));
+        // The role-level variant ignores the agent dimension.
+        let role_level = config.effective_for_role_restricted("worker", Some(&documentation));
+        assert!(role_level.filesystem.read_only());
     }
 }

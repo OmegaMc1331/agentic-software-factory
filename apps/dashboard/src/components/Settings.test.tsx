@@ -2,16 +2,20 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   addRoleAssignment,
+  createRecipe,
+  deleteRecipe,
   deleteRole,
   fetchAgents,
   fetchConfig,
+  fetchRecipes,
   fetchRoles,
   removeRoleAssignment,
   saveConfig,
   setPreferredAssignment,
+  updateRecipe,
   updateRole,
 } from "../api";
-import type { ConfigData, RoleInfo } from "../types";
+import type { ConfigData, Recipe, RoleInfo } from "../types";
 import { SettingsView } from "./Settings";
 
 vi.mock("../api", () => ({
@@ -20,6 +24,10 @@ vi.mock("../api", () => ({
   fetchAgents: vi.fn(),
   fetchConfig: vi.fn(),
   fetchRoles: vi.fn(),
+  fetchRecipes: vi.fn(),
+  createRecipe: vi.fn(),
+  updateRecipe: vi.fn(),
+  deleteRecipe: vi.fn(),
   removeRoleAssignment: vi.fn(),
   saveConfig: vi.fn(),
   setPreferredAssignment: vi.fn(),
@@ -69,6 +77,7 @@ beforeEach(() => {
   vi.mocked(fetchConfig).mockReset().mockResolvedValue(config);
   vi.mocked(fetchAgents).mockReset().mockResolvedValue([]);
   vi.mocked(fetchRoles).mockReset().mockResolvedValue([workerRole, reviewerRole, customRole]);
+  vi.mocked(fetchRecipes).mockReset().mockResolvedValue([]);
   vi.mocked(saveConfig).mockReset().mockResolvedValue();
   vi.mocked(addRoleAssignment).mockReset().mockResolvedValue(workerRole);
   vi.mocked(removeRoleAssignment).mockReset().mockResolvedValue(workerRole);
@@ -152,5 +161,128 @@ describe("Settings roles", () => {
 
     await waitFor(() => expect(deleteRole).toHaveBeenCalledWith("database_engineer"));
     expect(await screen.findByText(/used by an active workflow/)).toBeTruthy();
+  });
+});
+
+const builtinSecurity: Recipe = {
+  id: "security",
+  name: "Security Sensitive",
+  description: "Security-relevant work.",
+  roles: ["planner", "worker", "reviewer"],
+  routing: "project_default",
+  maxParallelTasks: 2,
+  policyPresets: {},
+  plannerGuidance: "",
+  builtin: true,
+};
+
+const customRecipe: Recipe = {
+  id: "backend_feature",
+  name: "Backend Feature",
+  description: "Backend implementation.",
+  roles: ["planner", "worker", "reviewer"],
+  routing: "performance",
+  maxParallelTasks: null,
+  policyPresets: {},
+  plannerGuidance: "Prefer a compact plan.",
+  builtin: false,
+};
+
+describe("Settings recipes", () => {
+  beforeEach(() => {
+    vi.mocked(fetchConfig).mockReset().mockResolvedValue(config);
+    vi.mocked(fetchAgents).mockReset().mockResolvedValue([]);
+    vi.mocked(fetchRoles)
+      .mockReset()
+      .mockResolvedValue([
+        workerRole,
+        reviewerRole,
+        role("planner", "Planner", [{ agent: "codex", preferred: true }]),
+      ]);
+    vi.mocked(fetchRecipes).mockReset().mockResolvedValue([builtinSecurity, customRecipe]);
+    vi.mocked(saveConfig).mockReset().mockResolvedValue();
+    vi.mocked(createRecipe).mockReset().mockResolvedValue(customRecipe);
+    vi.mocked(updateRecipe).mockReset().mockResolvedValue(customRecipe);
+    vi.mocked(deleteRecipe).mockReset().mockResolvedValue();
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  it("lists built-in read-only and custom editable recipes", async () => {
+    render(<SettingsView />);
+
+    expect(await screen.findByText("Security Sensitive")).toBeTruthy();
+    expect(screen.getByText("Backend Feature")).toBeTruthy();
+    expect(screen.getAllByText(/Built-in · read-only/).length).toBe(1);
+    expect(screen.getByText(/Custom · Performance-aware/)).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Duplicate Security Sensitive" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Duplicate Backend Feature" })).toBeTruthy();
+    expect(screen.getAllByRole("button", { name: /^Delete$/ }).length).toBe(1);
+    expect(screen.getByRole("button", { name: "Edit Backend Feature recipe" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Edit Security Sensitive recipe" })).toBeNull();
+  });
+
+  it("creates a custom recipe from the compact editor", async () => {
+    render(<SettingsView />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "New recipe" }));
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Hotfix" } });
+    fireEvent.change(screen.getByLabelText("Routing"), { target: { value: "round_robin" } });
+    fireEvent.change(screen.getByLabelText("Parallelism (1–32)"), {
+      target: { value: "2" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Create recipe" }));
+
+    await waitFor(() =>
+      expect(createRecipe).toHaveBeenCalledWith(
+        expect.objectContaining({
+          name: "Hotfix",
+          roles: ["planner"],
+          routing: "round_robin",
+          maxParallelTasks: 2,
+        })
+      )
+    );
+  });
+
+  it("duplicates a built-in recipe into a custom one", async () => {
+    render(<SettingsView />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Duplicate Security Sensitive" }));
+    const name = await screen.findByLabelText("Name");
+    expect((name as HTMLInputElement).value).toBe("Security Sensitive (copy)");
+    fireEvent.click(screen.getByRole("button", { name: "Create recipe" }));
+
+    await waitFor(() =>
+      expect(createRecipe).toHaveBeenCalledWith(
+        expect.objectContaining({
+          name: "Security Sensitive (copy)",
+          roles: builtinSecurity.roles,
+          maxParallelTasks: 2,
+        })
+      )
+    );
+  });
+
+  it("edits and deletes a custom recipe", async () => {
+    render(<SettingsView />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Edit Backend Feature recipe" }));
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Renamed" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save recipe" }));
+
+    await waitFor(() =>
+      expect(updateRecipe).toHaveBeenCalledWith(
+        "backend_feature",
+        expect.objectContaining({ name: "Renamed" })
+      )
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /^Delete$/ }));
+    await waitFor(() => expect(deleteRecipe).toHaveBeenCalledWith("backend_feature"));
   });
 });

@@ -104,6 +104,10 @@ pub struct Run {
     pub plan_revision: i64,
     #[serde(default)]
     pub team: Option<crate::team::WorkflowTeam>,
+    /// Immutable snapshot of the recipe this workflow was created from.
+    /// Absent for workflows created before recipes existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipe: Option<crate::recipe::RecipeSnapshot>,
     pub created_at: String,
     pub updated_at: String,
 }

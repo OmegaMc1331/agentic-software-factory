@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use factory_core::{Factory, FactoryError};
 use factory_db::FactoryDb;
-use factory_types::{AgentSession, AgentSessionMode, Run, WorkflowTeam};
+use factory_types::{AgentSession, AgentSessionMode, RecipeSnapshot, Run, WorkflowTeam};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -224,8 +224,20 @@ impl Runtime {
         objective: &str,
         team: Option<WorkflowTeam>,
     ) -> Result<Run, RuntimeError> {
+        self.create_workflow_with_recipe(objective, team, None)
+    }
+
+    /// Creates a workflow from a recipe snapshot: the recipe pre-fills the
+    /// team and its configuration is persisted immutably on the run. The
+    /// Planner still generates the actual DAG from the objective.
+    pub fn create_workflow_with_recipe(
+        &self,
+        objective: &str,
+        team: Option<WorkflowTeam>,
+        recipe: Option<RecipeSnapshot>,
+    ) -> Result<Run, RuntimeError> {
         let factory = Factory::open(&self.root)?;
-        let run = factory.begin_run(objective, team)?;
+        let run = factory.begin_run_with_recipe(objective, team, recipe.as_ref())?;
         let cancel = self.reserve(run.id, OperationKind::Planning)?;
         let runtime = self.clone();
         let root = self.root.clone();
@@ -246,8 +258,18 @@ impl Runtime {
         reference: &str,
         team: Option<WorkflowTeam>,
     ) -> Result<Run, RuntimeError> {
+        self.import_workflow_from_issue_with_recipe(reference, team, None)
+    }
+
+    /// GitHub Issue + Recipe: the same delivery lane as objective workflows.
+    pub fn import_workflow_from_issue_with_recipe(
+        &self,
+        reference: &str,
+        team: Option<WorkflowTeam>,
+        recipe: Option<RecipeSnapshot>,
+    ) -> Result<Run, RuntimeError> {
         let factory = Factory::open(&self.root)?;
-        let run = factory.import_github_issue(reference, team)?;
+        let run = factory.import_github_issue(reference, team, recipe.as_ref())?;
         let cancel = self.reserve(run.id, OperationKind::Planning)?;
         let runtime = self.clone();
         let root = self.root.clone();

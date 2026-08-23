@@ -315,7 +315,7 @@ fn github_fixture_with_existing_pr(existing: Vec<u32>) -> (TempDir, Factory, Fak
 
 /// Imports an issue, plans, and executes the workflow to completion.
 fn completed_issue_workflow(factory: &Factory) -> i64 {
-    let run = factory.import_github_issue("#42", None).unwrap();
+    let run = factory.import_github_issue("#42", None, None).unwrap();
     assert_eq!(run.status, RunStatus::Planning);
     factory.plan_run(run.id, &AtomicBool::new(false)).unwrap();
     factory.prepare_start(run.id).unwrap();
@@ -331,7 +331,7 @@ fn imports_an_issue_as_an_unexecuted_workflow_with_untrusted_link() {
     let _guard = gh_env_lock();
     let (dir, factory, _gh, _bare) = github_fixture();
 
-    let run = factory.import_github_issue("#42", None).unwrap();
+    let run = factory.import_github_issue("#42", None, None).unwrap();
     assert_eq!(run.status, RunStatus::Planning, "import must not execute");
     assert!(run
         .objective
@@ -370,12 +370,12 @@ fn import_accepts_issue_urls_from_the_project_remote_only() {
     let (_dir, factory, _gh, _bare) = github_fixture();
 
     let run = factory
-        .import_github_issue("https://github.com/octocat/example/issues/42", None)
+        .import_github_issue("https://github.com/octocat/example/issues/42", None, None)
         .unwrap();
     assert!(run.objective.contains("Fix refresh token race"));
 
     let error = factory
-        .import_github_issue("https://github.com/other/repo/issues/7", None)
+        .import_github_issue("https://github.com/other/repo/issues/7", None, None)
         .unwrap_err();
     assert!(
         error
@@ -392,7 +392,7 @@ fn import_reports_missing_authentication_actionably() {
     FakeGh::new(dir.path()).unauthenticated().install();
     let factory = Factory::open(dir.path()).unwrap();
 
-    let error = factory.import_github_issue("#42", None).unwrap_err();
+    let error = factory.import_github_issue("#42", None, None).unwrap_err();
     assert!(
         error.to_string().contains("GitHub authentication required"),
         "unexpected error: {error}"
@@ -443,7 +443,7 @@ fn github_status_flags_missing_authentication_and_non_github_remotes() {
 fn delivery_requires_a_completed_workflow() {
     let _guard = gh_env_lock();
     let (_dir, factory, _gh, _bare) = github_fixture();
-    let run = factory.import_github_issue("#42", None).unwrap();
+    let run = factory.import_github_issue("#42", None, None).unwrap();
 
     let report = factory.delivery_report(run.id).unwrap();
     assert!(!report.eligible);
