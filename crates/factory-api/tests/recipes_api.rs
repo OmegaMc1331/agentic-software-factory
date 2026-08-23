@@ -5,6 +5,7 @@
 #![allow(clippy::await_holding_lock)]
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
@@ -71,7 +72,21 @@ fn init_git(root: &Path) {
     }
 }
 
-fn install_fake_gh(dir: &Path) {
+struct GhEnvOverride {
+    previous: Option<OsString>,
+}
+
+impl Drop for GhEnvOverride {
+    fn drop(&mut self) {
+        if let Some(previous) = self.previous.take() {
+            std::env::set_var("FACTORY_GH_BIN", previous);
+        } else {
+            std::env::remove_var("FACTORY_GH_BIN");
+        }
+    }
+}
+
+fn install_fake_gh(dir: &Path) -> GhEnvOverride {
     let issue_file = dir.join("issue.json");
     std::fs::write(
         &issue_file,
@@ -119,7 +134,9 @@ fn install_fake_gh(dir: &Path) {
         }
         path
     };
+    let previous = std::env::var_os("FACTORY_GH_BIN");
     std::env::set_var("FACTORY_GH_BIN", &path);
+    GhEnvOverride { previous }
 }
 
 fn init_github_clone(dir: &Path) {
@@ -166,7 +183,7 @@ fn init_github_clone(dir: &Path) {
 }
 
 /// A fixture with planner/worker/reviewer/architect/test_engineer agents so
-/// the built-in recipes resolve, plus a fake `gh` on the environment.
+/// the built-in recipes resolve. Tests that need `gh` install it explicitly.
 fn fixture() -> (TempDir, Arc<factory_api::ApiState>) {
     let dir = TempDir::new().unwrap();
     init_github_clone(dir.path());
@@ -202,7 +219,6 @@ fn fixture() -> (TempDir, Arc<factory_api::ApiState>) {
     }
     config.write_atomic(dir.path()).unwrap();
 
-    install_fake_gh(dir.path());
     let state = Arc::new(factory_api::ApiState::new(dir.path().to_path_buf()).unwrap());
     (dir, state)
 }
@@ -552,7 +568,8 @@ async fn inline_recipe_requires_available_roles() {
 #[tokio::test]
 async fn github_issue_workflows_accept_a_recipe() {
     let _guard = gh_env_lock();
-    let (_dir, state) = fixture();
+    let (dir, state) = fixture();
+    let _gh = install_fake_gh(dir.path());
     let app = factory_api::router(state);
 
     let response = app
