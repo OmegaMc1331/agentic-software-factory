@@ -1,39 +1,128 @@
 # Agentic Software Factory
 
-Agentic Software Factory is a local tool that orchestrates coding agents from an
-interactive Agent Graph. You install and authenticate the agents (Codex, Claude Code,
-OpenCode, Gemini CLI, or another CLI). The Factory plans workflows into real task DAGs,
-runs tasks in isolated git worktrees, reviews evidence, and records each invocation in
-local SQLite state.
+A local multi-agent software engineering runtime that turns an objective or GitHub
+Issue into a planned, reviewed and integrable software workflow using the coding
+agents you already use.
 
-The runtime is **role-aware**: a plan's tasks carry a semantic operation
-(`advisory`, `implement`, `verify`, `review`, `post_process`), matched to each role's
-execution class. Researchers and Architects produce persisted artifacts consumed by
-implementation tasks; a Test Engineer verifies; specialized review roles such as the
-Security Auditor evaluate the diff and can route `request_changes` back into bounded
-implementation rework; a Documentation Writer runs last. Custom roles work without
-source changes — for example a `performance_analyst` with `execution_class = "review"`
-behaves like any other specialized reviewer.
+Factory does not provide models. It orchestrates agents.
 
-Simple workflows stay simple: a small fix still plans as Worker → Reviewer.
+You install coding CLIs — Codex, Claude Code, OpenCode, Gemini CLI, Qwen Code, or
+your own — and Factory plans the work into a real task DAG, runs tasks in isolated
+Git worktrees, reviews the evidence, integrates approved work onto a per-run branch,
+and can deliver it as a pull request. All state stays on your machine.
 
 ![Factory Agent Graph](docs/assets/dashboard-network.png)
 
-See [docs/roles.md](docs/roles.md) for execution classes, operations, artifacts,
-specialized reviews, and custom roles.
+```text
+Objective / GitHub Issue
+        ↓
+      Planner
+        ↓
+   Editable Task DAG
+        ↓
+┌───────┼────────┐
+Worker  Worker   Specialist
+        ↓
+     Reviews
+        ↓
+ Integration Engine
+        ↓
+factory/run-<id>
+        ↓
+   Pull Request
+```
+
+## Why Factory
+
+- **Coordinate several independent coding agents.** Agents share roles; Factory
+  decides which agent handles each dispatch and records every invocation.
+- **Turn objectives into dependency-aware plans.** The Planner produces a task DAG
+  you can inspect before anything runs.
+- **Isolate implementation in Git worktrees.** Every task works on its own branch;
+  approved work is integrated onto `factory/run-<id>`. Your main branch is never
+  touched.
+- **Review before integration.** A task completes only after structured Reviewer
+  approval; specialized reviews can route `request_changes` into bounded rework.
+- **Preserve durable workflow state.** Runs, tasks, attempts, sessions, evidence,
+  artifacts, and plan revisions live in local SQLite and survive restarts.
+- **Route work according to agent performance.** Opt-in deterministic routing ranks
+  eligible agents from measured local history.
+- **Enforce role/policy boundaries.** Roles say what an agent should do; policies
+  say what it is permitted to do. Deny wins, and Factory's safety invariants always
+  apply.
+- **Replan unfinished work without rewriting history.** Plan changes are stored as
+  durable revisions; completed tasks are never silently rewritten.
+- **Connect GitHub Issues to pull requests.** Import an Issue, run the normal
+  pipeline, and deliver the completed run as a PR through the locally authenticated
+  `gh` CLI.
+- **Expose controlled MCP tools.** External tools reach task agents only through
+  policy-mediated, scoped grants — and their results stay untrusted data.
+
+Simple workflows stay simple: a small fix still plans as Worker → Reviewer.
+
+## How it works
+
+```text
+Agent Graph → local API → Factory Core → Planner → task DAG
+                                      → task worktrees → evidence
+                                      → Reviewer → approve or retry
+                                      → Integration Engine → factory/run-<id>
+```
+
+- **Plan** asks the selected Planner for structured tasks and dependencies without
+  changing the repository. Tasks may target specific roles from the workflow's team.
+- **Start** validates the team, the Git repository, the DAG, and each task's
+  effective policy, then runs ready tasks one at a time in isolated worktrees.
+- **Every task is dispatched by role and operation.** Each attempt is an
+  `AgentSession` that records the role, the agent, and the policy that applied.
+- **Process exit is not completion.** A task completes only after structured
+  Reviewer approval. Worker failures and change requests retry up to three total
+  attempts; policy blocks never consume retries.
+- **Approved work is integrated.** The Integration Engine lands each approved
+  implementation-family task on the run's `factory/run-<id>` branch; a completed
+  run can be delivered as a pull request.
+
+The Rust Factory process owns execution — closing the browser does not stop active
+work. All state lives in `.factory/`:
+
+```text
+.factory/
+  db.sqlite3          workflows, tasks, attempts, sessions, artifacts, and audit
+  config.toml         agents, role assignments, policies, and MCP servers
+  recipes.toml        custom workflow recipes (created on first save)
+  graph.json          saved positions, visual nodes, and custom links
+  context/index.json  bounded repository context index
+  worktrees/t<id>/    one Git worktree per task
+```
+
+## Core capabilities
+
+| Capability | What it does | Reference |
+| --- | --- | --- |
+| Role-aware multi-agent workflows | Eight core roles plus custom roles; every task carries a role and a semantic operation validated against the role's execution class. | [Roles](docs/roles.md) |
+| Parallel-ready execution | Multiple workflows run concurrently with capacity-aware agent selection; per-run task width and per-agent concurrency are configurable. Task scheduling within one run is sequential in this release. | [Architecture](docs/architecture.md#workflow-lifecycle) |
+| Plan inspection and durable revisions | Inspect the generated DAG and the team before start; plan edits and partial replans persist as durable revisions that never rewrite completed work. | [Architecture](docs/architecture.md#workflow-lifecycle) |
+| Git Integration Engine | Approved tasks land on the per-run `factory/run-<id>` branch, ready for a pull request; `main` is never modified. | [GitHub](docs/github.md) |
+| Repository Context Engine | A bounded, read-only index of paths, symbols, and related tests is injected into every mission. | [Architecture](docs/architecture.md#repository-context-engine) |
+| Policy / Permission Engine | Project-local filesystem, command, environment, Git, network (advisory), and tool policies per role and agent. | [Policies](docs/policies.md) |
+| GitHub Issue → Workflow → PR | Import an Issue as a normal workflow and deliver the completed run as a pull request. | [GitHub](docs/github.md) |
+| Agent Evaluation & Performance | First-pass approval, retries, durations, and integration quality measured from local history, with honest sample sizes. | [Evaluations](docs/evaluations.md) |
+| Intelligent Agent Routing | Deterministic round-robin by default; opt-in performance routing ranks eligible agents from measured history. | [Routing](docs/routing.md) |
+| Workflow Recipes | Reusable workflow configuration — roles, routing, concurrency, policy presets, Planner guidance — snapshotted immutably per run. | [Recipes](docs/recipes.md) |
+| External Tools / MCP | Policy-mediated access to MCP servers with scoped grants, limits, and audit; results are marked untrusted. | [MCP](docs/mcp.md) |
 
 ## Install
 
 Ready-made binaries are available for Windows (x86_64), Linux (x86_64), and macOS
 (Apple Silicon and Intel). No Rust, Node, or administrator rights are required.
 
-### Windows
+**Windows**
 
 ```powershell
 irm https://raw.githubusercontent.com/OmegaMc1331/agentic-software-factory/main/install.ps1 | iex
 ```
 
-### Linux / macOS
+**Linux / macOS**
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/OmegaMc1331/agentic-software-factory/main/install.sh | sh
@@ -43,20 +132,19 @@ Then check the install:
 
 ```bash
 factory --version
-factory init
-factory start
 ```
 
-If `factory` is not found, open a new terminal. Windows adds the install location to
-your user PATH; macOS and Linux print the line to add to your shell profile. Running the
-installer again replaces an older version with the latest release.
+The installers download release archives over HTTPS and verify their published
+SHA-256 checksums. If `factory` is not found, open a new terminal: Windows adds the
+install location to your user PATH; macOS and Linux print the line to add to your
+shell profile. Running the installer again replaces an older version with the latest
+release.
 
-### Uninstall
-
-Remove the binary and any PATH entry you added:
+**Uninstall** — remove the binary and any PATH entry you added:
 
 - Windows: delete `%LOCALAPPDATA%\Programs\AgenticSoftwareFactory`, then remove its
-  `bin` directory from your user PATH under **System Properties → Environment Variables**.
+  `bin` directory from your user PATH under **System Properties → Environment
+  Variables**.
 - macOS / Linux: `rm ~/.local/bin/factory`.
 
 Your project-local `.factory/` state is not removed.
@@ -69,220 +157,124 @@ factory init
 factory start
 ```
 
-`factory init` creates `.factory/` with a default configuration. `factory start` serves
-the local API and dashboard, waits until the server is ready, then opens
-`http://127.0.0.1:4321`.
+`factory init` creates `.factory/` with a starter configuration: example agent
+entries (Codex, OpenCode, Claude Code), pipeline role assignments, and policy
+presets for the core roles. `factory start` serves the local API and dashboard,
+waits until the server is ready, then opens `http://127.0.0.1:4321`.
 
-In Agent Graph, configure the Planner, Worker, and Reviewer agents. Create a Workflow,
-review its task plan, then select **Start**. The Rust Factory process owns execution, so
-closing the browser doesn't stop active work.
+In Agent Graph:
 
-## Configure agents
+1. **Configure and authenticate your coding agents.** Factory never talks to model
+   providers; each CLI keeps its own authentication.
+2. **Assign Planner, Worker, and Reviewer.** A fresh configuration assigns all
+   three pipeline roles already; adjust them to the agents you actually have.
+3. **Create a workflow** from an objective, or import a GitHub Issue.
+4. **Inspect the generated plan** — tasks, dependencies, roles, and operations —
+   and edit the team before starting.
+5. **Start** the workflow.
+6. **Inspect execution** — attempts, evidence, reviews, artifacts, and the
+   integration branch — from the Workflow Inspector and Performance view.
+7. **Optionally create a pull request** from the completed run.
 
-Use Agent Graph or **Settings → Agents** to add installed coding agents and assign
-roles. Configuration lives in `.factory/config.toml`; the dashboard writes it for you,
-and you can edit it directly:
+## Agents and roles
 
-```toml
-[agents.codex]
-kind = "codex"
-command = "codex"
-args = ["exec"]
-
-[[role_assignments]]
-role = "planner"
-agent = "codex"
-preferred = true
-
-[[role_assignments]]
-role = "worker"
-agent = "opencode"
-```
-
-Known coding agents are configured with their standard non-interactive workflow
-invocation. Custom CLIs can choose whether Factory passes the mission through stdin or
-as one process argument; `{mission}` can set that argument's exact position.
-
-The Factory never talks to model providers. If a required role is missing or its
-executable or workflow invocation is unavailable, the operation fails instead of
-selecting a fallback agent.
-
-## Roles
-
-Roles describe responsibilities; agents are the CLIs that perform them. Eight core
-roles are built in (Planner, Worker, Reviewer, Architect, Researcher, Test Engineer,
-Security Auditor, Documentation Writer), a role can be filled by several agents at
-once, and one agent can hold several roles — no `worker2`-style duplicates. You can
-create custom roles with their own instructions from Agent Graph, and each workflow
-selects the team of roles and agents that may participate. See
-[docs/roles.md](docs/roles.md) for the full guide.
-
-## Policies
-
-Role instructions say what an agent should do; a **policy** says what Factory
-permits it to do. Project-local policies in `.factory/config.toml` control
-filesystem read/write scopes, command allow/deny lists, Git operations,
-network (advisory), and which environment variables reach the agent process.
-Policies apply per role and per agent, deny rules win, and Factory's own safety
-invariants (protected `.factory` state, no push/force-push from task agents,
-Integration Engine authority) always apply. Tasks that cannot legally execute are
-blocked before anything runs, without consuming retries. See
-[docs/policies.md](docs/policies.md).
-
-```toml
-[policies.roles.worker.filesystem]
-read = ["**"]
-write = ["src/**", "tests/**"]
-deny_write = [".github/**"]
-```
-
-## GitHub: Issue → Workflow → Pull Request
-
-With the locally authenticated [`gh`](https://cli.github.com) CLI, Factory closes
-the loop from issue to pull request. In Agent Graph, **+ Workflow → From GitHub
-Issue** imports `#42` or an issue URL as a normal workflow: the Planner produces
-an editable DAG, execution is unchanged, and issue content is treated as
-untrusted context that can never alter permissions. After a workflow completes,
-the Workflow Inspector offers **Create Pull Request** — an editable preview,
-then a safe push of the Factory-owned `factory/run-<id>` branch and a
-deterministic, evidence-based PR body. Existing PRs are linked, never
-duplicated; agents never gain push permission. See
-[docs/github.md](docs/github.md).
-
-## External Tools / MCP
-
-Factory can connect task agents to project-configured MCP servers over stdio or
-Streamable HTTP. Access is denied by default and mediated end to end by Factory:
-discovery, deterministic relevance, role/agent/Recipe policy, scoped grants,
-timeouts, response limits, cancellation, and compact audit records. Agents receive
-only a bounded permitted catalog; external results are clearly marked as untrusted
-data. Configure and test servers under **Settings → External Tools / MCP**. See
-[docs/mcp.md](docs/mcp.md).
-
-## Recipes
-
-Recipes are reusable workflow **configuration** — selected roles, routing and
-concurrency defaults, policy preset references, and bounded Planner guidance.
-A recipe never stores the task DAG: the Planner still generates every plan
-from the objective, so recipes stay adaptive (the Security Sensitive recipe
-plus a trivial CSS fix may still produce just Worker → review). Six built-ins
-ship read-only (Standard, Thorough, Security Sensitive, Bug Fix, Documentation,
-Custom); custom recipes live in `.factory/recipes.toml` and are managed from
-Settings. `+ Workflow` (objective and GitHub Issue) pre-fills the team from a
-recipe, every run stores an immutable snapshot of the applied configuration,
-and planned workflows offer **Save as Recipe** — configuration only, never
-tasks or history. See [docs/recipes.md](docs/recipes.md).
-
-## Dashboard
-
-Agent Graph is the primary operating interface:
-
-- Create a Workflow from an objective, then inspect its real tasks and dependencies.
-- Start, cancel, and retry supported workflow operations.
-- Drag nodes; add agents, roles, groups, and notes; edit supported links; and use
-  fit, center, zoom, or reset controls. Layout persists in `.factory/graph.json`.
-- Select an agent to inspect real workflow sessions or explicitly start its interactive
-  console.
-
-The Performance view measures how each agent actually performs from local workflow
-history — first-pass approval, retries, durations, and integration quality, with role,
-operation, and language breakdowns and honest sample sizes ([docs/evaluations.md](docs/evaluations.md)).
-
-Routing stays deterministic and local. The default round-robin behavior is unchanged;
-opting into `[routing] mode = "performance"` ranks eligible agents by a documented
-confidence-aware score over that measured history (capacity- and policy-aware, with a
-round-robin fallback when data is thin), and every dispatch records an explainable
-routing decision. Tasks can also be pinned to a specific agent from the Task Inspector
-([docs/routing.md](docs/routing.md)).
-
-The Runs and Settings views remain available for focused inspection and configuration.
-
-![Factory Agent Console](docs/assets/dashboard-agent-console.png)
-
-The local API is bound to `127.0.0.1`:
-
-| Method | Route                         | Description                                      |
-| ------ | ----------------------------- | ------------------------------------------------ |
-| GET    | `/api/health`                 | Service health                                   |
-| GET    | `/api/runs`                   | Workflow summaries and task counts               |
-| POST   | `/api/runs`                   | Create and asynchronously plan a workflow        |
-| POST   | `/api/runs/from-issue`        | Import a GitHub Issue as a workflow               |
-| GET    | `/api/runs/:id`               | Workflow, tasks, attempts, and sessions           |
-| POST   | `/api/runs/:id/start`         | Validate and start a planned workflow             |
-| POST   | `/api/runs/:id/cancel`        | Cancel a live workflow operation                  |
-| PUT    | `/api/runs/:id/team`          | Replace the workflow team before it starts        |
-| POST   | `/api/runs/:id/recipe`        | Save the run's configuration as a custom recipe   |
-| GET    | `/api/recipes`                | Built-in and custom workflow recipes              |
-| POST   | `/api/recipes`                | Create a custom recipe (validated atomically)     |
-| PUT    | `/api/recipes/:id`            | Update a custom recipe (built-ins are read-only)  |
-| DELETE | `/api/recipes/:id`            | Delete a custom recipe                            |
-| GET    | `/api/runs/:id/delivery`      | GitHub link, delivery state, and eligibility      |
-| GET    | `/api/runs/:id/pr-preview`    | Editable pull request preview and blockers        |
-| POST   | `/api/runs/:id/pull-request`  | Deliver: push the run branch and create the PR    |
-| GET    | `/api/github/status`          | gh auth status and the resolved GitHub remote     |
-| POST   | `/api/tasks/:id/retry`        | Retry an eligible failed task                     |
-| GET    | `/api/roles`                  | Role definitions and assignments                  |
-| POST   | `/api/roles`                  | Create a custom role                              |
-| PUT    | `/api/roles/:id`              | Update a custom role definition                   |
-| DELETE | `/api/roles/:id`              | Delete an unused custom role                      |
-| PUT    | `/api/roles/:id/policy`       | Set or clear a role's policy preset               |
-| POST   | `/api/roles/:id/assignments`  | Assign an agent to a role                         |
-| GET    | `/api/graph`                  | Agents, workflows, tasks, and semantic links     |
-| GET    | `/api/performance/agents`     | Measured agent performance summaries             |
-| GET    | `/api/performance/agents/:agent` | Full performance detail for one agent         |
-| GET    | `/api/mcp/servers`           | Configured MCP servers and cached status          |
-| POST   | `/api/mcp/servers`           | Add a validated project-local MCP server          |
-| PUT    | `/api/mcp/servers/:id`       | Update one MCP server configuration                |
-| DELETE | `/api/mcp/servers/:id`       | Remove a server and its discovery cache            |
-| POST   | `/api/mcp/servers/:id/test`  | Test MCP initialization and tool discovery         |
-| GET    | `/api/mcp/servers/:id/tools` | Inspect discovered tool metadata and schemas       |
-| GET    | `/api/mcp/invocations`       | Compact external-tool invocation audit             |
-| GET    | `/api/mcp/metrics`           | External-tool operational metrics                  |
-| GET    | `/api/roles/:id/tools`       | Effective discovered-tool decisions for a role    |
-| GET    | `/api/agents/:agent/tools`   | Effective tool decisions for an agent's roles      |
-| GET    | `/api/graph/workspace`        | Saved visual layout and custom topology          |
-| PUT    | `/api/graph/workspace`        | Validate and atomically save the graph workspace |
-| GET    | `/api/agents/:agent/sessions` | Recent persisted sessions for one agent          |
-| POST   | `/api/agents/:agent/sessions` | Start an interactive session for that agent       |
-| GET    | `/api/sessions/:id/stream`    | SSE updates for one known session                |
-| GET    | `/api/sessions/:id/terminal`  | WebSocket for one live interactive session       |
-| GET    | `/api/config`                 | The agent and role configuration                 |
-| PUT    | `/api/config`                 | Write a validated configuration atomically       |
-
-## How it works
+Three concepts, deliberately separate:
 
 ```text
-Agent Graph → local API → Factory Core → Planner → task DAG
-                                      → Worker → worktree → evidence
-                                      → Reviewer → approve or retry
+Agent      = an executable coding CLI you install and authenticate
+Role       = a responsibility inside Factory
+Assignment = permission for an agent to perform a role
 ```
-
-**Plan** asks the selected Planner for structured tasks and dependencies without
-changing the repository; tasks may target specific roles from the workflow's team.
-**Start** validates the team, Git repository, DAG, and each task's effective policy,
-then runs ready tasks in isolated worktrees. A task completes only after structured
-Reviewer approval; process exit alone is not completion. Worker failures and change
-requests retry up to three total attempts; policy blocks never consume retries.
-Every invocation is an `AgentSession` that records the role and agent that ran, plus
-which policy applied.
-
-All state lives in `.factory/`:
 
 ```text
-.factory/
-  db.sqlite3          runs, tasks, sessions, MCP metadata, grants, and audit
-  config.toml         agents, role assignments, policies, and MCP server references
-  graph.json          saved positions, visual nodes, and custom links
-  worktrees/t<id>/    one git worktree per task
+Codex                    Claude
+ ├─ Planner               ├─ Reviewer
+ ├─ Worker                └─ Security Auditor
+ └─ Reviewer
 ```
 
-Not implemented: OS-level sandboxing (policies are orchestration controls, not
-virtualization) or remote/cloud execution.
+A role can be filled by several agents, and one agent can hold several roles — no
+`worker2`-style duplicates. Roles are agent-independent: whichever assigned agent
+executes a role, the responsibility, operation semantics, and policy stay the same.
+
+- Role system reference: [docs/roles.md](docs/roles.md)
+- Designing custom roles: [docs/role-design-guide.md](docs/role-design-guide.md)
+
+## Example workflow
+
+Objective: *"Add rate limiting to the public API endpoints."*
+
+```text
+Planner produces the DAG
+  1. Architect        advisory      rate-limiting design, constraints      → artifact
+  2. Worker           implement     middleware + configuration (needs 1)   → evidence
+  3. Test Engineer    verify        regression tests (needs 2)             → artifact
+  built-in Reviewer approves each implementation-family attempt
+  Integration Engine lands approved work on factory/run-7
+```
+
+- Task 2 runs in `.factory/worktrees/t2`, consumes the Architect artifact of its
+  dependency, and is reviewed against its acceptance criteria.
+- Task 3 bases its worktree on the already-integrated head, so it tests what task
+  2 actually changed.
+- When the run completes, **Create Pull Request** pushes `factory/run-7` and opens
+  a PR whose body is generated from recorded evidence — never invented.
+
+## Security and trust model
+
+- Factory is **local-first**: state lives in `.factory/`, and nothing is sent to
+  external services.
+- The API **binds to `127.0.0.1`** and has no authentication — do not proxy or
+  expose it.
+- Task worktrees are **Git isolation, not OS sandboxing**.
+- External coding agents **retain the OS permissions of the user** who started
+  Factory.
+- The **Policy Engine provides orchestration-level controls** (filesystem scopes,
+  command allow/deny, environment filtering, Git limits) enforced at Factory's
+  boundaries and against recorded evidence — it is not a process sandbox.
+- **Network restrictions may not be enforceable** at the OS level; network policy
+  is advisory on all current platforms.
+- **MCP results and GitHub Issue content are treated as untrusted data** and can
+  never change roles, permissions, or output contracts.
+
+Run agents you trust. See [docs/security.md](docs/security.md) for the full model.
+
+## Documentation
+
+| Guide | Purpose |
+| --- | --- |
+| [Architecture](docs/architecture.md) | How Factory is structured |
+| [Roles](docs/roles.md) | Role system and runtime reference |
+| [Designing Effective Roles](docs/role-design-guide.md) | How to create effective custom roles |
+| [Policies](docs/policies.md) | Permissions and boundaries |
+| [Evaluations](docs/evaluations.md) | Agent performance metrics |
+| [Routing](docs/routing.md) | Intelligent agent routing |
+| [Recipes](docs/recipes.md) | Reusable workflow strategies |
+| [GitHub](docs/github.md) | Issue → Workflow → Pull Request |
+| [External Tools / MCP](docs/mcp.md) | External tool integration |
+| [API](docs/api.md) | Local HTTP API reference |
+| [Development](docs/development.md) | Build, test, and contribute |
+| [Security](docs/security.md) | Trust and security model |
+
+The local dashboard communicates with a semantic API bound to `127.0.0.1`
+(default port `4321`). See [docs/api.md](docs/api.md).
 
 ## Development
 
-See [docs/development.md](docs/development.md) for source builds, tests, and embedded
-dashboard release builds.
+See [docs/development.md](docs/development.md) for source builds, tests, and the
+embedded dashboard release build, and [CONTRIBUTING.md](CONTRIBUTING.md) for the
+contribution principles. Quality gates:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+```
+
+```bash
+cd apps/dashboard
+npm ci && npm run format:check && npm run lint && npm run typecheck && npm test && npm run build
+```
 
 ## License
 

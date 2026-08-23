@@ -81,6 +81,21 @@ operations are short and never span external I/O. Invocation guards make cancell
 terminal and auditable. Results are bounded and remain marked external data rather
 than repository truth. See [External Tools / MCP](mcp.md).
 
+## Repository Context Engine
+
+`factory-context` builds a bounded, persisted index of the repository — paths,
+languages, and regex-extracted symbols — stored at `.factory/context/index.json`,
+searches it with ripgrep (pure-Rust fallback), and deterministically resolves the
+most relevant files, symbols, and related tests for a task. Factory Core renders
+the result as the `REPOSITORY CONTEXT` section of every automated mission
+(implementation, verification, advisory, and review invocations).
+
+The engine is read-only with respect to the repository: it never executes
+repository code, never follows symlinks, prunes the search space through ignore
+rules, and caps every indexed read and every rendered output. The `[context]`
+table in `.factory/config.toml` controls it (`enabled`, `max_files`, `max_chars`,
+`include_tests`, `include_symbols`).
+
 ## Evaluation
 
 `factory-eval` measures agent performance (first-pass approval, retries,
@@ -337,38 +352,9 @@ macOS use the platform PTY through `portable-pty`.
 
 ## API boundary
 
-| Method | Route                         | Purpose                                      |
-| ------ | ----------------------------- | -------------------------------------------- |
-| POST   | `/api/runs`                   | Persist and begin planning a workflow (optional team) |
-| POST   | `/api/runs/from-issue`        | Import a GitHub Issue as a workflow          |
-| GET    | `/api/runs/:id`               | Read tasks, attempts, sessions, derived stages, and artifacts |
-| POST   | `/api/runs/:id/start`         | Validate and schedule a planned workflow; returns its team |
-| POST   | `/api/runs/:id/cancel`        | Cancel that run's live operation             |
-| PUT    | `/api/runs/:id/team`          | Replace the team before the workflow starts  |
-| GET    | `/api/runs/:id/delivery`      | GitHub link, delivery state, and eligibility |
-| GET    | `/api/runs/:id/pr-preview`    | Editable pull request preview and blockers   |
-| POST   | `/api/runs/:id/pull-request`  | The Factory-owned delivery action            |
-| GET    | `/api/github/status`          | gh auth status and the resolved GitHub remote |
-| POST   | `/api/tasks/:id/retry`        | Retry an eligible task within the limit      |
-| GET    | `/api/runs/:id/artifacts`     | Role artifacts persisted by a workflow       |
-| GET    | `/api/tasks/:id/artifacts`    | Role artifacts produced by one task          |
-| GET    | `/api/roles`                  | Read role definitions and assignments        |
-| POST   | `/api/roles`                  | Create a custom role definition              |
-| PUT    | `/api/roles/:id`              | Update a custom role definition              |
-| DELETE | `/api/roles/:id`              | Delete an unused custom role                 |
-| POST   | `/api/roles/:id/assignments`  | Assign an agent to a role                    |
-| DELETE | `/api/roles/:id/assignments/:agent` | Remove one role assignment            |
-| PUT    | `/api/roles/:id/preferred`    | Mark one assignment as preferred             |
-| PUT    | `/api/roles/:id/policy`       | Set or clear a role's policy preset          |
-| GET    | `/api/graph`                  | Read Factory entities and semantic links     |
-| GET    | `/api/sessions/:id/stream`    | Stream one known session through SSE         |
-| POST   | `/api/agents/:agent/sessions` | Start that configured agent in a PTY          |
-| DELETE | `/api/sessions/:id`           | Stop one live interactive session             |
-| GET    | `/api/sessions/:id/terminal`  | Upgrade one live interactive session to WS    |
-| GET    | `/api/graph/workspace`        | Read visual workspace state                  |
-| PUT    | `/api/graph/workspace`        | Validate and atomically save visual state    |
-| GET    | `/api/config`                 | Read agents, custom role definitions, and role assignments |
-| PUT    | `/api/config`                 | Validate and atomically save configuration   |
+The complete endpoint reference lives in [api.md](api.md): workflows, tasks,
+roles, recipes, agents and sessions, graph and configuration, GitHub,
+performance, and external tools / MCP.
 
 Artifacts are read through the explicit artifact routes (or the run detail). The
 frontend never invokes agents directly: workflow execution is owned by the runtime,
@@ -395,8 +381,9 @@ agent links are visual topology only and never trigger execution.
 
 ## CLI
 
-The public CLI is limited to `factory init`, `factory start`, and read-only
-`factory status`, plus `--help` and `--version`. Debugging commands remain under
+The public CLI is limited to `factory init`, `factory start`, read-only
+`factory status`, and `factory mcp call` (the scoped external-tool bridge used
+by task agents), plus `--help` and `--version`. Debugging commands remain under
 `factory dev`. Normal workflow creation and operation happen in Agent Graph.
 
 Release builds embed the compiled dashboard with `rust-embed`; development builds read

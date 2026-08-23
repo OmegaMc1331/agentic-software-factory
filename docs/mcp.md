@@ -157,8 +157,7 @@ The Role and Agent inspectors show effective decisions for discovered tools. Rec
 entries use the same qualified patterns:
 
 ```toml
-[[recipes]]
-id = "backend"
+[recipes.backend]
 name = "Backend Development"
 roles = ["planner", "worker", "reviewer"]
 tools = ["docs.*", "postgres.inspect_schema"]

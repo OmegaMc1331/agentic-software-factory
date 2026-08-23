@@ -5,6 +5,11 @@ agents, which roles are built in, how multiple agents share a role, how workflow
 a team, and — since the role-aware release — how **execution classes drive real
 runtime behavior** instead of only guiding the Planner and the UI.
 
+> **For a practical method for designing custom roles — when to create one, a
+> step-by-step design method, complete examples, anti-patterns, and a reusable
+> worksheet — see [Designing Effective Roles](role-design-guide.md).** This
+> document stays the technical reference for role semantics and configuration.
+
 ![Role Inspector](assets/dashboard-roles.png)
 
 ## What a role is
@@ -394,6 +399,9 @@ bounded, individual artifacts are capped, and oversized context is truncated wit
 visible marker instead of silently dropped.
 
 ## Writing good role instructions
+
+See [Designing Effective Roles](role-design-guide.md) for the full design method,
+an instruction template, examples, and anti-patterns. The short form:
 
 A good role answers four questions:
 
