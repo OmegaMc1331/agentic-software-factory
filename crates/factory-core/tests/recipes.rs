@@ -162,6 +162,7 @@ fn creating_a_run_from_a_recipe_snapshots_it_immutably() {
         max_parallel_tasks: Some(3),
         policy_presets: BTreeMap::new(),
         planner_guidance: "Prefer a compact dependency-aware plan.".into(),
+        tools: Vec::new(),
         github: None,
         builtin: false,
     };
@@ -327,6 +328,7 @@ fn recipe_routing_mode_overrides_the_project_default_for_the_run() {
         max_parallel_tasks: None,
         policy_presets: BTreeMap::new(),
         planner_guidance: String::new(),
+        tools: Vec::new(),
         github: None,
         builtin: false,
     };
@@ -378,6 +380,7 @@ fn recipe_concurrency_preference_is_validated_and_applied() {
         max_parallel_tasks: Some(2),
         policy_presets: BTreeMap::new(),
         planner_guidance: String::new(),
+        tools: Vec::new(),
         github: None,
         builtin: false,
     };
@@ -418,6 +421,7 @@ fn recipe_policy_narrows_but_never_elevates() {
         max_parallel_tasks: None,
         policy_presets: narrowing,
         planner_guidance: String::new(),
+        tools: Vec::new(),
         github: None,
         builtin: false,
     };

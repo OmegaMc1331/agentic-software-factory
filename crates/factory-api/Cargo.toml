@@ -17,6 +17,7 @@ factory-core = { workspace = true }
 factory-runtime = { workspace = true }
 factory-policy = { workspace = true }
 factory-eval = { workspace = true }
+factory-mcp = { workspace = true }
 axum = { version = "0.7", features = ["ws"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "sync", "time"] }
 tower-http = { version = "0.5", features = ["fs"] }

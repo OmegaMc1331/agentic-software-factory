@@ -62,6 +62,7 @@ fn legacy_custom_configuration_keeps_stdin_transport() {
         routing: Default::default(),
         context: Default::default(),
         policies: Default::default(),
+        mcp: Default::default(),
     };
     let agent = config.agent_config("custom").unwrap();
     assert_eq!(agent.kind, AgentKind::Custom);
@@ -324,6 +325,7 @@ fn write_atomic_round_trips_configuration() {
         routing: Default::default(),
         context: Default::default(),
         policies: Default::default(),
+        mcp: Default::default(),
     };
     let path = config.write_atomic(dir.path()).unwrap();
     assert!(path.ends_with("config.toml"));
@@ -353,6 +355,7 @@ fn validation_rejects_unknown_role_agent() {
         routing: Default::default(),
         context: Default::default(),
         policies: Default::default(),
+        mcp: Default::default(),
     };
     let err = config.validate().unwrap_err();
     assert!(err.contains("unknown agent 'ghost'"));
@@ -368,6 +371,7 @@ fn validation_rejects_empty_commands_and_invalid_names() {
         routing: Default::default(),
         context: Default::default(),
         policies: Default::default(),
+        mcp: Default::default(),
     };
     let err = config.validate().unwrap_err();
     assert!(err.contains("invalid agent name"));
@@ -380,6 +384,7 @@ fn validation_rejects_empty_commands_and_invalid_names() {
         routing: Default::default(),
         context: Default::default(),
         policies: Default::default(),
+        mcp: Default::default(),
     };
     let err = config.validate().unwrap_err();
     assert!(err.contains("empty command"));

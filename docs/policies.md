@@ -49,7 +49,29 @@ The same `EffectivePolicy` is used everywhere: automated execution, validation,
 `AgentSession` audit metadata, and the dashboard's Permissions sections. Permission
 logic is never re-implemented in the runtime, API, or frontend.
 
+Recipes add one optional restriction layer after role and agent resolution. They
+can select narrower policy presets and external-tool patterns, but cannot elevate
+the effective policy.
+
 ## Dimensions
+
+### External tools / MCP
+
+```toml
+[policies.roles.worker.tools]
+allow = ["github.read_*", "docs.*", "github.create_issue"]
+deny = ["github.delete_*"]
+
+[policies.agents.codex.tools]
+allow = ["github.read_*", "docs.search"]
+deny = ["github.read_private"]
+```
+
+MCP permissions match qualified `server.tool` names. External tools are denied when
+the role has no explicit tool allow. Agent and Recipe layers intersect with that
+role allow, denies union and win, and `write`, `destructive`, or `unknown` tools
+require an exact role allow rather than only a wildcard. Discovery metadata and
+tool output never grant permission. See [External Tools / MCP](mcp.md).
 
 ### Filesystem
 

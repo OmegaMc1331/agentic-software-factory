@@ -28,6 +28,12 @@ Core and API workflow tests use configured fake executables and temporary Git
 repositories. CI doesn't require Codex, Claude Code, or OpenCode. Git and worktree tests
 are intentionally slower than pure unit tests.
 
+MCP tests use local fake stdio and Streamable HTTP servers and require no external
+credentials or network service. Keep discovery, schema, policy, denial, timeout,
+cancellation, crash, malformed/oversized response, redaction, prompt-injection, and
+parallel-call regressions in `factory-mcp`; keep the scoped CLI bridge and semantic API
+tests in their owning crates. Never replace these fixtures with a live provider in CI.
+
 ## Local dashboard development
 
 Build the dashboard once, then run the API and Vite in separate terminals:
@@ -94,6 +100,9 @@ Focused commands:
 cargo test -p factory-core --test workflow_runtime
 cargo test -p factory-db
 cargo test -p factory-api --test api workflow_
+cargo test -p factory-mcp
+cargo test -p factory-cli --test mcp_cli
+cargo test -p factory-api --test mcp_api
 ```
 
 ## Agent Graph and sessions
@@ -161,8 +170,8 @@ builds all supported platform archives, verifies installers, and creates a GitHu
 Release. Do not tag routine changes automatically.
 
 ```bash
-git tag v0.3.4
-git push origin v0.3.4
+git tag v1.0.0
+git push origin v1.0.0
 ```
 
 [CI](../.github/workflows/ci.yml) runs Rust checks on Ubuntu and Windows, dashboard

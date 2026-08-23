@@ -58,6 +58,9 @@ pub(crate) struct PerformanceOverviewResponse {
     window: PerformanceWindow,
     agents: Vec<AgentPerformanceSummary>,
     facets: PerformanceFacets,
+    /// Operational MCP telemetry is intentionally separate from agent quality
+    /// metrics and never feeds routing.
+    tool_operations: factory_types::ToolMetrics,
 }
 
 /// `GET /api/performance/agents` — one compact summary per agent, with the
@@ -73,6 +76,7 @@ pub(crate) async fn list_agent_performance(
         window: report.window,
         agents: report.agents,
         facets: report.facets,
+        tool_operations: db.tool_metrics()?,
     }))
 }
 

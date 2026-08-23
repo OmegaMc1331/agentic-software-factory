@@ -60,6 +60,28 @@ Terminal input and resize are accepted only for a Factory-owned interactive sess
 Automated Planner, Worker, and Reviewer sessions remain non-interactive. Arbitrary
 command execution through the dashboard API is not supported.
 
+## External tools / MCP
+
+MCP server configuration does not grant access. A role must explicitly allow a
+qualified tool, agent and Recipe policy can only narrow that allow list, every deny
+wins, and write/destructive/unknown tools require an exact role allow. Tool metadata
+and output never participate in authorization. See [External Tools / MCP](mcp.md).
+
+Factory starts stdio servers with structured argv and a repository-bounded working
+directory; HTTP endpoints must be absolute and cannot embed credentials. Server env
+and headers accept only `${ENV_NAME}` references. Resolved values are redacted and
+are never persisted or sent in missions. Scoped task grants are stored hashed,
+expire, are revoked after the session, and cannot call tools outside their catalog.
+
+Schemas are validated, discovery and calls have timeouts, raw responses have hard
+size limits, and returned text is visibly marked untrusted external data. The local
+API exposes semantic configuration/test/inspection operations only—never raw MCP
+JSON-RPC, an arbitrary executable, or unrestricted dashboard tool invocation.
+
+These controls do not make MCP an OS sandbox. Configure only trusted server processes
+and URLs, and do not separately give coding CLIs unmanaged native MCP credentials if
+Factory is intended to be the authorization boundary.
+
 ## Process permissions
 
 External coding agents run with the OS permissions of the user who started Factory.

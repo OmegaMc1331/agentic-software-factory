@@ -19,7 +19,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use factory_policy::PolicyPreset;
+use factory_policy::{PolicyPreset, PolicyScope, ToolPolicy};
 use factory_types::{Recipe, RecipeRouting};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -78,6 +78,7 @@ pub fn builtin_recipes() -> Vec<Recipe> {
             routing: RecipeRouting::ProjectDefault,
             max_parallel_tasks: Some(4),
             policy_presets: BTreeMap::new(),
+            tools: Vec::new(),
             planner_guidance: String::new(),
             github: None,
             builtin: true,
@@ -99,6 +100,7 @@ pub fn builtin_recipes() -> Vec<Recipe> {
             routing: RecipeRouting::ProjectDefault,
             max_parallel_tasks: None,
             policy_presets: BTreeMap::new(),
+            tools: Vec::new(),
             planner_guidance: "Use Architect and Documentation Writer only when the change is \
                                 substantial enough to need them; verify behavioral changes with \
                                 the Test Engineer."
@@ -130,6 +132,7 @@ pub fn builtin_recipes() -> Vec<Recipe> {
                 ("security_auditor".to_string(), "read_only".to_string()),
                 ("reviewer".to_string(), "review".to_string()),
             ]),
+            tools: vec!["docs.*".into(), "github.read_*".into()],
             planner_guidance: "Treat the objective as security-sensitive: put a Security \
                                Auditor review after the security-relevant implementation, cover \
                                the changed behavior with tests, and keep the plan proportional \
@@ -151,6 +154,7 @@ pub fn builtin_recipes() -> Vec<Recipe> {
             routing: RecipeRouting::ProjectDefault,
             max_parallel_tasks: None,
             policy_presets: BTreeMap::new(),
+            tools: Vec::new(),
             planner_guidance: "Prefer a compact workflow: one focused diagnosis/fix task, a \
                                 regression test that fails without the fix, and a review. Avoid \
                                 architecture or documentation tasks unless the bug exposes a \
@@ -174,6 +178,7 @@ pub fn builtin_recipes() -> Vec<Recipe> {
                 "documentation_writer".to_string(),
                 "documentation".to_string(),
             )]),
+            tools: vec!["docs.*".into()],
             planner_guidance: "Keep every task inside documentation: no production code changes."
                 .into(),
             github: None,
@@ -187,6 +192,7 @@ pub fn builtin_recipes() -> Vec<Recipe> {
             routing: RecipeRouting::ProjectDefault,
             max_parallel_tasks: None,
             policy_presets: BTreeMap::new(),
+            tools: Vec::new(),
             planner_guidance: String::new(),
             github: None,
             builtin: true,
@@ -235,6 +241,8 @@ struct RecipeEntry {
     max_parallel_tasks: Option<usize>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     policy_presets: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    tools: Vec<String>,
     #[serde(default)]
     planner_guidance: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -264,6 +272,7 @@ fn recipe_from_entry(id: String, entry: RecipeEntry) -> Result<Recipe, RecipeErr
         routing,
         max_parallel_tasks: entry.max_parallel_tasks,
         policy_presets: entry.policy_presets,
+        tools: entry.tools,
         planner_guidance: entry.planner_guidance,
         github: entry.github.map(|delivery| factory_types::RecipeDelivery {
             draft: delivery.draft,
@@ -282,6 +291,7 @@ fn recipe_to_entry(recipe: &Recipe) -> (String, RecipeEntry) {
             routing: recipe.routing.as_str().to_string(),
             max_parallel_tasks: recipe.max_parallel_tasks,
             policy_presets: recipe.policy_presets.clone(),
+            tools: recipe.tools.clone(),
             planner_guidance: recipe.planner_guidance.clone(),
             github: recipe.github.map(|delivery| RecipeDeliveryEntry {
                 draft: delivery.draft,
@@ -427,6 +437,17 @@ pub fn validate_recipe(
             ));
         }
     }
+    if !recipe.tools.is_empty() {
+        PolicyScope {
+            tools: Some(ToolPolicy {
+                allow: recipe.tools.clone(),
+                deny: Vec::new(),
+            }),
+            ..PolicyScope::default()
+        }
+        .validate("recipe.tools")
+        .map_err(|reason| format!("recipe '{}': {reason}", recipe.id))?;
+    }
     if recipe.planner_guidance.chars().count() > MAX_PLANNER_GUIDANCE_CHARS {
         return Err(format!(
             "recipe '{}' planner guidance exceeds {MAX_PLANNER_GUIDANCE_CHARS} characters",
@@ -533,16 +554,29 @@ pub fn delete_recipe(root: &Path, config: &Config, id: &str) -> Result<(), Recip
     write_custom(root, &custom, config)
 }
 
-/// The only-narrowing policy restriction a snapshot applies to a role, when
-/// it references a preset for that role. The Policy Engine stays
-/// authoritative; the preset scope can only intersect existing access.
+/// The only-narrowing policy restriction a snapshot applies to a role. Policy
+/// presets and MCP tool selectors share the same intersection layer, so a
+/// recipe can select existing access but never elevate it.
 pub fn snapshot_policy_restriction(
     snapshot: &factory_types::RecipeSnapshot,
     role: &str,
 ) -> Option<factory_policy::PolicyScope> {
-    let preset = snapshot.policy_preset_for(role)?;
-    let preset = PolicyPreset::parse(preset)?;
-    Some(preset.scope())
+    let mut scope = snapshot
+        .policy_preset_for(role)
+        .and_then(PolicyPreset::parse)
+        .map(PolicyPreset::scope)
+        .unwrap_or_default();
+    if !snapshot.tools.is_empty() {
+        scope.tools = Some(ToolPolicy {
+            allow: snapshot.tools.clone(),
+            deny: Vec::new(),
+        });
+    }
+    if scope == PolicyScope::default() {
+        None
+    } else {
+        Some(scope)
+    }
 }
 
 #[cfg(test)]
@@ -660,6 +694,7 @@ mod tests {
             max_parallel_tasks: Some(3),
             policy_presets: BTreeMap::from([("worker".to_string(), "implementation".to_string())]),
             planner_guidance: "Prefer a compact dependency-aware plan.".into(),
+            tools: vec!["docs.*".into()],
             github: Some(RecipeDelivery { draft: true }),
             builtin: false,
         };
@@ -700,6 +735,7 @@ mod tests {
             max_parallel_tasks: None,
             policy_presets: BTreeMap::new(),
             planner_guidance: String::new(),
+            tools: Vec::new(),
             github: None,
             builtin: false,
         };
@@ -846,6 +882,21 @@ mod tests {
         assert!(read_only.filesystem.unwrap().write.is_empty());
     }
 
+    #[test]
+    fn recipe_tool_selection_cannot_elevate_role_access() {
+        let mut snapshot = empty().snapshot();
+        snapshot.tools = vec!["docs.*".into()];
+        let restriction = snapshot_policy_restriction(&snapshot, "worker").unwrap();
+        let mut policies = factory_policy::PoliciesConfig::default();
+        policies.role_mut("worker").tools = Some(factory_policy::ToolPolicy {
+            allow: vec!["github.read_*".into()],
+            deny: Vec::new(),
+        });
+        let effective = policies.effective_restricted("worker", "codex", Some(&restriction));
+        assert!(!effective.tools.allowed("docs.search", false));
+        assert!(!effective.tools.allowed("github.read_issue", false));
+    }
+
     fn empty() -> Recipe {
         Recipe {
             id: "x".into(),
@@ -856,6 +907,7 @@ mod tests {
             max_parallel_tasks: None,
             policy_presets: BTreeMap::new(),
             planner_guidance: String::new(),
+            tools: Vec::new(),
             github: None,
             builtin: false,
         }

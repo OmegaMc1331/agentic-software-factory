@@ -42,6 +42,9 @@ enum Command {
     },
     /// Show the current factory status
     Status,
+    /// Invoke a Factory-authorized external MCP tool
+    #[command(subcommand)]
+    Mcp(McpCommand),
     /// Internal and development commands
     #[command(subcommand)]
     Dev(DevCommand),
@@ -88,6 +91,18 @@ enum DevCommand {
 }
 
 #[derive(Subcommand)]
+enum McpCommand {
+    /// Call one tool through the task's opaque scoped grant
+    Call {
+        /// Qualified tool name (`server.tool`)
+        tool: String,
+        /// Tool arguments as one JSON object
+        #[arg(long)]
+        input_json: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum ConfigCommand {
     /// Show the role-to-agent mapping
     List,
@@ -125,6 +140,9 @@ impl Cli {
             Command::Status => {
                 status(&root)?;
             }
+            Command::Mcp(command) => match command {
+                McpCommand::Call { tool, input_json } => mcp_call(tool, input_json)?,
+            },
             Command::Dev(command) => match command {
                 DevCommand::Agents => agents(&root)?,
                 DevCommand::Config { command } => match command {
@@ -145,6 +163,40 @@ impl Cli {
         }
         Ok(())
     }
+}
+
+fn mcp_call(tool: &str, input_json: &str) -> Result<()> {
+    const MAX_INPUT_BYTES: usize = 1_048_576;
+    if input_json.len() > MAX_INPUT_BYTES {
+        bail!("MCP tool input exceeds the {MAX_INPUT_BYTES}-byte limit");
+    }
+    let root = std::env::var_os("FACTORY_MCP_ROOT")
+        .map(std::path::PathBuf::from)
+        .context("this command requires a Factory task tool grant")?;
+    let token = std::env::var("FACTORY_MCP_GRANT")
+        .context("this command requires a Factory task tool grant")?;
+    // Minimize the lifetime of the plaintext capability in this process and
+    // ensure it cannot reach any MCP child process through inheritance.
+    std::env::remove_var("FACTORY_MCP_GRANT");
+    factory_root(&root)?;
+    let input: serde_json::Value =
+        serde_json::from_str(input_json).context("--input-json must be valid JSON")?;
+    if !input.is_object() {
+        bail!("--input-json must be a JSON object");
+    }
+    let config = Config::load(&root)?;
+    let registry = factory_mcp::ToolRegistry::new(&root, config.mcp.clone());
+    let grant = registry
+        .grant_for_token(&token)?
+        .context("invalid or expired Factory task tool grant")?;
+    let policy = config.effective_policy(&grant.role, &grant.agent);
+    let output = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("cannot initialize MCP runtime")?
+        .block_on(registry.execute_grant(&token, tool, input, &policy))?;
+    println!("{}", output.rendered);
+    Ok(())
 }
 
 fn factory_root(root: &Path) -> Result<()> {

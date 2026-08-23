@@ -13,6 +13,7 @@ factory-db = { workspace = true }
 factory-git = { workspace = true }
 factory-github = { workspace = true }
 factory-eval = { workspace = true }
+factory-mcp = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

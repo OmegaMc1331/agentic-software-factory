@@ -45,6 +45,13 @@ pub struct SessionPolicyAudit {
     /// Effective write scopes at session start.
     #[serde(default)]
     pub write_scopes: Vec<String>,
+    /// Effective external-tool allow layers (role first, then any narrowing
+    /// agent/recipe layers). These are patterns, never credentials.
+    #[serde(default)]
+    pub tool_allow: Vec<String>,
+    /// Effective deny patterns; deny always wins.
+    #[serde(default)]
+    pub tool_deny: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

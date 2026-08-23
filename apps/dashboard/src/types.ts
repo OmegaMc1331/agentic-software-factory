@@ -122,6 +122,8 @@ export interface Recipe {
   maxParallelTasks: number | null;
   policyPresets: Record<string, string>;
   plannerGuidance: string;
+  /** Tool patterns selected by the recipe; this layer can only narrow policy. */
+  tools?: string[];
   github?: RecipeDelivery | null;
   builtin: boolean;
 }
@@ -138,6 +140,7 @@ export interface RecipeSnapshot {
   maxParallelTasks: number | null;
   policyPresets: Record<string, string>;
   plannerGuidance: string;
+  tools?: string[];
   github?: RecipeDelivery | null;
 }
 
@@ -252,6 +255,64 @@ export interface ConfigData {
   roles: Record<string, RoleDefinitionEntry>;
   role_assignments: RoleAssignmentEntry[];
   routing?: RoutingConfigData;
+  mcp?: Record<string, McpServerConfig>;
+}
+
+export type ToolClassification = "read" | "write" | "destructive" | "unknown";
+
+/** Project-local MCP config uses the same snake_case keys as config.toml. */
+export interface McpServerConfig {
+  transport: "stdio" | "http";
+  command?: string;
+  args?: string[];
+  cwd?: string;
+  url?: string;
+  env?: Record<string, string>;
+  headers?: Record<string, string>;
+  timeout_ms?: number;
+  discovery_timeout_ms?: number;
+  max_response_bytes?: number;
+  max_concurrency?: number;
+  classifications?: Record<string, ToolClassification>;
+}
+
+export interface McpServerView {
+  id: string;
+  transport: "stdio" | "http";
+  command?: string;
+  args: string[];
+  cwd?: string;
+  url?: string;
+  env: Record<string, string>;
+  headers: Record<string, string>;
+  timeoutMs: number;
+  discoveryTimeoutMs: number;
+  maxResponseBytes: number;
+  maxConcurrency: number;
+  classifications: Record<string, ToolClassification>;
+  status: "connected" | "unavailable" | "unknown";
+  toolCount: number;
+  lastError?: string;
+}
+
+export interface McpTool {
+  server: string;
+  name: string;
+  qualifiedName: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+  annotations?: Record<string, unknown> | null;
+  classification: ToolClassification;
+  discoveredAt: string;
+}
+
+export interface EffectiveToolPermission {
+  role?: string;
+  server: string;
+  tool: string;
+  qualifiedName: string;
+  classification: ToolClassification;
+  allowed: boolean;
 }
 
 export type ExecutionClass = "planning" | "execution" | "review" | "advisory" | "post_process";
@@ -341,6 +402,8 @@ export interface PolicyView {
   environmentDenied: string[];
   gitAllowed: string[];
   gitDenied: string[];
+  toolsAllow?: string[];
+  toolsDeny?: string[];
 }
 
 export interface RoleInfo {
@@ -717,6 +780,8 @@ export interface SessionPolicyAudit {
   network: string;
   environment: string;
   writeScopes: string[];
+  toolAllow?: string[];
+  toolDeny?: string[];
 }
 
 export interface AgentSession {
@@ -938,6 +1003,12 @@ export interface PerformanceOverview {
   window: PerformanceWindowKey;
   agents: AgentPerformanceSummary[];
   facets: PerformanceFacets;
+  toolOperations?: {
+    calls: number;
+    successes: number;
+    failures: number;
+    medianDurationMs: number | null;
+  };
 }
 
 export interface PerformanceFilters {

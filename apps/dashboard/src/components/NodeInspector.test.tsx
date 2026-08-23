@@ -1,6 +1,7 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  fetchAgentTools,
   fetchRoles,
   fetchRoutingDecisions,
   fetchRoutingPreview,
@@ -12,6 +13,7 @@ import { NodeInspector } from "./NodeInspector";
 
 vi.mock("../api", () => ({
   fetchRunArtifacts: vi.fn(),
+  fetchAgentTools: vi.fn(),
   fetchTaskArtifacts: vi.fn(),
   fetchRun: vi.fn(),
   fetchRoutingPreview: vi.fn(),
@@ -84,6 +86,7 @@ const taskNode: GraphNode = {
 };
 
 beforeEach(() => {
+  vi.mocked(fetchAgentTools).mockReset().mockResolvedValue([]);
   vi.mocked(fetchRunArtifacts).mockReset();
   vi.mocked(fetchRoutingPreview)
     .mockReset()

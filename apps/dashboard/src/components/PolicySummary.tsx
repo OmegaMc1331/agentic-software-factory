@@ -86,6 +86,12 @@ export function PolicySummary({ permissions }: { permissions: PolicyView | undef
       </Row>
       <Row label="Environment">{environmentLabel(permissions)}</Row>
       <Row label="Git">{gitLabel(permissions)}</Row>
+      <Row label="External tools">
+        {scopeList(permissions.toolsAllow ?? [])}
+        {(permissions.toolsDeny ?? []).length > 0 && (
+          <span className="policy-scopes"> â€” deny: {scopeList(permissions.toolsDeny ?? [])}</span>
+        )}
+      </Row>
       <p className="policy-invariant-note">
         Dangerous Git operations (push, force push, branch deletion, reset, remotes) are always
         denied; task agents cannot touch Factory's integration branches.

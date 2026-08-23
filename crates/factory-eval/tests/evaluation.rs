@@ -10,7 +10,7 @@ use factory_eval::{
 };
 use factory_types::{
     AgentSession, AgentSessionMode, AttemptStatus, IntegrationOutcomeKind, ReviewDecision,
-    ReviewResult, TaskEvidence, TaskOperation, TaskState,
+    ReviewResult, TaskEvidence, TaskOperation, TaskState, ToolClassification, ToolInvocation,
 };
 use rusqlite::Connection;
 use tempfile::TempDir;
@@ -22,6 +22,54 @@ struct HistoryBuilder {
     path: std::path::PathBuf,
     run_id: i64,
     task_seq: i64,
+}
+
+#[test]
+fn mcp_infrastructure_failures_do_not_change_agent_quality_metrics() {
+    let now = Utc::now();
+    let (mut builder, _dir) = HistoryBuilder::new();
+    builder.task(
+        "worker",
+        TaskOperation::Implement,
+        &[AttemptSpec::by("codex", AttemptStatus::Approved)],
+        now - Duration::hours(1),
+        &["src/lib.rs"],
+    );
+    let before = evaluate(&builder.db, &query(), now).unwrap();
+    let invocation = builder
+        .db
+        .start_tool_invocation(&ToolInvocation {
+            id: 0,
+            run_id: Some(builder.run_id),
+            task_id: None,
+            attempt_id: None,
+            session_id: None,
+            agent: "codex".into(),
+            role: "worker".into(),
+            server: "docs".into(),
+            tool: "search".into(),
+            classification: ToolClassification::Read,
+            status: "running".into(),
+            started_at: now.to_rfc3339(),
+            duration_ms: None,
+            input_summary: "JSON object with 1 key; names and values omitted".into(),
+            output_summary: None,
+            error: None,
+        })
+        .unwrap();
+    builder
+        .db
+        .finish_tool_invocation(
+            invocation.id,
+            "server_unavailable",
+            25,
+            None,
+            Some("MCP server unavailable"),
+        )
+        .unwrap();
+    let after = evaluate(&builder.db, &query(), now).unwrap();
+    assert_eq!(after, before);
+    assert_eq!(builder.db.tool_metrics().unwrap().failures, 1);
 }
 
 impl HistoryBuilder {

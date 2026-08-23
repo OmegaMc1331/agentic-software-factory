@@ -13,11 +13,13 @@ use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use factory_core::{Agents, Config, ConfigError, RoleAssignment};
 use factory_db::FactoryDb;
+use factory_mcp::{McpFailureKind, McpServerConfig, McpServerStatus, McpServerView, ToolRegistry};
 use factory_runtime::{Runtime, RuntimeError, TerminalSubscription};
 use factory_types::{
     AgentSessionMode, Recipe, RecipeDelivery, RecipeRouting, RecipeSnapshot, WorkflowTeam,
 };
 use serde::Deserialize;
+use serde::Serialize;
 use serde_json::json;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -93,6 +95,22 @@ impl From<ConfigError> for ApiError {
 impl From<GraphWorkspaceError> for ApiError {
     fn from(err: GraphWorkspaceError) -> Self {
         ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
+    }
+}
+
+impl From<factory_mcp::McpError> for ApiError {
+    fn from(error: factory_mcp::McpError) -> Self {
+        let status = match error.kind {
+            McpFailureKind::PermissionDenied => StatusCode::FORBIDDEN,
+            McpFailureKind::InvalidSchema => StatusCode::BAD_REQUEST,
+            McpFailureKind::ServerUnavailable
+            | McpFailureKind::Timeout
+            | McpFailureKind::Cancelled
+            | McpFailureKind::ProtocolError
+            | McpFailureKind::ResponseTooLarge
+            | McpFailureKind::ToolFailure => StatusCode::SERVICE_UNAVAILABLE,
+        };
+        ApiError::new(status, error.to_string())
     }
 }
 
@@ -190,6 +208,7 @@ pub fn router(state: SharedState) -> Router {
         )
         .route("/api/roles/:id/preferred", put(set_preferred_assignment))
         .route("/api/roles/:id/policy", put(put_role_policy))
+        .route("/api/roles/:id/tools", get(get_role_tools))
         .route("/api/graph", get(get_graph))
         .route(
             "/api/graph/workspace",
@@ -197,6 +216,7 @@ pub fn router(state: SharedState) -> Router {
         )
         .route("/api/github/status", get(github_status))
         .route("/api/agents", get(get_agents))
+        .route("/api/agents/:agent/tools", get(get_agent_tools))
         .route(
             "/api/performance/agents",
             get(crate::performance::list_agent_performance),
@@ -216,6 +236,18 @@ pub fn router(state: SharedState) -> Router {
         .route("/api/sessions/:id/stream", get(stream_agent_session))
         .route("/api/sessions/:id/terminal", get(interactive_terminal))
         .route("/api/config", get(get_config).put(put_config))
+        .route(
+            "/api/mcp/servers",
+            get(list_mcp_servers).post(create_mcp_server),
+        )
+        .route(
+            "/api/mcp/servers/:id",
+            put(update_mcp_server).delete(delete_mcp_server),
+        )
+        .route("/api/mcp/servers/:id/test", post(test_mcp_server))
+        .route("/api/mcp/servers/:id/tools", get(list_mcp_tools))
+        .route("/api/mcp/invocations", get(list_mcp_invocations))
+        .route("/api/mcp/metrics", get(get_mcp_metrics))
         .route("/api/*rest", get(api_not_found))
         .fallback_service(dashboard::router(&state.root))
         .with_state(state)
@@ -305,6 +337,8 @@ struct RecipeDefinitionBody {
     #[serde(default)]
     policy_presets: BTreeMap<String, String>,
     #[serde(default)]
+    tools: Vec<String>,
+    #[serde(default)]
     planner_guidance: String,
     #[serde(default)]
     github: Option<RecipeDelivery>,
@@ -324,6 +358,7 @@ impl RecipeDefinitionBody {
             routing: self.routing,
             max_parallel_tasks: self.max_parallel_tasks,
             policy_presets: self.policy_presets,
+            tools: self.tools,
             planner_guidance: self.planner_guidance,
             github: self.github,
             builtin: false,
@@ -709,6 +744,242 @@ fn save_config(state: &SharedState, config: &Config) -> Result<(), ApiError> {
         .map_err(|reason| ApiError::new(StatusCode::BAD_REQUEST, reason))?;
     config.write_atomic(&state.root).map_err(ApiError::from)?;
     Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct McpServerMutation {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(flatten)]
+    config: McpServerConfig,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EffectiveToolPermission {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    role: Option<String>,
+    server: String,
+    tool: String,
+    qualified_name: String,
+    classification: factory_types::ToolClassification,
+    allowed: bool,
+}
+
+fn mcp_registry(state: &SharedState, config: &Config) -> ToolRegistry {
+    ToolRegistry::new(&state.root, config.mcp.clone())
+}
+
+async fn list_mcp_servers(
+    State(state): State<SharedState>,
+) -> Result<Json<Vec<McpServerView>>, ApiError> {
+    let config = load_config(&state)?;
+    Ok(Json(mcp_registry(&state, &config).server_views()?))
+}
+
+async fn create_mcp_server(
+    State(state): State<SharedState>,
+    body: Result<Json<McpServerMutation>, axum::extract::rejection::JsonRejection>,
+) -> Result<(StatusCode, Json<McpServerView>), ApiError> {
+    let request = body
+        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "invalid MCP server JSON body"))?
+        .0;
+    let id = request
+        .id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "MCP server id is required"))?
+        .to_string();
+    let mut config = load_config(&state)?;
+    if config.mcp.contains_key(&id) {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            format!("MCP server '{id}' already exists"),
+        ));
+    }
+    config.mcp.insert(id.clone(), request.config);
+    save_config(&state, &config)?;
+    let server = config.mcp.get(&id).expect("inserted MCP server");
+    Ok((
+        StatusCode::CREATED,
+        Json(McpServerView::from_config(
+            id,
+            server,
+            McpServerStatus::Unknown,
+            0,
+            None,
+        )),
+    ))
+}
+
+async fn update_mcp_server(
+    State(state): State<SharedState>,
+    UrlPath(id): UrlPath<String>,
+    body: Result<Json<McpServerMutation>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<McpServerView>, ApiError> {
+    let request = body
+        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "invalid MCP server JSON body"))?
+        .0;
+    let mut config = load_config(&state)?;
+    if !config.mcp.contains_key(&id) {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            format!("MCP server '{id}' not found"),
+        ));
+    }
+    config.mcp.insert(id.clone(), request.config);
+    save_config(&state, &config)?;
+    let db = state.db.lock().expect("db mutex poisoned");
+    db.remove_mcp_server_cache(&id)?;
+    let server = config.mcp.get(&id).expect("updated MCP server");
+    Ok(Json(McpServerView::from_config(
+        id,
+        server,
+        McpServerStatus::Unknown,
+        0,
+        None,
+    )))
+}
+
+async fn delete_mcp_server(
+    State(state): State<SharedState>,
+    UrlPath(id): UrlPath<String>,
+) -> Result<StatusCode, ApiError> {
+    let mut config = load_config(&state)?;
+    if config.mcp.remove(&id).is_none() {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            format!("MCP server '{id}' not found"),
+        ));
+    }
+    save_config(&state, &config)?;
+    let db = state.db.lock().expect("db mutex poisoned");
+    db.remove_mcp_server_cache(&id)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn test_mcp_server(
+    State(state): State<SharedState>,
+    UrlPath(id): UrlPath<String>,
+) -> Result<Json<McpServerView>, ApiError> {
+    let config = load_config(&state)?;
+    let server = config.mcp.get(&id).ok_or_else(|| {
+        ApiError::new(
+            StatusCode::NOT_FOUND,
+            format!("MCP server '{id}' not found"),
+        )
+    })?;
+    let registry = mcp_registry(&state, &config);
+    let view = match registry.discover_server(&id).await {
+        Ok(tools) => {
+            McpServerView::from_config(id, server, McpServerStatus::Connected, tools.len(), None)
+        }
+        Err(error) => McpServerView::from_config(
+            id,
+            server,
+            McpServerStatus::Unavailable,
+            0,
+            Some(error.to_string().chars().take(500).collect()),
+        ),
+    };
+    Ok(Json(view))
+}
+
+async fn list_mcp_tools(
+    State(state): State<SharedState>,
+    UrlPath(id): UrlPath<String>,
+) -> Result<Json<Vec<factory_types::McpToolMetadata>>, ApiError> {
+    let config = load_config(&state)?;
+    if !config.mcp.contains_key(&id) {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            format!("MCP server '{id}' not found"),
+        ));
+    }
+    let registry = mcp_registry(&state, &config);
+    let cached = registry.cached_tools(Some(&id))?;
+    if cached.is_empty() {
+        return Ok(Json(registry.discover_server(&id).await?));
+    }
+    Ok(Json(cached))
+}
+
+async fn get_role_tools(
+    State(state): State<SharedState>,
+    UrlPath(id): UrlPath<String>,
+) -> Result<Json<Vec<EffectiveToolPermission>>, ApiError> {
+    let config = load_config(&state)?;
+    role_info(&config, &id)?;
+    let policy = config.effective_role_policy(&id);
+    let tools = mcp_registry(&state, &config).cached_tools(None)?;
+    Ok(Json(
+        tools
+            .into_iter()
+            .map(|tool| EffectiveToolPermission {
+                role: None,
+                server: tool.server,
+                tool: tool.name,
+                qualified_name: tool.qualified_name.clone(),
+                classification: tool.classification,
+                allowed: policy.tools.allowed(
+                    &tool.qualified_name,
+                    tool.classification.requires_exact_permission(),
+                ),
+            })
+            .collect(),
+    ))
+}
+
+async fn get_agent_tools(
+    State(state): State<SharedState>,
+    UrlPath(agent): UrlPath<String>,
+) -> Result<Json<Vec<EffectiveToolPermission>>, ApiError> {
+    let config = load_config(&state)?;
+    if !config.agents.contains_key(&agent) {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            format!("agent '{agent}' not found"),
+        ));
+    }
+    let roles: Vec<String> = config
+        .role_assignments
+        .iter()
+        .filter(|assignment| assignment.agent == agent)
+        .map(|assignment| assignment.role.clone())
+        .collect();
+    let tools = mcp_registry(&state, &config).cached_tools(None)?;
+    let mut permissions = Vec::new();
+    for role in roles {
+        let policy = config.effective_policy(&role, &agent);
+        permissions.extend(tools.iter().map(|tool| EffectiveToolPermission {
+            role: Some(role.clone()),
+            server: tool.server.clone(),
+            tool: tool.name.clone(),
+            qualified_name: tool.qualified_name.clone(),
+            classification: tool.classification,
+            allowed: policy.tools.allowed(
+                &tool.qualified_name,
+                tool.classification.requires_exact_permission(),
+            ),
+        }));
+    }
+    Ok(Json(permissions))
+}
+
+async fn list_mcp_invocations(
+    State(state): State<SharedState>,
+) -> Result<Json<Vec<factory_types::ToolInvocation>>, ApiError> {
+    let db = state.db.lock().expect("db mutex poisoned");
+    Ok(Json(db.list_tool_invocations()?))
+}
+
+async fn get_mcp_metrics(
+    State(state): State<SharedState>,
+) -> Result<Json<factory_types::ToolMetrics>, ApiError> {
+    let db = state.db.lock().expect("db mutex poisoned");
+    Ok(Json(db.tool_metrics()?))
 }
 
 fn role_info(config: &Config, id: &str) -> Result<factory_core::RoleInfo, ApiError> {

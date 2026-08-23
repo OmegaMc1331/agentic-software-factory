@@ -461,6 +461,15 @@ export function PerformanceView({ initialAgent = null }: { initialAgent?: string
 
       {error && <p className="error">{error}</p>}
       {!error && overview === null && <p className="empty-title">Loading…</p>}
+      {overview?.toolOperations && (
+        <div className="performance-routing" aria-label="External tool operations">
+          <strong>External tool operations:</strong> {overview.toolOperations.calls} calls Â·{" "}
+          {overview.toolOperations.successes} succeeded Â· {overview.toolOperations.failures} failed
+          Â· median {formatDurationMs(overview.toolOperations.medianDurationMs)}. MCP usage is
+          operational telemetry only; it does not improve quality scores, and infrastructure outages
+          are not attributed to agents.
+        </div>
+      )}
       {overview !== null && (
         <OverviewTable agents={overview.agents} onSelect={select} selected={selectedAgent} />
       )}

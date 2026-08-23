@@ -1,13 +1,14 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   addRoleAssignment,
   createRole,
+  fetchRoleTools,
   removeRoleAssignment,
   setPreferredAssignment,
   setRolePolicy,
   updateRole,
 } from "../api";
-import type { RoleInfo, RolePolicyPreset } from "../types";
+import type { EffectiveToolPermission, RoleInfo, RolePolicyPreset } from "../types";
 import { PolicySummary } from "./PolicySummary";
 import { RoleForm } from "./RoleForm";
 
@@ -46,6 +47,21 @@ export function RoleInspector({
   const [editing, setEditing] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [externalTools, setExternalTools] = useState<EffectiveToolPermission[]>([]);
+
+  useEffect(() => {
+    let active = true;
+    fetchRoleTools(role.id)
+      .then((tools) => {
+        if (active) setExternalTools(tools);
+      })
+      .catch(() => {
+        if (active) setExternalTools([]);
+      });
+    return () => {
+      active = false;
+    };
+  }, [role.id]);
 
   const unassignedAgents = useMemo(
     () => agents.filter((agent) => !role.assignments.some((entry) => entry.agent === agent)),
@@ -241,6 +257,24 @@ export function RoleInspector({
             </select>
           </div>
           <PolicySummary permissions={role.permissions} />
+          <div className="role-agents" aria-label="External tools">
+            <span className="inspector-label">External tools</span>
+            {externalTools.length === 0 ? (
+              <p className="inspector-hint">No discovered MCP tools.</p>
+            ) : (
+              <ul className="role-agent-list">
+                {externalTools.map((tool) => (
+                  <li key={tool.qualifiedName} className="role-agent-row">
+                    <code>{tool.qualifiedName}</code>
+                    <span className={tool.allowed ? "net-ok" : "net-bad"}>
+                      {tool.allowed ? "Allowed" : "Denied"}
+                    </span>
+                    <small>{tool.classification}</small>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
         </section>
 
         {role.kind === "custom" && (

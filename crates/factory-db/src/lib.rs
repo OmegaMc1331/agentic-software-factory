@@ -5,10 +5,11 @@ pub use error::DbError;
 use chrono::Utc;
 use factory_types::{
     resolve_patch, resolve_replan, AgentSession, AgentSessionMode, AttemptStatus, GitHubDelivery,
-    GitHubIssueLink, IntegrationOutcome, IntegrationOutcomeKind, Plan, PlanApplyOutcome, PlanPatch,
-    PlanRevisionRecord, PlanRevisionSource, PlanSnapshot, PlanState, ReplanRequest, ResolvedPlan,
-    ReviewResult, RoleArtifact, RoutingCandidateScore, RoutingDecision, Run, RunStatus, Task,
-    TaskAttempt, TaskEvidence, TaskOperation, TaskState,
+    GitHubIssueLink, IntegrationOutcome, IntegrationOutcomeKind, McpToolMetadata, Plan,
+    PlanApplyOutcome, PlanPatch, PlanRevisionRecord, PlanRevisionSource, PlanSnapshot, PlanState,
+    ReplanRequest, ResolvedPlan, ReviewResult, RoleArtifact, RoutingCandidateScore,
+    RoutingDecision, Run, RunStatus, Task, TaskAttempt, TaskEvidence, TaskOperation, TaskState,
+    ToolClassification, ToolGrant, ToolInvocation, ToolMetrics,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashMap;
@@ -177,6 +178,320 @@ impl FactoryDb {
             )
             .optional()?;
         Ok(sha.flatten())
+    }
+
+    /// Atomically replaces one server's lightweight discovery cache. External
+    /// I/O is completed before this method is called, so the transaction never
+    /// waits on an MCP peer.
+    pub fn replace_mcp_tools(&self, server_id: &str, tools: &[McpToolMetadata]) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM mcp_tools WHERE server_id = ?1",
+            params![server_id],
+        )?;
+        for tool in tools {
+            tx.execute(
+                "INSERT INTO mcp_tools
+                 (server_id, tool_name, description, input_schema, annotations, classification, discovered_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    server_id,
+                    tool.name,
+                    tool.description,
+                    serde_json::to_string(&tool.input_schema)?,
+                    tool.annotations
+                        .as_ref()
+                        .map(serde_json::to_string)
+                        .transpose()?,
+                    tool.classification.as_str(),
+                    tool.discovered_at,
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Removes ephemeral discovery/concurrency state for a deleted server.
+    /// Historical invocation rows remain intact as audit evidence.
+    pub fn remove_mcp_server_cache(&self, server_id: &str) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM mcp_tools WHERE server_id = ?1",
+            params![server_id],
+        )?;
+        tx.execute(
+            "DELETE FROM mcp_server_leases WHERE server_id = ?1",
+            params![server_id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn list_mcp_tools(&self, server_id: Option<&str>) -> Result<Vec<McpToolMetadata>> {
+        let sql = if server_id.is_some() {
+            "SELECT server_id, tool_name, description, input_schema, annotations, classification, discovered_at
+             FROM mcp_tools WHERE server_id = ?1 ORDER BY server_id, tool_name"
+        } else {
+            "SELECT server_id, tool_name, description, input_schema, annotations, classification, discovered_at
+             FROM mcp_tools ORDER BY server_id, tool_name"
+        };
+        let mut stmt = self.conn.prepare(sql)?;
+        let build = |row: &rusqlite::Row<'_>| -> rusqlite::Result<McpToolMetadata> {
+            let server: String = row.get(0)?;
+            let name: String = row.get(1)?;
+            let schema: String = row.get(3)?;
+            let annotations: Option<String> = row.get(4)?;
+            let classification: String = row.get(5)?;
+            Ok(McpToolMetadata {
+                qualified_name: format!("{server}.{name}"),
+                server,
+                name,
+                description: row.get(2)?,
+                input_schema: serde_json::from_str(&schema).unwrap_or(serde_json::Value::Null),
+                annotations: annotations.and_then(|value| serde_json::from_str(&value).ok()),
+                classification: classification.parse().unwrap_or_default(),
+                discovered_at: row.get(6)?,
+            })
+        };
+        let tools = match server_id {
+            Some(server_id) => stmt
+                .query_map(params![server_id], build)?
+                .collect::<std::result::Result<Vec<_>, _>>()?,
+            None => stmt
+                .query_map([], build)?
+                .collect::<std::result::Result<Vec<_>, _>>()?,
+        };
+        Ok(tools)
+    }
+
+    pub fn insert_tool_grant(&self, grant: &ToolGrant) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO tool_grants
+             (id, token_hash, run_id, task_id, attempt_id, session_id, agent, role, operation,
+              allowed_tools, expires_at, revoked_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                grant.id,
+                grant.token_hash,
+                grant.run_id,
+                grant.task_id,
+                grant.attempt_id,
+                grant.session_id,
+                grant.agent,
+                grant.role,
+                grant.operation,
+                serde_json::to_string(&grant.allowed_tools)?,
+                grant.expires_at,
+                grant.revoked_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_tool_grant_by_hash(&self, token_hash: &str) -> Result<Option<ToolGrant>> {
+        self.conn
+            .query_row(
+                "SELECT id, token_hash, run_id, task_id, attempt_id, session_id, agent, role,
+                        operation, allowed_tools, expires_at, revoked_at
+                 FROM tool_grants WHERE token_hash = ?1",
+                params![token_hash],
+                |row| {
+                    let allowed: String = row.get(9)?;
+                    Ok(ToolGrant {
+                        id: row.get(0)?,
+                        token_hash: row.get(1)?,
+                        run_id: row.get(2)?,
+                        task_id: row.get(3)?,
+                        attempt_id: row.get(4)?,
+                        session_id: row.get(5)?,
+                        agent: row.get(6)?,
+                        role: row.get(7)?,
+                        operation: row.get(8)?,
+                        allowed_tools: serde_json::from_str(&allowed).unwrap_or_default(),
+                        expires_at: row.get(10)?,
+                        revoked_at: row.get(11)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn revoke_tool_grant(&self, id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE tool_grants SET revoked_at = COALESCE(revoked_at, ?1) WHERE id = ?2",
+            params![now(), id],
+        )?;
+        Ok(())
+    }
+
+    pub fn revoke_session_tool_grants(&self, session_id: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE tool_grants SET revoked_at = COALESCE(revoked_at, ?1) WHERE session_id = ?2",
+            params![now(), session_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn start_tool_invocation(&self, invocation: &ToolInvocation) -> Result<ToolInvocation> {
+        self.conn.execute(
+            "INSERT INTO tool_invocations
+             (run_id, task_id, attempt_id, session_id, agent, role, server, tool,
+              classification, status, started_at, duration_ms, input_summary, output_summary, error)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'running', ?10, NULL, ?11, NULL, NULL)",
+            params![
+                invocation.run_id,
+                invocation.task_id,
+                invocation.attempt_id,
+                invocation.session_id,
+                invocation.agent,
+                invocation.role,
+                invocation.server,
+                invocation.tool,
+                invocation.classification.as_str(),
+                invocation.started_at,
+                invocation.input_summary,
+            ],
+        )?;
+        let mut stored = invocation.clone();
+        stored.id = self.conn.last_insert_rowid();
+        stored.status = "running".into();
+        Ok(stored)
+    }
+
+    pub fn finish_tool_invocation(
+        &self,
+        id: i64,
+        status: &str,
+        duration_ms: u64,
+        output_summary: Option<&str>,
+        error: Option<&str>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE tool_invocations
+             SET status = ?1, duration_ms = ?2, output_summary = ?3, error = ?4
+             WHERE id = ?5 AND status = 'running'",
+            params![status, duration_ms as i64, output_summary, error, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_tool_invocation_classification(
+        &self,
+        id: i64,
+        classification: ToolClassification,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE tool_invocations SET classification = ?1 WHERE id = ?2 AND status = 'running'",
+            params![classification.as_str(), id],
+        )?;
+        Ok(())
+    }
+
+    /// Marks an in-flight call cancelled only if no terminal result was
+    /// recorded. Used by cancellation-safe lease cleanup.
+    pub fn cancel_running_tool_invocation(&self, id: i64, duration_ms: u64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE tool_invocations
+             SET status = 'cancelled', duration_ms = COALESCE(duration_ms, ?1),
+                 error = COALESCE(error, 'MCP operation cancelled')
+             WHERE id = ?2 AND status = 'running'",
+            params![duration_ms as i64, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_tool_invocations(&self) -> Result<Vec<ToolInvocation>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, run_id, task_id, attempt_id, session_id, agent, role, server, tool,
+                    classification, status, started_at, duration_ms, input_summary,
+                    output_summary, error
+             FROM tool_invocations ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let classification: String = row.get(9)?;
+            Ok(ToolInvocation {
+                id: row.get(0)?,
+                run_id: row.get(1)?,
+                task_id: row.get(2)?,
+                attempt_id: row.get(3)?,
+                session_id: row.get(4)?,
+                agent: row.get(5)?,
+                role: row.get(6)?,
+                server: row.get(7)?,
+                tool: row.get(8)?,
+                classification: classification.parse().unwrap_or_default(),
+                status: row.get(10)?,
+                started_at: row.get(11)?,
+                duration_ms: row.get::<_, Option<i64>>(12)?.map(|value| value as u64),
+                input_summary: row.get(13)?,
+                output_summary: row.get(14)?,
+                error: row.get(15)?,
+            })
+        })?;
+        let invocations = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(invocations)
+    }
+
+    pub fn tool_metrics(&self) -> Result<ToolMetrics> {
+        let invocations = self.list_tool_invocations()?;
+        let mut durations: Vec<u64> = invocations
+            .iter()
+            .filter_map(|invocation| invocation.duration_ms)
+            .collect();
+        durations.sort_unstable();
+        Ok(ToolMetrics {
+            calls: invocations.len(),
+            successes: invocations
+                .iter()
+                .filter(|invocation| invocation.status == "success")
+                .count(),
+            failures: invocations
+                .iter()
+                .filter(|invocation| !matches!(invocation.status.as_str(), "success" | "running"))
+                .count(),
+            median_duration_ms: durations.get(durations.len() / 2).copied(),
+        })
+    }
+
+    /// Cross-process, per-server concurrency lease. The update transaction is
+    /// short and is committed before any external call begins.
+    pub fn try_acquire_mcp_server_slot(
+        &self,
+        server_id: &str,
+        max_concurrency: usize,
+        stale_before: &str,
+    ) -> Result<bool> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT OR IGNORE INTO mcp_server_leases (server_id, active_calls, updated_at)
+             VALUES (?1, 0, ?2)",
+            params![server_id, now()],
+        )?;
+        tx.execute(
+            "UPDATE mcp_server_leases SET active_calls = 0
+             WHERE server_id = ?1 AND updated_at < ?2",
+            params![server_id, stale_before],
+        )?;
+        let changed = tx.execute(
+            "UPDATE mcp_server_leases
+             SET active_calls = active_calls + 1, updated_at = ?1
+             WHERE server_id = ?2 AND active_calls < ?3",
+            params![now(), server_id, max_concurrency as i64],
+        )?;
+        tx.commit()?;
+        Ok(changed == 1)
+    }
+
+    pub fn release_mcp_server_slot(&self, server_id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE mcp_server_leases
+             SET active_calls = MAX(active_calls - 1, 0), updated_at = ?1
+             WHERE server_id = ?2",
+            params![now(), server_id],
+        )?;
+        Ok(())
     }
 
     /// Atomically claims a Ready task for dispatch. Returns `true` exactly when
@@ -1263,6 +1578,18 @@ impl FactoryDb {
 
     pub fn reconcile_interrupted(&self) -> Result<Reconciliation> {
         let timestamp = now();
+        self.conn.execute(
+            "UPDATE tool_grants SET revoked_at = ?1 WHERE revoked_at IS NULL",
+            params![timestamp],
+        )?;
+        self.conn.execute(
+            "UPDATE tool_invocations
+             SET status = 'cancelled', duration_ms = COALESCE(duration_ms, 0),
+                 error = COALESCE(error, 'Factory stopped during MCP operation')
+             WHERE status = 'running'",
+            [],
+        )?;
+        self.conn.execute("DELETE FROM mcp_server_leases", [])?;
         let sessions = self.conn.execute(
             "UPDATE agent_sessions
              SET status = 'interrupted', finished_at = ?1
@@ -2036,9 +2363,66 @@ ALTER TABLE tasks ADD COLUMN agent_override TEXT;
 /// deleting the source recipe never mutates existing runs.
 const V15_SCHEMA: &str = "ALTER TABLE runs ADD COLUMN recipe TEXT;";
 
+/// External Tools / MCP: lightweight discovery metadata, scoped capability
+/// grants (hash only), compact invocation audit, and short per-server leases.
+const V16_SCHEMA: &str = "
+CREATE TABLE mcp_tools (
+    server_id TEXT NOT NULL,
+    tool_name TEXT NOT NULL,
+    description TEXT NOT NULL,
+    input_schema TEXT NOT NULL,
+    annotations TEXT,
+    classification TEXT NOT NULL,
+    discovered_at TEXT NOT NULL,
+    PRIMARY KEY (server_id, tool_name)
+);
+CREATE INDEX idx_mcp_tools_server ON mcp_tools(server_id);
+CREATE TABLE tool_grants (
+    id TEXT PRIMARY KEY,
+    token_hash TEXT NOT NULL UNIQUE,
+    run_id INTEGER REFERENCES runs(id) ON DELETE CASCADE,
+    task_id INTEGER REFERENCES tasks(id) ON DELETE CASCADE,
+    attempt_id INTEGER REFERENCES task_attempts(id) ON DELETE CASCADE,
+    session_id INTEGER REFERENCES agent_sessions(id) ON DELETE CASCADE,
+    agent TEXT NOT NULL,
+    role TEXT NOT NULL,
+    operation TEXT,
+    allowed_tools TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    revoked_at TEXT
+);
+CREATE INDEX idx_tool_grants_session ON tool_grants(session_id);
+CREATE TABLE tool_invocations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER REFERENCES runs(id) ON DELETE SET NULL,
+    task_id INTEGER REFERENCES tasks(id) ON DELETE SET NULL,
+    attempt_id INTEGER REFERENCES task_attempts(id) ON DELETE SET NULL,
+    session_id INTEGER REFERENCES agent_sessions(id) ON DELETE SET NULL,
+    agent TEXT NOT NULL,
+    role TEXT NOT NULL,
+    server TEXT NOT NULL,
+    tool TEXT NOT NULL,
+    classification TEXT NOT NULL,
+    status TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    duration_ms INTEGER,
+    input_summary TEXT NOT NULL,
+    output_summary TEXT,
+    error TEXT
+);
+CREATE INDEX idx_tool_invocations_run ON tool_invocations(run_id);
+CREATE INDEX idx_tool_invocations_task ON tool_invocations(task_id);
+CREATE INDEX idx_tool_invocations_agent ON tool_invocations(agent);
+CREATE TABLE mcp_server_leases (
+    server_id TEXT PRIMARY KEY,
+    active_calls INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL
+);
+";
+
 const MIGRATIONS: &[&str] = &[
     V1_SCHEMA, V2_SCHEMA, V3_SCHEMA, V4_SCHEMA, V5_SCHEMA, V6_SCHEMA, V7_SCHEMA, V8_SCHEMA,
-    V9_SCHEMA, V10_SCHEMA, V11_SCHEMA, V12_SCHEMA, V13_SCHEMA, V14_SCHEMA, V15_SCHEMA,
+    V9_SCHEMA, V10_SCHEMA, V11_SCHEMA, V12_SCHEMA, V13_SCHEMA, V14_SCHEMA, V15_SCHEMA, V16_SCHEMA,
 ];
 
 fn migrate(conn: &mut Connection) -> Result<()> {
@@ -2078,6 +2462,7 @@ mod tests {
         AgentSession, AgentSessionMode, AttemptStatus, IntegrationOutcomeKind, Plan,
         PlanApplyOutcome, PlanMutation, PlanPatch, PlanRevisionSource, PlannedTask, ReplanRequest,
         ReviewDecision, ReviewResult, RunStatus, TaskEvidence, TaskOperation, TaskRef, TaskState,
+        ToolClassification, ToolGrant, ToolInvocation,
     };
     use rusqlite::Connection;
     use tempfile::TempDir;
@@ -2092,7 +2477,7 @@ mod tests {
         let versions = schema_versions(&path);
         assert_eq!(
             versions,
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
         );
         db.create_run("objective", Some("codex")).unwrap();
         drop(db);
@@ -2100,7 +2485,7 @@ mod tests {
         let db = FactoryDb::open(&path).unwrap();
         assert_eq!(
             schema_versions(&path),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
         );
         db.list_runs().unwrap();
     }
@@ -2128,7 +2513,7 @@ mod tests {
         let db = FactoryDb::open(&path).unwrap();
         assert_eq!(
             schema_versions(&path),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
         );
         let run = db.get_run(1).unwrap().unwrap();
         assert_eq!(run.objective, "legacy");
@@ -2186,7 +2571,7 @@ mod tests {
         // opening records versions 6 and 7 exactly once
         assert_eq!(
             schema_versions(&path),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
         );
         let tasks = db.list_tasks(1).unwrap();
         let operation_of = |title: &str| {
@@ -2859,6 +3244,7 @@ mod tests {
                 "implementation".to_string(),
             )]),
             planner_guidance: "Keep the plan proportional.".into(),
+            tools: Vec::new(),
             github: None,
         };
         db.set_run_recipe(run.id, &snapshot).unwrap();
@@ -3161,6 +3547,64 @@ mod tests {
             db.get_run(run.id).unwrap().unwrap().status,
             RunStatus::Failed
         );
+    }
+
+    #[test]
+    fn restart_reconciliation_revokes_mcp_grants_and_cancels_active_calls() {
+        let dir = TempDir::new().unwrap();
+        let db = FactoryDb::open(&dir.path().join("test.db")).unwrap();
+        db.insert_tool_grant(&ToolGrant {
+            id: "grant-1".into(),
+            token_hash: "hash-1".into(),
+            run_id: None,
+            task_id: None,
+            attempt_id: None,
+            session_id: None,
+            agent: "codex".into(),
+            role: "worker".into(),
+            operation: Some("implement".into()),
+            allowed_tools: vec!["docs.search".into()],
+            expires_at: "2099-01-01T00:00:00Z".into(),
+            revoked_at: None,
+        })
+        .unwrap();
+        let invocation = db
+            .start_tool_invocation(&ToolInvocation {
+                id: 0,
+                run_id: None,
+                task_id: None,
+                attempt_id: None,
+                session_id: None,
+                agent: "codex".into(),
+                role: "worker".into(),
+                server: "docs".into(),
+                tool: "search".into(),
+                classification: ToolClassification::Read,
+                status: "running".into(),
+                started_at: "2026-01-01T00:00:00Z".into(),
+                duration_ms: None,
+                input_summary: "input omitted".into(),
+                output_summary: None,
+                error: None,
+            })
+            .unwrap();
+        assert!(db
+            .try_acquire_mcp_server_slot("docs", 1, "2026-01-01T00:00:00Z")
+            .unwrap());
+        assert!(!db
+            .try_acquire_mcp_server_slot("docs", 1, "2026-01-01T00:00:00Z")
+            .unwrap());
+
+        db.reconcile_interrupted().unwrap();
+
+        let grant = db.get_tool_grant_by_hash("hash-1").unwrap().unwrap();
+        assert!(grant.revoked_at.is_some());
+        let audit = db.list_tool_invocations().unwrap();
+        assert_eq!(audit[0].id, invocation.id);
+        assert_eq!(audit[0].status, "cancelled");
+        assert!(db
+            .try_acquire_mcp_server_slot("docs", 1, "2026-01-01T00:00:00Z")
+            .unwrap());
     }
 
     #[test]

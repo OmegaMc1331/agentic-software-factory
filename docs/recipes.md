@@ -133,6 +133,12 @@ invariants → role scope → agent scope). Filesystem allow lists intersect,
 deny lists union, and a recipe can never elevate privileges beyond what the
 Policy Engine already permits. The Policy Engine remains authoritative.
 
+Recipes may also declare `tools = ["docs.*", "postgres.inspect_schema"]`.
+This is a selection layer over already permitted MCP tools: it intersects with
+the effective role/agent tool policy and can never grant access. Tool denies and
+the exact-allow requirement for write, destructive, or unknown tools still apply.
+See [External Tools / MCP](mcp.md#permissions).
+
 ## Workflow creation with recipes
 
 `+ Workflow` in the Agent Graph offers a recipe picker on both tabs

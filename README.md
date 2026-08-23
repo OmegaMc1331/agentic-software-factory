@@ -149,6 +149,16 @@ deterministic, evidence-based PR body. Existing PRs are linked, never
 duplicated; agents never gain push permission. See
 [docs/github.md](docs/github.md).
 
+## External Tools / MCP
+
+Factory can connect task agents to project-configured MCP servers over stdio or
+Streamable HTTP. Access is denied by default and mediated end to end by Factory:
+discovery, deterministic relevance, role/agent/Recipe policy, scoped grants,
+timeouts, response limits, cancellation, and compact audit records. Agents receive
+only a bounded permitted catalog; external results are clearly marked as untrusted
+data. Configure and test servers under **Settings → External Tools / MCP**. See
+[docs/mcp.md](docs/mcp.md).
+
 ## Recipes
 
 Recipes are reusable workflow **configuration** — selected roles, routing and
@@ -220,6 +230,16 @@ The local API is bound to `127.0.0.1`:
 | GET    | `/api/graph`                  | Agents, workflows, tasks, and semantic links     |
 | GET    | `/api/performance/agents`     | Measured agent performance summaries             |
 | GET    | `/api/performance/agents/:agent` | Full performance detail for one agent         |
+| GET    | `/api/mcp/servers`           | Configured MCP servers and cached status          |
+| POST   | `/api/mcp/servers`           | Add a validated project-local MCP server          |
+| PUT    | `/api/mcp/servers/:id`       | Update one MCP server configuration                |
+| DELETE | `/api/mcp/servers/:id`       | Remove a server and its discovery cache            |
+| POST   | `/api/mcp/servers/:id/test`  | Test MCP initialization and tool discovery         |
+| GET    | `/api/mcp/servers/:id/tools` | Inspect discovered tool metadata and schemas       |
+| GET    | `/api/mcp/invocations`       | Compact external-tool invocation audit             |
+| GET    | `/api/mcp/metrics`           | External-tool operational metrics                  |
+| GET    | `/api/roles/:id/tools`       | Effective discovered-tool decisions for a role    |
+| GET    | `/api/agents/:agent/tools`   | Effective tool decisions for an agent's roles      |
 | GET    | `/api/graph/workspace`        | Saved visual layout and custom topology          |
 | PUT    | `/api/graph/workspace`        | Validate and atomically save the graph workspace |
 | GET    | `/api/agents/:agent/sessions` | Recent persisted sessions for one agent          |
@@ -250,8 +270,8 @@ All state lives in `.factory/`:
 
 ```text
 .factory/
-  db.sqlite3          runs, tasks, attempts, and agent sessions
-  config.toml         agents, role assignments, and policies
+  db.sqlite3          runs, tasks, sessions, MCP metadata, grants, and audit
+  config.toml         agents, role assignments, policies, and MCP server references
   graph.json          saved positions, visual nodes, and custom links
   worktrees/t<id>/    one git worktree per task
 ```

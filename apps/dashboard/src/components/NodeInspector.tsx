@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import {
+  fetchAgentTools,
   fetchRun,
   fetchRunArtifacts,
   fetchRoutingDecisions,
@@ -10,6 +11,7 @@ import {
 import type {
   GraphEdge,
   GraphNode,
+  EffectiveToolPermission,
   RoleArtifact,
   RoleMeta,
   RoutingDecision,
@@ -109,6 +111,25 @@ export function NodeInspector({
   const [roleAgentsForTask, setRoleAgentsForTask] = useState<string[]>([]);
   const [routingError, setRoutingError] = useState<string | null>(null);
   const [routingBusy, setRoutingBusy] = useState(false);
+  const [agentTools, setAgentTools] = useState<EffectiveToolPermission[]>([]);
+  useEffect(() => {
+    if (node?.kind !== "agent") {
+      setAgentTools([]);
+      return;
+    }
+    let active = true;
+    const agent = node.id.startsWith("agent:") ? node.id.slice("agent:".length) : node.label;
+    fetchAgentTools(agent)
+      .then((tools) => {
+        if (active) setAgentTools(tools);
+      })
+      .catch(() => {
+        if (active) setAgentTools([]);
+      });
+    return () => {
+      active = false;
+    };
+  }, [node]);
   useEffect(() => {
     if (node?.kind !== "task") return;
     let active = true;
@@ -277,6 +298,24 @@ export function NodeInspector({
           </div>
         </details>
         <PolicySummary permissions={meta.permissions} />
+        <section className="policy-section" aria-label="Agent external tools">
+          <h4>External tools by role</h4>
+          {agentTools.length === 0 ? (
+            <p className="inspector-hint">No discovered MCP tools for assigned roles.</p>
+          ) : (
+            <ul className="role-agent-list">
+              {agentTools.map((tool) => (
+                <li key={`${tool.role}:${tool.qualifiedName}`} className="role-agent-row">
+                  <code>{tool.qualifiedName}</code>
+                  <span className={tool.allowed ? "net-ok" : "net-bad"}>
+                    {tool.allowed ? "Allowed" : "Denied"}
+                  </span>
+                  <small>{tool.role}</small>
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
       </>
     );
   } else if (node.kind === "run") {

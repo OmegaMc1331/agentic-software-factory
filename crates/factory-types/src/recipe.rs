@@ -95,6 +95,10 @@ pub struct Recipe {
     /// Policy Engine's effective scopes; they can never widen them.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub policy_presets: BTreeMap<String, String>,
+    /// Optional qualified MCP tool patterns. When non-empty this is an
+    /// only-narrowing selection applied to every role in the run.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<String>,
     /// Bounded planning context handed to the Planner alongside the objective.
     #[serde(default)]
     pub planner_guidance: String,
@@ -116,6 +120,7 @@ impl Recipe {
             routing: self.routing,
             max_parallel_tasks: self.max_parallel_tasks,
             policy_presets: self.policy_presets.clone(),
+            tools: self.tools.clone(),
             planner_guidance: self.planner_guidance.clone(),
             github: self.github,
         }
@@ -138,6 +143,8 @@ pub struct RecipeSnapshot {
     pub max_parallel_tasks: Option<usize>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub policy_presets: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<String>,
     #[serde(default)]
     pub planner_guidance: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -179,6 +186,7 @@ mod tests {
             routing: RecipeRouting::Performance,
             max_parallel_tasks: Some(3),
             policy_presets: BTreeMap::from([("worker".to_string(), "implementation".into())]),
+            tools: vec!["docs.*".into()],
             planner_guidance: "Prefer a compact plan.".into(),
             github: None,
             builtin: false,
@@ -194,6 +202,7 @@ mod tests {
         assert_eq!(snapshot.routing, RecipeRouting::Performance);
         assert_eq!(snapshot.max_parallel_tasks, Some(3));
         assert_eq!(snapshot.policy_preset_for("worker"), Some("implementation"));
+        assert_eq!(snapshot.tools, vec!["docs.*"]);
         assert!(snapshot.policy_preset_for("reviewer").is_none());
         // Snapshots carry configuration only; there is no task or history data
         // to copy because the model has none.

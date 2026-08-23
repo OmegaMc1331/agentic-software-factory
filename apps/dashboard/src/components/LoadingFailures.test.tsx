@@ -5,6 +5,7 @@ import {
   fetchConfig,
   fetchGraph,
   fetchGraphWorkspace,
+  fetchMcpServers,
   fetchRecipes,
   fetchRoles,
 } from "../api";
@@ -18,6 +19,7 @@ vi.mock("../api", () => ({
   fetchGraphWorkspace: vi.fn(),
   fetchRoles: vi.fn(),
   fetchRecipes: vi.fn(),
+  fetchMcpServers: vi.fn(),
   saveConfig: vi.fn(),
   saveGraphWorkspace: vi.fn(),
 }));
@@ -29,6 +31,7 @@ beforeEach(() => {
   vi.mocked(fetchGraphWorkspace).mockReset();
   vi.mocked(fetchRoles).mockReset();
   vi.mocked(fetchRecipes).mockReset().mockResolvedValue([]);
+  vi.mocked(fetchMcpServers).mockReset().mockResolvedValue([]);
   vi.mocked(fetchGraphWorkspace).mockResolvedValue({
     version: 1,
     nodes: {},

@@ -153,6 +153,8 @@ impl PoliciesConfig {
                 .restrict(restriction.as_ref()),
             git: EffectiveGit::resolve(role.as_ref(), agent.as_ref())
                 .restrict(restriction.as_ref()),
+            tools: EffectiveTools::resolve(role.as_ref(), agent.as_ref())
+                .restrict(restriction.as_ref()),
         }
     }
 }
@@ -174,6 +176,10 @@ pub struct PolicyScope {
     pub environment: Option<EnvironmentPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git: Option<GitPolicy>,
+    /// External MCP tools. Unlike the legacy process dimensions, tools are
+    /// deny-by-default: a role must explicitly allow every visible tool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<ToolPolicy>,
 }
 
 impl PolicyScope {
@@ -187,6 +193,13 @@ impl PolicyScope {
             for pattern in &filesystem.deny_write {
                 validate_scope(pattern)
                     .map_err(|reason| format!("invalid deny_write scope in {context}: {reason}"))?;
+            }
+        }
+        if let Some(tools) = &self.tools {
+            for pattern in tools.allow.iter().chain(tools.deny.iter()) {
+                validate_tool_pattern(pattern).map_err(|reason| {
+                    format!("invalid external-tool pattern in {context}: {reason}")
+                })?;
             }
         }
         Ok(())
@@ -265,6 +278,7 @@ impl PolicyPreset {
                     deny: Vec::new(),
                 }),
                 git: None,
+                tools: None,
             },
             PolicyPreset::Documentation => PolicyScope {
                 preset: Some(self),
@@ -286,6 +300,7 @@ impl PolicyPreset {
                     deny: Vec::new(),
                 }),
                 git: None,
+                tools: None,
             },
             PolicyPreset::Review => read_only_defaults(self),
             PolicyPreset::Custom => PolicyScope {
@@ -317,6 +332,7 @@ fn read_only_defaults(preset: PolicyPreset) -> PolicyScope {
             deny: Vec::new(),
         }),
         git: None,
+        tools: None,
     }
 }
 
@@ -492,6 +508,17 @@ pub struct GitPolicy {
     pub allow: Vec<String>,
 }
 
+/// Declared access to qualified MCP tool names (`server.tool`). Patterns use
+/// `*` and `?`; deny always wins. This dimension is intentionally absent from
+/// policy presets so upgrading never grants external access implicitly.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolPolicy {
+    #[serde(default)]
+    pub allow: Vec<String>,
+    #[serde(default)]
+    pub deny: Vec<String>,
+}
+
 // --- Effective policy ------------------------------------------------------
 
 /// One resolved policy for a running (role, agent) pair. Produced by
@@ -506,6 +533,130 @@ pub struct EffectivePolicy {
     pub network: EffectiveNetwork,
     pub environment: EffectiveEnvironment,
     pub git: EffectiveGit,
+    pub tools: EffectiveTools,
+}
+
+/// External-tool rules after role, agent, and recipe composition. The first
+/// layer is always the role allow list; an absent role policy is therefore an
+/// empty layer and denies every tool. Agent and recipe declarations add
+/// intersections and can never widen access.
+#[derive(Debug, Clone, Default)]
+pub struct EffectiveTools {
+    allow_layers: Vec<(&'static str, Vec<String>)>,
+    deny: Vec<String>,
+}
+
+impl EffectiveTools {
+    fn resolve(role: Option<&PolicyScope>, agent: Option<&PolicyScope>) -> Self {
+        let role_tools = role.and_then(|scope| scope.tools.as_ref());
+        let mut effective = Self {
+            allow_layers: vec![(
+                "role",
+                role_tools
+                    .map(|tools| tools.allow.clone())
+                    .unwrap_or_default(),
+            )],
+            deny: role_tools
+                .map(|tools| tools.deny.clone())
+                .unwrap_or_default(),
+        };
+        if let Some(tools) = agent.and_then(|scope| scope.tools.as_ref()) {
+            effective.allow_layers.push(("agent", tools.allow.clone()));
+            effective.deny.extend(tools.deny.iter().cloned());
+        }
+        effective
+    }
+
+    fn restrict(mut self, restriction: Option<&PolicyScope>) -> Self {
+        if let Some(tools) = restriction.and_then(|scope| scope.tools.as_ref()) {
+            self.allow_layers.push(("recipe", tools.allow.clone()));
+            self.deny.extend(tools.deny.iter().cloned());
+        }
+        self
+    }
+
+    /// Checks a qualified name. Write/destructive/unknown callers set
+    /// `require_exact_role_allow` so a catch-all cannot accidentally grant a
+    /// newly discovered privileged capability.
+    pub fn allowed(&self, qualified_name: &str, require_exact_role_allow: bool) -> bool {
+        if self
+            .deny
+            .iter()
+            .any(|pattern| tool_pattern_matches(pattern, qualified_name))
+        {
+            return false;
+        }
+        if require_exact_role_allow
+            && !self
+                .allow_layers
+                .first()
+                .is_some_and(|(_, patterns)| patterns.iter().any(|p| p == qualified_name))
+        {
+            return false;
+        }
+        self.allow_layers.iter().all(|(_, patterns)| {
+            patterns
+                .iter()
+                .any(|pattern| tool_pattern_matches(pattern, qualified_name))
+        })
+    }
+
+    pub fn allow_patterns(&self) -> Vec<String> {
+        self.allow_layers
+            .iter()
+            .flat_map(|(label, patterns)| {
+                patterns.iter().map(move |pattern| {
+                    if *label == "role" {
+                        pattern.clone()
+                    } else {
+                        format!("({label}) {pattern}")
+                    }
+                })
+            })
+            .collect()
+    }
+
+    pub fn deny_patterns(&self) -> &[String] {
+        &self.deny
+    }
+
+    /// Whether every narrowing layer contains at least one pattern that could
+    /// select a tool from this server. This is used to avoid contacting MCP
+    /// servers that cannot contribute to the effective catalog.
+    pub fn may_allow_server(&self, server: &str) -> bool {
+        self.allow_layers.iter().all(|(_, patterns)| {
+            patterns.iter().any(|pattern| {
+                pattern == "*"
+                    || pattern.split_once('.').is_some_and(|(server_pattern, _)| {
+                        tool_pattern_matches(server_pattern, server)
+                    })
+            })
+        })
+    }
+}
+
+fn validate_tool_pattern(pattern: &str) -> Result<(), String> {
+    if pattern.is_empty() || pattern.chars().count() > 160 {
+        return Err("pattern must contain 1..=160 characters".into());
+    }
+    if pattern.chars().any(|character| {
+        !(character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-' | '*' | '?'))
+    }) {
+        return Err(format!(
+            "pattern '{pattern}' contains unsupported characters"
+        ));
+    }
+    Ok(())
+}
+
+fn tool_pattern_matches(pattern: &str, qualified_name: &str) -> bool {
+    // Reuse the policy glob matcher by mapping the qualified-name separator to
+    // a path separator. MCP identifiers are compared case-sensitively.
+    matches_glob(
+        &pattern.replace('.', "/"),
+        &qualified_name.replace('.', "/"),
+        true,
+    )
 }
 
 /// Filesystem rules after role/agent merging.
@@ -1119,6 +1270,7 @@ fn merged_scope(scope: Option<&PolicyScope>) -> Option<PolicyScope> {
         network: scope.network.clone().or(defaults.network),
         environment: scope.environment.clone().or(defaults.environment),
         git: scope.git.clone().or(defaults.git),
+        tools: scope.tools.clone().or(defaults.tools),
     })
 }
 
@@ -1178,6 +1330,8 @@ pub struct PolicyView {
     pub environment_denied: Vec<String>,
     pub git_allowed: Vec<String>,
     pub git_denied: Vec<String>,
+    pub tools_allow: Vec<String>,
+    pub tools_deny: Vec<String>,
 }
 
 impl EffectivePolicy {
@@ -1212,6 +1366,8 @@ impl EffectivePolicy {
                 .map(|operation| operation.as_str().to_string())
                 .collect(),
             git_denied: all_dangerous_git_operations(),
+            tools_allow: self.tools.allow_patterns(),
+            tools_deny: self.tools.deny_patterns().to_vec(),
         }
     }
 }
@@ -1386,6 +1542,90 @@ write = ["src/**"]
         );
         let other = config.effective("worker", "opencode");
         assert!(other.filesystem.write_allowed("tests/unit.rs"));
+    }
+
+    #[test]
+    fn external_tools_are_denied_without_an_explicit_role_allow() {
+        let config = PoliciesConfig::default();
+        let policy = config.effective("worker", "codex");
+        assert!(!policy.tools.allowed("docs.search", false));
+    }
+
+    #[test]
+    fn external_tool_deny_wins_over_allow() {
+        let config = config(
+            r#"
+[policies.roles.worker.tools]
+allow = ["github.*", "docs.*"]
+deny = ["github.delete_*"]
+"#,
+        );
+        let policy = config.effective("worker", "codex");
+        assert!(policy.tools.allowed("github.search_code", false));
+        assert!(policy.tools.allowed("docs.search", false));
+        assert!(!policy.tools.allowed("github.delete_branch", false));
+    }
+
+    #[test]
+    fn agent_and_recipe_tool_policies_only_narrow() {
+        let config = config(
+            r#"
+[policies.roles.worker.tools]
+allow = ["github.*", "docs.*"]
+
+[policies.agents.codex.tools]
+allow = ["github.read_*", "docs.search"]
+deny = ["github.read_private"]
+"#,
+        );
+        let recipe = PolicyScope {
+            tools: Some(ToolPolicy {
+                allow: vec!["github.*".into()],
+                deny: vec!["github.read_archive".into()],
+            }),
+            ..PolicyScope::default()
+        };
+        let policy = config.effective_restricted("worker", "codex", Some(&recipe));
+        assert!(policy.tools.allowed("github.read_issue", false));
+        assert!(!policy.tools.allowed("docs.search", false));
+        assert!(!policy.tools.allowed("github.write_issue", false));
+        assert!(!policy.tools.allowed("github.read_private", false));
+        assert!(!policy.tools.allowed("github.read_archive", false));
+    }
+
+    #[test]
+    fn privileged_tools_require_an_exact_role_allow() {
+        let wildcard = config(
+            r#"
+[policies.roles.worker.tools]
+allow = ["github.*"]
+"#,
+        )
+        .effective("worker", "codex");
+        assert!(!wildcard.tools.allowed("github.delete_issue", true));
+
+        let exact = config(
+            r#"
+[policies.roles.worker.tools]
+allow = ["github.delete_issue"]
+"#,
+        )
+        .effective("worker", "codex");
+        assert!(exact.tools.allowed("github.delete_issue", true));
+    }
+
+    #[test]
+    fn external_tool_discovery_understands_wildcarded_server_segments() {
+        let config = config(
+            r#"
+[policies.roles.worker.tools]
+allow = ["git*.read_*", "docs.search"]
+"#,
+        );
+        let policy = config.effective("worker", "codex");
+        assert!(policy.tools.may_allow_server("github"));
+        assert!(policy.tools.may_allow_server("docs"));
+        assert!(!policy.tools.may_allow_server("postgres"));
     }
 
     #[test]

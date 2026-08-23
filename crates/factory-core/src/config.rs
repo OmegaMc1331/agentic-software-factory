@@ -92,6 +92,10 @@ pub struct Config {
     /// Project-local policies (`[policies.roles.<id>]` / `[policies.agents.<name>]`).
     #[serde(default)]
     pub policies: PoliciesConfig,
+    /// Project-local external MCP servers (`[mcp.<server>]`). Empty for every
+    /// pre-MCP project, preserving historical behavior.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub mcp: BTreeMap<String, factory_mcp::McpServerConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -440,6 +444,11 @@ impl Config {
         }
         if let Err(error) = self.policies.validate() {
             return Err(format!("invalid policy configuration: {error}"));
+        }
+        for (id, server) in &self.mcp {
+            server
+                .validate(id, Path::new("."))
+                .map_err(|reason| format!("invalid MCP server configuration: {reason}"))?;
         }
         for (id, entry) in &self.roles {
             if !valid_name(id) {

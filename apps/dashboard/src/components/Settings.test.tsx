@@ -1,21 +1,27 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   addRoleAssignment,
+  createMcpServer,
   createRecipe,
   deleteRecipe,
   deleteRole,
+  deleteMcpServer,
   fetchAgents,
   fetchConfig,
+  fetchMcpServers,
+  fetchMcpTools,
   fetchRecipes,
   fetchRoles,
   removeRoleAssignment,
   saveConfig,
   setPreferredAssignment,
+  testMcpServer,
+  updateMcpServer,
   updateRecipe,
   updateRole,
 } from "../api";
-import type { ConfigData, Recipe, RoleInfo } from "../types";
+import type { ConfigData, McpServerView, Recipe, RoleInfo } from "../types";
 import { SettingsView } from "./Settings";
 
 vi.mock("../api", () => ({
@@ -25,6 +31,12 @@ vi.mock("../api", () => ({
   fetchConfig: vi.fn(),
   fetchRoles: vi.fn(),
   fetchRecipes: vi.fn(),
+  fetchMcpServers: vi.fn(),
+  createMcpServer: vi.fn(),
+  updateMcpServer: vi.fn(),
+  deleteMcpServer: vi.fn(),
+  testMcpServer: vi.fn(),
+  fetchMcpTools: vi.fn(),
   createRecipe: vi.fn(),
   updateRecipe: vi.fn(),
   deleteRecipe: vi.fn(),
@@ -78,6 +90,12 @@ beforeEach(() => {
   vi.mocked(fetchAgents).mockReset().mockResolvedValue([]);
   vi.mocked(fetchRoles).mockReset().mockResolvedValue([workerRole, reviewerRole, customRole]);
   vi.mocked(fetchRecipes).mockReset().mockResolvedValue([]);
+  vi.mocked(fetchMcpServers).mockReset().mockResolvedValue([]);
+  vi.mocked(fetchMcpTools).mockReset().mockResolvedValue([]);
+  vi.mocked(createMcpServer).mockReset();
+  vi.mocked(updateMcpServer).mockReset();
+  vi.mocked(deleteMcpServer).mockReset().mockResolvedValue();
+  vi.mocked(testMcpServer).mockReset();
   vi.mocked(saveConfig).mockReset().mockResolvedValue();
   vi.mocked(addRoleAssignment).mockReset().mockResolvedValue(workerRole);
   vi.mocked(removeRoleAssignment).mockReset().mockResolvedValue(workerRole);
@@ -187,6 +205,77 @@ const customRecipe: Recipe = {
   plannerGuidance: "Prefer a compact plan.",
   builtin: false,
 };
+
+describe("Settings MCP servers", () => {
+  const server: McpServerView = {
+    id: "docs",
+    transport: "http",
+    args: [],
+    url: "http://127.0.0.1:3001/mcp",
+    env: {},
+    headers: {},
+    timeoutMs: 60000,
+    discoveryTimeoutMs: 10000,
+    maxResponseBytes: 262144,
+    maxConcurrency: 4,
+    classifications: {},
+    status: "connected",
+    toolCount: 1,
+  };
+
+  it("tests, inspects, edits, and removes a configured server", async () => {
+    vi.mocked(fetchMcpServers).mockResolvedValue([server]);
+    vi.mocked(testMcpServer).mockResolvedValue(server);
+    vi.mocked(fetchMcpTools).mockResolvedValue([
+      {
+        server: "docs",
+        name: "search",
+        qualifiedName: "docs.search",
+        description: "Search documentation.",
+        inputSchema: { type: "object" },
+        classification: "read",
+        discoveredAt: "2026-08-23T00:00:00Z",
+      },
+    ]);
+    render(<SettingsView />);
+
+    expect(await screen.findByText(/Connected/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Test connection" }));
+    await waitFor(() => expect(testMcpServer).toHaveBeenCalledWith("docs"));
+    fireEvent.click(screen.getByRole("button", { name: "Inspect tools" }));
+    expect(await screen.findByText("docs.search")).toBeTruthy();
+    const mcpSection = screen.getByLabelText("External Tools MCP");
+    fireEvent.click(within(mcpSection).getByRole("button", { name: "Edit" }));
+    expect((screen.getByLabelText("Server id") as HTMLInputElement).value).toBe("docs");
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    fireEvent.click(within(mcpSection).getByRole("button", { name: "Remove" }));
+    await waitFor(() => expect(deleteMcpServer).toHaveBeenCalledWith("docs"));
+  });
+
+  it("adds a structured stdio server with environment references", async () => {
+    vi.mocked(createMcpServer).mockResolvedValue({ ...server, id: "github" });
+    render(<SettingsView />);
+    fireEvent.click(await screen.findByRole("button", { name: "Add server" }));
+    fireEvent.change(screen.getByLabelText("Server id"), { target: { value: "github" } });
+    fireEvent.change(screen.getByLabelText("Command"), {
+      target: { value: "github-mcp-server" },
+    });
+    fireEvent.change(screen.getByLabelText(/Environment references/), {
+      target: { value: "GITHUB_TOKEN=${GITHUB_TOKEN}" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save server" }));
+    await waitFor(() =>
+      expect(createMcpServer).toHaveBeenCalledWith(
+        "github",
+        expect.objectContaining({
+          transport: "stdio",
+          command: "github-mcp-server",
+          env: { GITHUB_TOKEN: "${GITHUB_TOKEN}" },
+        })
+      )
+    );
+  });
+});
 
 describe("Settings recipes", () => {
   beforeEach(() => {

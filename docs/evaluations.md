@@ -12,6 +12,11 @@ Everything is derived from the immutable workflow history stored locally in
 telemetry exists. No LLM ever scores another LLM's output, and no token or
 cost numbers are invented when the underlying CLI does not provide them.
 
+External-tool calls have separate operational counters (calls, successes,
+failures, and median duration). MCP usage is not a positive quality signal, and
+MCP transport/server failures never enter agent-quality denominators. See
+[External Tools / MCP](mcp.md#auditing-and-evaluation).
+
 ## Evaluation architecture
 
 - **`factory-eval`** (crates/factory-eval) is the evaluation engine. It reads

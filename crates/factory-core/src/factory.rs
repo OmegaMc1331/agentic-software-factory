@@ -6,11 +6,12 @@ use chrono::Utc;
 use factory_agent::{AgentError, AgentRequest, AgentResult, CommandAgent, OutputStream};
 use factory_db::{FactoryDb, Reconciliation};
 use factory_git::{Repo, WorktreeInfo};
+use factory_mcp::{render_tool_catalog, GrantContext, ToolRegistry};
 use factory_types::{
     AgentSession, AgentSessionMode, AttemptStatus, DeliveryState, GitHubDelivery, GitHubIssueLink,
-    Recipe, RecipeRouting, RecipeSnapshot, ReviewDecision, ReviewResult, RoleArtifact,
-    RoutingCandidateScore, RoutingDecision, RoutingPreview, Run, RunStatus, SpecializedReview,
-    Task, TaskAttempt, TaskEvidence, TaskOperation, TaskState, WorkflowTeam,
+    McpToolMetadata, Recipe, RecipeRouting, RecipeSnapshot, ReviewDecision, ReviewResult,
+    RoleArtifact, RoutingCandidateScore, RoutingDecision, RoutingPreview, Run, RunStatus,
+    SpecializedReview, Task, TaskAttempt, TaskEvidence, TaskOperation, TaskState, WorkflowTeam,
 };
 use thiserror::Error;
 
@@ -80,6 +81,8 @@ pub enum FactoryError {
     Git(#[from] factory_git::GitError),
     #[error("GitHub error: {0}")]
     GitHub(#[from] factory_github::GitHubError),
+    #[error("external tool error: {0}")]
+    Mcp(#[from] factory_mcp::McpError),
     #[error("delivery not allowed: {0}")]
     NotDeliverable(String),
     #[error("task {0} is not ready to run")]
@@ -438,16 +441,18 @@ impl Factory {
                 policy_presets.insert(role.clone(), preset.as_str().to_string());
             }
         }
-        let (routing, max_parallel_tasks, planner_guidance) = match &run.recipe {
+        let (routing, max_parallel_tasks, planner_guidance, tools) = match &run.recipe {
             Some(snapshot) => (
                 snapshot.routing,
                 snapshot.max_parallel_tasks,
                 snapshot.planner_guidance.clone(),
+                snapshot.tools.clone(),
             ),
             None => (
                 RecipeRouting::ProjectDefault,
                 Some(config.runtime.max_parallel_tasks),
                 String::new(),
+                Vec::new(),
             ),
         };
         Ok(Recipe {
@@ -458,6 +463,7 @@ impl Factory {
             routing,
             max_parallel_tasks,
             policy_presets,
+            tools,
             planner_guidance,
             github: None,
             builtin: false,
@@ -1632,7 +1638,7 @@ impl Factory {
             let repository_context =
                 self.repository_context(&task, operation, &worktree, &base_sha, &[], &upstream);
             let untrusted_notice = self.untrusted_issue_notice(task.run_id)?;
-            let worker_policy = self.agents.config().effective_policy(&role, &worker_name);
+            let worker_policy = self.policy_with_recipe(run.recipe.as_ref(), &role, &worker_name);
             let worker_instruction = build_mission(&MissionContext {
                 role: role_definition,
                 operation,
@@ -1797,10 +1803,8 @@ impl Factory {
                 .get(roles::REVIEWER)
                 .cloned()
                 .unwrap_or_else(|| roles::core_role(roles::REVIEWER).expect("core reviewer"));
-            let reviewer_policy = self
-                .agents
-                .config()
-                .effective_policy(roles::REVIEWER, &reviewer_name);
+            let reviewer_policy =
+                self.policy_with_recipe(run.recipe.as_ref(), roles::REVIEWER, &reviewer_name);
             let review_instruction = build_mission(&MissionContext {
                 role: &reviewer_role,
                 operation: TaskOperation::Review,
@@ -2011,7 +2015,7 @@ impl Factory {
                 &[],
                 &upstream,
             );
-            let advisory_policy = self.agents.config().effective_policy(&role, &agent_name);
+            let advisory_policy = self.policy_with_recipe(run.recipe.as_ref(), &role, &agent_name);
             let untrusted_notice = self.untrusted_issue_notice(task.run_id)?;
             let instruction = build_mission(&MissionContext {
                 role: role_definition,
@@ -2241,7 +2245,7 @@ impl Factory {
                 &review_input.evidence.changed_files,
                 &upstream,
             );
-            let review_policy = self.agents.config().effective_policy(&role, &reviewer_name);
+            let review_policy = self.policy_with_recipe(run.recipe.as_ref(), &role, &reviewer_name);
             let untrusted_notice = self.untrusted_issue_notice(task.run_id)?;
             let instruction = build_mission(&MissionContext {
                 role: role_definition,
@@ -2601,6 +2605,7 @@ impl Factory {
             .and_then(|run_id| self.db.get_run(run_id).ok().flatten())
             .and_then(|run| run.recipe);
         let policy = self.policy_with_recipe(recipe.as_ref(), scope.role, agent.name());
+        let external_tools = self.external_tools_for_invocation(&scope, &policy);
         let policy_audit = factory_types::SessionPolicyAudit {
             source: policy.source.clone(),
             filesystem: policy.filesystem.mode_name().to_string(),
@@ -2612,6 +2617,8 @@ impl Factory {
             .to_string(),
             environment: policy.environment.mode().to_string(),
             write_scopes: policy.filesystem.effective_write_scopes(),
+            tool_allow: policy.tools.allow_patterns(),
+            tool_deny: policy.tools.deny_patterns().to_vec(),
         };
         // Environment filtering before process launch: when the policy filters
         // or denies variables, the child receives exactly the computed set
@@ -2642,11 +2649,40 @@ impl Factory {
             stderr: Some(String::new()),
             policy_audit: Some(policy_audit),
         })?;
+        let registry = ToolRegistry::new(&self.root, self.agents.config().mcp.clone());
+        let grant = registry.create_grant(
+            GrantContext {
+                run_id: scope.run_id,
+                task_id: scope.task_id,
+                attempt_id: scope.attempt_id,
+                session_id: Some(session.id),
+                agent: agent.name().to_string(),
+                role: scope.role.to_string(),
+                operation: scope
+                    .operation
+                    .map(|operation| operation.as_str().to_string()),
+            },
+            &external_tools,
+        )?;
+        let mission = grant
+            .as_ref()
+            .map(|_| inject_external_tool_catalog(mission, &external_tools))
+            .unwrap_or_else(|| mission.to_string());
         let mut request = AgentRequest::new(mission, scope.working_dir);
         if needs_clear {
             request.env = policy.environment.environment(std::env::vars());
             request.env_deny = policy.environment.denied.clone();
             request.clear_env = true;
+        }
+        if let Some(grant) = &grant {
+            secrets.add(&grant.token, 4);
+            request.env.insert(
+                "FACTORY_MCP_ROOT".into(),
+                self.root.to_string_lossy().to_string(),
+            );
+            request
+                .env
+                .insert("FACTORY_MCP_GRANT".into(), grant.token.clone());
         }
         let timer = Instant::now();
         let mut output_error = None;
@@ -2669,6 +2705,12 @@ impl Factory {
                 output_error = Some(error);
             }
         });
+        if let Some(grant) = &grant {
+            // Revocation happens before any task state transition. If the
+            // agent was cancelled, its active MCP subprocess is terminated by
+            // the same process-tree cancellation and this closes reuse.
+            registry.revoke_grant(&grant.id)?;
+        }
         match result {
             Ok(result) => {
                 let status = if result.cancelled {
@@ -2705,6 +2747,57 @@ impl Factory {
                 Err(error.into())
             }
         }
+    }
+
+    fn external_tools_for_invocation(
+        &self,
+        scope: &InvocationScope<'_>,
+        policy: &factory_policy::EffectivePolicy,
+    ) -> Vec<McpToolMetadata> {
+        if self.agents.config().mcp.is_empty()
+            || policy.tools.allow_patterns().is_empty()
+            || policy
+                .environment
+                .denied
+                .iter()
+                .any(|key| key.eq_ignore_ascii_case("FACTORY_MCP_GRANT"))
+        {
+            return Vec::new();
+        }
+        let registry = ToolRegistry::new(&self.root, self.agents.config().mcp.clone());
+        let cached = registry.cached_tools(None).unwrap_or_default();
+        for server in self.agents.config().mcp.keys() {
+            if policy.tools.may_allow_server(server)
+                && !cached.iter().any(|tool| &tool.server == server)
+            {
+                // External tooling is optional infrastructure. An unavailable
+                // server removes its tools from this catalog without failing
+                // the task or becoming an agent-quality failure.
+                let _ = registry.discover_server_blocking(server);
+            }
+        }
+        let objective = scope
+            .task_id
+            .and_then(|id| self.db.get_task(id).ok().flatten())
+            .map(|task| format!("{} {}", task.title, task.objective))
+            .or_else(|| {
+                scope
+                    .run_id
+                    .and_then(|id| self.db.get_run(id).ok().flatten())
+                    .map(|run| run.objective)
+            })
+            .unwrap_or_default();
+        registry
+            .relevant_cached_tools(
+                policy,
+                scope.role,
+                scope
+                    .operation
+                    .map(TaskOperation::as_str)
+                    .unwrap_or("unknown"),
+                &objective,
+            )
+            .unwrap_or_default()
     }
 
     pub fn cancel_run(&self, run_id: i64) -> Result<(), FactoryError> {
@@ -3612,6 +3705,18 @@ fn default_artifact_content(output: &str) -> String {
     serde_json::json!({ "summary": tail(output, 4_000) }).to_string()
 }
 
+fn inject_external_tool_catalog(mission: &str, tools: &[McpToolMetadata]) -> String {
+    let references: Vec<&McpToolMetadata> = tools.iter().collect();
+    let Some(catalog) = render_tool_catalog(&references) else {
+        return mission.to_string();
+    };
+    const OUTPUT: &str = "\n\nOUTPUT CONTRACT\n";
+    match mission.rsplit_once(OUTPUT) {
+        Some((before, after)) => format!("{before}\n\n{catalog}{OUTPUT}{after}"),
+        None => format!("{mission}\n\n{catalog}"),
+    }
+}
+
 fn truncate_chars(value: &str, max_chars: usize) -> String {
     if value.chars().count() <= max_chars {
         return value.to_string();
@@ -3834,5 +3939,26 @@ mod tests {
         });
         assert!(retry.contains("CONTEXT\nPrevious review requested changes:\nmissing test"));
         assert!(retry.contains("- add a regression test"));
+    }
+
+    #[test]
+    fn external_tool_catalog_precedes_the_output_contract_without_schemas() {
+        let tool = McpToolMetadata {
+            server: "docs".into(),
+            name: "search".into(),
+            qualified_name: "docs.search".into(),
+            description: "Search trusted documentation sources.".into(),
+            input_schema: serde_json::json!({"type": "object", "required": ["query"]}),
+            annotations: None,
+            classification: factory_types::ToolClassification::Read,
+            discovered_at: String::new(),
+        };
+        let mission = inject_external_tool_catalog(
+            "TASK\nInspect docs.\n\nOUTPUT CONTRACT\nReturn JSON.",
+            &[tool],
+        );
+        assert!(mission.contains("AVAILABLE EXTERNAL TOOLS"));
+        assert!(mission.find("docs.search").unwrap() < mission.find("OUTPUT CONTRACT").unwrap());
+        assert!(!mission.contains("required"));
     }
 }

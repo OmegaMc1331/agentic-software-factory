@@ -15,6 +15,6 @@ pub use environment::{
 pub use policy::{
     operation_is_mutating, validate_executable, CommandsMode, CommandsPolicy, EffectiveCommands,
     EffectiveEnvironment, EffectiveFilesystem, EffectiveGit, EffectiveNetwork, EffectivePolicy,
-    EnvironmentPolicy, FilesystemPolicy, GitOperation, GitPolicy, NetworkMode, NetworkPolicy,
-    PoliciesConfig, PolicyPreset, PolicyScope, PolicyView,
+    EffectiveTools, EnvironmentPolicy, FilesystemPolicy, GitOperation, GitPolicy, NetworkMode,
+    NetworkPolicy, PoliciesConfig, PolicyPreset, PolicyScope, PolicyView, ToolPolicy,
 };

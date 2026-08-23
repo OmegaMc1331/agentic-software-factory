@@ -26,6 +26,11 @@ flowchart TB
     IS --> CA[Configured coding agent]
     CORE --> WT[Git worktrees]
     CORE --> DB[(SQLite)]
+    CORE --> TR[Tool Resolver / Registry]
+    TR -->|policy-scoped grant| MCP[MCP client]
+    MCP --> STDIO[stdio server]
+    MCP --> HTTP[Streamable HTTP server]
+    MCP -->|bounded untrusted result| S
     CORE --> GH[factory-github]
     GH --> GHC[gh CLI]
     GH --> PUSH[git push / gh pr create]
@@ -43,6 +48,8 @@ crates/
                     review, session, and GitHub linkage/delivery types
   factory-agent     Configured subprocess execution, output capture, cancellation
   factory-policy    Policy model, precedence resolver, path/environment enforcement
+  factory-mcp       MCP configuration, discovery, deterministic tool resolution,
+                    scoped grants, transports, limits, leases, and invocation audit
   factory-db        SQLite persistence and versioned migrations
   factory-git       Repository checks, worktrees, and Git evidence
   factory-core      Planning, invariants, mission building, task transitions, and
@@ -59,6 +66,20 @@ apps/
 
 Dependencies point toward `factory-types`. The CLI and API use Factory Core; the API
 also owns one `factory-runtime` instance for background operations.
+
+## External tool boundary
+
+MCP is centralized in `factory-mcp`; agents and workflow code do not open MCP
+connections directly. Factory discovers and caches server metadata, composes role,
+agent, and Recipe tool policy, selects a bounded relevant catalog without an LLM, and
+issues a hashed, expiring grant scoped to the concrete run/task/attempt/session.
+`factory mcp call` is the provider-neutral bridge that revalidates that grant and the
+current policy before `tools/call`.
+
+Per-server SQLite leases provide concurrency limits without a global mutex. Database
+operations are short and never span external I/O. Invocation guards make cancellation
+terminal and auditable. Results are bounded and remain marked external data rather
+than repository truth. See [External Tools / MCP](mcp.md).
 
 ## Evaluation
 

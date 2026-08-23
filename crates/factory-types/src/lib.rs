@@ -2,6 +2,7 @@ pub mod artifact;
 pub mod attempt;
 pub mod github;
 pub mod integration;
+pub mod mcp;
 pub mod plan;
 pub mod plan_edit;
 pub mod plans;
@@ -19,6 +20,7 @@ pub use attempt::{
 };
 pub use github::{DeliveryState, GitHubDelivery, GitHubIssueLink, IssueComment, PullRequestInfo};
 pub use integration::{IntegrationOutcome, IntegrationOutcomeKind};
+pub use mcp::{McpToolMetadata, ToolClassification, ToolGrant, ToolInvocation, ToolMetrics};
 pub use plan::{Plan, PlannedTask};
 pub use plan_edit::{
     is_immutable, mutable_scope, resolve_patch, resolve_replan, PlanApplyOutcome, PlanState,

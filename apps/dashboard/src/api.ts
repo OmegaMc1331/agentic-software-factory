@@ -11,6 +11,10 @@ import type {
   GitHubStatus,
   GraphData,
   GraphWorkspace,
+  McpServerConfig,
+  McpServerView,
+  McpTool,
+  EffectiveToolPermission,
   PerformanceFilters,
   PerformanceOverview,
   PrPreview,
@@ -150,6 +154,7 @@ export interface RecipeSaveRequest {
   maxParallelTasks?: number | null;
   policyPresets?: Record<string, string>;
   plannerGuidance?: string;
+  tools?: string[];
   github?: { draft: boolean } | null;
 }
 
@@ -275,6 +280,40 @@ export function fetchConfig(): Promise<ConfigData> {
 
 export function saveConfig(config: ConfigData): Promise<void> {
   return put<void>("/config", config);
+}
+
+// --- External tools / MCP ----------------------------------------------------
+
+export function fetchMcpServers(): Promise<McpServerView[]> {
+  return get<McpServerView[]>("/mcp/servers");
+}
+
+export function createMcpServer(id: string, config: McpServerConfig): Promise<McpServerView> {
+  return post<McpServerView>("/mcp/servers", { id, ...config });
+}
+
+export function updateMcpServer(id: string, config: McpServerConfig): Promise<McpServerView> {
+  return put<McpServerView>(`/mcp/servers/${encodeURIComponent(id)}`, config);
+}
+
+export function deleteMcpServer(id: string): Promise<void> {
+  return remove(`/mcp/servers/${encodeURIComponent(id)}`);
+}
+
+export function testMcpServer(id: string): Promise<McpServerView> {
+  return post<McpServerView>(`/mcp/servers/${encodeURIComponent(id)}/test`);
+}
+
+export function fetchMcpTools(id: string): Promise<McpTool[]> {
+  return get<McpTool[]>(`/mcp/servers/${encodeURIComponent(id)}/tools`);
+}
+
+export function fetchRoleTools(roleId: string): Promise<EffectiveToolPermission[]> {
+  return get<EffectiveToolPermission[]>(`/roles/${encodeURIComponent(roleId)}/tools`);
+}
+
+export function fetchAgentTools(agent: string): Promise<EffectiveToolPermission[]> {
+  return get<EffectiveToolPermission[]>(`/agents/${encodeURIComponent(agent)}/tools`);
 }
 
 export function fetchAgents(): Promise<AgentStatusInfo[]> {

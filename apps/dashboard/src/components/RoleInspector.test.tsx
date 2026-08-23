@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   addRoleAssignment,
   createRole,
+  fetchRoleTools,
   removeRoleAssignment,
   setPreferredAssignment,
   setRolePolicy,
@@ -14,6 +15,7 @@ import { RoleInspector } from "./RoleInspector";
 vi.mock("../api", () => ({
   addRoleAssignment: vi.fn(),
   createRole: vi.fn(),
+  fetchRoleTools: vi.fn(),
   removeRoleAssignment: vi.fn(),
   setPreferredAssignment: vi.fn(),
   setRolePolicy: vi.fn(),
@@ -75,6 +77,7 @@ const agents = ["claude", "codex", "gemini"];
 beforeEach(() => {
   vi.mocked(addRoleAssignment).mockReset().mockResolvedValue(customRole());
   vi.mocked(createRole).mockReset().mockResolvedValue(customRole());
+  vi.mocked(fetchRoleTools).mockReset().mockResolvedValue([]);
   vi.mocked(removeRoleAssignment).mockReset().mockResolvedValue(customRole());
   vi.mocked(setPreferredAssignment).mockReset().mockResolvedValue(customRole());
   vi.mocked(setRolePolicy).mockReset().mockResolvedValue(customRole());
@@ -87,6 +90,38 @@ afterEach(() => {
 });
 
 describe("Role inspector", () => {
+  it("shows effective discovered external tool decisions", async () => {
+    vi.mocked(fetchRoleTools).mockResolvedValue([
+      {
+        server: "github",
+        tool: "search_code",
+        qualifiedName: "github.search_code",
+        classification: "read",
+        allowed: true,
+      },
+      {
+        server: "github",
+        tool: "create_issue",
+        qualifiedName: "github.create_issue",
+        classification: "write",
+        allowed: false,
+      },
+    ]);
+    render(
+      <RoleInspector
+        role={customRole({ permissions: permissions() })}
+        agents={agents}
+        onClose={vi.fn()}
+        onChanged={vi.fn()}
+        onDelete={vi.fn()}
+      />
+    );
+    expect(await screen.findByText("github.search_code")).toBeTruthy();
+    expect(screen.getByText("github.create_issue")).toBeTruthy();
+    expect(screen.getAllByText("Allowed").length).toBeGreaterThan(0);
+    expect(screen.getByText("Denied")).toBeTruthy();
+  });
+
   it("shows core role agents without definition edit or delete actions", async () => {
     const onChanged = vi.fn();
     render(

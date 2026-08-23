@@ -1,16 +1,22 @@
 import { useCallback, useEffect, useState } from "react";
 import {
   addRoleAssignment,
+  createMcpServer,
   createRecipe,
   deleteRecipe,
+  deleteMcpServer,
   deleteRole,
   fetchAgents,
   fetchConfig,
+  fetchMcpServers,
+  fetchMcpTools,
   fetchRecipes,
   fetchRoles,
   removeRoleAssignment,
   saveConfig,
   setPreferredAssignment,
+  testMcpServer,
+  updateMcpServer,
   updateRecipe,
   updateRole,
 } from "../api";
@@ -19,6 +25,9 @@ import {
   type AgentKind,
   type AgentStatusInfo,
   type ConfigData,
+  type McpServerConfig,
+  type McpServerView,
+  type McpTool,
   type PromptTransport,
   type Recipe,
   type RoleInfo,
@@ -113,11 +122,96 @@ function parseEnv(text: string): Record<string, string> {
   return result;
 }
 
+interface McpDraft {
+  originalId: string | null;
+  id: string;
+  transport: "stdio" | "http";
+  command: string;
+  argsText: string;
+  url: string;
+  cwd: string;
+  envText: string;
+  headersText: string;
+  classificationsText: string;
+  timeoutMs: string;
+  maxResponseBytes: string;
+  maxConcurrency: string;
+}
+
+function emptyMcpDraft(): McpDraft {
+  return {
+    originalId: null,
+    id: "",
+    transport: "stdio",
+    command: "",
+    argsText: "",
+    url: "",
+    cwd: "",
+    envText: "",
+    headersText: "",
+    classificationsText: "",
+    timeoutMs: "60000",
+    maxResponseBytes: "262144",
+    maxConcurrency: "4",
+  };
+}
+
+function mcpDraftFrom(server: McpServerView): McpDraft {
+  return {
+    originalId: server.id,
+    id: server.id,
+    transport: server.transport,
+    command: server.command ?? "",
+    argsText: server.args.join("\n"),
+    url: server.url ?? "",
+    cwd: server.cwd ?? "",
+    envText: Object.entries(server.env)
+      .map(([key, value]) => `${key}=${value}`)
+      .join("\n"),
+    headersText: Object.entries(server.headers)
+      .map(([key, value]) => `${key}=${value}`)
+      .join("\n"),
+    classificationsText: Object.entries(server.classifications)
+      .map(([key, value]) => `${key}=${value}`)
+      .join("\n"),
+    timeoutMs: String(server.timeoutMs),
+    maxResponseBytes: String(server.maxResponseBytes),
+    maxConcurrency: String(server.maxConcurrency),
+  };
+}
+
+function mcpConfigFrom(draft: McpDraft): McpServerConfig {
+  const classifications = parseEnv(draft.classificationsText) as McpServerConfig["classifications"];
+  return {
+    transport: draft.transport,
+    ...(draft.transport === "stdio"
+      ? {
+          command: draft.command.trim(),
+          args: parseLines(draft.argsText),
+          ...(draft.cwd.trim() ? { cwd: draft.cwd.trim() } : {}),
+          env: parseEnv(draft.envText),
+        }
+      : {
+          url: draft.url.trim(),
+          headers: parseEnv(draft.headersText),
+        }),
+    timeout_ms: Number(draft.timeoutMs),
+    discovery_timeout_ms: 10000,
+    max_response_bytes: Number(draft.maxResponseBytes),
+    max_concurrency: Number(draft.maxConcurrency),
+    classifications,
+  };
+}
+
 export function SettingsView() {
   const [config, setConfig] = useState<ConfigData | null>(null);
   const [available, setAvailable] = useState<Record<string, AgentStatusInfo>>({});
   const [roles, setRoles] = useState<RoleInfo[]>([]);
   const [recipes, setRecipes] = useState<Recipe[]>([]);
+  const [mcpServers, setMcpServers] = useState<McpServerView[]>([]);
+  const [mcpDraft, setMcpDraft] = useState<McpDraft | null>(null);
+  const [mcpTools, setMcpTools] = useState<Record<string, McpTool[]>>({});
+  const [mcpBusy, setMcpBusy] = useState<string | null>(null);
   const [draft, setDraft] = useState<Draft | null>(null);
   const [editingRole, setEditingRole] = useState<RoleInfo | null>(null);
   const [roleSelection, setRoleSelection] = useState<Record<string, string>>({});
@@ -132,12 +226,13 @@ export function SettingsView() {
   const reload = useCallback(() => {
     setError(null);
     setSaved(null);
-    Promise.all([fetchConfig(), fetchAgents(), fetchRoles(), fetchRecipes()])
-      .then(([nextConfig, list, nextRoles, nextRecipes]) => {
+    Promise.all([fetchConfig(), fetchAgents(), fetchRoles(), fetchRecipes(), fetchMcpServers()])
+      .then(([nextConfig, list, nextRoles, nextRecipes, nextMcpServers]) => {
         setConfig(nextConfig);
         setAvailable(Object.fromEntries(list.map((agent) => [agent.name, agent])));
         setRoles(nextRoles);
         setRecipes(nextRecipes);
+        setMcpServers(nextMcpServers);
         setEditingRole((current) =>
           current ? (nextRoles.find((role) => role.id === current.id) ?? null) : null
         );
@@ -222,6 +317,66 @@ export function SettingsView() {
     fetchAgents()
       .then((list) => setAvailable(Object.fromEntries(list.map((agent) => [agent.name, agent]))))
       .catch((err: Error) => setError(err.message));
+  };
+
+  const saveMcpDraft = async () => {
+    if (!mcpDraft) return;
+    const id = mcpDraft.id.trim();
+    if (!id) {
+      setError("MCP server id is required.");
+      return;
+    }
+    if (mcpDraft.transport === "stdio" && !mcpDraft.command.trim()) {
+      setError("A structured command is required for a stdio MCP server.");
+      return;
+    }
+    if (mcpDraft.transport === "http" && !mcpDraft.url.trim()) {
+      setError("A URL is required for an HTTP MCP server.");
+      return;
+    }
+    setMcpBusy(id);
+    setError(null);
+    try {
+      if (mcpDraft.originalId) {
+        await updateMcpServer(mcpDraft.originalId, mcpConfigFrom(mcpDraft));
+      } else {
+        await createMcpServer(id, mcpConfigFrom(mcpDraft));
+      }
+      setMcpDraft(null);
+      setSaved(`${mcpDraft.originalId ? "Saved" : "Added"} MCP server ${id}.`);
+      reload();
+    } catch (reason) {
+      setError((reason as Error).message);
+    } finally {
+      setMcpBusy(null);
+    }
+  };
+
+  const testMcp = async (id: string) => {
+    setMcpBusy(id);
+    setError(null);
+    try {
+      const tested = await testMcpServer(id);
+      setMcpServers((current) => current.map((server) => (server.id === id ? tested : server)));
+      if (tested.status === "connected") setSaved(`${id} connected; ${tested.toolCount} tools.`);
+    } catch (reason) {
+      setError((reason as Error).message);
+    } finally {
+      setMcpBusy(null);
+    }
+  };
+
+  const inspectMcp = async (id: string) => {
+    setMcpBusy(id);
+    setError(null);
+    try {
+      const tools = await fetchMcpTools(id);
+      setMcpTools((current) => ({ ...current, [id]: tools }));
+    } catch (reason) {
+      setError((reason as Error).message);
+    } finally {
+      setMcpBusy(null);
+    }
   };
 
   if (config === null) {
@@ -312,6 +467,256 @@ export function SettingsView() {
             </p>
           </div>
         )}
+      </section>
+
+      <section className="section" aria-label="External Tools MCP">
+        <div className="settings-section-head">
+          <h3 className="section-title">External Tools / MCP</h3>
+          {!mcpDraft && (
+            <button className="button" onClick={() => setMcpDraft(emptyMcpDraft())}>
+              Add server
+            </button>
+          )}
+        </div>
+        <p className="settings-note">
+          Factory discovers and invokes external tools through scoped role policy. Commands use
+          structured arguments; secrets must be environment references such as{" "}
+          <code>{"${GITHUB_TOKEN}"}</code> and are never shown here as resolved values.
+        </p>
+        {mcpDraft && (
+          <form
+            className="recipe-form settings-form"
+            onSubmit={(event) => {
+              event.preventDefault();
+              void saveMcpDraft();
+            }}
+          >
+            <div className="settings-routing recipe-form-row">
+              <label>
+                <span>Server id</span>
+                <input
+                  value={mcpDraft.id}
+                  disabled={mcpDraft.originalId !== null}
+                  onChange={(event) => setMcpDraft({ ...mcpDraft, id: event.target.value })}
+                  placeholder="github"
+                />
+              </label>
+              <label>
+                <span>Transport</span>
+                <select
+                  value={mcpDraft.transport}
+                  onChange={(event) =>
+                    setMcpDraft({
+                      ...mcpDraft,
+                      transport: event.target.value as "stdio" | "http",
+                    })
+                  }
+                >
+                  <option value="stdio">stdio</option>
+                  <option value="http">Streamable HTTP</option>
+                </select>
+              </label>
+            </div>
+            {mcpDraft.transport === "stdio" ? (
+              <>
+                <label>
+                  <span>Command</span>
+                  <input
+                    value={mcpDraft.command}
+                    onChange={(event) => setMcpDraft({ ...mcpDraft, command: event.target.value })}
+                    placeholder="github-mcp-server"
+                  />
+                </label>
+                <label>
+                  <span>Arguments (one per line)</span>
+                  <textarea
+                    rows={3}
+                    value={mcpDraft.argsText}
+                    onChange={(event) => setMcpDraft({ ...mcpDraft, argsText: event.target.value })}
+                  />
+                </label>
+                <label>
+                  <span>Working directory (optional, existing project directory)</span>
+                  <input
+                    value={mcpDraft.cwd}
+                    onChange={(event) => setMcpDraft({ ...mcpDraft, cwd: event.target.value })}
+                  />
+                </label>
+                <label>
+                  <span>Environment references (NAME=${"${NAME}"}, one per line)</span>
+                  <textarea
+                    rows={3}
+                    value={mcpDraft.envText}
+                    onChange={(event) => setMcpDraft({ ...mcpDraft, envText: event.target.value })}
+                  />
+                </label>
+              </>
+            ) : (
+              <>
+                <label>
+                  <span>Streamable HTTP URL</span>
+                  <input
+                    type="url"
+                    value={mcpDraft.url}
+                    onChange={(event) => setMcpDraft({ ...mcpDraft, url: event.target.value })}
+                    placeholder="http://127.0.0.1:3001/mcp"
+                  />
+                </label>
+                <label>
+                  <span>Header references (NAME=${"${NAME}"}, one per line)</span>
+                  <textarea
+                    rows={3}
+                    value={mcpDraft.headersText}
+                    onChange={(event) =>
+                      setMcpDraft({ ...mcpDraft, headersText: event.target.value })
+                    }
+                  />
+                </label>
+              </>
+            )}
+            <div className="settings-routing recipe-form-row">
+              <label>
+                <span>Call timeout (ms)</span>
+                <input
+                  type="number"
+                  min={100}
+                  max={600000}
+                  value={mcpDraft.timeoutMs}
+                  onChange={(event) => setMcpDraft({ ...mcpDraft, timeoutMs: event.target.value })}
+                />
+              </label>
+              <label>
+                <span>Response limit (bytes)</span>
+                <input
+                  type="number"
+                  min={1024}
+                  max={1048576}
+                  value={mcpDraft.maxResponseBytes}
+                  onChange={(event) =>
+                    setMcpDraft({ ...mcpDraft, maxResponseBytes: event.target.value })
+                  }
+                />
+              </label>
+              <label>
+                <span>Per-server concurrency</span>
+                <input
+                  type="number"
+                  min={1}
+                  max={32}
+                  value={mcpDraft.maxConcurrency}
+                  onChange={(event) =>
+                    setMcpDraft({ ...mcpDraft, maxConcurrency: event.target.value })
+                  }
+                />
+              </label>
+            </div>
+            <label>
+              <span>Classification overrides (tool=classification)</span>
+              <textarea
+                rows={3}
+                value={mcpDraft.classificationsText}
+                onChange={(event) =>
+                  setMcpDraft({ ...mcpDraft, classificationsText: event.target.value })
+                }
+                placeholder={"create_issue=write\ndelete_issue=destructive"}
+              />
+            </label>
+            <div className="settings-actions">
+              <button className="button" type="submit" disabled={mcpBusy !== null}>
+                Save server
+              </button>
+              <button className="button" type="button" onClick={() => setMcpDraft(null)}>
+                Cancel
+              </button>
+            </div>
+          </form>
+        )}
+        <div className="settings-roles">
+          {mcpServers.length === 0 && !mcpDraft ? (
+            <p className="muted">No MCP servers configured.</p>
+          ) : (
+            mcpServers.map((server) => (
+              <article key={server.id} className="settings-role">
+                <div className="settings-role-head">
+                  <strong>{server.id}</strong>
+                  <span
+                    className={
+                      server.status === "connected"
+                        ? "net-ok"
+                        : server.status === "unavailable"
+                          ? "net-bad"
+                          : "muted"
+                    }
+                  >
+                    {server.status === "connected"
+                      ? `Connected Â· ${server.toolCount} tools`
+                      : server.status === "unavailable"
+                        ? "Unavailable"
+                        : "Not tested"}
+                  </span>
+                </div>
+                <p className="settings-note">
+                  {server.transport === "stdio"
+                    ? [server.command, ...server.args].filter(Boolean).join(" ")
+                    : server.url}
+                </p>
+                {server.lastError && <p className="inline-error">{server.lastError}</p>}
+                <div className="settings-role-actions">
+                  <span className="settings-actions">
+                    <button
+                      className="button"
+                      disabled={mcpBusy !== null}
+                      onClick={() => void testMcp(server.id)}
+                    >
+                      Test connection
+                    </button>
+                    <button
+                      className="button"
+                      disabled={mcpBusy !== null}
+                      onClick={() => void inspectMcp(server.id)}
+                    >
+                      Inspect tools
+                    </button>
+                    <button className="button" onClick={() => setMcpDraft(mcpDraftFrom(server))}>
+                      Edit
+                    </button>
+                    <button
+                      className="button"
+                      onClick={() => {
+                        if (!window.confirm(`Remove the ${server.id} MCP server?`)) return;
+                        setMcpBusy(server.id);
+                        deleteMcpServer(server.id)
+                          .then(() => {
+                            setMcpBusy(null);
+                            reload();
+                          })
+                          .catch((reason: Error) => {
+                            setMcpBusy(null);
+                            setError(reason.message);
+                          });
+                      }}
+                    >
+                      Remove
+                    </button>
+                  </span>
+                </div>
+                {mcpTools[server.id] && (
+                  <div className="role-agent-list" aria-label={`${server.id} tools`}>
+                    {mcpTools[server.id].map((tool) => (
+                      <details key={tool.qualifiedName} className="agent-resolution-details">
+                        <summary>
+                          <code>{tool.qualifiedName}</code> · {tool.classification}
+                        </summary>
+                        <p className="settings-note">{tool.description || "No description."}</p>
+                        <pre>{JSON.stringify(tool.inputSchema, null, 2)}</pre>
+                      </details>
+                    ))}
+                  </div>
+                )}
+              </article>
+            ))
+          )}
+        </div>
       </section>
 
       <section className="section">
@@ -511,6 +916,7 @@ export function SettingsView() {
                     maxParallelTasks: recipeEditor.duplicateOf.maxParallelTasks,
                     policyPresets: recipeEditor.duplicateOf.policyPresets,
                     plannerGuidance: recipeEditor.duplicateOf.plannerGuidance,
+                    tools: recipeEditor.duplicateOf.tools ?? [],
                   }
                 : recipeEditor.mode === "edit"
                   ? (() => {
@@ -524,6 +930,7 @@ export function SettingsView() {
                             maxParallelTasks: recipe.maxParallelTasks,
                             policyPresets: recipe.policyPresets,
                             plannerGuidance: recipe.plannerGuidance,
+                            tools: recipe.tools ?? [],
                           }
                         : undefined;
                     })()

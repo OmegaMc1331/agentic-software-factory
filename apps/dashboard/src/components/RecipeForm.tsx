@@ -18,6 +18,7 @@ export interface RecipeFormValue {
   maxParallelTasks: number | null;
   policyPresets: Record<string, string>;
   plannerGuidance: string;
+  tools: string[];
 }
 
 /**
@@ -52,6 +53,7 @@ export function RecipeForm({
     initial?.policyPresets ?? {}
   );
   const [guidance, setGuidance] = useState(initial?.plannerGuidance ?? "");
+  const [toolsText, setToolsText] = useState((initial?.tools ?? []).join("\n"));
   const [validationError, setValidationError] = useState<string | null>(null);
 
   const plannerRequired = mode === "create" || selectedRoles.length > 0;
@@ -98,6 +100,10 @@ export function RecipeForm({
       maxParallelTasks,
       policyPresets,
       plannerGuidance: guidance,
+      tools: toolsText
+        .split("\n")
+        .map((value) => value.trim())
+        .filter(Boolean),
     });
   };
 
@@ -208,6 +214,19 @@ export function RecipeForm({
           onChange={(event) => setGuidance(event.target.value)}
           placeholder="Bounded planning context, e.g. prefer a compact diagnosis/fix/regression-test workflow."
         />
+      </label>
+      <label>
+        <span>External tool selection</span>
+        <textarea
+          rows={3}
+          value={toolsText}
+          onChange={(event) => setToolsText(event.target.value)}
+          placeholder={"docs.*\ngithub.read_*"}
+        />
+        <small className="inline-note">
+          One policy pattern per line. Recipes can only select or narrow access already granted to
+          the role; they can never elevate it.
+        </small>
       </label>
       {(validationError ?? error) && <p className="inline-error">{validationError ?? error}</p>}
       <div className="settings-actions">
