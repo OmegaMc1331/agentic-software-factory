@@ -478,7 +478,7 @@ dependencies = [
 
 [[package]]
 name = "factory-agent"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "serde",
  "tempfile",
@@ -487,7 +487,7 @@ dependencies = [
 
 [[package]]
 name = "factory-api"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "axum",
  "chrono",
@@ -512,7 +512,7 @@ dependencies = [
 
 [[package]]
 name = "factory-cli"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -531,7 +531,7 @@ dependencies = [
 
 [[package]]
 name = "factory-context"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "factory-git",
  "factory-types",
@@ -544,7 +544,7 @@ dependencies = [
 
 [[package]]
 name = "factory-core"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "chrono",
  "factory-agent",
@@ -565,7 +565,7 @@ dependencies = [
 
 [[package]]
 name = "factory-db"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "chrono",
  "factory-types",
@@ -577,7 +577,7 @@ dependencies = [
 
 [[package]]
 name = "factory-eval"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "chrono",
  "factory-db",
@@ -589,7 +589,7 @@ dependencies = [
 
 [[package]]
 name = "factory-git"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "tempfile",
  "thiserror 2.0.20",
@@ -597,7 +597,7 @@ dependencies = [
 
 [[package]]
 name = "factory-github"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "chrono",
  "factory-types",
@@ -609,7 +609,7 @@ dependencies = [
 
 [[package]]
 name = "factory-mcp"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "chrono",
  "factory-db",
@@ -630,7 +630,7 @@ dependencies = [
 
 [[package]]
 name = "factory-policy"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "serde",
  "toml",
@@ -638,7 +638,7 @@ dependencies = [
 
 [[package]]
 name = "factory-runtime"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "chrono",
  "factory-agent",
@@ -653,7 +653,7 @@ dependencies = [
 
 [[package]]
 name = "factory-types"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "serde",
  "serde_json",

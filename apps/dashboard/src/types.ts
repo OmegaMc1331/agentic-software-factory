@@ -227,7 +227,8 @@ export interface AgentEntry {
   command: string;
   /** Omitted by the API when the persisted config has zero arguments. */
   args?: string[];
-  env: Record<string, string>;
+  /** Omitted by the API when the persisted config has no environment entries. */
+  env?: Record<string, string>;
   prompt_transport?: PromptTransport;
   interactive_args?: string[];
   capabilities?: string[];

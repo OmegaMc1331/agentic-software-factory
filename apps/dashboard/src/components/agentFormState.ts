@@ -55,7 +55,7 @@ export function agentDraftFrom(name: string, entry: ConfigData["agents"][string]
     kind: inferredKind(entry),
     command: entry.command,
     args: [...agentArgs(entry)],
-    envText: Object.entries(entry.env)
+    envText: Object.entries(entry.env ?? {})
       .map(([key, value]) => `${key}=${value}`)
       .join("\n"),
     promptTransport: entry.prompt_transport ?? "stdin",

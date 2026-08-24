@@ -323,6 +323,122 @@ describe("Settings agents", () => {
     );
   });
 
+  it("opens an existing agent editor and prefills API-shaped values when env is omitted", async () => {
+    const existing: ConfigData = {
+      ...config,
+      agents: {
+        ...config.agents,
+        opencode: {
+          kind: "custom",
+          command: "opencode",
+          args: ["run", "--model", "openai/gpt-5", "{mission}"],
+          prompt_transport: "argument",
+          interactive_args: ["--interactive"],
+          capabilities: ["coding", "review"],
+          max_concurrency: 3,
+        },
+      },
+    };
+    vi.mocked(fetchConfig).mockReset().mockResolvedValue(existing);
+    render(<SettingsView />);
+
+    const row = await screen.findByRole("row", { name: /opencode/ });
+    fireEvent.click(within(row).getByRole("button", { name: "Edit" }));
+
+    expect(await screen.findByRole("region", { name: "Agent configuration form" })).toBeTruthy();
+    expect((screen.getByLabelText("Name") as HTMLInputElement).value).toBe("opencode");
+    expect((screen.getByLabelText("Command") as HTMLInputElement).value).toBe("opencode");
+    expect((screen.getByLabelText("Argument 1") as HTMLInputElement).value).toBe("run");
+    expect((screen.getByLabelText("Argument 3") as HTMLInputElement).value).toBe("openai/gpt-5");
+    expect((screen.getByLabelText("Argument 4") as HTMLInputElement).value).toBe("{mission}");
+    expect((screen.getByLabelText("Workflow prompt transport") as HTMLSelectElement).value).toBe(
+      "argument"
+    );
+    expect(
+      (screen.getByLabelText("Interactive arguments (one per line)") as HTMLTextAreaElement).value
+    ).toBe("--interactive");
+    expect((screen.getByLabelText("Max concurrency (optional)") as HTMLInputElement).value).toBe(
+      "3"
+    );
+    expect(
+      (screen.getByLabelText("Capabilities (one per line)") as HTMLTextAreaElement).value
+    ).toBe("coding\nreview");
+  });
+
+  it("saves an existing agent through config without creating a duplicate or changing assignments", async () => {
+    const existing: ConfigData = {
+      ...config,
+      agents: {
+        codex: { command: "codex", args: ["exec"], env: {} },
+        opencode: {
+          kind: "custom",
+          command: "opencode",
+          args: ["run", "{mission}"],
+        },
+      },
+      role_assignments: [
+        { role: "worker", agent: "opencode", preferred: true },
+        { role: "reviewer", agent: "codex", preferred: false },
+      ],
+    };
+    vi.mocked(fetchConfig).mockReset().mockResolvedValue(existing);
+    render(<SettingsView />);
+
+    const row = await screen.findByRole("row", { name: /opencode/ });
+    fireEvent.click(within(row).getByRole("button", { name: "Edit" }));
+    fireEvent.change(screen.getByLabelText("Command"), { target: { value: "opencode-next" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+
+    await waitFor(() => expect(saveConfig).toHaveBeenCalledTimes(1));
+    const saved = vi.mocked(saveConfig).mock.calls[0][0];
+    expect(Object.keys(saved.agents).sort()).toEqual(["codex", "opencode"]);
+    expect(saved.agents.opencode).toEqual(
+      expect.objectContaining({ command: "opencode-next", args: ["run", "{mission}"] })
+    );
+    expect(saved.role_assignments).toEqual(existing.role_assignments);
+  });
+
+  it("cancels an existing agent edit without saving or changing the entry", async () => {
+    const existing: ConfigData = {
+      ...config,
+      agents: {
+        ...config.agents,
+        opencode: { command: "opencode", args: ["run"], env: {} },
+      },
+    };
+    vi.mocked(fetchConfig).mockReset().mockResolvedValue(existing);
+    render(<SettingsView />);
+
+    const row = await screen.findByRole("row", { name: /opencode/ });
+    fireEvent.click(within(row).getByRole("button", { name: "Edit" }));
+    fireEvent.change(screen.getByLabelText("Command"), { target: { value: "changed" } });
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+    expect(screen.queryByRole("region", { name: "Agent configuration form" })).toBeNull();
+    expect(saveConfig).not.toHaveBeenCalled();
+    expect(screen.getByRole("row", { name: /opencode/ })).toBeTruthy();
+  });
+
+  it("shows a config API error and keeps the existing editor open", async () => {
+    const existing: ConfigData = {
+      ...config,
+      agents: {
+        ...config.agents,
+        opencode: { command: "opencode", args: ["run"], env: {} },
+      },
+    };
+    vi.mocked(fetchConfig).mockReset().mockResolvedValue(existing);
+    vi.mocked(saveConfig).mockRejectedValue(new Error("invalid agent configuration"));
+    render(<SettingsView />);
+
+    const row = await screen.findByRole("row", { name: /opencode/ });
+    fireEvent.click(within(row).getByRole("button", { name: "Edit" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+
+    expect((await screen.findByRole("alert")).textContent).toContain("invalid agent configuration");
+    expect(screen.getByRole("region", { name: "Agent configuration form" })).toBeTruthy();
+  });
+
   it("loads a legacy agent configuration without an args field", async () => {
     const legacy: ConfigData = {
       ...config,
