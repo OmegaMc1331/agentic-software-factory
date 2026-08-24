@@ -225,7 +225,8 @@ export type AgentResolutionStatus = "available" | "missing" | "broken";
 export interface AgentEntry {
   kind?: AgentKind;
   command: string;
-  args: string[];
+  /** Omitted by the API when the persisted config has zero arguments. */
+  args?: string[];
   env: Record<string, string>;
   prompt_transport?: PromptTransport;
   interactive_args?: string[];

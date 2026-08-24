@@ -53,7 +53,7 @@ interface Draft {
   name: string;
   kind: AgentKind;
   command: string;
-  argsText: string;
+  args: string[];
   envText: string;
   promptTransport: PromptTransport;
   interactive: boolean;
@@ -66,7 +66,7 @@ function emptyDraft(): Draft {
     name: "",
     kind: "codex",
     command: "codex",
-    argsText: "exec",
+    args: ["exec"],
     envText: "",
     promptTransport: "stdin",
     interactive: true,
@@ -74,15 +74,20 @@ function emptyDraft(): Draft {
   };
 }
 
+function agentArgs(entry: ConfigData["agents"][string]): string[] {
+  return entry.args ?? [];
+}
+
 function inferredKind(entry: ConfigData["agents"][string]): AgentKind {
   if (entry.kind) return entry.kind;
-  if (entry.command === "codex" && entry.args[0] === "exec") return "codex";
-  if (entry.command === "opencode" && entry.args[0] === "run") return "open_code";
-  if (entry.command === "claude" && entry.args.some((arg) => arg === "-p" || arg === "--print"))
+  const args = agentArgs(entry);
+  if (entry.command === "codex" && args[0] === "exec") return "codex";
+  if (entry.command === "opencode" && args[0] === "run") return "open_code";
+  if (entry.command === "claude" && args.some((arg) => arg === "-p" || arg === "--print"))
     return "claude_code";
-  if (entry.command === "gemini" && entry.args.some((arg) => arg === "-p" || arg === "--prompt"))
+  if (entry.command === "gemini" && args.some((arg) => arg === "-p" || arg === "--prompt"))
     return "gemini_cli";
-  if (entry.command === "qwen" && entry.args.some((arg) => arg === "-p" || arg === "--prompt"))
+  if (entry.command === "qwen" && args.some((arg) => arg === "-p" || arg === "--prompt"))
     return "qwen_code";
   return "custom";
 }
@@ -93,7 +98,7 @@ function draftFrom(name: string, entry: ConfigData["agents"][string]): Draft {
     name,
     kind: inferredKind(entry),
     command: entry.command,
-    argsText: entry.args.join("\n"),
+    args: [...agentArgs(entry)],
     envText: Object.entries(entry.env)
       .map(([key, value]) => `${key}=${value}`)
       .join("\n"),
@@ -290,7 +295,7 @@ export function SettingsView() {
     const entry: ConfigData["agents"][string] = {
       kind: draft.kind,
       command: draft.command.trim(),
-      args: parseLines(draft.argsText),
+      args: draft.args.filter((argument) => argument.trim().length > 0),
       env: parseEnv(draft.envText),
       capabilities: draft.originalName ? config.agents[draft.originalName]?.capabilities : [],
     };
@@ -302,6 +307,31 @@ export function SettingsView() {
     const editing = draft.originalName !== null;
     setDraft(null);
     apply({ ...config, agents }, editing ? `Saved agent ${name}.` : `Added agent ${name}.`);
+  };
+
+  const updateArgument = (index: number, value: string) => {
+    setDraft((current) =>
+      current
+        ? { ...current, args: current.args.map((argument, i) => (i === index ? value : argument)) }
+        : current
+    );
+  };
+
+  const removeArgument = (index: number) => {
+    setDraft((current) =>
+      current ? { ...current, args: current.args.filter((_, i) => i !== index) } : current
+    );
+  };
+
+  const moveArgument = (index: number, offset: -1 | 1) => {
+    setDraft((current) => {
+      if (!current) return current;
+      const target = index + offset;
+      if (target < 0 || target >= current.args.length) return current;
+      const args = [...current.args];
+      [args[index], args[target]] = [args[target], args[index]];
+      return { ...current, args };
+    });
   };
 
   const removeAgent = (name: string) => {
@@ -1062,7 +1092,7 @@ export function SettingsView() {
                       <code>{name}</code>
                     </td>
                     <td className="run-objective">
-                      <code>{[entry.command, ...entry.args].join(" ")}</code>
+                      <code>{[entry.command, ...agentArgs(entry)].join(" ")}</code>
                     </td>
                     <td>
                       {status === undefined ? (
@@ -1179,7 +1209,7 @@ export function SettingsView() {
                 onChange={(event) => {
                   const kind = event.target.value as AgentKind;
                   if (kind === "custom") {
-                    setDraft({ ...draft, kind, command: "", argsText: "", interactive: false });
+                    setDraft({ ...draft, kind, command: "", args: [], interactive: false });
                     return;
                   }
                   const preset = PRESETS[kind];
@@ -1187,7 +1217,7 @@ export function SettingsView() {
                     ...draft,
                     kind,
                     command: preset.command,
-                    argsText: preset.args.join("\n"),
+                    args: [...preset.args],
                     interactive: true,
                   });
                 }}
@@ -1204,25 +1234,70 @@ export function SettingsView() {
           <details className="settings-advanced" open={draft.kind === "custom" || undefined}>
             <summary>{draft.kind === "custom" ? "Invocation" : "Advanced"}</summary>
             <div className="settings-grid">
-              <label className="settings-field">
+              <div className="settings-field">
                 <span className="meta-label">Command</span>
                 <input
                   className="net-select"
+                  aria-label="Command"
                   value={draft.command}
                   onChange={(event) => setDraft({ ...draft, command: event.target.value })}
                   placeholder="codex"
                 />
-              </label>
-              <label className="settings-field">
-                <span className="meta-label">Arguments (one per line)</span>
-                <textarea
-                  className="net-select"
-                  rows={3}
-                  value={draft.argsText}
-                  onChange={(event) => setDraft({ ...draft, argsText: event.target.value })}
-                  placeholder={"exec"}
-                />
-              </label>
+              </div>
+              <div className="settings-field">
+                <span className="meta-label">Arguments</span>
+                <div className="settings-argument-list">
+                  {draft.args.map((argument, index) => (
+                    <div className="settings-argument-row" key={index}>
+                      <input
+                        className="net-select"
+                        aria-label={`Argument ${index + 1}`}
+                        value={argument}
+                        onChange={(event) => updateArgument(index, event.target.value)}
+                        placeholder="argv argument"
+                      />
+                      <span className="settings-actions">
+                        <button
+                          className="button"
+                          type="button"
+                          aria-label={`Move argument ${index + 1} up`}
+                          disabled={index === 0}
+                          onClick={() => moveArgument(index, -1)}
+                        >
+                          ↑
+                        </button>
+                        <button
+                          className="button"
+                          type="button"
+                          aria-label={`Move argument ${index + 1} down`}
+                          disabled={index === draft.args.length - 1}
+                          onClick={() => moveArgument(index, 1)}
+                        >
+                          ↓
+                        </button>
+                        <button
+                          className="button"
+                          type="button"
+                          aria-label={`Remove argument ${index + 1}`}
+                          onClick={() => removeArgument(index)}
+                        >
+                          Remove
+                        </button>
+                      </span>
+                    </div>
+                  ))}
+                  <button
+                    className="button"
+                    type="button"
+                    onClick={() => setDraft({ ...draft, args: [...draft.args, ""] })}
+                  >
+                    + Add argument
+                  </button>
+                </div>
+                <small className="muted">
+                  Each row is one argv argument. Spaces are preserved; blank rows are ignored.
+                </small>
+              </div>
               {draft.kind === "custom" && (
                 <>
                   <label className="settings-field">

@@ -182,6 +182,144 @@ describe("Settings roles", () => {
   });
 });
 
+describe("Settings agents", () => {
+  async function openCustomAgentEditor() {
+    fireEvent.click(await screen.findByRole("button", { name: /^Add agent$/ }));
+    fireEvent.change(screen.getByLabelText("Agent type"), { target: { value: "custom" } });
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "test-agent" } });
+    fireEvent.change(screen.getByLabelText("Command"), { target: { value: "test-agent" } });
+  }
+
+  function saveNewAgent() {
+    const buttons = screen.getAllByRole("button", { name: /^Add agent$/ });
+    fireEvent.click(buttons[buttons.length - 1]);
+  }
+
+  it("saves zero arguments and ignores empty rows", async () => {
+    render(<SettingsView />);
+    await openCustomAgentEditor();
+    fireEvent.click(screen.getByRole("button", { name: "+ Add argument" }));
+    saveNewAgent();
+
+    await waitFor(() =>
+      expect(saveConfig).toHaveBeenCalledWith(
+        expect.objectContaining({
+          agents: expect.objectContaining({
+            "test-agent": expect.objectContaining({ args: [] }),
+          }),
+        })
+      )
+    );
+  });
+
+  it("keeps one argument containing spaces as one argv entry", async () => {
+    render(<SettingsView />);
+    await openCustomAgentEditor();
+    fireEvent.click(screen.getByRole("button", { name: "+ Add argument" }));
+    fireEvent.change(screen.getByLabelText("Argument 1"), {
+      target: { value: "--model openai/gpt-5" },
+    });
+    saveNewAgent();
+
+    await waitFor(() =>
+      expect(saveConfig).toHaveBeenCalledWith(
+        expect.objectContaining({
+          agents: expect.objectContaining({
+            "test-agent": expect.objectContaining({ args: ["--model openai/gpt-5"] }),
+          }),
+        })
+      )
+    );
+  });
+
+  it("preserves multiple argument order and supports reordering rows", async () => {
+    render(<SettingsView />);
+    await openCustomAgentEditor();
+    const addArgument = screen.getByRole("button", { name: "+ Add argument" });
+    for (let index = 0; index < 5; index += 1) fireEvent.click(addArgument);
+
+    ["run", "--model", "openai/gpt-5", "--format", "json"].forEach((value, index) => {
+      fireEvent.change(screen.getByLabelText(`Argument ${index + 1}`), {
+        target: { value },
+      });
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Move argument 5 up" }));
+    fireEvent.click(screen.getByRole("button", { name: "Move argument 4 down" }));
+    saveNewAgent();
+
+    await waitFor(() =>
+      expect(saveConfig).toHaveBeenCalledWith(
+        expect.objectContaining({
+          agents: expect.objectContaining({
+            "test-agent": expect.objectContaining({
+              args: ["run", "--model", "openai/gpt-5", "--format", "json"],
+            }),
+          }),
+        })
+      )
+    );
+  });
+
+  it("removes an argument row before saving", async () => {
+    render(<SettingsView />);
+    await openCustomAgentEditor();
+    const addArgument = screen.getByRole("button", { name: "+ Add argument" });
+    fireEvent.click(addArgument);
+    fireEvent.click(addArgument);
+    fireEvent.change(screen.getByLabelText("Argument 1"), { target: { value: "first" } });
+    fireEvent.change(screen.getByLabelText("Argument 2"), { target: { value: "second" } });
+    fireEvent.click(screen.getByRole("button", { name: "Remove argument 1" }));
+    saveNewAgent();
+
+    await waitFor(() =>
+      expect(saveConfig).toHaveBeenCalledWith(
+        expect.objectContaining({
+          agents: expect.objectContaining({
+            "test-agent": expect.objectContaining({ args: ["second"] }),
+          }),
+        })
+      )
+    );
+  });
+
+  it("loads and saves existing arguments, including a mission placeholder, unchanged", async () => {
+    const existing: ConfigData = {
+      ...config,
+      agents: {
+        ...config.agents,
+        opencode: {
+          command: "opencode",
+          args: ["run", "--model", "openai/gpt-5", "{mission}", "--label hello world"],
+          env: {},
+        },
+      },
+    };
+    vi.mocked(fetchConfig).mockReset().mockResolvedValueOnce(existing).mockResolvedValue(config);
+    render(<SettingsView />);
+
+    const row = await screen.findByRole("row", { name: /opencode/ });
+    fireEvent.click(within(row).getByRole("button", { name: "Edit" }));
+    expect((screen.getByLabelText("Argument 1") as HTMLInputElement).value).toBe("run");
+    expect((screen.getByLabelText("Argument 4") as HTMLInputElement).value).toBe("{mission}");
+    expect((screen.getByLabelText("Argument 5") as HTMLInputElement).value).toBe(
+      "--label hello world"
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+
+    await waitFor(() =>
+      expect(saveConfig).toHaveBeenCalledWith(
+        expect.objectContaining({
+          agents: expect.objectContaining({
+            opencode: expect.objectContaining({
+              args: ["run", "--model", "openai/gpt-5", "{mission}", "--label hello world"],
+            }),
+          }),
+        })
+      )
+    );
+  });
+});
+
 const builtinSecurity: Recipe = {
   id: "security",
   name: "Security Sensitive",

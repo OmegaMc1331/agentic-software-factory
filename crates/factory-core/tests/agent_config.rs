@@ -52,6 +52,42 @@ agent = "codex"
 }
 
 #[test]
+fn preserves_ordered_arguments_with_spaces_and_mission_placeholders() {
+    let config: Config = toml::from_str(
+        r#"
+[agents.opencode]
+command = "opencode"
+args = ["run", "--model", "openai/gpt-5", "{mission}", "--label hello world"]
+"#,
+    )
+    .unwrap();
+
+    assert_eq!(
+        config.agents["opencode"].args,
+        vec![
+            "run",
+            "--model",
+            "openai/gpt-5",
+            "{mission}",
+            "--label hello world"
+        ]
+    );
+}
+
+#[test]
+fn missing_args_remain_backward_compatible_as_zero_arguments() {
+    let config: Config = toml::from_str(
+        r#"
+[agents.legacy]
+command = "legacy-agent"
+"#,
+    )
+    .unwrap();
+
+    assert!(config.agents["legacy"].args.is_empty());
+}
+
+#[test]
 fn legacy_custom_configuration_keeps_stdin_transport() {
     let entry = build_entry("my-coding-agent", vec!["--batch".into()]);
     let config = Config {
@@ -313,7 +349,15 @@ fn write_atomic_round_trips_configuration() {
     let config = Config {
         agents: BTreeMap::from([(
             "codex".to_string(),
-            build_entry("codex", vec!["exec".to_string()]),
+            build_entry(
+                "codex",
+                vec![
+                    "run".to_string(),
+                    "--model".to_string(),
+                    "openai/gpt-5".to_string(),
+                    "--label hello world".to_string(),
+                ],
+            ),
         )]),
         roles: BTreeMap::new(),
         role_assignments: vec![RoleAssignment {

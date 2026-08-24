@@ -902,6 +902,23 @@ code {
   gap: 4px;
 }
 
+.settings-argument-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.settings-argument-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.settings-argument-row input {
+  min-width: 0;
+  flex: 1;
+}
+
 .settings-field .meta-label {
   text-transform: uppercase;
   font-size: 11px;

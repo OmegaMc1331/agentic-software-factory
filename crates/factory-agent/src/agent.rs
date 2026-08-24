@@ -830,6 +830,53 @@ mod tests {
     }
 
     #[test]
+    fn builds_zero_and_one_argument_invocations_without_splitting_values() {
+        let command = if cfg!(windows) { "cmd" } else { "sh" };
+        let mut zero = AgentConfig::new("zero", command);
+        zero.prompt_transport = PromptTransport::Argument;
+        let zero_invocation = CommandAgent::new(zero)
+            .automated_invocation(&AgentRequest::new("mission", "."))
+            .unwrap();
+        assert_eq!(zero_invocation.args, vec!["mission"]);
+
+        let mut one = AgentConfig::new("one", command);
+        one.args = vec!["--model openai/gpt-5".into()];
+        one.prompt_transport = PromptTransport::Argument;
+        let one_invocation = CommandAgent::new(one)
+            .automated_invocation(&AgentRequest::new("mission", "."))
+            .unwrap();
+        assert_eq!(one_invocation.args, vec!["--model openai/gpt-5", "mission"]);
+    }
+
+    #[test]
+    fn preserves_order_and_replaces_a_mission_placeholder_among_arguments() {
+        let command = if cfg!(windows) { "cmd" } else { "sh" };
+        let mut config = AgentConfig::new("structured", command);
+        config.args = vec![
+            "run".into(),
+            "--model".into(),
+            "openai/gpt-5".into(),
+            MISSION_PLACEHOLDER.into(),
+            "--label hello world".into(),
+        ];
+        config.prompt_transport = PromptTransport::Argument;
+        let invocation = CommandAgent::new(config)
+            .automated_invocation(&AgentRequest::new("mission with spaces", "."))
+            .unwrap();
+
+        assert_eq!(
+            invocation.args,
+            vec![
+                "run",
+                "--model",
+                "openai/gpt-5",
+                "mission with spaces",
+                "--label hello world"
+            ]
+        );
+    }
+
+    #[test]
     fn rejects_automated_use_when_workflow_transport_is_disabled() {
         let mut config = AgentConfig::new("interactive-only", "unused");
         config.prompt_transport = PromptTransport::Disabled;
