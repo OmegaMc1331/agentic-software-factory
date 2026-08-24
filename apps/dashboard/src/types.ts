@@ -231,6 +231,7 @@ export interface AgentEntry {
   prompt_transport?: PromptTransport;
   interactive_args?: string[];
   capabilities?: string[];
+  max_concurrency?: number;
 }
 
 export interface RoleDefinitionEntry {

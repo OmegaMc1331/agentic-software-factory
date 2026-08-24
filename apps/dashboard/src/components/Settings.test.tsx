@@ -291,6 +291,7 @@ describe("Settings agents", () => {
           command: "opencode",
           args: ["run", "--model", "openai/gpt-5", "{mission}", "--label hello world"],
           env: {},
+          max_concurrency: 3,
         },
       },
     };
@@ -304,6 +305,9 @@ describe("Settings agents", () => {
     expect((screen.getByLabelText("Argument 5") as HTMLInputElement).value).toBe(
       "--label hello world"
     );
+    expect((screen.getByLabelText("Max concurrency (optional)") as HTMLInputElement).value).toBe(
+      "3"
+    );
     fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
 
     await waitFor(() =>
@@ -313,6 +317,32 @@ describe("Settings agents", () => {
             opencode: expect.objectContaining({
               args: ["run", "--model", "openai/gpt-5", "{mission}", "--label hello world"],
             }),
+          }),
+        })
+      )
+    );
+  });
+
+  it("loads a legacy agent configuration without an args field", async () => {
+    const legacy: ConfigData = {
+      ...config,
+      agents: {
+        codex: { command: "codex", env: {} },
+      },
+    };
+    vi.mocked(fetchConfig).mockReset().mockResolvedValueOnce(legacy).mockResolvedValue(config);
+    render(<SettingsView />);
+
+    const row = await screen.findByRole("row", { name: /codex/ });
+    fireEvent.click(within(row).getByRole("button", { name: "Edit" }));
+    expect(screen.queryByLabelText("Argument 1")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+
+    await waitFor(() =>
+      expect(saveConfig).toHaveBeenCalledWith(
+        expect.objectContaining({
+          agents: expect.objectContaining({
+            codex: expect.objectContaining({ args: [] }),
           }),
         })
       )

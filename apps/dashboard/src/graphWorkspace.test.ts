@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   findFreePosition,
   mergeGraphWorkspace,
+  renameAgentWorkspace,
   validateConnection,
   workspacePosition,
 } from "./graphWorkspace";
@@ -134,5 +135,17 @@ describe("graph workspace state", () => {
   it("places new nodes away from occupied bounds", () => {
     const result = findFreePosition({ x: 100, y: 100 }, [{ x: 20, y: 50, width: 160, height: 90 }]);
     expect(result).not.toEqual({ x: 30, y: 65 });
+  });
+
+  it("renames an agent workspace reference without rewriting unrelated graph state", () => {
+    const renamed = renameAgentWorkspace(workspace, "codex", "renamed-codex");
+    expect(renamed.nodes).toEqual({
+      "agent:renamed-codex": { x: 418, y: 216 },
+    });
+    expect(renamed.edges[0]).toMatchObject({
+      source: "agent:renamed-codex",
+      target: "agent:opencode",
+    });
+    expect(renamed.customNodes).toEqual(workspace.customNodes);
   });
 });

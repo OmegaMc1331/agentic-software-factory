@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   addRoleAssignment,
@@ -187,13 +187,23 @@ beforeEach(() => {
     .mockReset()
     .mockResolvedValue({
       agents: {
-        codex: { command: "codex", args: ["exec"], env: {} },
+        codex: {
+          kind: "custom",
+          command: "codex",
+          args: ["run", "--model", "openai/gpt-5", "{mission}", "--label hello world"],
+          env: { FACTORY_TEST: "1" },
+          prompt_transport: "argument",
+          interactive_args: ["--interactive"],
+          capabilities: ["planning"],
+          max_concurrency: 4,
+        },
         opencode: { command: "opencode", args: ["run"], env: {} },
       },
       roles: {},
       role_assignments: [{ role: "planner", agent: "codex", preferred: true }],
     });
   vi.mocked(fetchAgentSessions).mockReset().mockResolvedValue([]);
+  vi.mocked(saveConfig).mockReset().mockResolvedValue();
   vi.mocked(saveGraphWorkspace).mockReset().mockResolvedValue();
   vi.mocked(addRoleAssignment).mockReset().mockResolvedValue(roles[1]);
   vi.mocked(removeRoleAssignment).mockReset().mockResolvedValue(roles[1]);
@@ -221,6 +231,87 @@ describe("Agent Graph interactions", () => {
 
     expect(await screen.findByLabelText("codex Agent Console")).toBeTruthy();
     expect(screen.getByText("No active interactive session.")).toBeTruthy();
+  });
+
+  it("opens the existing agent editor and saves without duplicating the agent", async () => {
+    render(<NetworkView />);
+    fireEvent.click(await screen.findByRole("button", { name: "select agent:codex" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Edit" }));
+
+    expect(screen.getByRole("region", { name: "Agent configuration form" })).toBeTruthy();
+    expect((screen.getByLabelText("Argument 4") as HTMLInputElement).value).toBe("{mission}");
+    expect((screen.getByLabelText("Argument 5") as HTMLInputElement).value).toBe(
+      "--label hello world"
+    );
+    expect(
+      (screen.getByLabelText("Environment (KEY=VALUE, one per line)") as HTMLTextAreaElement).value
+    ).toBe("FACTORY_TEST=1");
+    expect((screen.getByLabelText("Max concurrency (optional)") as HTMLInputElement).value).toBe(
+      "4"
+    );
+    expect(
+      (screen.getByLabelText("Capabilities (one per line)") as HTMLTextAreaElement).value
+    ).toBe("planning");
+
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "renamed-codex" } });
+    fireEvent.change(screen.getByLabelText("Capabilities (one per line)"), {
+      target: { value: "planning\nreview" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+
+    await waitFor(() =>
+      expect(saveConfig).toHaveBeenCalledWith(
+        expect.objectContaining({
+          agents: expect.objectContaining({
+            "renamed-codex": expect.objectContaining({
+              args: ["run", "--model", "openai/gpt-5", "{mission}", "--label hello world"],
+              capabilities: ["planning", "review"],
+              max_concurrency: 4,
+            }),
+          }),
+          role_assignments: [{ role: "planner", agent: "renamed-codex", preferred: true }],
+        })
+      )
+    );
+    expect(vi.mocked(saveConfig).mock.calls[0][0].agents).not.toHaveProperty("codex");
+    expect(Object.keys(vi.mocked(saveConfig).mock.calls[0][0].agents)).toHaveLength(2);
+    expect(saveGraphWorkspace).toHaveBeenCalledWith(
+      expect.objectContaining({
+        nodes: expect.objectContaining({ "agent:renamed-codex": { x: 418, y: 216 } }),
+        edges: [expect.objectContaining({ source: "agent:renamed-codex" })],
+      })
+    );
+    await waitFor(() => expect(vi.mocked(fetchGraph).mock.calls.length).toBeGreaterThan(1));
+    expect(screen.queryByRole("region", { name: "Agent configuration form" })).toBeNull();
+  });
+
+  it("cancels an existing agent edit without saving", async () => {
+    render(<NetworkView />);
+    fireEvent.click(await screen.findByRole("button", { name: "select agent:codex" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Edit" }));
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "discarded-name" } });
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+    expect(saveConfig).not.toHaveBeenCalled();
+    expect(screen.queryByRole("region", { name: "Agent configuration form" })).toBeNull();
+    expect(await screen.findByLabelText("codex Agent Console")).toBeTruthy();
+  });
+
+  it("rejects a duplicate rename and leaves the editor open", async () => {
+    render(<NetworkView />);
+    fireEvent.click(await screen.findByRole("button", { name: "select agent:codex" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Edit" }));
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "opencode" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+
+    await waitFor(() =>
+      expect(
+        within(screen.getByRole("region", { name: "Agent configuration form" })).getByRole("alert")
+          .textContent
+      ).toContain("already exists")
+    );
+    expect(saveConfig).not.toHaveBeenCalled();
+    expect(screen.getByRole("region", { name: "Agent configuration form" })).toBeTruthy();
   });
 
   it("opens the compact node creation menu from the toolbar", async () => {

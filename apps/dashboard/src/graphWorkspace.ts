@@ -140,3 +140,24 @@ export function nextWorkspaceId(kind: "group" | "note", label: string): string {
   const slug = slugify(label) || kind;
   return `${kind}:${slug}-${Date.now().toString(36)}`;
 }
+
+export function renameAgentWorkspace(
+  workspace: GraphWorkspace,
+  originalName: string,
+  nextName: string
+): GraphWorkspace {
+  if (originalName === nextName) return workspace;
+  const originalId = `agent:${originalName}`;
+  const nextId = `agent:${nextName}`;
+  const nodes = { ...workspace.nodes };
+  if (nodes[originalId]) {
+    nodes[nextId] = nodes[originalId];
+    delete nodes[originalId];
+  }
+  const edges = workspace.edges.map((edge) => ({
+    ...edge,
+    source: edge.source === originalId ? nextId : edge.source,
+    target: edge.target === originalId ? nextId : edge.target,
+  }));
+  return { ...workspace, nodes, edges };
+}

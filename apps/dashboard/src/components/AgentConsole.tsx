@@ -104,6 +104,7 @@ export function AgentConsole({
   activity,
   nodesById = new Map(),
   onClose,
+  onEdit,
   onDelete,
   onConnect,
 }: {
@@ -112,6 +113,7 @@ export function AgentConsole({
   activity: AgentActivity | null;
   nodesById?: Map<string, GraphNode>;
   onClose: () => void;
+  onEdit?: () => void;
   onDelete: () => void;
   onConnect?: (targetId: string) => void;
 }) {
@@ -224,6 +226,11 @@ export function AgentConsole({
           <span className={state === "Failed" ? "net-bad" : "net-ok"}>{state}</span>
           {activity?.taskId ? <span>Task #{activity.taskId}</span> : null}
         </div>
+        {onEdit && (
+          <button className="button" onClick={onEdit}>
+            Edit
+          </button>
+        )}
         <button className="inspector-close" onClick={onClose} aria-label="Close Agent Console">
           x
         </button>

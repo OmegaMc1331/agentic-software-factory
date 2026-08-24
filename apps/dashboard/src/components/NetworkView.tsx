@@ -23,6 +23,7 @@ import {
   findFreePosition,
   mergeGraphWorkspace,
   nextWorkspaceId,
+  renameAgentWorkspace,
   validateConnection,
 } from "../graphWorkspace";
 import type {
@@ -41,6 +42,8 @@ import { agentActivity, agentMeta, taskMeta, type AgentActivity } from "../types
 import { computeNetworkLayout, neighborsOf, type NetworkLayout } from "../networkLayout";
 import { STATE_META } from "../state";
 import { AddNodeMenu } from "./AddNodeMenu";
+import { AgentForm } from "./AgentForm";
+import { agentDraftFrom, type AgentDraft } from "./agentFormState";
 import { AgentConsole } from "./AgentConsole";
 import { AgentGraph, type AgentGraphHandle } from "./AgentGraph";
 import { GraphToolbar, type RunOption } from "./GraphToolbar";
@@ -95,6 +98,7 @@ export function NetworkView() {
   const [showRoles, setShowRoles] = useState(true);
   const [addOpen, setAddOpen] = useState(false);
   const [initialAddKind, setInitialAddKind] = useState<"workflow" | null>(null);
+  const [editingAgent, setEditingAgent] = useState<AgentDraft | null>(null);
   const [zoom, setZoom] = useState(1);
   const [positionRevision, setPositionRevision] = useState(0);
   const graphRef = useRef<AgentGraphHandle>(null);
@@ -256,6 +260,47 @@ export function NetworkView() {
       }
     },
     [persistWorkspace, reloadGraph]
+  );
+
+  const editAgent = useCallback(() => {
+    if (!config || selectedNode?.kind !== "agent") return;
+    const name = selectedNode.id.slice("agent:".length);
+    const entry = config.agents[name];
+    if (!entry) {
+      setOperationError(`Agent '${name}' no longer exists.`);
+      return;
+    }
+    setOperationError(null);
+    setEditingAgent(agentDraftFrom(name, entry));
+  }, [config, selectedNode]);
+
+  const saveEditedAgent = useCallback(
+    async (name: string, entry: AgentEntry, originalName: string | null): Promise<boolean> => {
+      if (!config || !workspace || !originalName) return false;
+      if (!config.agents[originalName]) {
+        setOperationError(`Agent '${originalName}' no longer exists.`);
+        return false;
+      }
+      if (name !== originalName && config.agents[name]) {
+        setOperationError(`Agent '${name}' already exists.`);
+        return false;
+      }
+      const agents = { ...config.agents };
+      delete agents[originalName];
+      agents[name] = entry;
+      const role_assignments = config.role_assignments.map((assignment) =>
+        assignment.agent === originalName ? { ...assignment, agent: name } : assignment
+      );
+      const nextWorkspace = renameAgentWorkspace(workspace, originalName, name);
+      const saved = await saveConfiguration({ ...config, agents, role_assignments }, nextWorkspace);
+      if (!saved) return false;
+      setEditingAgent(null);
+      setSelectedNodeId(`agent:${name}`);
+      setSelectedEdgeId(null);
+      setPositionRevision((value) => value + 1);
+      return true;
+    },
+    [config, saveConfiguration, workspace]
   );
 
   const createAgent = useCallback(
@@ -599,6 +644,7 @@ export function NetworkView() {
       }
       if (event.key === "Escape") {
         setAddOpen(false);
+        setEditingAgent(null);
         setSelectedNodeId(null);
         setSelectedEdgeId(null);
       } else if (event.key === "Delete" || event.key === "Backspace") {
@@ -742,7 +788,17 @@ export function NetworkView() {
                 onZoomChange={setZoom}
               />
             </div>
-            {selectedNode?.kind === "agent" ? (
+            {editingAgent ? (
+              <AgentForm
+                initial={editingAgent}
+                error={operationError}
+                onSave={saveEditedAgent}
+                onCancel={() => {
+                  setEditingAgent(null);
+                  setOperationError(null);
+                }}
+              />
+            ) : selectedNode?.kind === "agent" ? (
               <AgentConsole
                 agentName={selectedNode.id.slice("agent:".length)}
                 meta={agentMeta(selectedNode)}
@@ -750,6 +806,7 @@ export function NetworkView() {
                 nodesById={allNodesById}
                 onClose={() => setSelectedNodeId(null)}
                 onDelete={deleteSelection}
+                onEdit={editAgent}
                 onConnect={(targetId) =>
                   connect({
                     source: selectedNode.id,

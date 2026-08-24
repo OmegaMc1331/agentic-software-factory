@@ -322,6 +322,130 @@ async fn config_round_trips_through_put_and_get() {
 }
 
 #[tokio::test]
+async fn editing_agent_config_preserves_structured_fields_and_rejects_invalid_writes_atomically() {
+    let dir = TempDir::new().unwrap();
+    init_root(dir.path());
+    let app = factory_api::router(make_state(dir.path()));
+
+    let initial = json!({
+        "agents": {
+            "codex": {
+                "kind": "custom",
+                "command": "opencode",
+                "args": ["run", "--model", "openai/gpt-5", "{mission}", "--label hello world"],
+                "env": { "FACTORY_TEST": "1" },
+                "prompt_transport": "argument",
+                "interactive_args": ["--interactive"],
+                "capabilities": ["planning"],
+                "max_concurrency": 4
+            }
+        },
+        "roles": {},
+        "role_assignments": [
+            { "role": "planner", "agent": "codex", "preferred": true }
+        ]
+    });
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/config")
+                .header("content-type", "application/json")
+                .body(Body::from(initial.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let renamed = json!({
+        "agents": {
+            "renamed-codex": {
+                "kind": "custom",
+                "command": "opencode",
+                "args": ["run", "--model", "openai/gpt-5", "{mission}", "--label hello world"],
+                "env": { "FACTORY_TEST": "1" },
+                "prompt_transport": "argument",
+                "interactive_args": ["--interactive"],
+                "capabilities": ["planning"],
+                "max_concurrency": 4
+            }
+        },
+        "roles": {},
+        "role_assignments": [
+            { "role": "planner", "agent": "renamed-codex", "preferred": true }
+        ]
+    });
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/config")
+                .header("content-type", "application/json")
+                .body(Body::from(renamed.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let config = Config::load(dir.path()).unwrap();
+    assert!(!config.agents.contains_key("codex"));
+    assert_eq!(
+        config.agent_for_role("planner").as_deref(),
+        Some("renamed-codex")
+    );
+    let entry = config.agents.get("renamed-codex").unwrap();
+    assert_eq!(entry.command, "opencode");
+    assert_eq!(
+        entry.args,
+        vec![
+            "run",
+            "--model",
+            "openai/gpt-5",
+            "{mission}",
+            "--label hello world"
+        ]
+    );
+    assert_eq!(entry.env.get("FACTORY_TEST").map(String::as_str), Some("1"));
+    assert_eq!(entry.max_concurrency, Some(4));
+
+    let invalid = json!({
+        "agents": {
+            "renamed-codex": {
+                "command": "changed",
+                "args": ["different"],
+                "max_concurrency": 33
+            }
+        },
+        "roles": {},
+        "role_assignments": [
+            { "role": "planner", "agent": "renamed-codex", "preferred": true }
+        ]
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/config")
+                .header("content-type", "application/json")
+                .body(Body::from(invalid.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let config = Config::load(dir.path()).unwrap();
+    let entry = config.agents.get("renamed-codex").unwrap();
+    assert_eq!(entry.command, "opencode");
+    assert_eq!(entry.args[4], "--label hello world");
+    assert_eq!(entry.max_concurrency, Some(4));
+}
+
+#[tokio::test]
 async fn role_assignment_can_be_reassigned_to_another_configured_agent() {
     let dir = TempDir::new().unwrap();
     init_root(dir.path());

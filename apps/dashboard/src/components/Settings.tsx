@@ -22,91 +22,20 @@ import {
 } from "../api";
 import {
   agentResolutionStatusLabel,
-  type AgentKind,
   type AgentStatusInfo,
   type ConfigData,
   type McpServerConfig,
   type McpServerView,
   type McpTool,
-  type PromptTransport,
   type Recipe,
   type RoleInfo,
   type RoutingModeValue,
 } from "../types";
 import { RECIPE_ROUTING_LABELS } from "../types";
+import { AgentForm } from "./AgentForm";
+import { agentArgs, agentDraftFrom, emptyAgentDraft, type AgentDraft } from "./agentFormState";
 import { RecipeForm } from "./RecipeForm";
 import { RoleForm, type RoleFormInitial } from "./RoleForm";
-
-const PRESETS: Record<
-  Exclude<AgentKind, "custom">,
-  { label: string; command: string; args: string[] }
-> = {
-  codex: { label: "Codex", command: "codex", args: ["exec"] },
-  claude_code: { label: "Claude Code", command: "claude", args: ["-p"] },
-  open_code: { label: "OpenCode", command: "opencode", args: ["run"] },
-  gemini_cli: { label: "Gemini CLI", command: "gemini", args: ["-p"] },
-  qwen_code: { label: "Qwen Code", command: "qwen", args: ["-p"] },
-};
-
-interface Draft {
-  originalName: string | null;
-  name: string;
-  kind: AgentKind;
-  command: string;
-  args: string[];
-  envText: string;
-  promptTransport: PromptTransport;
-  interactive: boolean;
-  interactiveArgsText: string;
-}
-
-function emptyDraft(): Draft {
-  return {
-    originalName: null,
-    name: "",
-    kind: "codex",
-    command: "codex",
-    args: ["exec"],
-    envText: "",
-    promptTransport: "stdin",
-    interactive: true,
-    interactiveArgsText: "",
-  };
-}
-
-function agentArgs(entry: ConfigData["agents"][string]): string[] {
-  return entry.args ?? [];
-}
-
-function inferredKind(entry: ConfigData["agents"][string]): AgentKind {
-  if (entry.kind) return entry.kind;
-  const args = agentArgs(entry);
-  if (entry.command === "codex" && args[0] === "exec") return "codex";
-  if (entry.command === "opencode" && args[0] === "run") return "open_code";
-  if (entry.command === "claude" && args.some((arg) => arg === "-p" || arg === "--print"))
-    return "claude_code";
-  if (entry.command === "gemini" && args.some((arg) => arg === "-p" || arg === "--prompt"))
-    return "gemini_cli";
-  if (entry.command === "qwen" && args.some((arg) => arg === "-p" || arg === "--prompt"))
-    return "qwen_code";
-  return "custom";
-}
-
-function draftFrom(name: string, entry: ConfigData["agents"][string]): Draft {
-  return {
-    originalName: name,
-    name,
-    kind: inferredKind(entry),
-    command: entry.command,
-    args: [...agentArgs(entry)],
-    envText: Object.entries(entry.env)
-      .map(([key, value]) => `${key}=${value}`)
-      .join("\n"),
-    promptTransport: entry.prompt_transport ?? "stdin",
-    interactive: entry.interactive_args !== undefined || inferredKind(entry) !== "custom",
-    interactiveArgsText: (entry.interactive_args ?? []).join("\n"),
-  };
-}
 
 function parseLines(text: string): string[] {
   return text
@@ -217,7 +146,7 @@ export function SettingsView() {
   const [mcpDraft, setMcpDraft] = useState<McpDraft | null>(null);
   const [mcpTools, setMcpTools] = useState<Record<string, McpTool[]>>({});
   const [mcpBusy, setMcpBusy] = useState<string | null>(null);
-  const [draft, setDraft] = useState<Draft | null>(null);
+  const [draft, setDraft] = useState<AgentDraft | null>(null);
   const [editingRole, setEditingRole] = useState<RoleInfo | null>(null);
   const [roleSelection, setRoleSelection] = useState<Record<string, string>>({});
   const [recipeEditor, setRecipeEditor] = useState<{
@@ -264,75 +193,53 @@ export function SettingsView() {
   );
 
   const apply = useCallback(
-    (next: ConfigData, note: string) => {
+    async (next: ConfigData, note: string): Promise<boolean> => {
       setError(null);
       setSaved(null);
-      saveConfig(next)
-        .then(() => {
-          setSaved(note);
-          reload();
-        })
-        .catch((err: Error) => setError(err.message));
+      try {
+        await saveConfig(next);
+        setSaved(note);
+        reload();
+        return true;
+      } catch (reason) {
+        setError((reason as Error).message);
+        return false;
+      }
     },
     [reload]
   );
 
-  const saveDraft = () => {
-    if (!config || !draft) return;
-    const name = draft.name.trim();
-    if (!name) {
-      setError("Agent name is required.");
-      return;
-    }
-    if (!draft.command.trim()) {
-      setError("Command is required.");
-      return;
-    }
-    const agents = { ...config.agents };
-    if (draft.originalName) {
-      delete agents[draft.originalName];
-    }
-    const entry: ConfigData["agents"][string] = {
-      kind: draft.kind,
-      command: draft.command.trim(),
-      args: draft.args.filter((argument) => argument.trim().length > 0),
-      env: parseEnv(draft.envText),
-      capabilities: draft.originalName ? config.agents[draft.originalName]?.capabilities : [],
-    };
-    if (draft.kind === "custom") {
-      entry.prompt_transport = draft.promptTransport;
-      if (draft.interactive) entry.interactive_args = parseLines(draft.interactiveArgsText);
-    }
-    agents[name] = entry;
-    const editing = draft.originalName !== null;
-    setDraft(null);
-    apply({ ...config, agents }, editing ? `Saved agent ${name}.` : `Added agent ${name}.`);
-  };
-
-  const updateArgument = (index: number, value: string) => {
-    setDraft((current) =>
-      current
-        ? { ...current, args: current.args.map((argument, i) => (i === index ? value : argument)) }
-        : current
-    );
-  };
-
-  const removeArgument = (index: number) => {
-    setDraft((current) =>
-      current ? { ...current, args: current.args.filter((_, i) => i !== index) } : current
-    );
-  };
-
-  const moveArgument = (index: number, offset: -1 | 1) => {
-    setDraft((current) => {
-      if (!current) return current;
-      const target = index + offset;
-      if (target < 0 || target >= current.args.length) return current;
-      const args = [...current.args];
-      [args[index], args[target]] = [args[target], args[index]];
-      return { ...current, args };
-    });
-  };
+  const saveAgentDraft = useCallback(
+    async (name: string, entry: ConfigData["agents"][string], originalName: string | null) => {
+      if (!config) return false;
+      if (originalName && !config.agents[originalName]) {
+        setError(`Agent '${originalName}' no longer exists.`);
+        return false;
+      }
+      if (name !== originalName && config.agents[name]) {
+        setError(`Agent '${name}' already exists.`);
+        return false;
+      }
+      const agents = { ...config.agents };
+      if (originalName && originalName !== name) {
+        delete agents[originalName];
+      }
+      agents[name] = entry;
+      const role_assignments =
+        originalName && originalName !== name
+          ? config.role_assignments.map((assignment) =>
+              assignment.agent === originalName ? { ...assignment, agent: name } : assignment
+            )
+          : config.role_assignments;
+      const saved = await apply(
+        { ...config, agents, role_assignments },
+        originalName ? `Saved agent ${name}.` : `Added agent ${name}.`
+      );
+      if (saved) setDraft(null);
+      return saved;
+    },
+    [apply, config]
+  );
 
   const removeAgent = (name: string) => {
     if (!config) return;
@@ -340,7 +247,7 @@ export function SettingsView() {
     delete agents[name];
     const role_assignments = config.role_assignments.filter((entry) => entry.agent !== name);
     setDraft(null);
-    apply({ ...config, agents, role_assignments }, `Removed agent ${name}.`);
+    void apply({ ...config, agents, role_assignments }, `Removed agent ${name}.`);
   };
 
   const refreshAvailability = () => {
@@ -1059,7 +966,7 @@ export function SettingsView() {
       <section className="section">
         <div className="settings-section-head">
           <h3 className="section-title">Agents</h3>
-          <button className="button" onClick={() => setDraft(emptyDraft())}>
+          <button className="button" onClick={() => setDraft(emptyAgentDraft())}>
             Add agent
           </button>
         </div>
@@ -1163,7 +1070,10 @@ export function SettingsView() {
                     </td>
                     <td>
                       <span className="settings-actions">
-                        <button className="button" onClick={() => setDraft(draftFrom(name, entry))}>
+                        <button
+                          className="button"
+                          onClick={() => setDraft(agentDraftFrom(name, entry))}
+                        >
                           Edit
                         </button>
                         <button className="button" onClick={() => removeAgent(name)}>
@@ -1187,182 +1097,12 @@ export function SettingsView() {
       </section>
 
       {draft && (
-        <section className="section settings-form">
-          <h3 className="section-title">
-            {draft.originalName ? `Edit agent ${draft.originalName}` : "New agent"}
-          </h3>
-          <div className="settings-grid">
-            <label className="settings-field">
-              <span className="meta-label">Name</span>
-              <input
-                className="net-select"
-                value={draft.name}
-                onChange={(event) => setDraft({ ...draft, name: event.target.value })}
-                placeholder="codex"
-              />
-            </label>
-            <label className="settings-field">
-              <span className="meta-label">Agent type</span>
-              <select
-                className="net-select"
-                value={draft.kind}
-                onChange={(event) => {
-                  const kind = event.target.value as AgentKind;
-                  if (kind === "custom") {
-                    setDraft({ ...draft, kind, command: "", args: [], interactive: false });
-                    return;
-                  }
-                  const preset = PRESETS[kind];
-                  setDraft({
-                    ...draft,
-                    kind,
-                    command: preset.command,
-                    args: [...preset.args],
-                    interactive: true,
-                  });
-                }}
-              >
-                {Object.entries(PRESETS).map(([kind, preset]) => (
-                  <option key={kind} value={kind}>
-                    {preset.label}
-                  </option>
-                ))}
-                <option value="custom">Custom</option>
-              </select>
-            </label>
-          </div>
-          <details className="settings-advanced" open={draft.kind === "custom" || undefined}>
-            <summary>{draft.kind === "custom" ? "Invocation" : "Advanced"}</summary>
-            <div className="settings-grid">
-              <div className="settings-field">
-                <span className="meta-label">Command</span>
-                <input
-                  className="net-select"
-                  aria-label="Command"
-                  value={draft.command}
-                  onChange={(event) => setDraft({ ...draft, command: event.target.value })}
-                  placeholder="codex"
-                />
-              </div>
-              <div className="settings-field">
-                <span className="meta-label">Arguments</span>
-                <div className="settings-argument-list">
-                  {draft.args.map((argument, index) => (
-                    <div className="settings-argument-row" key={index}>
-                      <input
-                        className="net-select"
-                        aria-label={`Argument ${index + 1}`}
-                        value={argument}
-                        onChange={(event) => updateArgument(index, event.target.value)}
-                        placeholder="argv argument"
-                      />
-                      <span className="settings-actions">
-                        <button
-                          className="button"
-                          type="button"
-                          aria-label={`Move argument ${index + 1} up`}
-                          disabled={index === 0}
-                          onClick={() => moveArgument(index, -1)}
-                        >
-                          ↑
-                        </button>
-                        <button
-                          className="button"
-                          type="button"
-                          aria-label={`Move argument ${index + 1} down`}
-                          disabled={index === draft.args.length - 1}
-                          onClick={() => moveArgument(index, 1)}
-                        >
-                          ↓
-                        </button>
-                        <button
-                          className="button"
-                          type="button"
-                          aria-label={`Remove argument ${index + 1}`}
-                          onClick={() => removeArgument(index)}
-                        >
-                          Remove
-                        </button>
-                      </span>
-                    </div>
-                  ))}
-                  <button
-                    className="button"
-                    type="button"
-                    onClick={() => setDraft({ ...draft, args: [...draft.args, ""] })}
-                  >
-                    + Add argument
-                  </button>
-                </div>
-                <small className="muted">
-                  Each row is one argv argument. Spaces are preserved; blank rows are ignored.
-                </small>
-              </div>
-              {draft.kind === "custom" && (
-                <>
-                  <label className="settings-field">
-                    <span className="meta-label">Workflow prompt transport</span>
-                    <select
-                      className="net-select"
-                      value={draft.promptTransport}
-                      onChange={(event) =>
-                        setDraft({
-                          ...draft,
-                          promptTransport: event.target.value as PromptTransport,
-                        })
-                      }
-                    >
-                      <option value="stdin">Pass mission through stdin</option>
-                      <option value="argument">Pass mission as an argument</option>
-                      <option value="disabled">Interactive sessions only</option>
-                    </select>
-                  </label>
-                  <label className="settings-field settings-checkbox">
-                    <input
-                      type="checkbox"
-                      checked={draft.interactive}
-                      onChange={(event) =>
-                        setDraft({ ...draft, interactive: event.target.checked })
-                      }
-                    />
-                    <span>Enable interactive Agent Console sessions</span>
-                  </label>
-                  {draft.interactive && (
-                    <label className="settings-field">
-                      <span className="meta-label">Interactive arguments (one per line)</span>
-                      <textarea
-                        className="net-select"
-                        rows={2}
-                        value={draft.interactiveArgsText}
-                        onChange={(event) =>
-                          setDraft({ ...draft, interactiveArgsText: event.target.value })
-                        }
-                      />
-                    </label>
-                  )}
-                </>
-              )}
-              <label className="settings-field">
-                <span className="meta-label">Environment (KEY=VALUE, one per line)</span>
-                <textarea
-                  className="net-select"
-                  rows={3}
-                  value={draft.envText}
-                  onChange={(event) => setDraft({ ...draft, envText: event.target.value })}
-                  placeholder="OPENAI_API_KEY=…"
-                />
-              </label>
-            </div>
-          </details>
-          <div className="settings-actions">
-            <button className="button" onClick={saveDraft}>
-              {draft.originalName ? "Save changes" : "Add agent"}
-            </button>
-            <button className="button" onClick={() => setDraft(null)}>
-              Cancel
-            </button>
-          </div>
-        </section>
+        <AgentForm
+          initial={draft}
+          error={error}
+          onSave={saveAgentDraft}
+          onCancel={() => setDraft(null)}
+        />
       )}
     </div>
   );
