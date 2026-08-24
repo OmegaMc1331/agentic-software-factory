@@ -143,6 +143,23 @@ describe("Role inspector", () => {
     expect(screen.queryByRole("button", { name: "Delete" })).toBeNull();
   });
 
+  it("exposes the custom role deletion action to the graph controller", async () => {
+    const onDelete = vi.fn();
+    render(
+      <RoleInspector
+        role={customRole()}
+        agents={agents}
+        onClose={vi.fn()}
+        onChanged={vi.fn()}
+        onDelete={onDelete}
+      />
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Delete role" }));
+
+    expect(onDelete).toHaveBeenCalledTimes(1);
+  });
+
   it("removes an assignment through the API", async () => {
     const onChanged = vi.fn();
     render(

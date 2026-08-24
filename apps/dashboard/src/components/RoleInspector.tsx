@@ -305,7 +305,7 @@ export function RoleInspector({
               Duplicate
             </button>
             <button className="button inspector-delete" onClick={onDelete}>
-              Delete
+              Delete role
             </button>
           </div>
         )}

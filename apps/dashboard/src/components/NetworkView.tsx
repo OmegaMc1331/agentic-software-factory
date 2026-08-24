@@ -574,8 +574,7 @@ export function NetworkView() {
       void deleteRole(role.id)
         .then(() => {
           setSelectedNodeId(null);
-          reloadGraph();
-          reloadRoles();
+          reload();
         })
         .catch((reason: Error) => setOperationError(reason.message));
       return;
@@ -611,6 +610,7 @@ export function NetworkView() {
     merged,
     persistWorkspace,
     reloadGraph,
+    reload,
     reloadRoles,
     roles,
     saveConfiguration,

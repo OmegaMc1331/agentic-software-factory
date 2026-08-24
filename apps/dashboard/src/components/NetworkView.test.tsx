@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   addRoleAssignment,
   createWorkflow,
+  deleteRole,
   fetchAgentSessions,
   fetchConfig,
   fetchGraph,
@@ -178,6 +179,31 @@ const roles: RoleInfo[] = [
   },
 ];
 
+const customRole: RoleInfo = {
+  id: "database_engineer",
+  name: "Database Engineer",
+  kind: "custom",
+  description: "Designs schema migrations.",
+  instructions: "Keep the schema consistent.",
+  executionClass: "advisory",
+  assignments: [{ agent: "codex", preferred: true }],
+  available: true,
+};
+
+const graphWithCustomRole: GraphData = {
+  ...graph,
+  nodes: [
+    ...graph.nodes,
+    {
+      id: "role:database_engineer",
+      kind: "role",
+      label: "Database Engineer",
+      meta: customRole,
+    },
+  ],
+  metadata: { ...graph.metadata, roles: 2 },
+};
+
 beforeEach(() => {
   vi.mocked(fetchGraph).mockReset().mockResolvedValue(graph);
   vi.mocked(fetchGraphWorkspace).mockReset().mockResolvedValue(workspace);
@@ -205,6 +231,7 @@ beforeEach(() => {
   vi.mocked(fetchAgentSessions).mockReset().mockResolvedValue([]);
   vi.mocked(saveConfig).mockReset().mockResolvedValue();
   vi.mocked(saveGraphWorkspace).mockReset().mockResolvedValue();
+  vi.mocked(deleteRole).mockReset().mockResolvedValue();
   vi.mocked(addRoleAssignment).mockReset().mockResolvedValue(roles[1]);
   vi.mocked(removeRoleAssignment).mockReset().mockResolvedValue(roles[1]);
   vi.mocked(createWorkflow).mockReset().mockResolvedValue({
@@ -395,7 +422,73 @@ describe("Agent Graph interactions", () => {
     expect(screen.getByText("Implements a planned task in an isolated worktree.")).toBeTruthy();
     expect(screen.getByText("opencode")).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Edit" })).toBeNull();
-    expect(screen.queryByRole("button", { name: "Delete" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Delete role" })).toBeNull();
+
+    fireEvent.keyDown(window, { key: "Delete" });
+    expect((await screen.findByRole("alert")).textContent).toContain(
+      "Built-in core roles cannot be deleted; remove their assignments instead."
+    );
+    expect(deleteRole).not.toHaveBeenCalled();
+  });
+
+  it("deletes an unused custom role and refreshes graph, roles, and config", async () => {
+    vi.mocked(fetchGraph)
+      .mockReset()
+      .mockResolvedValueOnce(graphWithCustomRole)
+      .mockResolvedValue(graph);
+    vi.mocked(fetchRoles)
+      .mockReset()
+      .mockResolvedValueOnce([...roles, customRole])
+      .mockResolvedValue(roles);
+
+    render(<NetworkView />);
+    fireEvent.click(await screen.findByRole("button", { name: "select role:database_engineer" }));
+    fireEvent.click(screen.getByRole("button", { name: "Delete role" }));
+
+    await waitFor(() => expect(deleteRole).toHaveBeenCalledWith("database_engineer"));
+    await waitFor(() => expect(fetchGraph).toHaveBeenCalledTimes(2));
+    expect(fetchRoles).toHaveBeenCalledTimes(2);
+    expect(fetchConfig).toHaveBeenCalledTimes(2);
+    expect(screen.queryByRole("button", { name: "select role:database_engineer" })).toBeNull();
+  });
+
+  it("cancels custom role deletion before calling the API", async () => {
+    vi.mocked(fetchGraph).mockReset().mockResolvedValue(graphWithCustomRole);
+    vi.mocked(fetchRoles)
+      .mockReset()
+      .mockResolvedValue([...roles, customRole]);
+    vi.mocked(window.confirm).mockReturnValue(false);
+
+    render(<NetworkView />);
+    fireEvent.click(await screen.findByRole("button", { name: "select role:database_engineer" }));
+    fireEvent.click(screen.getByRole("button", { name: "Delete role" }));
+
+    expect(window.confirm).toHaveBeenCalledWith(
+      "Delete the Database Engineer custom role and its assignments?"
+    );
+    expect(deleteRole).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "Delete role" })).toBeTruthy();
+  });
+
+  it("shows the exact API blocking reason when custom role deletion is rejected", async () => {
+    vi.mocked(fetchGraph).mockReset().mockResolvedValue(graphWithCustomRole);
+    vi.mocked(fetchRoles)
+      .mockReset()
+      .mockResolvedValue([...roles, customRole]);
+    vi.mocked(deleteRole).mockRejectedValue(
+      new Error(
+        "Factory API request failed (HTTP 409): role 'database_engineer' is used by an active workflow and cannot be deleted"
+      )
+    );
+
+    render(<NetworkView />);
+    fireEvent.click(await screen.findByRole("button", { name: "select role:database_engineer" }));
+    fireEvent.click(screen.getByRole("button", { name: "Delete role" }));
+
+    expect((await screen.findByRole("alert")).textContent).toContain(
+      "role 'database_engineer' is used by an active workflow and cannot be deleted"
+    );
+    expect(screen.getByRole("button", { name: "Delete role" })).toBeTruthy();
   });
 
   it("hides role nodes and binds edges when the Roles toggle is off", async () => {

@@ -1167,7 +1167,7 @@ async fn delete_role(
             "built-in core roles cannot be deleted; remove their assignments instead",
         ));
     }
-    if config.roles.remove(&id).is_none() {
+    if !config.roles.contains_key(&id) {
         return Err(ApiError::new(
             StatusCode::NOT_FOUND,
             format!("role '{id}' not found"),
@@ -1182,6 +1182,19 @@ async fn delete_role(
             ));
         }
     }
+    let recipes = factory_core::RecipeCatalog::load(&state.root)?;
+    if let Some(recipe) = recipes.list().into_iter().find(|recipe| {
+        recipe.roles.iter().any(|role| role == &id) || recipe.policy_presets.contains_key(&id)
+    }) {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            format!(
+                "role '{id}' is referenced by persisted recipe '{}' and cannot be deleted; remove it from that recipe first",
+                recipe.id
+            ),
+        ));
+    }
+    config.roles.remove(&id);
     config
         .role_assignments
         .retain(|assignment| assignment.role != id);

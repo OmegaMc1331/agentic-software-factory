@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use factory_core::{AgentEntry, Config, RoleAssignment};
-use factory_types::RunStatus;
+use factory_core::{AgentEntry, Config, ExecutionClass, RoleAssignment, RoleDefinitionEntry};
+use factory_types::{RunStatus, WorkflowTeam};
 use http_body_util::BodyExt;
 use serde_json::json;
 use tempfile::TempDir;
@@ -71,6 +71,26 @@ fn configure_two_agents(root: &Path) {
             preferred: true,
         });
     }
+    config.write_atomic(root).unwrap();
+}
+
+fn add_custom_role(root: &Path, id: &str) {
+    let mut config = Config::load(root).unwrap();
+    config.roles.insert(
+        id.into(),
+        RoleDefinitionEntry {
+            name: Some("Database Engineer".into()),
+            description: Some("Designs schema migrations.".into()),
+            execution_class: Some(ExecutionClass::Advisory),
+            instructions: "Keep the schema consistent.".into(),
+            agent: None,
+        },
+    );
+    config.role_assignments.push(RoleAssignment {
+        role: id.into(),
+        agent: "codex".into(),
+        preferred: true,
+    });
     config.write_atomic(root).unwrap();
 }
 
@@ -143,6 +163,7 @@ async fn custom_role_lifecycle_create_assign_edit_delete() {
             "executionClass": "execution",
             "instructions": "Focus on schema design and migrations.",
             "agents": ["codex"],
+            "policyPreset": "documentation",
             "preferredAgent": "codex"
         })),
     )
@@ -221,6 +242,13 @@ async fn custom_role_lifecycle_create_assign_edit_delete() {
         .role_assignments
         .iter()
         .all(|assignment| assignment.role != "database_engineer"));
+    assert!(!config.policies.roles.contains_key("database_engineer"));
+    assert!(config
+        .role_assignments
+        .iter()
+        .any(|assignment| assignment.role == "planner" && assignment.agent == "codex"));
+    assert!(config.agents.contains_key("codex"));
+    assert!(config.agents.contains_key("claude"));
 }
 
 #[tokio::test]
@@ -247,6 +275,83 @@ async fn core_roles_are_protected_from_redefinition_and_deletion() {
     let response = request(app, "DELETE", "/api/roles/worker", None).await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert!(body_text(response).await.contains("cannot be deleted"));
+}
+
+#[tokio::test]
+async fn custom_role_used_by_an_active_workflow_cannot_be_deleted() {
+    let dir = TempDir::new().unwrap();
+    init_root(dir.path());
+    configure_two_agents(dir.path());
+    add_custom_role(dir.path(), "database_engineer");
+    let state = make_state(dir.path());
+    let run = {
+        let db = state.db.lock().unwrap();
+        let run = db
+            .create_run_with_status("active custom role", Some("codex"), RunStatus::Active)
+            .unwrap();
+        db.set_run_team(
+            run.id,
+            &WorkflowTeam {
+                planner: "codex".into(),
+                workers: vec!["codex".into()],
+                reviewers: vec!["claude".into()],
+                additional: BTreeMap::from([("database_engineer".into(), vec!["codex".into()])]),
+            },
+        )
+        .unwrap();
+        run
+    };
+    let app = factory_api::router(state);
+
+    let response = request(app, "DELETE", "/api/roles/database_engineer", None).await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert!(body_text(response)
+        .await
+        .contains("role 'database_engineer' is used by an active workflow and cannot be deleted"));
+    let config = Config::load(dir.path()).unwrap();
+    assert!(config.roles.contains_key("database_engineer"));
+    assert!(config
+        .role_assignments
+        .iter()
+        .any(|assignment| assignment.role == "database_engineer"));
+    assert_eq!(
+        Config::load(dir.path()).unwrap().roles["database_engineer"].name,
+        Some("Database Engineer".into())
+    );
+    assert_eq!(run.status, RunStatus::Active);
+}
+
+#[tokio::test]
+async fn custom_role_referenced_by_a_persisted_recipe_cannot_be_deleted() {
+    let dir = TempDir::new().unwrap();
+    init_root(dir.path());
+    configure_two_agents(dir.path());
+    add_custom_role(dir.path(), "database_engineer");
+    let app = factory_api::router(make_state(dir.path()));
+
+    let response = request(
+        app.clone(),
+        "POST",
+        "/api/recipes",
+        Some(json!({
+            "name": "Database workflow",
+            "roles": ["planner", "database_engineer"]
+        })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let response = request(app, "DELETE", "/api/roles/database_engineer", None).await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert!(body_text(response).await.contains(
+        "role 'database_engineer' is referenced by persisted recipe 'database_workflow' and cannot be deleted"
+    ));
+    let config = Config::load(dir.path()).unwrap();
+    assert!(config.roles.contains_key("database_engineer"));
+    assert!(factory_core::RecipeCatalog::load(dir.path())
+        .unwrap()
+        .get("database_workflow")
+        .is_some());
 }
 
 #[tokio::test]
