@@ -922,10 +922,11 @@ mod tests {
     #[test]
     fn codex_mission_uses_stdin_and_is_absent_from_argv() {
         let mission = "large codex mission";
+        let command = if cfg!(windows) { "cmd" } else { "sh" };
         let config = AgentConfig {
             name: "codex".into(),
             kind: AgentKind::Codex,
-            command: "codex".into(),
+            command: command.into(),
             args: vec![
                 "exec".into(),
                 "--model".into(),
@@ -960,10 +961,11 @@ mod tests {
     #[test]
     fn very_large_codex_mission_stays_out_of_argv() {
         let mission = "mission context ".repeat(100_000);
+        let command = if cfg!(windows) { "cmd" } else { "sh" };
         let config = AgentConfig {
             name: "codex".into(),
             kind: AgentKind::Codex,
-            command: "codex".into(),
+            command: command.into(),
             args: vec!["exec".into(), "--model".into(), "openai/gpt-5".into()],
             env: BTreeMap::new(),
             prompt_transport: AgentKind::Codex.prompt_transport(),
