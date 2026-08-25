@@ -51,8 +51,15 @@ impl AgentKind {
 
     pub fn prompt_transport(self) -> PromptTransport {
         match self {
-            AgentKind::Custom => PromptTransport::Stdin,
-            _ => PromptTransport::Argument,
+            // Codex accepts a workflow mission from stdin when `exec` has no
+            // positional prompt. Keeping the mission out of argv is required
+            // for large Windows workflows, while the configured args remain
+            // structured and unchanged.
+            AgentKind::Codex | AgentKind::Custom => PromptTransport::Stdin,
+            AgentKind::ClaudeCode
+            | AgentKind::OpenCode
+            | AgentKind::GeminiCli
+            | AgentKind::QwenCode => PromptTransport::Argument,
         }
     }
 
@@ -888,7 +895,7 @@ mod tests {
     }
 
     #[test]
-    fn known_profiles_define_non_interactive_argument_invocations() {
+    fn known_profiles_define_non_interactive_invocations() {
         for (kind, command, prefix) in [
             (AgentKind::Codex, "codex", vec!["exec"]),
             (AgentKind::ClaudeCode, "claude", vec!["-p"]),
@@ -908,8 +915,72 @@ mod tests {
             };
             assert_eq!(config.command, command);
             assert_eq!(config.args, prefix);
-            assert_eq!(config.prompt_transport, PromptTransport::Argument);
+            assert_eq!(config.prompt_transport, kind.prompt_transport());
         }
+    }
+
+    #[test]
+    fn codex_mission_uses_stdin_and_is_absent_from_argv() {
+        let mission = "large codex mission";
+        let config = AgentConfig {
+            name: "codex".into(),
+            kind: AgentKind::Codex,
+            command: "codex".into(),
+            args: vec![
+                "exec".into(),
+                "--model".into(),
+                "openai/gpt-5".into(),
+                "--sandbox".into(),
+                "workspace-write".into(),
+            ],
+            env: BTreeMap::new(),
+            prompt_transport: AgentKind::Codex.prompt_transport(),
+            interactive_args: Some(Vec::new()),
+            capabilities: AgentCapabilities::default(),
+        };
+
+        let invocation = CommandAgent::new(config)
+            .automated_invocation(&AgentRequest::new(mission, "."))
+            .unwrap();
+
+        assert_eq!(
+            invocation.args,
+            vec![
+                "exec",
+                "--model",
+                "openai/gpt-5",
+                "--sandbox",
+                "workspace-write"
+            ]
+        );
+        assert!(!invocation.args.iter().any(|argument| argument == mission));
+        assert_eq!(invocation.stdin_payload, Some(mission.as_bytes().to_vec()));
+    }
+
+    #[test]
+    fn very_large_codex_mission_stays_out_of_argv() {
+        let mission = "mission context ".repeat(100_000);
+        let config = AgentConfig {
+            name: "codex".into(),
+            kind: AgentKind::Codex,
+            command: "codex".into(),
+            args: vec!["exec".into(), "--model".into(), "openai/gpt-5".into()],
+            env: BTreeMap::new(),
+            prompt_transport: AgentKind::Codex.prompt_transport(),
+            interactive_args: Some(Vec::new()),
+            capabilities: AgentCapabilities::default(),
+        };
+
+        let invocation = CommandAgent::new(config)
+            .automated_invocation(&AgentRequest::new(&mission, "."))
+            .unwrap();
+
+        assert!(mission.len() > 32_768);
+        assert_eq!(invocation.args, vec!["exec", "--model", "openai/gpt-5"]);
+        assert_eq!(
+            invocation.stdin_payload.as_deref(),
+            Some(mission.as_bytes())
+        );
     }
 
     #[cfg(windows)]
@@ -944,6 +1015,54 @@ mod tests {
             .args([
                 "--exact",
                 "agent::tests::windows_cmd_found_through_path_is_the_executable_that_runs",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("PATH", directory.path())
+            .env("PATHEXT", ".CMD;.EXE")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_codex_invocation_reads_a_mission_from_stdin() {
+        const CHILD: &str = "FACTORY_WINDOWS_CODEX_STDIN_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let config = AgentConfig {
+                name: "codex".into(),
+                kind: AgentKind::Codex,
+                command: "codex".into(),
+                args: vec!["exec".into(), "--model".into(), "test-model".into()],
+                env: BTreeMap::new(),
+                prompt_transport: AgentKind::Codex.prompt_transport(),
+                interactive_args: Some(Vec::new()),
+                capabilities: AgentCapabilities::default(),
+            };
+            let result = CommandAgent::new(config)
+                .run(&AgentRequest::new("windows codex mission", "."))
+                .unwrap();
+            assert_eq!(result.exit_code, Some(0));
+            assert!(result.stdout.contains("windows codex mission"));
+            return;
+        }
+
+        let directory = TempDir::new().unwrap();
+        std::fs::write(
+            directory.path().join("codex.cmd"),
+            "@echo off\r\nif /I not \"%~1\"==\"exec\" exit /b 2\r\nif /I not \"%~2\"==\"--model\" exit /b 3\r\nif /I not \"%~3\"==\"test-model\" exit /b 4\r\nif not \"%~4\"==\"\" exit /b 5\r\nset /p MISSION=\r\necho(%MISSION%\r\n",
+        )
+        .unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "agent::tests::windows_codex_invocation_reads_a_mission_from_stdin",
                 "--nocapture",
             ])
             .env(CHILD, "1")

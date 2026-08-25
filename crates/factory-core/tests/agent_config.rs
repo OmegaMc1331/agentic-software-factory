@@ -48,7 +48,33 @@ agent = "codex"
     assert_eq!(agent.env.get("TEST").map(|s| s.as_str()), Some("1"));
     assert!(agent.capabilities.supports("planner"));
     assert_eq!(agent.kind, AgentKind::Codex);
-    assert_eq!(agent.prompt_transport, PromptTransport::Argument);
+    assert_eq!(agent.prompt_transport, PromptTransport::Stdin);
+}
+
+#[test]
+fn legacy_codex_config_defaults_to_stdin_without_changing_configured_args() {
+    let config: Config = toml::from_str(
+        r#"
+[agents.codex]
+command = "codex"
+args = ["exec", "--model", "openai/gpt-5", "--sandbox", "workspace-write"]
+"#,
+    )
+    .unwrap();
+
+    let agent = config.agent_config("codex").unwrap();
+    assert_eq!(agent.kind, AgentKind::Codex);
+    assert_eq!(agent.prompt_transport, PromptTransport::Stdin);
+    assert_eq!(
+        agent.args,
+        vec![
+            "exec",
+            "--model",
+            "openai/gpt-5",
+            "--sandbox",
+            "workspace-write"
+        ]
+    );
 }
 
 #[test]

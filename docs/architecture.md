@@ -338,11 +338,12 @@ Agent Console               -> PTY or ConPTY          <-> terminal WebSocket
 ```
 
 An agent profile defines its executable, workflow arguments, prompt transport, and
-interactive arguments. Known profiles use argument transport (`codex exec`, `claude
--p`, `opencode run`, `gemini -p`, and `qwen -p`). Legacy known configurations are
-inferred without rewriting their TOML; unknown legacy configurations remain custom
-stdin agents. Custom argument transport replaces one complete `{mission}` argument or
-appends the mission as one argument. No shell interpolation is used.
+interactive arguments. Codex uses stdin for the mission (`codex exec`), while the
+other known profiles use their configured argument transport (`claude -p`, `opencode
+run`, `gemini -p`, and `qwen -p`). Legacy known configurations are inferred without
+rewriting their TOML; unknown legacy configurations remain custom stdin agents.
+Custom argument transport replaces one complete `{mission}` argument or appends the
+mission as one argument. No shell interpolation is used.
 
 `AgentSession.mode` distinguishes `automated` workflow invocations from `interactive`
 console invocations. Automated output remains split into stdout and stderr and streams
