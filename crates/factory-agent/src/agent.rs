@@ -429,36 +429,59 @@ impl CommandAgent {
         let mut child = cmd
             .spawn()
             .map_err(|e| spawn_error(&self.config.command, &e))?;
-        let write_error = match invocation.stdin_payload {
-            Some(payload) => {
-                let mut stdin = child.stdin.take().ok_or_else(|| {
-                    AgentError::Spawn(self.config.command.clone(), "stdin not available".into())
-                })?;
-                let error = stdin.write_all(&payload).err();
-                drop(stdin);
-                error
+        let stdin = child.stdin.take();
+        let stdout = match child.stdout.take() {
+            Some(stdout) => stdout,
+            None => {
+                terminate_and_reap(&mut child);
+                return Err(AgentError::Spawn(
+                    self.config.command.clone(),
+                    "stdout not available".into(),
+                ));
             }
-            None => None,
         };
-        let stdout = child.stdout.take().ok_or_else(|| {
-            AgentError::Spawn(self.config.command.clone(), "stdout not available".into())
-        })?;
-        let stderr = child.stderr.take().ok_or_else(|| {
-            AgentError::Spawn(self.config.command.clone(), "stderr not available".into())
-        })?;
+        let stderr = match child.stderr.take() {
+            Some(stderr) => stderr,
+            None => {
+                terminate_and_reap(&mut child);
+                return Err(AgentError::Spawn(
+                    self.config.command.clone(),
+                    "stderr not available".into(),
+                ));
+            }
+        };
+        if stdin.is_none() && invocation.stdin_payload.is_some() {
+            terminate_and_reap(&mut child);
+            return Err(AgentError::Spawn(
+                self.config.command.clone(),
+                "stdin not available".into(),
+            ));
+        }
         let (sender, receiver) = mpsc::channel();
         let stdout_reader = output_reader(stdout, OutputStream::Stdout, sender.clone());
         let stderr_reader = output_reader(stderr, OutputStream::Stderr, sender);
+        let stdin_writer = match (stdin, invocation.stdin_payload) {
+            (Some(stdin), Some(payload)) => Some(spawn_stdin_writer(stdin, payload)),
+            _ => None,
+        };
         let mut stdout_text = String::new();
         let mut stderr_text = String::new();
         let mut was_cancelled = false;
         let status = loop {
-            while let Ok((stream, chunk)) = receiver.try_recv() {
+            let mut received = false;
+            for _ in 0..64 {
+                let Ok((stream, chunk)) = receiver.try_recv() else {
+                    break;
+                };
+                received = true;
                 match stream {
                     OutputStream::Stdout => stdout_text.push_str(&chunk),
                     OutputStream::Stderr => stderr_text.push_str(&chunk),
                 }
                 on_output(stream, &chunk);
+                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
             }
             if cancel.load(std::sync::atomic::Ordering::Relaxed) && !was_cancelled {
                 was_cancelled = true;
@@ -467,14 +490,41 @@ impl CommandAgent {
             if let Some(status) = child.try_wait()? {
                 break status;
             }
-            std::thread::sleep(Duration::from_millis(40));
+            if !received {
+                std::thread::sleep(Duration::from_millis(40));
+            }
         };
-        stdout_reader.join().map_err(|_| {
-            AgentError::Spawn(self.config.command.clone(), "stdout reader stopped".into())
-        })??;
-        stderr_reader.join().map_err(|_| {
-            AgentError::Spawn(self.config.command.clone(), "stderr reader stopped".into())
-        })??;
+        let stdout_join = stdout_reader.join();
+        let stderr_join = stderr_reader.join();
+        let stdin_join = stdin_writer.map(|writer| writer.join());
+        let stdout_error = match stdout_join {
+            Ok(result) => result.err(),
+            Err(_) => {
+                return Err(AgentError::Spawn(
+                    self.config.command.clone(),
+                    "stdout reader stopped".into(),
+                ));
+            }
+        };
+        let stderr_error = match stderr_join {
+            Ok(result) => result.err(),
+            Err(_) => {
+                return Err(AgentError::Spawn(
+                    self.config.command.clone(),
+                    "stderr reader stopped".into(),
+                ));
+            }
+        };
+        let stdin_error = match stdin_join {
+            Some(Ok(result)) => result.err(),
+            Some(Err(_)) => {
+                return Err(AgentError::Spawn(
+                    self.config.command.clone(),
+                    "stdin writer stopped".into(),
+                ));
+            }
+            None => None,
+        };
         while let Ok((stream, chunk)) = receiver.try_recv() {
             match stream {
                 OutputStream::Stdout => stdout_text.push_str(&chunk),
@@ -483,12 +533,17 @@ impl CommandAgent {
             on_output(stream, &chunk);
         }
         let duration = started.elapsed();
-        if let Some(err) = write_error {
-            if err.kind() != std::io::ErrorKind::BrokenPipe {
+        if !was_cancelled {
+            if let Some(err) = stdout_error.or(stderr_error) {
                 return Err(AgentError::Io(err));
             }
+            if let Some(err) = stdin_error {
+                if err.kind() != std::io::ErrorKind::BrokenPipe {
+                    return Err(AgentError::Io(err));
+                }
+            }
         }
-        if !status.success() && terminal_required(&stdout_text, &stderr_text) {
+        if !was_cancelled && !status.success() && terminal_required(&stdout_text, &stderr_text) {
             return Err(AgentError::RequiresTerminal(self.config.name.clone()));
         }
         Ok(AgentResult {
@@ -556,6 +611,11 @@ fn terminal_required(stdout: &str, stderr: &str) -> bool {
     .any(|message| output.contains(message))
 }
 
+fn terminate_and_reap(child: &mut std::process::Child) {
+    terminate_process_tree(child);
+    let _ = child.wait();
+}
+
 fn terminate_process_tree(child: &mut std::process::Child) {
     #[cfg(windows)]
     {
@@ -576,6 +636,13 @@ fn terminate_process_tree(child: &mut std::process::Child) {
             .status();
     }
     let _ = child.kill();
+}
+
+fn spawn_stdin_writer(
+    mut stdin: std::process::ChildStdin,
+    payload: Vec<u8>,
+) -> std::thread::JoinHandle<std::io::Result<()>> {
+    std::thread::spawn(move || stdin.write_all(&payload))
 }
 
 fn output_reader<R: Read + Send + 'static>(
