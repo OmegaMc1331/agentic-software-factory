@@ -206,6 +206,41 @@ FACTORY_SECURITY_PTY_CHILD = "1"
     .unwrap();
 }
 
+fn configure_runnable_agent(root: &std::path::Path) {
+    let (command, args) = if cfg!(windows) {
+        ("cmd", r#"["/d", "/c", "exit", "0"]"#)
+    } else {
+        ("sh", r#"["-c", "exit 0"]"#)
+    };
+    std::fs::write(
+        root.join(".factory").join("config.toml"),
+        format!(
+            r#"
+[agents.security-test]
+kind = "custom"
+command = "{command}"
+args = {args}
+
+[[role_assignments]]
+role = "planner"
+agent = "security-test"
+preferred = true
+
+[[role_assignments]]
+role = "worker"
+agent = "security-test"
+preferred = true
+
+[[role_assignments]]
+role = "reviewer"
+agent = "security-test"
+preferred = true
+"#
+        ),
+    )
+    .unwrap();
+}
+
 async fn connect_terminal(
     address: SocketAddr,
     session_id: i64,
@@ -575,7 +610,19 @@ async fn encoded_api_paths_cannot_bypass_authentication() {
         "/API/runs",
     ] {
         let response = raw_request(server.address, get_request(server.address, path, "")).await;
-        assert_ne!(response.status, 200, "{path} was not protected");
+        let dashboard_fallback = response
+            .header("content-type")
+            .is_some_and(|value| value.starts_with("text/html"));
+        assert!(
+            response.status != 200 || dashboard_fallback,
+            "{path} was not protected: {response:?}"
+        );
+        assert!(
+            !response
+                .set_cookies()
+                .any(|cookie| cookie.starts_with("factory_session=")),
+            "{path} issued a session: {response:?}"
+        );
     }
 }
 
@@ -688,6 +735,7 @@ async fn expired_sessions_are_rejected() {
 async fn authorized_mutation_with_csrf_and_missing_origin_still_works() {
     let dir = TempDir::new().unwrap();
     init_root(dir.path());
+    configure_runnable_agent(dir.path());
     let server = TestServer::start(make_state(dir.path()));
     let origin = format!("http://{}", server.address);
     let (_, cookies) = bootstrap(server.address, &origin).await;
@@ -702,7 +750,7 @@ async fn authorized_mutation_with_csrf_and_missing_origin_still_works() {
         ),
     )
     .await;
-    assert_eq!(response.status, 202);
+    assert_eq!(response.status, 202, "{response:?}");
 
     let response = raw_request(
         server.address,
@@ -714,7 +762,7 @@ async fn authorized_mutation_with_csrf_and_missing_origin_still_works() {
         ),
     )
     .await;
-    assert_eq!(response.status, 202);
+    assert_eq!(response.status, 202, "{response:?}");
 }
 
 #[test]

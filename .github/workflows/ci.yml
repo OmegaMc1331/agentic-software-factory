@@ -89,7 +89,16 @@ jobs:
             sleep 0.2
           done
           python3 -c 'import json; assert json.load(open("/tmp/factory-health.json"))["status"] == "ok"'
-          curl --max-time 2 -fsS http://127.0.0.1:4321/api/runs >/tmp/factory-runs.json
+          status="$(curl --max-time 2 -s -o /tmp/factory-unauthorized.json -w '%{http_code}' http://127.0.0.1:4321/api/runs)"
+          test "$status" = "401"
+          curl --max-time 2 -fsS -c /tmp/factory-cookies.txt \
+            -H 'Origin: http://127.0.0.1:4321' \
+            -H 'Content-Type: application/json' \
+            -d '{}' \
+            http://127.0.0.1:4321/api/auth/session >/tmp/factory-session.json
+          python3 -c 'import json; assert len(json.load(open("/tmp/factory-session.json"))["csrfToken"]) == 64'
+          curl --max-time 2 -fsS -b /tmp/factory-cookies.txt \
+            http://127.0.0.1:4321/api/runs >/tmp/factory-runs.json
           python3 -c 'import json; assert isinstance(json.load(open("/tmp/factory-runs.json")), list)'
           curl -fsS http://127.0.0.1:4321/ | grep -q 'id="root"'
           echo "OK: standalone binary serves health, runs, and the embedded dashboard"
