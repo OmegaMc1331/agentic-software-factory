@@ -456,11 +456,11 @@ async fn wait_for_run(root: &Path, id: i64, expected: RunStatus) {
             Instant::now() < deadline,
             "run {id} never reached {expected:?}"
         );
-        let state = make_state(root);
-        let run = {
-            let db = state.db.lock().unwrap();
-            db.get_run(id).unwrap().unwrap()
-        };
+        let run = factory_core::Factory::open(root)
+            .unwrap()
+            .get_run(id)
+            .unwrap()
+            .unwrap();
         if run.status == expected {
             return;
         }

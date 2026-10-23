@@ -442,9 +442,10 @@ fn worktree_status(root: &Path) -> Result<()> {
 
 fn start(root: &Path, port: u16, no_browser: bool) -> Result<()> {
     factory_root(root)?;
-    let state = factory_api::ApiState::new(root.to_path_buf())?;
-    let listener = factory_api::bind(port)?;
+    let listener = factory_api::bind(port)
+        .with_context(|| format!("cannot bind the Factory API to 127.0.0.1:{port}"))?;
     let address = listener.local_addr()?;
+    let state = factory_api::ApiState::new(root.to_path_buf())?;
     let url = format!("http://127.0.0.1:{}", address.port());
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -505,8 +506,9 @@ async fn wait_until_ready(address: std::net::SocketAddr) -> Result<()> {
 
 fn serve(root: &Path, port: u16) -> Result<()> {
     factory_root(root)?;
+    let listener = factory_api::bind(port)
+        .with_context(|| format!("cannot bind the Factory API to 127.0.0.1:{port}"))?;
     let state = factory_api::ApiState::new(root.to_path_buf())?;
-    let listener = factory_api::bind(port)?;
     println!(
         "Factory API listening on http://127.0.0.1:{}",
         listener.local_addr()?.port()

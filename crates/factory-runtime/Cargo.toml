@@ -10,6 +10,7 @@ factory-core = { workspace = true }
 factory-db = { workspace = true }
 factory-types = { workspace = true }
 chrono = { workspace = true }
+fs4 = { workspace = true }
 portable-pty = "0.9"
 thiserror = { workspace = true }
 tokio = { version = "1", features = ["rt-multi-thread", "sync"] }

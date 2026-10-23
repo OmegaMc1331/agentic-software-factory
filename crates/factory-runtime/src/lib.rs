@@ -5,12 +5,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc as std_mpsc, Arc, Mutex};
 use std::time::Instant;
 
-use factory_core::{Factory, FactoryError};
+use factory_core::{Factory, FactoryError, FACTORY_DIR};
 use factory_db::FactoryDb;
 use factory_types::{AgentSession, AgentSessionMode, RecipeSnapshot, Run, WorkflowTeam};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use thiserror::Error;
 use tokio::sync::mpsc;
+
+mod project_lock;
+
+use project_lock::ProjectLock;
 
 const MAX_TERMINAL_HISTORY_BYTES: usize = 1_000_000;
 
@@ -36,6 +40,22 @@ pub enum RuntimeError {
     TerminalNotActive(i64),
     #[error("interactive terminal error: {0}")]
     Terminal(String),
+    #[error(
+        "another Factory runtime is already serving project {root} (lock: {lock}); stop that Factory process before starting a new one"
+    )]
+    ProjectAlreadyLocked { root: PathBuf, lock: PathBuf },
+    #[error("cannot acquire the Factory project lock at {lock}: {source}")]
+    ProjectLock {
+        lock: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("cannot resolve the Factory project root {root}: {source}")]
+    ProjectRoot {
+        root: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error(transparent)]
     Factory(#[from] FactoryError),
 }
@@ -45,6 +65,7 @@ pub struct Runtime {
     root: Arc<PathBuf>,
     active: Arc<Mutex<HashMap<i64, Active>>>,
     terminals: Arc<Mutex<HashMap<i64, Arc<InteractiveTerminal>>>>,
+    _project_lock: Arc<ProjectLock>,
 }
 
 struct Active {
@@ -73,11 +94,21 @@ pub struct TerminalSubscription {
 
 impl Runtime {
     pub fn new(root: &Path) -> Result<Self, RuntimeError> {
+        let canonical_root =
+            std::fs::canonicalize(root).map_err(|source| RuntimeError::ProjectRoot {
+                root: root.to_path_buf(),
+                source,
+            })?;
+        if !canonical_root.join(FACTORY_DIR).join("db.sqlite3").exists() {
+            return Err(FactoryError::NotInitialized.into());
+        }
+        let project_lock = ProjectLock::acquire(&canonical_root, root)?;
         Factory::open(root)?.reconcile_interrupted()?;
         Ok(Self {
             root: Arc::new(root.to_path_buf()),
             active: Arc::new(Mutex::new(HashMap::new())),
             terminals: Arc::new(Mutex::new(HashMap::new())),
+            _project_lock: Arc::new(project_lock),
         })
     }
 
