@@ -1,5 +1,5 @@
 import { useEffect, useRef } from "react";
-import { agentTerminalSocketUrl } from "../api";
+import { agentTerminalSocketUrl, refreshFactorySession } from "../api";
 
 export function InteractiveTerminal({
   sessionId,
@@ -22,7 +22,7 @@ export function InteractiveTerminal({
     let disposed = false;
     let cleanup = () => {};
     void Promise.all([import("@xterm/xterm"), import("@xterm/addon-fit")])
-      .then(([{ Terminal }, { FitAddon }]) => {
+      .then(async ([{ Terminal }, { FitAddon }]) => {
         if (disposed) return;
         const terminal = new Terminal({
           convertEol: true,
@@ -55,6 +55,24 @@ export function InteractiveTerminal({
         if (!active) {
           terminal.write(output || "No terminal output was recorded.\r\n");
           cleanup = () => terminal.dispose();
+          return;
+        }
+
+        try {
+          await refreshFactorySession();
+        } catch (reason: unknown) {
+          if (!disposed) {
+            onError(
+              reason instanceof Error
+                ? reason.message
+                : "The Factory session could not be established."
+            );
+          }
+          terminal.dispose();
+          return;
+        }
+        if (disposed) {
+          terminal.dispose();
           return;
         }
 

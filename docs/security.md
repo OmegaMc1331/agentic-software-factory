@@ -1,8 +1,50 @@
 # Security
 
 Agentic Software Factory is a local developer tool. `factory start` binds only to
-`127.0.0.1`; the API has no authentication, so do not proxy or expose it to another
-machine.
+`127.0.0.1` and requires an authenticated loopback browser session for its API. Do
+not proxy or expose it to another machine.
+
+## Local API authentication
+
+Every `/api` route except `GET /api/health` and the session bootstrap route requires
+a short-lived browser session. The dashboard establishes it automatically; users do
+not enter a password.
+
+**Host and Origin.** The server rejects requests whose `Host` header is not exactly
+`127.0.0.1`, `localhost`, or `::1` (with an optional port). A present `Origin` must
+exactly match the request's scheme, host, and port, or one explicitly configured
+development origin. Wildcards, suffix matches, `localhost.evil.example`, and
+non-loopback origins are rejected. This blocks DNS-rebinding and cross-origin browser
+requests before they reach any API, SSE, or WebSocket handler.
+
+**Session.** At process start Factory generates a random 32-byte secret in memory and
+sets a `factory_session` cookie for `POST /api/auth/session`, issued only for a
+same-origin `Origin` and an `application/json` request. The cookie is `HttpOnly`,
+`SameSite=Strict`, scoped to `/api`, and defaults to a 12-hour lifetime. Its value is
+a signed, expiring token; restarting Factory invalidates every session. No session
+secret is written to disk, logged, or placed in a URL or local storage.
+
+**CSRF.** Bootstrap also sets the readable `factory_csrf` cookie and returns the same
+value as `csrfToken`. The dashboard sends it in `X-Factory-CSRF` on POST, PUT, PATCH,
+and DELETE. The backend requires the header and cookie to match. The dashboard keeps
+the token in memory only.
+
+**Streaming transports.** SSE (`/api/sessions/:id/stream`) and the interactive
+terminal WebSocket (`/api/sessions/:id/terminal`) use the same `factory_session`
+cookie. Authentication runs before the WebSocket upgrade, so an unauthenticated or
+cross-origin handshake is rejected with HTTP `401` or `403` and never creates a PTY
+connection. The dashboard refreshes the session before opening them.
+
+**Development.** Vite proxies `/api` to the backend and forwards WebSockets. Because
+the browser origin is then `http://localhost:5173`, start the backend with
+`--dev-origin http://localhost:5173` (or `FACTORY_DEV_ORIGIN`). That exact origin is
+the only addition; no production route trusts arbitrary localhost ports.
+
+**Limits.** This is browser boundary protection, not user authentication. A local
+process running as the same user, or any person with access to the machine and its
+loopback interface, can request a session and is equivalent to a trusted local
+operator. Keep the server bound to loopback and do not expose it through a proxy,
+tunnel, or port forward.
 
 ## Workflow operations
 

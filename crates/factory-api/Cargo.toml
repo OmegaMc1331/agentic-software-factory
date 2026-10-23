@@ -27,8 +27,12 @@ thiserror = { workspace = true }
 chrono = { workspace = true }
 rust-embed = { version = "8", features = ["mime-guess"], optional = true }
 tokio-stream = "0.1"
+rand = "0.8"
+sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = "3"
 tower = { version = "0.4", features = ["util"] }
 http-body-util = "0.1"
+futures-util = "0.3"
+tokio-tungstenite = "0.24"

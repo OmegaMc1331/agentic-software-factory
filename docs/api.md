@@ -2,19 +2,59 @@
 
 `factory start` serves the dashboard and a semantic HTTP API on
 `http://127.0.0.1:4321` (`--port` changes the port). The API binds to localhost
-only and has no authentication — do not proxy or expose it. See
+only and requires a short-lived, same-origin browser session. See
 [Security](security.md).
 
 Every route is an explicit Factory operation. There is no generic shell, command,
 process-launch, or raw MCP JSON-RPC endpoint; the dashboard never executes agents
 directly. Bodies and responses are JSON; errors return an appropriate status code
-with `{"error": "<message>"}`. Unknown `/api/*` paths return `404`.
+with `{"error": "<message>"}`. Unknown unauthenticated `/api/*` paths return `401`;
+authenticated unknown paths return `404`.
+
+## Authentication
+
+The dashboard bootstraps its session automatically. Scripts and other local clients
+must first request a session and then send both cookies plus the CSRF header on
+mutations:
+
+```bash
+# 1. Establish a session. Origin must exactly match the API origin.
+curl -i -c cookies.txt -X POST http://127.0.0.1:4321/api/auth/session \
+  -H "Origin: http://127.0.0.1:4321" \
+  -H "Content-Type: application/json" \
+  -d '{}'
+# Response: {"csrfToken":"..."} and Set-Cookie: factory_session, factory_csrf
+
+# 2. Send the session cookie on reads.
+curl -b cookies.txt http://127.0.0.1:4321/api/runs
+
+# 3. Send the cookie and CSRF token on mutations.
+curl -b cookies.txt -X POST http://127.0.0.1:4321/api/runs \
+  -H "Origin: http://127.0.0.1:4321" \
+  -H "X-Factory-CSRF: <csrfToken>" \
+  -H "Content-Type: application/json" \
+  -d '{"objective":"Add a regression test"}'
+```
+
+`GET /api/health` and `POST /api/auth/session` are public (the latter is constrained
+to same-origin JSON bootstrap requests). All other `/api` routes require
+`factory_session`. POST, PUT, PATCH, and DELETE additionally require the
+`X-Factory-CSRF` header to match
+the `factory_csrf` cookie. SSE and the terminal WebSocket authenticate with the same
+session cookie; browser clients cannot set custom headers on those transports.
+
+The session is valid for 12 hours or until the Factory process restarts, whichever
+comes first. Requests from unapproved `Host` or `Origin` values are rejected before
+routing. Non-browser command-line clients may omit `Origin` for normal API requests;
+browser session bootstrap itself requires a same-origin `Origin` header and
+`Content-Type: application/json`.
 
 ## Health
 
 | Method | Route | Purpose |
 | --- | --- | --- |
-| GET | `/api/health` | Service health (`{"status": "ok"}`) |
+| GET | `/api/health` | Public service health (`{"status": "ok"}`) |
+| POST | `/api/auth/session` | Bootstrap a same-origin browser session and return `{csrfToken}` |
 
 ## Workflows
 

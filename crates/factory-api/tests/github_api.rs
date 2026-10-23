@@ -21,6 +21,8 @@ use serde_json::json;
 use tempfile::TempDir;
 use tower::ServiceExt;
 
+mod common;
+
 fn gh_env_lock() -> MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     let mutex = LOCK.get_or_init(|| Mutex::new(()));
@@ -220,7 +222,7 @@ async fn body_text(response: axum::response::Response) -> String {
 async fn github_status_reports_the_connected_account_and_repository() {
     let _guard = gh_env_lock();
     let (_dir, state) = fixture();
-    let app = factory_api::router(state);
+    let app = common::authenticated_app(state).await;
 
     let response = app
         .oneshot(
@@ -243,7 +245,7 @@ async fn github_status_reports_the_connected_account_and_repository() {
 async fn from_issue_creates_a_workflow_with_a_persisted_untrusted_link() {
     let _guard = gh_env_lock();
     let (dir, state) = fixture();
-    let app = factory_api::router(state);
+    let app = common::authenticated_app(state).await;
 
     let response = app
         .clone()
@@ -276,7 +278,7 @@ async fn from_issue_creates_a_workflow_with_a_persisted_untrusted_link() {
 async fn from_issue_rejects_invalid_references() {
     let _guard = gh_env_lock();
     let (_dir, state) = fixture();
-    let app = factory_api::router(state);
+    let app = common::authenticated_app(state).await;
 
     let response = app
         .oneshot(
@@ -298,7 +300,7 @@ async fn from_issue_rejects_invalid_references() {
 async fn delivery_endpoints_report_ineligibility_and_unknown_runs() {
     let _guard = gh_env_lock();
     let (dir, state) = fixture();
-    let app = factory_api::router(state);
+    let app = common::authenticated_app(state).await;
     let run = factory_core::Factory::open(dir.path())
         .unwrap()
         .import_github_issue("#42", None, None)
@@ -377,7 +379,7 @@ async fn delivery_endpoints_report_ineligibility_and_unknown_runs() {
 async fn graph_exposes_compact_github_issue_and_pr_nodes() {
     let _guard = gh_env_lock();
     let (dir, state) = fixture();
-    let app = factory_api::router(state);
+    let app = common::authenticated_app(state).await;
     let factory = factory_core::Factory::open(dir.path()).unwrap();
     let run = factory.import_github_issue("#42", None, None).unwrap();
 

@@ -11,6 +11,8 @@ use serde_json::json;
 use tempfile::TempDir;
 use tower::ServiceExt;
 
+mod common;
+
 fn init_root(root: &Path) {
     factory_core::Factory::init(root).unwrap();
 }
@@ -59,7 +61,7 @@ async fn mcp_server_crud_is_semantic_and_never_resolves_secret_values() {
     let dir = TempDir::new().unwrap();
     init_root(dir.path());
     let state = make_state(dir.path());
-    let app = factory_api::router(state.clone());
+    let app = common::authenticated_app(state.clone()).await;
     let create = request(
         app.clone(),
         "POST",
@@ -182,7 +184,7 @@ async fn role_and_agent_inspectors_receive_effective_concrete_permissions() {
             ],
         )
         .unwrap();
-    let app = factory_api::router(state);
+    let app = common::authenticated_app(state).await;
 
     for uri in ["/api/roles/worker/tools", "/api/agents/codex/tools"] {
         let response = request(app.clone(), "GET", uri, None).await;

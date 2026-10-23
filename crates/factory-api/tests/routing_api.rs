@@ -14,6 +14,8 @@ use serde_json::json;
 use tempfile::TempDir;
 use tower::ServiceExt;
 
+mod common;
+
 fn init_root(root: &Path) {
     std::fs::write(root.join("README.md"), "test repository\n").unwrap();
     for args in [
@@ -130,7 +132,8 @@ fn performance_root() -> (TempDir, Arc<factory_api::ApiState>, i64, i64) {
 }
 
 async fn get(state: &Arc<factory_api::ApiState>, uri: &str) -> (StatusCode, serde_json::Value) {
-    let response = factory_api::router(state.clone())
+    let response = common::authenticated_app(state.clone())
+        .await
         .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
         .await
         .unwrap();
@@ -145,7 +148,8 @@ async fn put(
     uri: &str,
     body: serde_json::Value,
 ) -> (StatusCode, serde_json::Value) {
-    let response = factory_api::router(state.clone())
+    let response = common::authenticated_app(state.clone())
+        .await
         .oneshot(
             Request::builder()
                 .method("PUT")

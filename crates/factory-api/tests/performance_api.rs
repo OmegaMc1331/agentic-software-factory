@@ -14,6 +14,8 @@ use serde_json::json;
 use tempfile::TempDir;
 use tower::ServiceExt;
 
+mod common;
+
 fn init_root(root: &Path) {
     factory_core::Factory::init(root).unwrap();
 }
@@ -139,7 +141,7 @@ async fn performance_overview_lists_agents_with_sample_sizes() {
     init_root(dir.path());
     let state = make_state(dir.path());
     seed_history(&state);
-    let app = factory_api::router(state);
+    let app = common::authenticated_app(state).await;
 
     let response = app
         .oneshot(
@@ -179,7 +181,7 @@ async fn performance_agent_detail_returns_breakdowns_and_trend() {
     init_root(dir.path());
     let state = make_state(dir.path());
     seed_history(&state);
-    let app = factory_api::router(state);
+    let app = common::authenticated_app(state).await;
 
     let response = app
         .oneshot(
@@ -210,7 +212,7 @@ async fn performance_endpoints_reject_unknown_filters_and_agents() {
     let dir = TempDir::new().unwrap();
     init_root(dir.path());
     let state = make_state(dir.path());
-    let app = factory_api::router(state);
+    let app = common::authenticated_app(state).await;
 
     let response = app
         .clone()
@@ -254,7 +256,7 @@ async fn performance_endpoints_apply_window_and_role_filters() {
     init_root(dir.path());
     let state = make_state(dir.path());
     seed_history(&state);
-    let app = factory_api::router(state);
+    let app = common::authenticated_app(state).await;
 
     let response = app
         .clone()
@@ -292,7 +294,7 @@ async fn performance_endpoints_are_read_only() {
     init_root(dir.path());
     let state = make_state(dir.path());
     seed_history(&state);
-    let app = factory_api::router(state);
+    let app = common::authenticated_app(state).await;
 
     let response = app
         .oneshot(

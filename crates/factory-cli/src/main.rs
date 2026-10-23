@@ -39,6 +39,9 @@ enum Command {
         /// Do not open the dashboard in a browser
         #[arg(long)]
         no_browser: bool,
+        /// Exact development dashboard origin allowed to call the local API
+        #[arg(long, env = "FACTORY_DEV_ORIGIN", value_name = "ORIGIN")]
+        dev_origin: Option<String>,
     },
     /// Show the current factory status
     Status,
@@ -87,6 +90,9 @@ enum DevCommand {
         /// Port to bind (default: 4321)
         #[arg(long, default_value_t = 4321)]
         port: u16,
+        /// Exact development dashboard origin allowed to call the local API
+        #[arg(long, env = "FACTORY_DEV_ORIGIN", value_name = "ORIGIN")]
+        dev_origin: Option<String>,
     },
 }
 
@@ -134,8 +140,12 @@ impl Cli {
             Command::Init => {
                 init(&root)?;
             }
-            Command::Start { port, no_browser } => {
-                start(&root, *port, *no_browser)?;
+            Command::Start {
+                port,
+                no_browser,
+                dev_origin,
+            } => {
+                start(&root, *port, *no_browser, dev_origin.as_deref())?;
             }
             Command::Status => {
                 status(&root)?;
@@ -158,7 +168,9 @@ impl Cli {
                     }
                     WorktreeCommand::Status => worktree_status(&root)?,
                 },
-                DevCommand::Serve { port } => serve(&root, *port)?,
+                DevCommand::Serve { port, dev_origin } => {
+                    serve(&root, *port, dev_origin.as_deref())?
+                }
             },
         }
         Ok(())
@@ -440,12 +452,25 @@ fn worktree_status(root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn start(root: &Path, port: u16, no_browser: bool) -> Result<()> {
+fn api_state(root: &Path, dev_origin: Option<&str>) -> Result<factory_api::ApiState> {
+    let mut options = factory_api::ApiOptions::default();
+    if let Some(origin) = dev_origin {
+        options = options
+            .with_dev_origin(origin)
+            .map_err(anyhow::Error::msg)?;
+    }
+    Ok(factory_api::ApiState::new_with_options(
+        root.to_path_buf(),
+        options,
+    )?)
+}
+
+fn start(root: &Path, port: u16, no_browser: bool, dev_origin: Option<&str>) -> Result<()> {
     factory_root(root)?;
     let listener = factory_api::bind(port)
         .with_context(|| format!("cannot bind the Factory API to 127.0.0.1:{port}"))?;
     let address = listener.local_addr()?;
-    let state = factory_api::ApiState::new(root.to_path_buf())?;
+    let state = api_state(root, dev_origin)?;
     let url = format!("http://127.0.0.1:{}", address.port());
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -504,11 +529,11 @@ async fn wait_until_ready(address: std::net::SocketAddr) -> Result<()> {
     Ok(())
 }
 
-fn serve(root: &Path, port: u16) -> Result<()> {
+fn serve(root: &Path, port: u16, dev_origin: Option<&str>) -> Result<()> {
     factory_root(root)?;
     let listener = factory_api::bind(port)
         .with_context(|| format!("cannot bind the Factory API to 127.0.0.1:{port}"))?;
-    let state = factory_api::ApiState::new(root.to_path_buf())?;
+    let state = api_state(root, dev_origin)?;
     println!(
         "Factory API listening on http://127.0.0.1:{}",
         listener.local_addr()?.port()

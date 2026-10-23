@@ -7,6 +7,7 @@ use std::time::Duration;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path as UrlPath, State};
 use axum::http::StatusCode;
+use axum::middleware;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
@@ -25,6 +26,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::dashboard;
 use crate::graph_workspace::{GraphWorkspace, GraphWorkspaceError, GraphWorkspaceResponse};
+use crate::security::{self, ApiOptions, SecurityPolicy};
 use crate::types::{
     AgentSessionResponse, GraphEdge, GraphNode, GraphResponse, RetryResponse, RunDetail,
     RunSummary, StageStatus, TaskCounts,
@@ -34,10 +36,15 @@ pub struct ApiState {
     pub db: Mutex<FactoryDb>,
     pub root: PathBuf,
     pub runtime: Runtime,
+    pub(crate) security: SecurityPolicy,
 }
 
 impl ApiState {
     pub fn new(root: PathBuf) -> Result<Self, RuntimeError> {
+        Self::new_with_options(root, ApiOptions::default())
+    }
+
+    pub fn new_with_options(root: PathBuf, options: ApiOptions) -> Result<Self, RuntimeError> {
         let runtime = Runtime::new(&root)?;
         let db = FactoryDb::open(&root.join(".factory").join("db.sqlite3"))
             .map_err(factory_core::FactoryError::from)?;
@@ -45,6 +52,7 @@ impl ApiState {
             db: Mutex::new(db),
             root,
             runtime,
+            security: SecurityPolicy::new(options),
         })
     }
 }
@@ -170,8 +178,10 @@ impl From<factory_core::RecipeError> for ApiError {
 }
 
 pub fn router(state: SharedState) -> Router {
+    let security_state = state.clone();
     Router::new()
         .route("/api/health", get(health))
+        .route("/api/auth/session", post(security::issue_browser_session))
         .route("/api/runs", get(list_runs).post(create_run))
         .route("/api/runs/from-issue", post(create_run_from_issue))
         .route("/api/runs/:id", get(get_run))
@@ -250,6 +260,10 @@ pub fn router(state: SharedState) -> Router {
         .route("/api/mcp/metrics", get(get_mcp_metrics))
         .route("/api/*rest", get(api_not_found))
         .fallback_service(dashboard::router(&state.root))
+        .layer(middleware::from_fn_with_state(
+            security_state,
+            security::enforce_security,
+        ))
         .with_state(state)
 }
 

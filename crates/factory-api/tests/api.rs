@@ -15,6 +15,8 @@ use serde_json::json;
 use tempfile::TempDir;
 use tower::ServiceExt;
 
+mod common;
+
 fn init_root(root: &Path) {
     factory_core::Factory::init(root).unwrap();
 }
@@ -197,7 +199,7 @@ fn bind_returns_a_nonblocking_listener() {
     assert_eq!(result.unwrap_err(), std::io::ErrorKind::WouldBlock);
 }
 
-async fn live_get(address: SocketAddr, path: &'static str) -> String {
+async fn live_get(address: SocketAddr, path: &'static str, cookie: Option<String>) -> String {
     tokio::task::spawn_blocking(move || {
         let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(10)).unwrap();
         stream.set_nodelay(true).unwrap();
@@ -207,9 +209,10 @@ async fn live_get(address: SocketAddr, path: &'static str) -> String {
         stream
             .set_write_timeout(Some(Duration::from_secs(10)))
             .unwrap();
+        let cookie = cookie.map_or_else(String::new, |value| format!("Cookie: {value}\r\n"));
         write!(
             stream,
-            "GET {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n"
+            "GET {path} HTTP/1.1\r\nHost: {address}\r\nOrigin: http://{address}\r\n{cookie}Connection: close\r\n\r\n"
         )
         .unwrap();
         let mut response = Vec::new();
@@ -222,6 +225,59 @@ async fn live_get(address: SocketAddr, path: &'static str) -> String {
             response.extend_from_slice(&chunk[..read]);
         }
         String::from_utf8(response).unwrap()
+    })
+    .await
+    .unwrap()
+}
+
+async fn live_bootstrap(address: SocketAddr) -> String {
+    tokio::task::spawn_blocking(move || {
+        let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(10)).unwrap();
+        stream.set_nodelay(true).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        write!(
+            stream,
+            "POST /api/auth/session HTTP/1.1\r\nHost: {address}\r\nOrigin: http://{address}\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+        )
+        .unwrap();
+        let mut response = Vec::new();
+        let mut chunk = [0; 1024];
+        while !http_response_is_complete(&response) {
+            let read = stream.read(&mut chunk).unwrap();
+            if read == 0 {
+                break;
+            }
+            response.extend_from_slice(&chunk[..read]);
+        }
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        let mut session = None;
+        let mut csrf = None;
+        for line in response.lines() {
+            let Some((name, value)) = line.split_once(':') else {
+                continue;
+            };
+            if !name.eq_ignore_ascii_case("set-cookie") {
+                continue;
+            }
+            let value = value.trim();
+            if let Some(value) = value.strip_prefix("factory_session=") {
+                session = Some(value.split(';').next().unwrap().to_string());
+            }
+            if let Some(value) = value.strip_prefix("factory_csrf=") {
+                csrf = Some(value.split(';').next().unwrap().to_string());
+            }
+        }
+        format!(
+            "factory_session={}; factory_csrf={}",
+            session.expect("session cookie"),
+            csrf.expect("csrf cookie")
+        )
     })
     .await
     .unwrap()
@@ -249,18 +305,22 @@ async fn live_server_handles_sequential_api_requests() {
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(factory_api::serve(make_state(dir.path()), listener));
 
-    let health = live_get(address, "/api/health").await;
+    let health = live_get(address, "/api/health", None).await;
     assert!(health.starts_with("HTTP/1.1 200 OK"));
     assert!(health.contains(r#"{"status":"ok"}"#));
 
-    let runs = live_get(address, "/api/runs").await;
+    let unauthorized = live_get(address, "/api/runs", None).await;
+    assert!(unauthorized.starts_with("HTTP/1.1 401 Unauthorized"));
+
+    let cookie = live_bootstrap(address).await;
+    let runs = live_get(address, "/api/runs", Some(cookie)).await;
     assert!(runs.starts_with("HTTP/1.1 200 OK"));
     let runs_body = runs.split_once("\r\n\r\n").unwrap().1;
     assert!(serde_json::from_str::<serde_json::Value>(runs_body)
         .unwrap()
         .is_array());
 
-    let health_again = live_get(address, "/api/health").await;
+    let health_again = live_get(address, "/api/health", None).await;
     assert!(health_again.starts_with("HTTP/1.1 200 OK"));
     assert!(health_again.contains(r#"{"status":"ok"}"#));
 
@@ -273,7 +333,7 @@ async fn config_round_trips_through_put_and_get() {
     let dir = TempDir::new().unwrap();
     init_root(dir.path());
     let state = make_state(dir.path());
-    let app = factory_api::router(state.clone());
+    let app = common::authenticated_app(state.clone()).await;
 
     let config = json!({
         "agents": {
@@ -325,7 +385,7 @@ async fn config_round_trips_through_put_and_get() {
 async fn editing_agent_config_preserves_structured_fields_and_rejects_invalid_writes_atomically() {
     let dir = TempDir::new().unwrap();
     init_root(dir.path());
-    let app = factory_api::router(make_state(dir.path()));
+    let app = common::authenticated_app(make_state(dir.path())).await;
 
     let initial = json!({
         "agents": {
@@ -449,7 +509,7 @@ async fn editing_agent_config_preserves_structured_fields_and_rejects_invalid_wr
 async fn role_assignment_can_be_reassigned_to_another_configured_agent() {
     let dir = TempDir::new().unwrap();
     init_root(dir.path());
-    let app = factory_api::router(make_state(dir.path()));
+    let app = common::authenticated_app(make_state(dir.path())).await;
 
     let config = json!({
         "agents": {
@@ -509,7 +569,7 @@ async fn role_assignment_can_be_reassigned_to_another_configured_agent() {
 async fn rejects_invalid_configuration_writes() {
     let dir = TempDir::new().unwrap();
     init_root(dir.path());
-    let app = factory_api::router(make_state(dir.path()));
+    let app = common::authenticated_app(make_state(dir.path())).await;
 
     let config = json!({
         "agents": {},
@@ -540,7 +600,7 @@ async fn rejects_invalid_configuration_writes() {
 async fn lists_agents_with_availability() {
     let dir = TempDir::new().unwrap();
     init_root(dir.path());
-    let app = factory_api::router(make_state(dir.path()));
+    let app = common::authenticated_app(make_state(dir.path())).await;
 
     let response = app
         .oneshot(
@@ -573,7 +633,7 @@ async fn lists_agents_with_availability() {
 async fn serves_the_embedded_dashboard_and_spa_fallback() {
     let dir = TempDir::new().unwrap();
     init_root(dir.path());
-    let app = factory_api::router(make_state(dir.path()));
+    let app = common::authenticated_app(make_state(dir.path())).await;
 
     let response = app
         .clone()
@@ -618,7 +678,7 @@ async fn serves_the_dashboard_index_from_dist() {
     std::fs::write(dist.join("index.html"), "<h1>dashboard works</h1>").unwrap();
     std::fs::write(dist.join("asset.js"), "// nothing").unwrap();
 
-    let app = factory_api::router(make_state(dir.path()));
+    let app = common::authenticated_app(make_state(dir.path())).await;
     let response = app
         .clone()
         .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
@@ -655,7 +715,7 @@ async fn serves_the_dashboard_index_from_dist() {
 async fn graph_workspace_round_trips_and_rejects_unknown_endpoints() {
     let dir = TempDir::new().unwrap();
     init_root(dir.path());
-    let app = factory_api::router(make_state(dir.path()));
+    let app = common::authenticated_app(make_state(dir.path())).await;
 
     let response = app
         .clone()
@@ -750,7 +810,7 @@ async fn malformed_graph_workspace_returns_a_safe_empty_layout() {
     let dir = TempDir::new().unwrap();
     init_root(dir.path());
     std::fs::write(dir.path().join(".factory").join("graph.json"), "{not json").unwrap();
-    let app = factory_api::router(make_state(dir.path()));
+    let app = common::authenticated_app(make_state(dir.path())).await;
 
     let response = app
         .oneshot(
@@ -798,7 +858,7 @@ async fn agent_session_endpoints_return_persisted_output_and_close_completed_str
         })
         .unwrap()
     };
-    let app = factory_api::router(state);
+    let app = common::authenticated_app(state).await;
 
     let response = app
         .clone()
@@ -891,7 +951,7 @@ FACTORY_API_PTY_CHILD = "1"
     )
     .unwrap();
     let state = make_state(dir.path());
-    let app = factory_api::router(state.clone());
+    let app = common::authenticated_app(state.clone()).await;
 
     let response = app
         .clone()
@@ -918,7 +978,7 @@ FACTORY_API_PTY_CHILD = "1"
 async fn configured_idle_agent_has_an_empty_session_history() {
     let dir = TempDir::new().unwrap();
     init_root(dir.path());
-    let app = factory_api::router(make_state(dir.path()));
+    let app = common::authenticated_app(make_state(dir.path())).await;
 
     let response = app
         .clone()
@@ -951,7 +1011,7 @@ async fn workflow_api_plans_and_executes_through_factory_core() {
     init_root(dir.path());
     configure_test_agents(dir.path(), false);
     init_git(dir.path());
-    let app = factory_api::router(make_state(dir.path()));
+    let app = common::authenticated_app(make_state(dir.path())).await;
 
     let response = app
         .clone()
@@ -1076,7 +1136,7 @@ async fn role_aware_artifacts_and_stages_are_exposed() {
     }
     config.write_atomic(dir.path()).unwrap();
 
-    let app = factory_api::router(make_state(dir.path()));
+    let app = common::authenticated_app(make_state(dir.path())).await;
     let response = app
         .clone()
         .oneshot(
@@ -1177,7 +1237,7 @@ async fn workflow_cancel_stops_a_known_planning_session() {
     init_root(dir.path());
     configure_test_agents(dir.path(), true);
     let state = make_state(dir.path());
-    let app = factory_api::router(state.clone());
+    let app = common::authenticated_app(state.clone()).await;
 
     let response = app
         .clone()
@@ -1249,7 +1309,7 @@ async fn workflow_cancel_stops_a_known_planning_session() {
 async fn role_policy_endpoint_sets_and_clears_presets() {
     let dir = TempDir::new().unwrap();
     init_root(dir.path());
-    let app = factory_api::router(make_state(dir.path()));
+    let app = common::authenticated_app(make_state(dir.path())).await;
 
     let response = app
         .clone()
@@ -1314,7 +1374,7 @@ async fn role_policy_endpoint_sets_and_clears_presets() {
 async fn custom_roles_can_select_a_policy_preset_at_creation() {
     let dir = TempDir::new().unwrap();
     init_root(dir.path());
-    let app = factory_api::router(make_state(dir.path()));
+    let app = common::authenticated_app(make_state(dir.path())).await;
 
     let response = app
         .clone()
@@ -1367,7 +1427,7 @@ async fn custom_roles_can_select_a_policy_preset_at_creation() {
 async fn graph_exposes_effective_permissions_for_agents_and_roles() {
     let dir = TempDir::new().unwrap();
     init_root(dir.path());
-    let app = factory_api::router(make_state(dir.path()));
+    let app = common::authenticated_app(make_state(dir.path())).await;
 
     let response = app
         .oneshot(

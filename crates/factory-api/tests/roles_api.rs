@@ -13,6 +13,8 @@ use serde_json::json;
 use tempfile::TempDir;
 use tower::ServiceExt;
 
+mod common;
+
 async fn body_text(response: axum::http::Response<Body>) -> String {
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     String::from_utf8(bytes.to_vec()).unwrap()
@@ -116,7 +118,7 @@ async fn roles_endpoint_lists_core_and_custom_roles() {
     let dir = TempDir::new().unwrap();
     init_root(dir.path());
     configure_two_agents(dir.path());
-    let app = factory_api::router(make_state(dir.path()));
+    let app = common::authenticated_app(make_state(dir.path())).await;
 
     let response = request(app, "GET", "/api/roles", None).await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -151,7 +153,7 @@ async fn custom_role_lifecycle_create_assign_edit_delete() {
     let dir = TempDir::new().unwrap();
     init_root(dir.path());
     configure_two_agents(dir.path());
-    let app = factory_api::router(make_state(dir.path()));
+    let app = common::authenticated_app(make_state(dir.path())).await;
 
     let response = request(
         app.clone(),
@@ -256,7 +258,7 @@ async fn core_roles_are_protected_from_redefinition_and_deletion() {
     let dir = TempDir::new().unwrap();
     init_root(dir.path());
     configure_two_agents(dir.path());
-    let app = factory_api::router(make_state(dir.path()));
+    let app = common::authenticated_app(make_state(dir.path())).await;
 
     let response = request(
         app.clone(),
@@ -301,7 +303,7 @@ async fn custom_role_used_by_an_active_workflow_cannot_be_deleted() {
         .unwrap();
         run
     };
-    let app = factory_api::router(state);
+    let app = common::authenticated_app(state).await;
 
     let response = request(app, "DELETE", "/api/roles/database_engineer", None).await;
     assert_eq!(response.status(), StatusCode::CONFLICT);
@@ -327,7 +329,7 @@ async fn custom_role_referenced_by_a_persisted_recipe_cannot_be_deleted() {
     init_root(dir.path());
     configure_two_agents(dir.path());
     add_custom_role(dir.path(), "database_engineer");
-    let app = factory_api::router(make_state(dir.path()));
+    let app = common::authenticated_app(make_state(dir.path())).await;
 
     let response = request(
         app.clone(),
@@ -359,7 +361,7 @@ async fn assignment_validation_rejects_unknown_and_duplicate_agents() {
     let dir = TempDir::new().unwrap();
     init_root(dir.path());
     configure_two_agents(dir.path());
-    let app = factory_api::router(make_state(dir.path()));
+    let app = common::authenticated_app(make_state(dir.path())).await;
 
     let response = request(
         app.clone(),
@@ -410,7 +412,7 @@ async fn graph_shows_one_role_node_with_one_edge_per_assignment() {
         preferred: false,
     });
     config.write_atomic(dir.path()).unwrap();
-    let app = factory_api::router(make_state(dir.path()));
+    let app = common::authenticated_app(make_state(dir.path())).await;
 
     let response = request(app, "GET", "/api/graph", None).await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -546,7 +548,7 @@ async fn run_team_can_be_updated_before_start() {
     init_root(dir.path());
     configure_test_agents(dir.path());
     init_git(dir.path());
-    let app = factory_api::router(make_state(dir.path()));
+    let app = common::authenticated_app(make_state(dir.path())).await;
 
     let response = request(
         app.clone(),

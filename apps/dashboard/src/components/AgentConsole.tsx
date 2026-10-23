@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   agentSessionStreamUrl,
+  refreshFactorySession,
   fetchAgentPerformance,
   fetchAgentSessions,
   startInteractiveAgentSession,
@@ -170,19 +171,35 @@ export function AgentConsole({
       !["running", "active"].includes(sessionStatus)
     )
       return;
-    const source = new EventSource(agentSessionStreamUrl(sessionId));
-    source.addEventListener("session", (event) => {
-      const next = JSON.parse((event as MessageEvent).data) as AgentSession;
-      setSessions((current) =>
-        current.map((candidate) => (candidate.id === next.id ? next : candidate))
-      );
-      if (!["running", "active"].includes(next.status)) source.close();
-    });
-    source.onerror = () => {
-      setError("The agent session stream disconnected.");
-      source.close();
+    let disposed = false;
+    let source: EventSource | null = null;
+    void refreshFactorySession()
+      .then(() => {
+        if (disposed) return;
+        source = new EventSource(agentSessionStreamUrl(sessionId));
+        source.addEventListener("session", (event) => {
+          const next = JSON.parse((event as MessageEvent).data) as AgentSession;
+          setSessions((current) =>
+            current.map((candidate) => (candidate.id === next.id ? next : candidate))
+          );
+          if (!["running", "active"].includes(next.status)) source?.close();
+        });
+        source.onerror = () => {
+          setError("The agent session stream disconnected.");
+          source?.close();
+        };
+      })
+      .catch((reason: unknown) => {
+        if (!disposed) {
+          setError(
+            reason instanceof Error ? reason.message : "The agent session stream could not connect."
+          );
+        }
+      });
+    return () => {
+      disposed = true;
+      source?.close();
     };
-    return () => source.close();
   }, [sessionId, sessionInteractive, sessionStatus]);
 
   useEffect(() => {
@@ -374,7 +391,7 @@ export function AgentConsole({
                 disabled={!meta.available || !meta.interactiveAvailable || startingInteractive}
                 onClick={startInteractive}
               >
-                {startingInteractive ? "Starting…" : "Start session"}
+                {startingInteractive ? "Startingâ€¦" : "Start session"}
               </button>
               {!meta.interactiveAvailable && (
                 <small>This agent has no interactive invocation configured.</small>
@@ -448,7 +465,7 @@ export function AgentConsole({
                       disabled={startingInteractive}
                       onClick={startInteractive}
                     >
-                      {startingInteractive ? "Starting…" : "Start interactive session"}
+                      {startingInteractive ? "Startingâ€¦" : "Start interactive session"}
                     </button>
                   )}
                 </>

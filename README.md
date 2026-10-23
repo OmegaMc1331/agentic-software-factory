@@ -224,8 +224,9 @@ Planner produces the DAG
 
 - Factory is **local-first**: state lives in `.factory/`, and nothing is sent to
   external services.
-- The API **binds to `127.0.0.1`** and has no authentication — do not proxy or
-  expose it.
+- The API **binds to `127.0.0.1`** and requires a short-lived same-origin browser
+  session with Host/Origin checks and CSRF protection. It is still a local trust
+  boundary: do not proxy or expose it.
 - Task worktrees are **Git isolation, not OS sandboxing**.
 - External coding agents **retain the OS permissions of the user** who started
   Factory.

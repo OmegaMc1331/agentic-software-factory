@@ -245,7 +245,10 @@ it does not automatically terminate the Factory process or unrelated workflow wo
 
 ## Local API and dashboard
 
-The local API exposes semantic management and inspection operations:
+The local API requires its short-lived browser session (see
+[Security](security.md#local-api-authentication)); the dashboard handles bootstrap,
+cookies, and CSRF automatically. It exposes semantic management and inspection
+operations:
 
 | Method | Route | Purpose |
 | --- | --- | --- |

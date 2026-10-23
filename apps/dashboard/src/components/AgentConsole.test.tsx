@@ -7,6 +7,7 @@ import { AgentConsole } from "./AgentConsole";
 vi.mock("../api", () => ({
   agentSessionStreamUrl: (id: number) => `/api/sessions/${id}/stream`,
   agentTerminalSocketUrl: (id: number) => `/api/sessions/${id}/terminal`,
+  refreshFactorySession: vi.fn().mockResolvedValue("csrf-token"),
   fetchAgentSessions: vi.fn(),
   fetchAgentPerformance: vi.fn(),
   startInteractiveAgentSession: vi.fn(),

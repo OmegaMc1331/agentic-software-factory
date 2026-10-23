@@ -19,6 +19,8 @@ use serde_json::json;
 use tempfile::TempDir;
 use tower::ServiceExt;
 
+mod common;
+
 fn gh_env_lock() -> MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     let mutex = LOCK.get_or_init(|| Mutex::new(()));
@@ -236,7 +238,7 @@ async fn body_text(response: axum::response::Response) -> String {
 #[tokio::test]
 async fn lists_built_in_and_custom_recipes() {
     let (dir, state) = fixture();
-    let app = factory_api::router(state);
+    let app = common::authenticated_app(state).await;
 
     let response = app
         .clone()
@@ -268,7 +270,7 @@ async fn lists_built_in_and_custom_recipes() {
 #[tokio::test]
 async fn custom_recipe_crud_round_trips() {
     let (_dir, state) = fixture();
-    let app = factory_api::router(state);
+    let app = common::authenticated_app(state).await;
 
     let create = json!({
         "name": "Backend Feature",
@@ -392,7 +394,7 @@ async fn custom_recipe_crud_round_trips() {
 #[tokio::test]
 async fn invalid_recipe_payloads_are_rejected_atomically() {
     let (_dir, state) = fixture();
-    let app = factory_api::router(state);
+    let app = common::authenticated_app(state).await;
 
     // Unknown role.
     let response = app
@@ -455,7 +457,7 @@ async fn invalid_recipe_payloads_are_rejected_atomically() {
 #[tokio::test]
 async fn run_creation_accepts_a_recipe_id_and_snapshots_it() {
     let (_dir, state) = fixture();
-    let app = factory_api::router(state);
+    let app = common::authenticated_app(state).await;
 
     let response = app
         .clone()
@@ -505,7 +507,7 @@ async fn run_creation_accepts_a_recipe_id_and_snapshots_it() {
 #[tokio::test]
 async fn run_creation_accepts_an_inline_recipe_definition() {
     let (_dir, state) = fixture();
-    let app = factory_api::router(state);
+    let app = common::authenticated_app(state).await;
 
     let response = app
         .oneshot(
@@ -537,7 +539,7 @@ async fn run_creation_accepts_an_inline_recipe_definition() {
 #[tokio::test]
 async fn inline_recipe_requires_available_roles() {
     let (_dir, state) = fixture();
-    let app = factory_api::router(state);
+    let app = common::authenticated_app(state).await;
 
     let response = app
         .oneshot(
@@ -570,7 +572,7 @@ async fn github_issue_workflows_accept_a_recipe() {
     let _guard = gh_env_lock();
     let (dir, state) = fixture();
     let _gh = install_fake_gh(dir.path());
-    let app = factory_api::router(state);
+    let app = common::authenticated_app(state).await;
 
     let response = app
         .clone()
@@ -610,7 +612,7 @@ async fn github_issue_workflows_accept_a_recipe() {
 #[tokio::test]
 async fn save_as_recipe_derives_configuration_without_history() {
     let (_dir, state) = fixture();
-    let app = factory_api::router(state);
+    let app = common::authenticated_app(state).await;
 
     // Create and plan a workflow (background planning writes one task).
     let response = app
@@ -663,7 +665,7 @@ async fn save_as_recipe_derives_configuration_without_history() {
 #[tokio::test]
 async fn existing_runs_without_recipes_expose_none() {
     let (_guard, state) = fixture();
-    let app = factory_api::router(state);
+    let app = common::authenticated_app(state).await;
 
     let response = app
         .oneshot(

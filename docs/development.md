@@ -36,23 +36,32 @@ tests in their owning crates. Never replace these fixtures with a live provider 
 
 ## Local dashboard development
 
-Build the dashboard once, then run the API and Vite in separate terminals:
+Build the dashboard once, then run the API and Vite in separate terminals. Vite
+serves `http://localhost:5173`, so allow that exact origin explicitly:
 
 ```bash
 cd apps/dashboard
 npm ci
 npm run build
 cd ../..
-cargo run -p factory-cli -- dev serve
+cargo run -p factory-cli -- dev serve --dev-origin http://localhost:5173
 ```
+
+Alternatively set `FACTORY_DEV_ORIGIN=http://localhost:5173`. The same flag exists on
+`factory start` for development builds.
 
 ```bash
 cd apps/dashboard
 npm run dev
 ```
 
-Vite serves `http://localhost:5173` and proxies `/api` to the Factory process on port
-4321. The dashboard's pure layout modules (`src/layout.ts` and
+Vite proxies `/api` to the Factory process on port 4321 with `changeOrigin` and
+WebSocket forwarding. The backend validates the exact development `Origin`; it never
+trusts a wildcard or an arbitrary localhost port. The dashboard bootstraps its
+same-origin session automatically through `/api/auth/session`, retries once after a
+`401`, and sends `X-Factory-CSRF` on mutations.
+
+The dashboard's pure layout modules (`src/layout.ts` and
 `src/networkLayout.ts`) stay independent of React.
 
 ## Workflow runtime
@@ -100,6 +109,7 @@ Focused commands:
 cargo test -p factory-core --test workflow_runtime
 cargo test -p factory-db
 cargo test -p factory-api --test api workflow_
+cargo test -p factory-api --test security
 cargo test -p factory-mcp
 cargo test -p factory-cli --test mcp_cli
 cargo test -p factory-api --test mcp_api

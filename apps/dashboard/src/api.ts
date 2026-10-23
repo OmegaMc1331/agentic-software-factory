@@ -31,9 +31,88 @@ import type {
 
 const API_BASE = "/api";
 const REQUEST_TIMEOUT_MS = 5000;
+const CSRF_HEADER = "X-Factory-CSRF";
+
+let csrfToken: string | null = null;
+let sessionRequest: Promise<string> | null = null;
 
 function timeoutError(): Error {
   return new Error("Factory API did not respond. Check that `factory start` is still running.");
+}
+
+function connectionError(): Error {
+  return new Error("Could not connect to the Factory API. Check that `factory start` is running.");
+}
+
+async function establishSession(): Promise<string> {
+  if (sessionRequest) return sessionRequest;
+
+  const request = (async () => {
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    try {
+      let response: Response;
+      try {
+        response = await fetch(`${API_BASE}/auth/session`, {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { "Content-Type": "application/json" },
+          body: "{}",
+          signal: controller.signal,
+        });
+      } catch {
+        if (controller.signal.aborted) throw timeoutError();
+        throw connectionError();
+      }
+
+      if (!response.ok) {
+        throw new Error(
+          `Factory API session could not be established (HTTP ${response.status}). Restart \`factory start\` and reload the dashboard.`
+        );
+      }
+
+      let payload: { csrfToken?: unknown };
+      try {
+        payload = (await response.json()) as { csrfToken?: unknown };
+      } catch {
+        throw new Error("Factory API returned an invalid session response.");
+      }
+      if (typeof payload.csrfToken !== "string" || payload.csrfToken.length === 0) {
+        throw new Error("Factory API returned an invalid session response.");
+      }
+      csrfToken = payload.csrfToken;
+      return csrfToken;
+    } finally {
+      window.clearTimeout(timeout);
+    }
+  })();
+
+  sessionRequest = request;
+  void request
+    .catch(() => {})
+    .finally(() => {
+      if (sessionRequest === request) sessionRequest = null;
+    });
+  return request;
+}
+
+/**
+ * Establishes the same-origin browser session. API mutations call this
+ * automatically; a cached token avoids a redundant bootstrap.
+ */
+export async function ensureFactorySession(): Promise<string> {
+  if (csrfToken) return csrfToken;
+  return establishSession();
+}
+
+/**
+ * Rotates the browser session before a long-lived transport connects. This
+ * recovers cleanly from an expired session or a Factory restart even when a
+ * CSRF token is still cached in memory.
+ */
+export async function refreshFactorySession(): Promise<string> {
+  csrfToken = null;
+  return establishSession();
 }
 
 async function fail(response: Response): Promise<never> {
@@ -53,38 +132,58 @@ async function fail(response: Response): Promise<never> {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const controller = new AbortController();
-  const timeout = window.setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const method = (init?.method ?? "GET").toUpperCase();
+  const mutating = !["GET", "HEAD", "OPTIONS"].includes(method);
 
-  try {
-    let response: Response;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const headers = new Headers(init?.headers);
+    if (mutating) headers.set(CSRF_HEADER, await ensureFactorySession());
+
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
     try {
-      response = await fetch(`${API_BASE}${path}`, { ...init, signal: controller.signal });
-    } catch {
-      if (controller.signal.aborted) throw timeoutError();
-      throw new Error(
-        "Could not connect to the Factory API. Check that `factory start` is running."
-      );
-    }
-
-    if (!response.ok) {
+      let response: Response;
       try {
-        return await fail(response);
-      } catch (error) {
+        response = await fetch(`${API_BASE}${path}`, {
+          ...init,
+          method,
+          headers,
+          credentials: "same-origin",
+          signal: controller.signal,
+        });
+      } catch {
         if (controller.signal.aborted) throw timeoutError();
-        throw error;
+        throw connectionError();
       }
+
+      if ((response.status === 401 || response.status === 403) && attempt === 0) {
+        void response.body?.cancel().catch(() => {});
+        csrfToken = null;
+        await establishSession();
+        continue;
+      }
+
+      if (!response.ok) {
+        try {
+          return await fail(response);
+        } catch (error) {
+          if (controller.signal.aborted) throw timeoutError();
+          throw error;
+        }
+      }
+      if (response.status === 204) return undefined as T;
+      try {
+        return (await response.json()) as T;
+      } catch {
+        if (controller.signal.aborted) throw timeoutError();
+        throw new Error("Factory API returned an invalid response.");
+      }
+    } finally {
+      window.clearTimeout(timeout);
     }
-    if (response.status === 204) return undefined as T;
-    try {
-      return (await response.json()) as T;
-    } catch {
-      if (controller.signal.aborted) throw timeoutError();
-      throw new Error("Factory API returned an invalid response.");
-    }
-  } finally {
-    window.clearTimeout(timeout);
   }
+
+  throw new Error("Factory API session could not be established.");
 }
 
 async function get<T>(path: string): Promise<T> {
