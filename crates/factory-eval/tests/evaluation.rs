@@ -234,6 +234,7 @@ impl HistoryBuilder {
                     stdout: None,
                     stderr: None,
                     policy_audit: None,
+                    output_meta: None,
                 })
                 .unwrap();
         };

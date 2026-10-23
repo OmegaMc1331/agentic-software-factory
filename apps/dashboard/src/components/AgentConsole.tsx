@@ -89,6 +89,12 @@ function duration(session: AgentSession): string {
   return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
 }
 
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KiB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
+}
+
 function sessionState(session: AgentSession | null): string {
   if (!session) return "Available";
   if (["running", "active"].includes(session.status)) return "Running";
@@ -426,6 +432,14 @@ export function AgentConsole({
                 </>
               ) : (
                 <>
+                  {(session.outputMeta?.stdoutTruncated || session.outputMeta?.stderrTruncated) && (
+                    <p className="agent-output-truncated" role="status">
+                      Output was truncated at {formatBytes(session.outputMeta.limitBytes)} per
+                      stream ({formatBytes(session.outputMeta.stdoutBytes)} stdout,{" "}
+                      {formatBytes(session.outputMeta.stderrBytes)} stderr). The beginning and end
+                      are retained; middle bytes were not recorded.
+                    </p>
+                  )}
                   <div
                     className="agent-terminal"
                     ref={outputRef}

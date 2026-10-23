@@ -142,7 +142,10 @@ configuration only — never tasks or history. See [Recipes](recipes.md).
 
 Interactive sessions launch only the selected configured agent in a Factory-owned
 PTY; automated Planner/Worker/Reviewer sessions are non-interactive and stream
-through SSE. Both transports close at a terminal state. See [Security](security.md).
+through SSE. Both transports close at a terminal state. Automated session records may
+include `outputMeta`, which reports the per-stream byte limit, total emitted and dropped
+bytes, and truncation flags; `stdout`/`stderr` retain the bounded head and tail. See
+[Security](security.md).
 
 ## Graph and configuration
 

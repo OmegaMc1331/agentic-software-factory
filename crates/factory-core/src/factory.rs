@@ -71,6 +71,15 @@ pub enum FactoryError {
     Plan(#[from] PlanError),
     #[error("agent process failed: {0}")]
     AgentProcess(#[from] AgentError),
+    #[error(
+        "{role} output exceeded the {limit_bytes}-byte capture limit (stdout {stdout_bytes} bytes, stderr {stderr_bytes} bytes); structured output was not parsed"
+    )]
+    AgentOutputLimit {
+        role: String,
+        limit_bytes: u64,
+        stdout_bytes: u64,
+        stderr_bytes: u64,
+    },
     #[error("agent resolution: {0}")]
     Agent(#[from] AgentResolutionError),
     #[error("configuration error: {0}")]
@@ -591,6 +600,11 @@ impl Factory {
                     invocation.result.stderr,
                 ))
                 .into());
+            }
+            if let Some(error) = agent_output_limit_error("planner", &invocation.result) {
+                self.db
+                    .set_agent_session_status(invocation.session_id, "rejected")?;
+                return Err(error);
             }
             let parsed = parse_plan(&invocation.result.stdout).and_then(|plan| {
                 let plan = normalize_plan(plan);
@@ -1665,6 +1679,23 @@ impl Factory {
                 &worker_instruction,
                 cancel,
             );
+            let worker_run = match worker_run {
+                Ok(run) => {
+                    if let Some(error) = agent_output_limit_error(&role, &run.result) {
+                        return Err(self.record_output_limit_failure(
+                            run.session_id,
+                            attempt.id,
+                            task_id,
+                            error,
+                            run.result.exit_code,
+                            None,
+                            None,
+                        )?);
+                    }
+                    Ok(run)
+                }
+                Err(error) => Err(error),
+            };
             let mut evidence = collect_evidence(
                 &repo,
                 &worktree,
@@ -1852,6 +1883,17 @@ impl Factory {
                     return Ok(false);
                 }
                 Ok(run) if run.result.exit_code == Some(0) => {
+                    if let Some(error) = agent_output_limit_error("reviewer", &run.result) {
+                        return Err(self.record_output_limit_failure(
+                            run.session_id,
+                            attempt.id,
+                            task_id,
+                            error,
+                            run.result.exit_code,
+                            Some(&evidence),
+                            evidence.commit_sha.as_deref(),
+                        )?);
+                    }
                     match parse_review(&run.result.stdout) {
                         Ok(review) => review,
                         Err(reason) => {
@@ -2043,6 +2085,23 @@ impl Factory {
                 &instruction,
                 cancel,
             );
+            let agent_run = match agent_run {
+                Ok(run) => {
+                    if let Some(error) = agent_output_limit_error(&role, &run.result) {
+                        return Err(self.record_output_limit_failure(
+                            run.session_id,
+                            attempt.id,
+                            task_id,
+                            error,
+                            run.result.exit_code,
+                            None,
+                            None,
+                        )?);
+                    }
+                    Ok(run)
+                }
+                Err(error) => Err(error),
+            };
             let evidence = collect_evidence(
                 &repo,
                 &worktree,
@@ -2273,6 +2332,23 @@ impl Factory {
                 &instruction,
                 cancel,
             );
+            let review_run = match review_run {
+                Ok(run) => {
+                    if let Some(error) = agent_output_limit_error(&role, &run.result) {
+                        return Err(self.record_output_limit_failure(
+                            run.session_id,
+                            attempt.id,
+                            task_id,
+                            error,
+                            run.result.exit_code,
+                            None,
+                            None,
+                        )?);
+                    }
+                    Ok(run)
+                }
+                Err(error) => Err(error),
+            };
             let evidence = collect_evidence(
                 &repo,
                 &worktree,
@@ -2588,6 +2664,31 @@ impl Factory {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn record_output_limit_failure(
+        &self,
+        session_id: i64,
+        attempt_id: i64,
+        task_id: i64,
+        error: FactoryError,
+        exit_code: Option<i32>,
+        evidence: Option<&TaskEvidence>,
+        commit_sha: Option<&str>,
+    ) -> Result<FactoryError, FactoryError> {
+        self.db.set_agent_session_status(session_id, "rejected")?;
+        self.db.finish_task_attempt(
+            attempt_id,
+            AttemptStatus::Failed,
+            exit_code,
+            commit_sha,
+            Some(&error.to_string()),
+            evidence,
+            None,
+        )?;
+        self.mark_task(task_id, TaskState::Failed)?;
+        Ok(error)
+    }
+
     fn invoke_with_agent(
         &self,
         agent: CommandAgent,
@@ -2648,6 +2749,7 @@ impl Factory {
             stdout: Some(String::new()),
             stderr: Some(String::new()),
             policy_audit: Some(policy_audit),
+            output_meta: None,
         })?;
         let registry = ToolRegistry::new(&self.root, self.agents.config().mcp.clone());
         let grant = registry.create_grant(
@@ -2726,6 +2828,12 @@ impl Factory {
                     result.exit_code,
                     result.duration.as_millis() as u64,
                 )?;
+                let stdout = secrets.redact(&result.stdout);
+                let stderr = secrets.redact(&result.stderr);
+                self.db
+                    .set_agent_session_output(session.id, Some(&stdout), Some(&stderr))?;
+                self.db
+                    .set_agent_session_output_metadata(session.id, Some(&result.output_metadata))?;
                 if let Some(error) = output_error {
                     return Err(error.into());
                 }
@@ -3658,6 +3766,18 @@ fn transitive_ancestors(task: &Task, run_tasks: &[Task]) -> std::collections::Ha
 }
 
 // --- Evidence helpers ------------------------------------------------------
+
+fn agent_output_limit_error(role: &str, result: &AgentResult) -> Option<FactoryError> {
+    if !result.output_metadata.stdout_truncated {
+        return None;
+    }
+    Some(FactoryError::AgentOutputLimit {
+        role: role.to_string(),
+        limit_bytes: result.output_metadata.limit_bytes,
+        stdout_bytes: result.output_metadata.stdout_bytes,
+        stderr_bytes: result.output_metadata.stderr_bytes,
+    })
+}
 
 fn collect_evidence(
     repo: &Repo,

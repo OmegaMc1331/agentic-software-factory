@@ -11,6 +11,8 @@ use tempfile::TempDir;
 
 const MODE_ENV: &str = "FACTORY_AGENT_TEST_IO_MODE";
 const BULK_OUTPUT: usize = 512 * 1024;
+const STRESS_OUTPUT: usize = 4 * 1024 * 1024;
+const OUTPUT_LIMIT: usize = 64 * 1024;
 const LARGE_MISSION: usize = 2 * 1024 * 1024;
 const WATCHDOG: Duration = Duration::from_secs(20);
 const CANCEL_BUDGET: Duration = Duration::from_secs(10);
@@ -163,6 +165,43 @@ fn fake_child() {
                 stderr.write_all(&chunk).unwrap();
             }
         }
+        "truncate_stdout" => {
+            let mut stdout = std::io::stdout().lock();
+            stdout.write_all(b"STDOUT_HEAD_MARKER\n").unwrap();
+            write_bulk(&mut stdout, b'o', STRESS_OUTPUT).unwrap();
+            stdout.write_all(b"\nSTDOUT_TAIL_MARKER\n").unwrap();
+            stdout.flush().unwrap();
+            drop(stdout);
+            read_stdin_and_report();
+        }
+        "truncate_stderr" => {
+            let mut stderr = std::io::stderr().lock();
+            stderr.write_all(b"STDERR_HEAD_MARKER\n").unwrap();
+            write_bulk(&mut stderr, b'e', STRESS_OUTPUT).unwrap();
+            stderr.write_all(b"\nSTDERR_TAIL_MARKER\n").unwrap();
+            stderr.flush().unwrap();
+            drop(stderr);
+            read_stdin_and_report();
+        }
+        "truncate_both" => {
+            let stdout_writer = std::thread::spawn(|| {
+                let mut stdout = std::io::stdout().lock();
+                stdout.write_all(b"STDOUT_HEAD_MARKER\n").unwrap();
+                write_bulk(&mut stdout, b'o', STRESS_OUTPUT).unwrap();
+                stdout.write_all(b"\nSTDOUT_TAIL_MARKER\n").unwrap();
+                stdout.flush().unwrap();
+            });
+            let stderr_writer = std::thread::spawn(|| {
+                let mut stderr = std::io::stderr().lock();
+                stderr.write_all(b"STDERR_HEAD_MARKER\n").unwrap();
+                write_bulk(&mut stderr, b'e', STRESS_OUTPUT).unwrap();
+                stderr.write_all(b"\nSTDERR_TAIL_MARKER\n").unwrap();
+                stderr.flush().unwrap();
+            });
+            stdout_writer.join().unwrap();
+            stderr_writer.join().unwrap();
+            read_stdin_and_report();
+        }
         other => panic!("unknown fake agent mode: {other}"),
     }
 }
@@ -259,6 +298,101 @@ fn stdout_and_stderr_are_drained_simultaneously() {
     assert!(result.stdout.contains(&expected_stdin_report(&mission)));
     assert!(result.stdout.len() >= BULK_OUTPUT);
     assert!(result.stderr.len() >= BULK_OUTPUT);
+}
+
+#[test]
+fn large_stdout_is_bounded_while_head_and_tail_remain_visible() {
+    let directory = TempDir::new().unwrap();
+    let mission = "bounded stdout mission";
+    let result = run(
+        &fake_agent("truncate_stdout").with_output_limit(OUTPUT_LIMIT),
+        mission,
+        &directory,
+    );
+
+    assert_eq!(result.exit_code, Some(0));
+    assert!(result.stdout.len() <= OUTPUT_LIMIT);
+    assert!(result.stdout.contains("STDOUT_HEAD_MARKER"));
+    assert!(result.stdout.contains("STDOUT_TAIL_MARKER"));
+    assert!(result.stdout.contains(&expected_stdin_report(mission)));
+    assert!(result.output_metadata.stdout_truncated);
+    assert!(!result.output_metadata.stderr_truncated);
+    assert!(result.output_metadata.stdout_bytes > STRESS_OUTPUT as u64);
+    assert!(result.output_metadata.stdout_dropped_bytes > 0);
+    assert_eq!(result.output_metadata.limit_bytes, OUTPUT_LIMIT as u64);
+}
+
+#[test]
+fn large_stderr_is_bounded_independently_from_stdout() {
+    let directory = TempDir::new().unwrap();
+    let result = run(
+        &fake_agent("truncate_stderr").with_output_limit(OUTPUT_LIMIT),
+        "bounded stderr mission",
+        &directory,
+    );
+
+    assert_eq!(result.exit_code, Some(0));
+    assert!(result.stderr.len() <= OUTPUT_LIMIT);
+    assert!(result.stderr.contains("STDERR_HEAD_MARKER"));
+    assert!(result.stderr.contains("STDERR_TAIL_MARKER"));
+    assert!(result.output_metadata.stderr_truncated);
+    assert!(!result.output_metadata.stdout_truncated);
+    assert!(result.output_metadata.stdout_bytes < OUTPUT_LIMIT as u64);
+    assert!(result.output_metadata.stderr_bytes > STRESS_OUTPUT as u64);
+}
+
+#[test]
+fn simultaneous_large_streams_remain_bounded_and_drained() {
+    let directory = TempDir::new().unwrap();
+    let mission = "bounded simultaneous mission";
+    let result = run(
+        &fake_agent("truncate_both").with_output_limit(OUTPUT_LIMIT),
+        mission,
+        &directory,
+    );
+
+    assert_eq!(result.exit_code, Some(0));
+    assert!(result.stdout.len() <= OUTPUT_LIMIT);
+    assert!(result.stderr.len() <= OUTPUT_LIMIT);
+    assert!(result.stdout.contains("STDOUT_HEAD_MARKER"));
+    assert!(result.stdout.contains("STDOUT_TAIL_MARKER"));
+    assert!(result.stderr.contains("STDERR_HEAD_MARKER"));
+    assert!(result.stderr.contains("STDERR_TAIL_MARKER"));
+    assert!(result.stdout.contains(&expected_stdin_report(mission)));
+    assert!(result.output_metadata.stdout_truncated);
+    assert!(result.output_metadata.stderr_truncated);
+}
+
+#[test]
+fn cancellation_stays_bounded_during_continuous_oversized_output() {
+    let directory = TempDir::new().unwrap();
+    let request = AgentRequest::new(mission_of_length(LARGE_MISSION), directory.path());
+    let (result, elapsed) = cancel_when_ready(
+        &fake_agent("flood_output").with_output_limit(OUTPUT_LIMIT),
+        &request,
+    );
+
+    assert!(result.cancelled);
+    assert!(result.stdout.contains("READY"));
+    assert!(result.stdout.len() <= OUTPUT_LIMIT);
+    assert!(result.stderr.len() <= OUTPUT_LIMIT);
+    assert!(result.output_metadata.stdout_truncated);
+    assert!(result.output_metadata.stderr_truncated);
+    assert!(elapsed < CANCEL_BUDGET);
+}
+
+#[test]
+fn repeated_bounded_runs_do_not_leak_reader_threads() {
+    let directory = TempDir::new().unwrap();
+    for _ in 0..4 {
+        let result = run(
+            &fake_agent("truncate_both").with_output_limit(OUTPUT_LIMIT),
+            "repeated bounded mission",
+            &directory,
+        );
+        assert_eq!(result.exit_code, Some(0));
+        assert!(result.output_metadata.truncated());
+    }
 }
 
 #[test]

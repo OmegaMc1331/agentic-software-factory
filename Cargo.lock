@@ -480,6 +480,7 @@ dependencies = [
 name = "factory-agent"
 version = "1.0.5"
 dependencies = [
+ "factory-types",
  "serde",
  "tempfile",
  "thiserror 2.0.20",

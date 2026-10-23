@@ -6,9 +6,14 @@ use std::sync::atomic::AtomicBool;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use factory_types::AgentOutputMetadata;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::capture::{
+    BoundedOutputCapture, Utf8StreamDecoder, DEFAULT_AGENT_OUTPUT_LIMIT_BYTES,
+    OUTPUT_CHANNEL_CAPACITY, OUTPUT_READ_BUFFER_BYTES,
+};
 use crate::executable::{
     resolve_executable, runtime_path_entries, ExecutableResolution, LaunchCommand,
     ResolvedExecutable,
@@ -195,6 +200,7 @@ pub struct AgentResult {
     pub exit_code: Option<i32>,
     pub duration: Duration,
     pub cancelled: bool,
+    pub output_metadata: AgentOutputMetadata,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -249,11 +255,24 @@ impl AgentError {
 #[derive(Debug, Clone)]
 pub struct CommandAgent {
     config: AgentConfig,
+    output_limit: usize,
 }
 
 impl CommandAgent {
     pub fn new(config: AgentConfig) -> Self {
-        CommandAgent { config }
+        CommandAgent {
+            config,
+            output_limit: DEFAULT_AGENT_OUTPUT_LIMIT_BYTES,
+        }
+    }
+
+    pub fn with_output_limit(mut self, limit: usize) -> Self {
+        self.output_limit = limit.max(1);
+        self
+    }
+
+    pub fn output_limit(&self) -> usize {
+        self.output_limit
     }
 
     pub fn name(&self) -> &str {
@@ -457,15 +476,34 @@ impl CommandAgent {
                 "stdin not available".into(),
             ));
         }
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = mpsc::sync_channel(OUTPUT_CHANNEL_CAPACITY);
         let stdout_reader = output_reader(stdout, OutputStream::Stdout, sender.clone());
         let stderr_reader = output_reader(stderr, OutputStream::Stderr, sender);
         let stdin_writer = match (stdin, invocation.stdin_payload) {
             (Some(stdin), Some(payload)) => Some(spawn_stdin_writer(stdin, payload)),
             _ => None,
         };
-        let mut stdout_text = String::new();
-        let mut stderr_text = String::new();
+        let mut stdout_capture = BoundedOutputCapture::new(self.output_limit);
+        let mut stderr_capture = BoundedOutputCapture::new(self.output_limit);
+        let mut stdout_decoder = Utf8StreamDecoder::default();
+        let mut stderr_decoder = Utf8StreamDecoder::default();
+        let mut stdout_forwarding = true;
+        let mut stderr_forwarding = true;
+        let mut handle_text = |stream: OutputStream, chunk: Option<&[u8]>, text: &str| {
+            let (capture, forwarding) = match stream {
+                OutputStream::Stdout => (&mut stdout_capture, &mut stdout_forwarding),
+                OutputStream::Stderr => (&mut stderr_capture, &mut stderr_forwarding),
+            };
+            if let Some(chunk) = chunk {
+                capture.push(chunk);
+            }
+            if *forwarding && !text.is_empty() {
+                on_output(stream, text);
+                if capture.reached_limit() {
+                    *forwarding = false;
+                }
+            }
+        };
         let mut was_cancelled = false;
         let status = loop {
             let mut received = false;
@@ -474,11 +512,11 @@ impl CommandAgent {
                     break;
                 };
                 received = true;
-                match stream {
-                    OutputStream::Stdout => stdout_text.push_str(&chunk),
-                    OutputStream::Stderr => stderr_text.push_str(&chunk),
-                }
-                on_output(stream, &chunk);
+                let text = match stream {
+                    OutputStream::Stdout => stdout_decoder.push(&chunk),
+                    OutputStream::Stderr => stderr_decoder.push(&chunk),
+                };
+                handle_text(stream, Some(&chunk), &text);
                 if cancel.load(std::sync::atomic::Ordering::Relaxed) {
                     break;
                 }
@@ -494,6 +532,13 @@ impl CommandAgent {
                 std::thread::sleep(Duration::from_millis(40));
             }
         };
+        while let Ok((stream, chunk)) = receiver.recv() {
+            let text = match stream {
+                OutputStream::Stdout => stdout_decoder.push(&chunk),
+                OutputStream::Stderr => stderr_decoder.push(&chunk),
+            };
+            handle_text(stream, Some(&chunk), &text);
+        }
         let stdout_join = stdout_reader.join();
         let stderr_join = stderr_reader.join();
         let stdin_join = stdin_writer.map(|writer| writer.join());
@@ -525,13 +570,15 @@ impl CommandAgent {
             }
             None => None,
         };
-        while let Ok((stream, chunk)) = receiver.try_recv() {
-            match stream {
-                OutputStream::Stdout => stdout_text.push_str(&chunk),
-                OutputStream::Stderr => stderr_text.push_str(&chunk),
-            }
-            on_output(stream, &chunk);
-        }
+        let stdout_tail = stdout_decoder.finish();
+        handle_text(OutputStream::Stdout, None, &stdout_tail);
+        let stderr_tail = stderr_decoder.finish();
+        handle_text(OutputStream::Stderr, None, &stderr_tail);
+        drop(handle_text);
+        let stdout_capture = stdout_capture.finish();
+        let stderr_capture = stderr_capture.finish();
+        let (stdout_text, stderr_text, output_metadata) =
+            stdout_capture.into_streams(stderr_capture);
         let duration = started.elapsed();
         if !was_cancelled {
             if let Some(err) = stdout_error.or(stderr_error) {
@@ -552,6 +599,7 @@ impl CommandAgent {
             exit_code: status.code(),
             duration,
             cancelled: was_cancelled,
+            output_metadata,
         })
     }
 }
@@ -648,17 +696,20 @@ fn spawn_stdin_writer(
 fn output_reader<R: Read + Send + 'static>(
     mut reader: R,
     stream: OutputStream,
-    sender: mpsc::Sender<(OutputStream, String)>,
+    sender: mpsc::SyncSender<(OutputStream, Vec<u8>)>,
 ) -> std::thread::JoinHandle<std::io::Result<()>> {
     std::thread::spawn(move || {
-        let mut buffer = [0_u8; 4096];
+        let mut buffer = [0_u8; OUTPUT_READ_BUFFER_BYTES];
         loop {
-            let read = reader.read(&mut buffer)?;
+            let read = match reader.read(&mut buffer) {
+                Ok(read) => read,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            };
             if read == 0 {
                 break;
             }
-            let chunk = String::from_utf8_lossy(&buffer[..read]).into_owned();
-            if sender.send((stream, chunk)).is_err() {
+            if sender.send((stream, buffer[..read].to_vec())).is_err() {
                 break;
             }
         }

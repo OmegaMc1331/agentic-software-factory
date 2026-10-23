@@ -855,6 +855,7 @@ async fn agent_session_endpoints_return_persisted_output_and_close_completed_str
             stdout: Some("compiled\n".to_string()),
             stderr: Some("warning\n".to_string()),
             policy_audit: None,
+            output_meta: None,
         })
         .unwrap()
     };

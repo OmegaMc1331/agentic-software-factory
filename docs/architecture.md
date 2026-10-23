@@ -311,8 +311,13 @@ delivery state and pull request metadata so duplicates are prevented across rest
 
 SQLite uses WAL mode and a bounded busy timeout. API handlers hold their shared
 connection only for short reads or writes. Runtime jobs open separate Factory/database
-connections, so no API mutex is held while an external agent runs. Session output is
-appended with short writes and bounded to the latest 1 MB per stream.
+connections, so no API mutex is held while an external agent runs. Automated stdout and
+stderr are each retained in full up to a 1 MB limit, then as bounded head and tail
+segments; the middle omitted bytes are counted. `AgentSession.output_meta` records the
+limit, total emitted bytes, dropped bytes, and truncation flags per stream. Structured
+planner/worker/reviewer output that exceeds the stdout limit is rejected before parsing
+rather than parsed from a partial document. Session output writes remain short and
+SQLite is also capped per stream as defense in depth.
 
 The Rust process owns background planning and execution. Browser reloads do not stop a
 workflow. This is an in-process runtime; it does not use an external queue or continue
@@ -326,6 +331,8 @@ and the `role_artifacts` table. Rows persisted by earlier releases get a compati
 operation backfilled by the migration (known core role ids map to their natural
 operation; everything else defaults to `implement`), so upgrading never requires
 deleting `.factory/db.sqlite3` and old workflows remain readable and runnable.
+Version 17 adds `agent_sessions.output_meta` as nullable JSON, so existing sessions and
+interactive consoles remain valid without backfilling process output.
 
 ## Agent invocation modes
 

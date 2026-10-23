@@ -87,6 +87,7 @@ fn seed_running_workflow(root: &Path) -> SeededWorkflow {
             stdout: Some(String::new()),
             stderr: Some(String::new()),
             policy_audit: None,
+            output_meta: None,
         })
         .unwrap();
     SeededWorkflow {

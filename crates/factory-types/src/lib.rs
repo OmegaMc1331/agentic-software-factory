@@ -33,6 +33,6 @@ pub use plans::{
 pub use recipe::{Recipe, RecipeDelivery, RecipeRouting, RecipeSnapshot};
 pub use routing::{RoutingCandidateScore, RoutingDecision, RoutingMode, RoutingPreview};
 pub use run::{Run, RunStatus};
-pub use session::{AgentSession, AgentSessionMode, SessionPolicyAudit};
+pub use session::{AgentOutputMetadata, AgentSession, AgentSessionMode, SessionPolicyAudit};
 pub use task::{Task, TaskState};
 pub use team::WorkflowTeam;

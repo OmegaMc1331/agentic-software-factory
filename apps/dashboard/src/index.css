@@ -1752,6 +1752,16 @@ code {
   overflow-wrap: anywhere;
 }
 
+.agent-output-truncated {
+  margin: 0;
+  padding: 7px 9px;
+  border: 1px solid #6f5428;
+  border-radius: 5px;
+  background: #241c10;
+  color: #e5bb73;
+  font-size: 10.5px;
+}
+
 .agent-terminal {
   flex: 1;
   min-height: 300px;

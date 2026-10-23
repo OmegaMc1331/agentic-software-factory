@@ -4,12 +4,12 @@ pub use error::DbError;
 
 use chrono::Utc;
 use factory_types::{
-    resolve_patch, resolve_replan, AgentSession, AgentSessionMode, AttemptStatus, GitHubDelivery,
-    GitHubIssueLink, IntegrationOutcome, IntegrationOutcomeKind, McpToolMetadata, Plan,
-    PlanApplyOutcome, PlanPatch, PlanRevisionRecord, PlanRevisionSource, PlanSnapshot, PlanState,
-    ReplanRequest, ResolvedPlan, ReviewResult, RoleArtifact, RoutingCandidateScore,
-    RoutingDecision, Run, RunStatus, Task, TaskAttempt, TaskEvidence, TaskOperation, TaskState,
-    ToolClassification, ToolGrant, ToolInvocation, ToolMetrics,
+    resolve_patch, resolve_replan, AgentOutputMetadata, AgentSession, AgentSessionMode,
+    AttemptStatus, GitHubDelivery, GitHubIssueLink, IntegrationOutcome, IntegrationOutcomeKind,
+    McpToolMetadata, Plan, PlanApplyOutcome, PlanPatch, PlanRevisionRecord, PlanRevisionSource,
+    PlanSnapshot, PlanState, ReplanRequest, ResolvedPlan, ReviewResult, RoleArtifact,
+    RoutingCandidateScore, RoutingDecision, Run, RunStatus, Task, TaskAttempt, TaskEvidence,
+    TaskOperation, TaskState, ToolClassification, ToolGrant, ToolInvocation, ToolMetrics,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashMap;
@@ -901,8 +901,8 @@ impl FactoryDb {
     pub fn insert_agent_session(&self, session: &AgentSession) -> Result<AgentSession> {
         let mut session = session.clone();
         self.conn.execute(
-            "INSERT INTO agent_sessions (run_id, task_id, attempt_id, role, operation, agent, mode, command, status, started_at, finished_at, exit_code, duration_ms, stdout, stderr, policy_audit)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            "INSERT INTO agent_sessions (run_id, task_id, attempt_id, role, operation, agent, mode, command, status, started_at, finished_at, exit_code, duration_ms, stdout, stderr, policy_audit, output_meta)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 session.run_id,
                 session.task_id,
@@ -922,7 +922,11 @@ impl FactoryDb {
                 session
                     .policy_audit
                     .as_ref()
-                    .map(|audit| serde_json::to_string(audit).unwrap_or_default())
+                    .map(|audit| serde_json::to_string(audit).unwrap_or_default()),
+                session
+                    .output_meta
+                    .as_ref()
+                    .map(|metadata| serde_json::to_string(metadata).unwrap_or_default())
             ],
         )?;
         session.id = self.conn.last_insert_rowid();
@@ -931,7 +935,7 @@ impl FactoryDb {
 
     pub fn list_agent_sessions(&self, run_id: Option<i64>) -> Result<Vec<AgentSession>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, run_id, task_id, attempt_id, role, operation, agent, mode, command, status, started_at, finished_at, exit_code, duration_ms, stdout, stderr, policy_audit
+            "SELECT id, run_id, task_id, attempt_id, role, operation, agent, mode, command, status, started_at, finished_at, exit_code, duration_ms, stdout, stderr, policy_audit, output_meta
              FROM agent_sessions
              WHERE (?1 IS NULL OR run_id = ?1)
              ORDER BY id",
@@ -945,7 +949,7 @@ impl FactoryDb {
     pub fn get_agent_session(&self, id: i64) -> Result<Option<AgentSession>> {
         self.conn
             .query_row(
-                "SELECT id, run_id, task_id, attempt_id, role, operation, agent, mode, command, status, started_at, finished_at, exit_code, duration_ms, stdout, stderr, policy_audit
+                "SELECT id, run_id, task_id, attempt_id, role, operation, agent, mode, command, status, started_at, finished_at, exit_code, duration_ms, stdout, stderr, policy_audit, output_meta
                  FROM agent_sessions WHERE id = ?1",
                 params![id],
                 build_session,
@@ -960,7 +964,7 @@ impl FactoryDb {
         limit: usize,
     ) -> Result<Vec<AgentSession>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, run_id, task_id, attempt_id, role, operation, agent, mode, command, status, started_at, finished_at, exit_code, duration_ms, stdout, stderr, policy_audit
+            "SELECT id, run_id, task_id, attempt_id, role, operation, agent, mode, command, status, started_at, finished_at, exit_code, duration_ms, stdout, stderr, policy_audit, output_meta
              FROM agent_sessions
              WHERE agent = ?1
              ORDER BY id DESC
@@ -998,6 +1002,19 @@ impl FactoryDb {
         self.conn.execute(
             "UPDATE agent_sessions SET stdout = ?1, stderr = ?2 WHERE id = ?3",
             params![stdout, stderr, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_agent_session_output_metadata(
+        &self,
+        id: i64,
+        metadata: Option<&AgentOutputMetadata>,
+    ) -> Result<()> {
+        let encoded = metadata.map(|metadata| serde_json::to_string(metadata).unwrap_or_default());
+        self.conn.execute(
+            "UPDATE agent_sessions SET output_meta = ?1 WHERE id = ?2",
+            params![encoded, id],
         )?;
         Ok(())
     }
@@ -2022,6 +2039,7 @@ fn apply_resolved(
 
 fn build_session(r: &rusqlite::Row<'_>) -> rusqlite::Result<AgentSession> {
     let policy_audit: Option<String> = r.get(16)?;
+    let output_meta: Option<String> = r.get(17)?;
     Ok(AgentSession {
         id: r.get(0)?,
         run_id: r.get(1)?,
@@ -2045,6 +2063,7 @@ fn build_session(r: &rusqlite::Row<'_>) -> rusqlite::Result<AgentSession> {
         stdout: r.get(14)?,
         stderr: r.get(15)?,
         policy_audit: policy_audit.and_then(|value| serde_json::from_str(&value).ok()),
+        output_meta: output_meta.and_then(|value| serde_json::from_str(&value).ok()),
     })
 }
 
@@ -2420,9 +2439,15 @@ CREATE TABLE mcp_server_leases (
 );
 ";
 
+/// Bounded agent output accounting: retained/emitted byte counts and explicit
+/// truncation flags for each stream. Stored separately from process output so
+/// legacy rows and interactive sessions remain valid.
+const V17_SCHEMA: &str = "ALTER TABLE agent_sessions ADD COLUMN output_meta TEXT;";
+
 const MIGRATIONS: &[&str] = &[
     V1_SCHEMA, V2_SCHEMA, V3_SCHEMA, V4_SCHEMA, V5_SCHEMA, V6_SCHEMA, V7_SCHEMA, V8_SCHEMA,
     V9_SCHEMA, V10_SCHEMA, V11_SCHEMA, V12_SCHEMA, V13_SCHEMA, V14_SCHEMA, V15_SCHEMA, V16_SCHEMA,
+    V17_SCHEMA,
 ];
 
 fn migrate(conn: &mut Connection) -> Result<()> {
@@ -2459,10 +2484,10 @@ fn migrate_schemas(conn: &mut Connection, schemas: &[&str]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use factory_types::{
-        AgentSession, AgentSessionMode, AttemptStatus, IntegrationOutcomeKind, Plan,
-        PlanApplyOutcome, PlanMutation, PlanPatch, PlanRevisionSource, PlannedTask, ReplanRequest,
-        ReviewDecision, ReviewResult, RunStatus, TaskEvidence, TaskOperation, TaskRef, TaskState,
-        ToolClassification, ToolGrant, ToolInvocation,
+        AgentOutputMetadata, AgentSession, AgentSessionMode, AttemptStatus, IntegrationOutcomeKind,
+        Plan, PlanApplyOutcome, PlanMutation, PlanPatch, PlanRevisionSource, PlannedTask,
+        ReplanRequest, ReviewDecision, ReviewResult, RunStatus, TaskEvidence, TaskOperation,
+        TaskRef, TaskState, ToolClassification, ToolGrant, ToolInvocation,
     };
     use rusqlite::Connection;
     use tempfile::TempDir;
@@ -2477,7 +2502,7 @@ mod tests {
         let versions = schema_versions(&path);
         assert_eq!(
             versions,
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
         );
         db.create_run("objective", Some("codex")).unwrap();
         drop(db);
@@ -2485,7 +2510,7 @@ mod tests {
         let db = FactoryDb::open(&path).unwrap();
         assert_eq!(
             schema_versions(&path),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
         );
         db.list_runs().unwrap();
     }
@@ -2513,7 +2538,7 @@ mod tests {
         let db = FactoryDb::open(&path).unwrap();
         assert_eq!(
             schema_versions(&path),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
         );
         let run = db.get_run(1).unwrap().unwrap();
         assert_eq!(run.objective, "legacy");
@@ -2571,7 +2596,7 @@ mod tests {
         // opening records versions 6 and 7 exactly once
         assert_eq!(
             schema_versions(&path),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
         );
         let tasks = db.list_tasks(1).unwrap();
         let operation_of = |title: &str| {
@@ -2787,6 +2812,15 @@ mod tests {
             stdout: Some("{\"objective\":\"x\"}".to_string()),
             stderr: Some(String::new()),
             policy_audit: None,
+            output_meta: Some(AgentOutputMetadata {
+                limit_bytes: 1_048_576,
+                stdout_bytes: 1_200_000,
+                stderr_bytes: 0,
+                stdout_dropped_bytes: 151_424,
+                stderr_dropped_bytes: 0,
+                stdout_truncated: true,
+                stderr_truncated: false,
+            }),
         };
         let saved = db.insert_agent_session(&session).unwrap();
         assert!(saved.id > 0);
@@ -3345,6 +3379,7 @@ mod tests {
             stdout: Some("large output".into()),
             stderr: None,
             policy_audit: None,
+            output_meta: None,
         })
         .unwrap();
         // Unattached planner sessions must not appear in the lean projection.
@@ -3366,6 +3401,7 @@ mod tests {
             stdout: None,
             stderr: None,
             policy_audit: None,
+            output_meta: None,
         })
         .unwrap();
         db.record_integration_outcome(
@@ -3507,6 +3543,7 @@ mod tests {
                 stdout: Some("partial".into()),
                 stderr: Some(String::new()),
                 policy_audit: None,
+                output_meta: None,
             })
             .unwrap();
 

@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+factory-types = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 

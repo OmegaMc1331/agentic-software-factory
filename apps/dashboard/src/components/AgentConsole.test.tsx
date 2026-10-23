@@ -129,6 +129,38 @@ describe("Agent Console", () => {
     ).toBeTruthy();
   });
 
+  it("marks bounded workflow output as truncated", async () => {
+    vi.mocked(fetchAgentSessions).mockResolvedValue([
+      session({
+        stdout: "start\nend\n",
+        outputMeta: {
+          limitBytes: 1_048_576,
+          stdoutBytes: 5_242_880,
+          stderrBytes: 12,
+          stdoutDroppedBytes: 4_194_304,
+          stderrDroppedBytes: 0,
+          stdoutTruncated: true,
+          stderrTruncated: false,
+        },
+      }),
+    ]);
+    render(
+      <AgentConsole
+        agentName="codex"
+        meta={meta}
+        activity={null}
+        onClose={vi.fn()}
+        onDelete={vi.fn()}
+      />
+    );
+
+    expect(
+      await screen.findByText(
+        /Output was truncated at 1.0 MiB per stream \(5.0 MiB stdout, 12 B stderr\)/
+      )
+    ).toBeTruthy();
+  });
+
   it("starts a scoped interactive session on explicit user action", async () => {
     vi.mocked(fetchAgentSessions).mockResolvedValue([]);
     vi.mocked(startInteractiveAgentSession).mockResolvedValue(

@@ -528,6 +528,7 @@ async fn sse_streaming_requires_and_accepts_a_session() {
             stdout: Some("compiled\n".to_string()),
             stderr: Some("warning\n".to_string()),
             policy_audit: None,
+            output_meta: None,
         })
         .unwrap()
     };

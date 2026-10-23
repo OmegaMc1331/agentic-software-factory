@@ -54,6 +54,27 @@ pub struct SessionPolicyAudit {
     pub tool_deny: Vec<String>,
 }
 
+/// Bounded-capture accounting for an agent stream. `*_bytes` counts everything
+/// the process emitted; `*_dropped_bytes` counts the middle section Factory did
+/// not retain. Both streams are always bounded independently.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct AgentOutputMetadata {
+    pub limit_bytes: u64,
+    pub stdout_bytes: u64,
+    pub stderr_bytes: u64,
+    pub stdout_dropped_bytes: u64,
+    pub stderr_dropped_bytes: u64,
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
+}
+
+impl AgentOutputMetadata {
+    pub fn truncated(&self) -> bool {
+        self.stdout_truncated || self.stderr_truncated
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentSession {
@@ -80,4 +101,7 @@ pub struct AgentSession {
     /// recorded before the policy engine or for interactive consoles).
     #[serde(default)]
     pub policy_audit: Option<SessionPolicyAudit>,
+    /// Present for sessions captured after output limits were introduced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_meta: Option<AgentOutputMetadata>,
 }

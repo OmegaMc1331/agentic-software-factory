@@ -209,8 +209,11 @@ not change what the agent is allowed to do:
 ## Local files
 
 SQLite lives at `.factory/db.sqlite3` with the process default permissions. SQL writes
-are parameterized and schema changes use versioned migrations. Session stdout and
-stderr are bounded in the database but may contain agent-produced sensitive content.
+are parameterized and schema changes use versioned migrations. Automated stdout and
+stderr are drained concurrently, captured with a 1 MB per-stream head/tail bound, and
+stored with truncation metadata; oversized structured output is rejected before parsing.
+Session logs may still contain agent-produced sensitive content. Secret values are
+redacted before persistence.
 
 `PUT /api/config` and `PUT /api/graph/workspace` validate their bodies before atomic
 temp-file-and-rename writes. The graph workspace contains visual metadata only.

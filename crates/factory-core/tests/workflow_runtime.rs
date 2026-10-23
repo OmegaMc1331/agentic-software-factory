@@ -125,6 +125,27 @@ fn fixture(review_decision: &str) -> (TempDir, Factory) {
     (dir, factory)
 }
 
+fn output_file_entry(path: &Path) -> AgentEntry {
+    let script = if cfg!(windows) {
+        format!("type {}", path.display())
+    } else {
+        format!("cat '{}'", path.display())
+    };
+    command_entry(&script)
+}
+
+fn oversized_plan() -> String {
+    let padding = "x".repeat(1_100_000);
+    format!(
+        r#"{{"objective":"ship","tasks":[{{"id":"T1","title":"First","objective":"{padding}","dependencies":[],"acceptanceCriteria":["ok"]}}]}}"#
+    )
+}
+
+fn oversized_producer_report() -> String {
+    let padding = "x".repeat(1_100_000);
+    format!(r#"{{"commands":["fake-worker"],"tests":["fake-test"],"summary":"{padding}"}}"#)
+}
+
 #[test]
 fn planner_success_persists_a_planned_workflow_and_session() {
     let (_dir, factory) = fixture("approve");
@@ -163,6 +184,120 @@ fn planner_process_failure_marks_the_persisted_workflow_failed() {
     let sessions = factory.list_agent_sessions(Some(run.id)).unwrap();
     assert_eq!(sessions[0].exit_code, Some(7));
     assert_eq!(sessions[0].status, "failed");
+}
+
+#[test]
+fn oversized_planner_output_is_rejected_without_parsing_partial_json() {
+    let (dir, _factory) = fixture("approve");
+    let output_path = dir.path().join("oversized-plan.json");
+    std::fs::write(&output_path, oversized_plan()).unwrap();
+    let mut config = Config::load(dir.path()).unwrap();
+    config
+        .agents
+        .insert("planner-test".into(), output_file_entry(&output_path));
+    config.write_atomic(dir.path()).unwrap();
+    let factory = Factory::open(dir.path()).unwrap();
+    let run = factory.begin_run("oversized planner", None).unwrap();
+
+    let error = factory
+        .plan_run(run.id, &AtomicBool::new(false))
+        .unwrap_err();
+    assert!(error.to_string().contains("capture limit"), "{error}");
+    assert_eq!(
+        factory.get_run(run.id).unwrap().unwrap().status,
+        RunStatus::Failed
+    );
+
+    let sessions = factory.list_agent_sessions(Some(run.id)).unwrap();
+    let planner = sessions
+        .iter()
+        .find(|session| session.role == "planner")
+        .expect("planner session");
+    assert_eq!(planner.status, "rejected");
+    let metadata = planner.output_meta.as_ref().expect("output metadata");
+    assert!(metadata.stdout_truncated);
+    assert!(metadata.stdout_bytes > metadata.limit_bytes);
+    assert!(planner.stdout.as_ref().unwrap().len() <= metadata.limit_bytes as usize);
+}
+
+#[test]
+fn oversized_worker_output_fails_the_attempt_without_parsing_or_retrying() {
+    let (dir, _factory) = fixture("approve");
+    let output_path = dir.path().join("oversized-worker.json");
+    std::fs::write(&output_path, oversized_producer_report()).unwrap();
+    let mut config = Config::load(dir.path()).unwrap();
+    config
+        .agents
+        .insert("worker-test".into(), output_file_entry(&output_path));
+    config.write_atomic(dir.path()).unwrap();
+    let factory = Factory::open(dir.path()).unwrap();
+    let outcome = factory.create_run("oversized worker").unwrap();
+    factory.prepare_start(outcome.run.id).unwrap();
+
+    let error = factory
+        .execute_active_run(outcome.run.id, &AtomicBool::new(false))
+        .unwrap_err();
+    assert!(error.to_string().contains("capture limit"), "{error}");
+
+    let attempts = factory.list_task_attempts(outcome.run.id).unwrap();
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].status, AttemptStatus::Failed);
+    assert_eq!(
+        factory
+            .get_task(outcome.tasks[0].id)
+            .unwrap()
+            .unwrap()
+            .state,
+        TaskState::Failed
+    );
+
+    let sessions = factory.list_agent_sessions(Some(outcome.run.id)).unwrap();
+    let worker = sessions
+        .iter()
+        .find(|session| session.role == "worker")
+        .expect("worker session");
+    assert_eq!(worker.status, "rejected");
+    let metadata = worker.output_meta.as_ref().expect("output metadata");
+    assert!(metadata.stdout_truncated);
+    assert!(worker.stdout.as_ref().unwrap().len() <= metadata.limit_bytes as usize);
+}
+
+#[test]
+fn oversized_reviewer_output_is_not_treated_as_a_decision() {
+    let (dir, _factory) = fixture("approve");
+    let output_path = dir.path().join("oversized-review.json");
+    std::fs::write(
+        &output_path,
+        format!(
+            r#"{{"decision":"approve","reason":"{}"}}"#,
+            "x".repeat(1_100_000)
+        ),
+    )
+    .unwrap();
+    let mut config = Config::load(dir.path()).unwrap();
+    config
+        .agents
+        .insert("reviewer-test".into(), output_file_entry(&output_path));
+    config.write_atomic(dir.path()).unwrap();
+    let factory = Factory::open(dir.path()).unwrap();
+    let outcome = factory.create_run("oversized reviewer").unwrap();
+    factory.prepare_start(outcome.run.id).unwrap();
+
+    let error = factory
+        .execute_active_run(outcome.run.id, &AtomicBool::new(false))
+        .unwrap_err();
+    assert!(error.to_string().contains("capture limit"), "{error}");
+
+    let sessions = factory.list_agent_sessions(Some(outcome.run.id)).unwrap();
+    let reviewer = sessions
+        .iter()
+        .find(|session| session.role == "reviewer")
+        .expect("reviewer session");
+    assert_eq!(reviewer.status, "rejected");
+    assert!(reviewer
+        .output_meta
+        .as_ref()
+        .is_some_and(|metadata| metadata.stdout_truncated));
 }
 
 #[test]

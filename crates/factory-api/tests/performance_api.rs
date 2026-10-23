@@ -94,6 +94,7 @@ fn seed_history(state: &factory_api::ApiState) {
         stdout: None,
         stderr: None,
         policy_audit: None,
+        output_meta: None,
     })
     .unwrap();
     let evidence = TaskEvidence {

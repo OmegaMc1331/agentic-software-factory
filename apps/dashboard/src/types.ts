@@ -787,6 +787,16 @@ export interface SessionPolicyAudit {
   toolDeny?: string[];
 }
 
+export interface AgentOutputMetadata {
+  limitBytes: number;
+  stdoutBytes: number;
+  stderrBytes: number;
+  stdoutDroppedBytes: number;
+  stderrDroppedBytes: number;
+  stdoutTruncated: boolean;
+  stderrTruncated: boolean;
+}
+
 export interface AgentSession {
   id: number;
   runId: number | null;
@@ -805,6 +815,7 @@ export interface AgentSession {
   stdout: string | null;
   stderr: string | null;
   policyAudit?: SessionPolicyAudit | null;
+  outputMeta?: AgentOutputMetadata | null;
   workingDirectory: string;
   interactive: boolean;
 }

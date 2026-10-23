@@ -171,6 +171,7 @@ impl Runtime {
             // Interactive consoles are human-driven; the policy engine applies
             // to automated sessions, so no policy audit is recorded here.
             policy_audit: None,
+            output_meta: None,
         };
         let db = FactoryDb::open(&self.root.join(".factory").join("db.sqlite3"))
             .map_err(FactoryError::from)?;
