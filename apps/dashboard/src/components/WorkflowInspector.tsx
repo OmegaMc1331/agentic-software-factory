@@ -1,10 +1,11 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   createPullRequest,
   fetchDelivery,
   fetchPrPreview,
   fetchRoles,
   fetchRun,
+  isUncertainApiError,
   saveRunAsRecipe,
   updateWorkflowTeam,
 } from "../api";
@@ -103,6 +104,13 @@ export function WorkflowInspector({
     eligible: boolean;
     blockers: string[];
   } | null>(null);
+  const [deliveryRecovery, setDeliveryRecovery] = useState<{
+    message: string;
+    checking: boolean;
+    canRetry: boolean;
+  } | null>(null);
+  const [prPending, setPrPending] = useState(false);
+  const prSubmitPending = useRef(false);
   const [saveRecipeForm, setSaveRecipeForm] = useState<{
     name: string;
     description: string;
@@ -118,11 +126,88 @@ export function WorkflowInspector({
       .catch((reason: Error) => setError(reason.message));
   }, [meta.runId]);
 
-  const loadDelivery = useCallback(() => {
-    fetchDelivery(meta.runId)
-      .then((report) => setDelivery(report))
-      .catch(() => setDelivery(null));
+  const loadDelivery = useCallback(async (): Promise<DeliveryReport | null> => {
+    try {
+      const report = await fetchDelivery(meta.runId);
+      setDelivery(report);
+      return report;
+    } catch {
+      setDelivery(null);
+      return null;
+    }
   }, [meta.runId]);
+
+  const reconcileDeliveryStatus = useCallback(async () => {
+    setDeliveryRecovery((current) =>
+      current
+        ? { ...current, checking: true, canRetry: false }
+        : { message: "Checking delivery status…", checking: true, canRetry: false }
+    );
+
+    let report: DeliveryReport;
+    try {
+      report = await fetchDelivery(meta.runId);
+      setDelivery(report);
+    } catch (reason) {
+      setDeliveryRecovery({
+        message: `Delivery status could not be confirmed. ${(reason as Error).message} Check again before retrying.`,
+        checking: false,
+        canRetry: false,
+      });
+      return;
+    }
+
+    if (report.pullRequest) {
+      setPrForm(null);
+      setPrPreview(null);
+      setDeliveryRecovery(null);
+      setError(null);
+      onTeamUpdated?.();
+      return;
+    }
+
+    if (report.persistedState === "pushing" || report.persistedState === "creating_pr") {
+      setDeliveryRecovery({
+        message: "Delivery is still in progress. Wait for it to finish, then check status again.",
+        checking: false,
+        canRetry: false,
+      });
+      return;
+    }
+
+    if (report.persistedState === "failed") {
+      setDeliveryRecovery({
+        message: report.error
+          ? `Delivery failed: ${report.error}`
+          : "Delivery failed. Review the error and retry when ready.",
+        checking: false,
+        canRetry: true,
+      });
+      return;
+    }
+
+    if (
+      report.persistedState === "ready" ||
+      report.persistedState === "not_ready" ||
+      report.state === "ready" ||
+      report.state === "not_ready"
+    ) {
+      setDeliveryRecovery({
+        message:
+          "Delivery was not confirmed. No pull request or in-progress delivery was recorded; the earlier request may still be running. Retry only if you understand the earlier attempt may still complete.",
+        checking: false,
+        canRetry: true,
+      });
+      return;
+    }
+
+    setDeliveryRecovery({
+      message:
+        "The delivery outcome is still unknown. Check the delivery status again before retrying.",
+      checking: false,
+      canRetry: false,
+    });
+  }, [meta.runId, onTeamUpdated]);
 
   useEffect(() => {
     let active = true;
@@ -159,7 +244,7 @@ export function WorkflowInspector({
   // Delivery metadata is fetched on mount and whenever the workflow status
   // settles; it is persisted, so it also survives reloads.
   useEffect(() => {
-    loadDelivery();
+    void loadDelivery();
   }, [loadDelivery, status]);
 
   useEffect(() => {
@@ -255,6 +340,8 @@ export function WorkflowInspector({
   };
 
   const openPrPreview = () => {
+    if (busy) return;
+    setDeliveryRecovery(null);
     setBusy(true);
     setError(null);
     fetchPrPreview(meta.runId)
@@ -276,27 +363,40 @@ export function WorkflowInspector({
       });
   };
 
-  const submitPullRequest = () => {
-    if (!prForm || !prForm.title.trim()) return;
+  const submitPullRequest = async () => {
+    if (!prForm || !prForm.title.trim() || prSubmitPending.current) return;
+    prSubmitPending.current = true;
+    setPrPending(true);
     setBusy(true);
     setError(null);
-    createPullRequest(meta.runId, {
-      title: prForm.title,
-      body: prForm.body,
-      draft: prForm.draft,
-    })
-      .then(() => {
-        setBusy(false);
-        setPrForm(null);
-        setPrPreview(null);
-        loadDelivery();
-        onTeamUpdated?.();
-      })
-      .catch((reason: Error) => {
-        setError((reason as Error).message);
-        setBusy(false);
-        loadDelivery();
+    setDeliveryRecovery(null);
+    try {
+      await createPullRequest(meta.runId, {
+        title: prForm.title,
+        body: prForm.body,
+        draft: prForm.draft,
       });
+      setPrForm(null);
+      setPrPreview(null);
+      void loadDelivery();
+      onTeamUpdated?.();
+    } catch (reason) {
+      if (isUncertainApiError(reason)) {
+        setDeliveryRecovery({
+          message: (reason as Error).message,
+          checking: true,
+          canRetry: false,
+        });
+        await reconcileDeliveryStatus();
+      } else {
+        setError((reason as Error).message);
+        void loadDelivery();
+      }
+    } finally {
+      prSubmitPending.current = false;
+      setPrPending(false);
+      setBusy(false);
+    }
   };
 
   const submitSaveRecipe = () => {
@@ -573,25 +673,67 @@ export function WorkflowInspector({
                       ))}
                     </ul>
                   )}
-                  <div className="workflow-actions">
-                    <button
-                      className="button button-primary"
-                      onClick={submitPullRequest}
-                      disabled={busy || !prForm.title.trim() || !prPreview.eligible}
-                    >
-                      Create Pull Request
-                    </button>
-                    <button
-                      className="button"
-                      onClick={() => {
-                        setPrForm(null);
-                        setPrPreview(null);
-                      }}
-                      disabled={busy}
-                    >
-                      Cancel
-                    </button>
-                  </div>
+                  {deliveryRecovery ? (
+                    <div className="workflow-delivery-uncertain" role="status">
+                      <p className="inline-note">{deliveryRecovery.message}</p>
+                      <div className="workflow-actions">
+                        <button
+                          className="button"
+                          onClick={() => void reconcileDeliveryStatus()}
+                          disabled={busy || deliveryRecovery.checking}
+                        >
+                          {deliveryRecovery.checking
+                            ? "Checking delivery status…"
+                            : "Check delivery status"}
+                        </button>
+                        {deliveryRecovery.canRetry && (
+                          <button
+                            className="button button-primary"
+                            onClick={() => void submitPullRequest()}
+                            disabled={
+                              busy ||
+                              deliveryRecovery.checking ||
+                              !prForm.title.trim() ||
+                              !prPreview.eligible
+                            }
+                          >
+                            {prPending ? "Creating pull request…" : "Retry delivery"}
+                          </button>
+                        )}
+                        <button
+                          className="button"
+                          onClick={() => {
+                            setPrForm(null);
+                            setPrPreview(null);
+                            setDeliveryRecovery(null);
+                          }}
+                          disabled={busy || deliveryRecovery.checking}
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="workflow-actions">
+                      <button
+                        className="button button-primary"
+                        onClick={() => void submitPullRequest()}
+                        disabled={busy || !prForm.title.trim() || !prPreview.eligible}
+                      >
+                        {prPending ? "Creating pull request…" : "Create Pull Request"}
+                      </button>
+                      <button
+                        className="button"
+                        onClick={() => {
+                          setPrForm(null);
+                          setPrPreview(null);
+                        }}
+                        disabled={busy}
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  )}
                 </div>
               ) : (
                 <div className="workflow-actions">

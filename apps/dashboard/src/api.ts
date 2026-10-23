@@ -30,26 +30,218 @@ import type {
 } from "./types";
 
 const API_BASE = "/api";
-const REQUEST_TIMEOUT_MS = 5000;
 const CSRF_HEADER = "X-Factory-CSRF";
+const SESSION_TIMEOUT_MS = 5_000;
+const MIN_REQUEST_TIMEOUT_MS = 100;
+const MAX_REQUEST_TIMEOUT_MS = 605_000;
+const MCP_DISCOVERY_OVERHEAD_MS = 5_000;
+const DEFAULT_MCP_DISCOVERY_TIMEOUT_MS = 10_000;
+
+export type ApiTimeoutPolicy = "default" | "discovery" | "externalOperation";
+
+export const API_TIMEOUT_POLICIES = {
+  default: 5_000,
+  discovery: 15_000,
+  externalOperation: 120_000,
+} as const satisfies Record<ApiTimeoutPolicy, number>;
+
+export type ApiErrorKind =
+  | "http"
+  | "network"
+  | "timeout"
+  | "cancelled"
+  | "authentication"
+  | "invalid-response"
+  | "invalid-request";
+
+export interface ApiRequestOptions {
+  timeoutPolicy?: ApiTimeoutPolicy;
+  timeoutMs?: number;
+  signal?: AbortSignal;
+  effect?: "read" | "write";
+}
+
+export class FactoryApiError extends Error {
+  readonly kind: ApiErrorKind;
+  readonly status: number | null;
+  readonly uncertain: boolean;
+
+  constructor(
+    message: string,
+    kind: ApiErrorKind,
+    options: { status?: number | null; uncertain?: boolean } = {}
+  ) {
+    super(message);
+    this.name = "FactoryApiError";
+    this.kind = kind;
+    this.status = options.status ?? null;
+    this.uncertain = options.uncertain ?? false;
+  }
+}
+
+export function isUncertainApiError(error: unknown): error is FactoryApiError {
+  return error instanceof FactoryApiError && error.uncertain;
+}
+
+export function mcpDiscoveryRequestTimeoutMs(discoveryTimeoutMs?: number): number {
+  const configured =
+    typeof discoveryTimeoutMs === "number" && Number.isFinite(discoveryTimeoutMs)
+      ? Math.max(0, discoveryTimeoutMs)
+      : DEFAULT_MCP_DISCOVERY_TIMEOUT_MS;
+  return Math.min(
+    MAX_REQUEST_TIMEOUT_MS,
+    Math.max(API_TIMEOUT_POLICIES.discovery, Math.ceil(configured) + MCP_DISCOVERY_OVERHEAD_MS)
+  );
+}
+
+function timeoutError(uncertain: boolean): FactoryApiError {
+  return new FactoryApiError(
+    uncertain
+      ? "The request timed out. The operation may still be running or may have completed. Check its status before retrying."
+      : "Factory API did not respond before the request deadline. Check that `factory start` is running, then retry.",
+    "timeout",
+    { uncertain }
+  );
+}
+
+function connectionError(uncertain: boolean): FactoryApiError {
+  return new FactoryApiError(
+    uncertain
+      ? "Could not connect to the Factory API. Check that `factory start` is running; the operation may still have completed, so check its status before retrying."
+      : "Could not connect to the Factory API. Check that `factory start` is running.",
+    "network",
+    { uncertain }
+  );
+}
+
+function cancellationError(uncertain: boolean): FactoryApiError {
+  return new FactoryApiError(
+    uncertain
+      ? "Request cancelled. The operation may still be running or may have completed. Check its status before retrying."
+      : "Factory API request was cancelled.",
+    "cancelled",
+    { uncertain }
+  );
+}
+
+function invalidResponseError(): FactoryApiError {
+  return new FactoryApiError("Factory API returned an invalid response.", "invalid-response");
+}
+
+function resolveTimeoutMs(options?: ApiRequestOptions): number {
+  const timeout = options?.timeoutMs ?? API_TIMEOUT_POLICIES[options?.timeoutPolicy ?? "default"];
+  if (
+    typeof timeout !== "number" ||
+    !Number.isFinite(timeout) ||
+    timeout < MIN_REQUEST_TIMEOUT_MS ||
+    timeout > MAX_REQUEST_TIMEOUT_MS
+  ) {
+    throw new FactoryApiError(
+      `Invalid Factory API timeout: expected ${MIN_REQUEST_TIMEOUT_MS}-${MAX_REQUEST_TIMEOUT_MS} ms.`,
+      "invalid-request"
+    );
+  }
+  return Math.floor(timeout);
+}
+
+function operationOptions(
+  options: ApiRequestOptions | undefined,
+  timeoutPolicy: ApiTimeoutPolicy,
+  effect: "read" | "write"
+): ApiRequestOptions {
+  return {
+    ...options,
+    timeoutPolicy: options?.timeoutPolicy ?? timeoutPolicy,
+    effect: options?.effect ?? effect,
+  };
+}
+
+interface RequestDeadline {
+  signal: AbortSignal;
+  timedOut: () => boolean;
+  cancelled: () => boolean;
+  cleanup: () => void;
+}
+
+function createDeadline(
+  timeoutMs: number,
+  signals: Array<AbortSignal | null | undefined> = []
+): RequestDeadline {
+  const controller = new AbortController();
+  const externalSignals = [
+    ...new Set(
+      signals.filter((signal): signal is AbortSignal => signal !== null && signal !== undefined)
+    ),
+  ];
+  let timedOut = false;
+  let cleaned = false;
+  const onAbort = () => controller.abort();
+
+  for (const signal of externalSignals) {
+    if (signal.aborted) {
+      controller.abort();
+    } else {
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
+  }
+
+  const timeout = window.setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
+
+  return {
+    signal: controller.signal,
+    timedOut: () => timedOut,
+    cancelled: () => externalSignals.some((signal) => signal.aborted),
+    cleanup: () => {
+      if (cleaned) return;
+      cleaned = true;
+      window.clearTimeout(timeout);
+      for (const signal of externalSignals) {
+        signal.removeEventListener("abort", onAbort);
+      }
+    },
+  };
+}
+
+function abortFailure(deadline: RequestDeadline, uncertain: boolean): FactoryApiError | null {
+  if (deadline.cancelled()) return cancellationError(uncertain);
+  if (deadline.timedOut()) return timeoutError(uncertain);
+  return null;
+}
+
+function waitForSignal<T>(promise: Promise<T>, signal?: AbortSignal | null): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(cancellationError(false));
+
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => {
+      signal.removeEventListener("abort", onAbort);
+      reject(cancellationError(false));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      }
+    );
+  });
+}
 
 let csrfToken: string | null = null;
 let sessionRequest: Promise<string> | null = null;
-
-function timeoutError(): Error {
-  return new Error("Factory API did not respond. Check that `factory start` is still running.");
-}
-
-function connectionError(): Error {
-  return new Error("Could not connect to the Factory API. Check that `factory start` is running.");
-}
 
 async function establishSession(): Promise<string> {
   if (sessionRequest) return sessionRequest;
 
   const request = (async () => {
-    const controller = new AbortController();
-    const timeout = window.setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    const deadline = createDeadline(SESSION_TIMEOUT_MS);
     try {
       let response: Response;
       try {
@@ -58,16 +250,19 @@ async function establishSession(): Promise<string> {
           credentials: "same-origin",
           headers: { "Content-Type": "application/json" },
           body: "{}",
-          signal: controller.signal,
+          signal: deadline.signal,
         });
       } catch {
-        if (controller.signal.aborted) throw timeoutError();
-        throw connectionError();
+        if (deadline.timedOut()) throw timeoutError(false);
+        throw connectionError(false);
       }
 
       if (!response.ok) {
-        throw new Error(
-          `Factory API session could not be established (HTTP ${response.status}). Restart \`factory start\` and reload the dashboard.`
+        void response.body?.cancel().catch(() => {});
+        throw new FactoryApiError(
+          `Factory API session could not be established (HTTP ${response.status}). Restart \`factory start\` and reload the dashboard.`,
+          "authentication",
+          { status: response.status }
         );
       }
 
@@ -75,15 +270,16 @@ async function establishSession(): Promise<string> {
       try {
         payload = (await response.json()) as { csrfToken?: unknown };
       } catch {
-        throw new Error("Factory API returned an invalid session response.");
+        if (deadline.timedOut()) throw timeoutError(false);
+        throw invalidResponseError();
       }
       if (typeof payload.csrfToken !== "string" || payload.csrfToken.length === 0) {
-        throw new Error("Factory API returned an invalid session response.");
+        throw invalidResponseError();
       }
       csrfToken = payload.csrfToken;
       return csrfToken;
     } finally {
-      window.clearTimeout(timeout);
+      deadline.cleanup();
     }
   })();
 
@@ -100,9 +296,9 @@ async function establishSession(): Promise<string> {
  * Establishes the same-origin browser session. API mutations call this
  * automatically; a cached token avoids a redundant bootstrap.
  */
-export async function ensureFactorySession(): Promise<string> {
+export async function ensureFactorySession(signal?: AbortSignal | null): Promise<string> {
   if (csrfToken) return csrfToken;
-  return establishSession();
+  return waitForSignal(establishSession(), signal);
 }
 
 /**
@@ -110,9 +306,9 @@ export async function ensureFactorySession(): Promise<string> {
  * recovers cleanly from an expired session or a Factory restart even when a
  * CSRF token is still cached in memory.
  */
-export async function refreshFactorySession(): Promise<string> {
+export async function refreshFactorySession(signal?: AbortSignal | null): Promise<string> {
   csrfToken = null;
-  return establishSession();
+  return waitForSignal(establishSession(), signal);
 }
 
 async function fail(response: Response): Promise<never> {
@@ -128,19 +324,31 @@ async function fail(response: Response): Promise<never> {
     detail = "";
   }
   const suffix = detail ? `: ${detail}` : "";
-  throw new Error(`Factory API request failed (HTTP ${response.status})${suffix}`);
+  throw new FactoryApiError(
+    `Factory API request failed (HTTP ${response.status})${suffix}`,
+    response.status === 401 || response.status === 403 ? "authentication" : "http",
+    { status: response.status }
+  );
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+async function request<T>(
+  path: string,
+  init?: RequestInit,
+  options?: ApiRequestOptions
+): Promise<T> {
   const method = (init?.method ?? "GET").toUpperCase();
   const mutating = !["GET", "HEAD", "OPTIONS"].includes(method);
+  const effect = options?.effect ?? (mutating ? "write" : "read");
+  const uncertain = effect === "write";
+  const timeoutMs = resolveTimeoutMs(options);
+  const callerSignals = [init?.signal, options?.signal];
+  const sessionSignal = options?.signal ?? init?.signal;
 
   for (let attempt = 0; attempt < 2; attempt += 1) {
     const headers = new Headers(init?.headers);
-    if (mutating) headers.set(CSRF_HEADER, await ensureFactorySession());
+    if (mutating) headers.set(CSRF_HEADER, await ensureFactorySession(sessionSignal));
 
-    const controller = new AbortController();
-    const timeout = window.setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    const deadline = createDeadline(timeoutMs, callerSignals);
     try {
       let response: Response;
       try {
@@ -149,17 +357,16 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
           method,
           headers,
           credentials: "same-origin",
-          signal: controller.signal,
+          signal: deadline.signal,
         });
       } catch {
-        if (controller.signal.aborted) throw timeoutError();
-        throw connectionError();
+        throw abortFailure(deadline, uncertain) ?? connectionError(uncertain);
       }
 
       if ((response.status === 401 || response.status === 403) && attempt === 0) {
         void response.body?.cancel().catch(() => {});
         csrfToken = null;
-        await establishSession();
+        await waitForSignal(establishSession(), sessionSignal);
         continue;
       }
 
@@ -167,78 +374,90 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
         try {
           return await fail(response);
         } catch (error) {
-          if (controller.signal.aborted) throw timeoutError();
-          throw error;
+          throw abortFailure(deadline, uncertain) ?? error;
         }
       }
       if (response.status === 204) return undefined as T;
       try {
         return (await response.json()) as T;
       } catch {
-        if (controller.signal.aborted) throw timeoutError();
-        throw new Error("Factory API returned an invalid response.");
+        throw abortFailure(deadline, uncertain) ?? invalidResponseError();
       }
     } finally {
-      window.clearTimeout(timeout);
+      deadline.cleanup();
     }
   }
 
-  throw new Error("Factory API session could not be established.");
+  throw new FactoryApiError("Factory API session could not be established.", "authentication");
 }
 
-async function get<T>(path: string): Promise<T> {
-  return request<T>(path);
+async function get<T>(path: string, options?: ApiRequestOptions): Promise<T> {
+  return request<T>(path, undefined, options);
 }
 
-async function put<T>(path: string, body: unknown): Promise<T> {
-  return request<T>(path, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
+async function put<T>(path: string, body: unknown, options?: ApiRequestOptions): Promise<T> {
+  return request<T>(
+    path,
+    {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    },
+    options
+  );
 }
 
-async function post<T>(path: string, body?: unknown): Promise<T> {
-  return request<T>(path, {
-    method: "POST",
-    headers: body === undefined ? undefined : { "Content-Type": "application/json" },
-    body: body === undefined ? undefined : JSON.stringify(body),
-  });
+async function post<T>(path: string, body?: unknown, options?: ApiRequestOptions): Promise<T> {
+  return request<T>(
+    path,
+    {
+      method: "POST",
+      headers: body === undefined ? undefined : { "Content-Type": "application/json" },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    },
+    options
+  );
 }
 
-async function remove<T = void>(path: string): Promise<T> {
-  return request<T>(path, { method: "DELETE" });
+async function remove<T = void>(path: string, options?: ApiRequestOptions): Promise<T> {
+  return request<T>(path, { method: "DELETE" }, options);
 }
 
-export function fetchRuns(): Promise<RunSummary[]> {
-  return get<RunSummary[]>("/runs");
+export function fetchRuns(options?: ApiRequestOptions): Promise<RunSummary[]> {
+  return get<RunSummary[]>("/runs", options);
 }
 
-export function fetchRun(id: number): Promise<RunDetail> {
-  return get<RunDetail>(`/runs/${id}`);
+export function fetchRun(id: number, options?: ApiRequestOptions): Promise<RunDetail> {
+  return get<RunDetail>(`/runs/${id}`, options);
 }
 
 export function createWorkflow(
   objective: string,
   team?: WorkflowTeam,
-  recipe?: string
+  recipe?: string,
+  options?: ApiRequestOptions
 ): Promise<Run> {
   const body: Record<string, unknown> = { objective };
   if (team !== undefined) body.team = team;
   if (recipe !== undefined) body.recipe = recipe;
-  return post<Run>("/runs", body);
+  return post<Run>("/runs", body, options);
 }
 
 /** Imports a GitHub Issue as a workflow. Planning starts; execution does not. */
 export function createWorkflowFromIssue(
   issue: string,
   team?: WorkflowTeam,
-  recipe?: string
+  recipe?: string,
+  options?: ApiRequestOptions
 ): Promise<Run> {
   const body: Record<string, unknown> = { issue };
   if (team !== undefined) body.team = team;
   if (recipe !== undefined) body.recipe = recipe;
-  return post<Run>("/runs/from-issue", body);
+  return post<Run>(
+    "/runs/from-issue",
+    body,
+    operationOptions(options, "externalOperation", "write")
+  );
 }
 
 // --- Recipes -------------------------------------------------------------------
@@ -257,20 +476,27 @@ export interface RecipeSaveRequest {
   github?: { draft: boolean } | null;
 }
 
-export function fetchRecipes(): Promise<Recipe[]> {
-  return get<Recipe[]>("/recipes");
+export function fetchRecipes(options?: ApiRequestOptions): Promise<Recipe[]> {
+  return get<Recipe[]>("/recipes", options);
 }
 
-export function createRecipe(request: RecipeSaveRequest): Promise<Recipe> {
-  return post<Recipe>("/recipes", request);
+export function createRecipe(
+  request: RecipeSaveRequest,
+  options?: ApiRequestOptions
+): Promise<Recipe> {
+  return post<Recipe>("/recipes", request, options);
 }
 
-export function updateRecipe(id: string, request: RecipeSaveRequest): Promise<Recipe> {
-  return put<Recipe>(`/recipes/${encodeURIComponent(id)}`, request);
+export function updateRecipe(
+  id: string,
+  request: RecipeSaveRequest,
+  options?: ApiRequestOptions
+): Promise<Recipe> {
+  return put<Recipe>(`/recipes/${encodeURIComponent(id)}`, request, options);
 }
 
-export function deleteRecipe(id: string): Promise<void> {
-  return remove(`/recipes/${encodeURIComponent(id)}`);
+export function deleteRecipe(id: string, options?: ApiRequestOptions): Promise<void> {
+  return remove(`/recipes/${encodeURIComponent(id)}`, options);
 }
 
 /**
@@ -280,25 +506,32 @@ export function deleteRecipe(id: string): Promise<void> {
  */
 export function saveRunAsRecipe(
   runId: number,
-  request: { name: string; description?: string; id?: string }
+  request: { name: string; description?: string; id?: string },
+  options?: ApiRequestOptions
 ): Promise<Recipe> {
-  return post<Recipe>(`/runs/${runId}/recipe`, request);
+  return post<Recipe>(`/runs/${runId}/recipe`, request, options);
 }
 
 // --- GitHub delivery ---------------------------------------------------------
 
 /** `gh auth status` + remote detection. Semantic read only. */
-export function fetchGithubStatus(): Promise<GitHubStatus> {
-  return get<GitHubStatus>("/github/status");
+export function fetchGithubStatus(options?: ApiRequestOptions): Promise<GitHubStatus> {
+  return get<GitHubStatus>(
+    "/github/status",
+    operationOptions(options, "externalOperation", "read")
+  );
 }
 
-export function fetchDelivery(runId: number): Promise<DeliveryReport> {
-  return get<DeliveryReport>(`/runs/${runId}/delivery`);
+export function fetchDelivery(runId: number, options?: ApiRequestOptions): Promise<DeliveryReport> {
+  return get<DeliveryReport>(`/runs/${runId}/delivery`, options);
 }
 
 /** The editable pull request preview shown before creation. */
-export function fetchPrPreview(runId: number): Promise<PrPreview> {
-  return get<PrPreview>(`/runs/${runId}/pr-preview`);
+export function fetchPrPreview(runId: number, options?: ApiRequestOptions): Promise<PrPreview> {
+  return get<PrPreview>(
+    `/runs/${runId}/pr-preview`,
+    operationOptions(options, "externalOperation", "read")
+  );
 }
 
 /**
@@ -308,119 +541,165 @@ export function fetchPrPreview(runId: number): Promise<PrPreview> {
  */
 export function createPullRequest(
   runId: number,
-  request: { title?: string; body?: string; draft?: boolean }
+  request: { title?: string; body?: string; draft?: boolean },
+  options?: ApiRequestOptions
 ): Promise<GitHubDeliveryRecord> {
-  return post<GitHubDeliveryRecord>(`/runs/${runId}/pull-request`, request);
+  return post<GitHubDeliveryRecord>(
+    `/runs/${runId}/pull-request`,
+    request,
+    operationOptions(options, "externalOperation", "write")
+  );
 }
 
-export function updateWorkflowTeam(runId: number, team: WorkflowTeam): Promise<WorkflowTeam> {
-  return put<WorkflowTeam>(`/runs/${runId}/team`, team);
+export function updateWorkflowTeam(
+  runId: number,
+  team: WorkflowTeam,
+  options?: ApiRequestOptions
+): Promise<WorkflowTeam> {
+  return put<WorkflowTeam>(`/runs/${runId}/team`, team, options);
 }
 
-export function startWorkflow(id: number): Promise<WorkflowTeam> {
-  return post<WorkflowTeam>(`/runs/${id}/start`);
+export function startWorkflow(id: number, options?: ApiRequestOptions): Promise<WorkflowTeam> {
+  return post<WorkflowTeam>(`/runs/${id}/start`, undefined, options);
 }
 
-export function cancelWorkflow(id: number): Promise<void> {
-  return post<void>(`/runs/${id}/cancel`);
+export function cancelWorkflow(id: number, options?: ApiRequestOptions): Promise<void> {
+  return post<void>(`/runs/${id}/cancel`, undefined, options);
 }
 
-export function retryTask(id: number): Promise<{ runId: number }> {
-  return post<{ runId: number }>(`/tasks/${id}/retry`);
+export function retryTask(id: number, options?: ApiRequestOptions): Promise<{ runId: number }> {
+  return post<{ runId: number }>(`/tasks/${id}/retry`, undefined, options);
 }
 
-export function fetchRunArtifacts(runId: number): Promise<RoleArtifact[]> {
-  return get<RoleArtifact[]>(`/runs/${runId}/artifacts`);
+export function fetchRunArtifacts(
+  runId: number,
+  options?: ApiRequestOptions
+): Promise<RoleArtifact[]> {
+  return get<RoleArtifact[]>(`/runs/${runId}/artifacts`, options);
 }
 
-export function fetchTaskArtifacts(taskId: number): Promise<RoleArtifact[]> {
-  return get<RoleArtifact[]>(`/tasks/${taskId}/artifacts`);
+export function fetchTaskArtifacts(
+  taskId: number,
+  options?: ApiRequestOptions
+): Promise<RoleArtifact[]> {
+  return get<RoleArtifact[]>(`/tasks/${taskId}/artifacts`, options);
 }
 
 // --- Routing ---------------------------------------------------------------
 
-export function fetchRoutingPreview(taskId: number): Promise<RoutingPreview> {
-  return get<RoutingPreview>(`/tasks/${taskId}/routing-preview`);
+export function fetchRoutingPreview(
+  taskId: number,
+  options?: ApiRequestOptions
+): Promise<RoutingPreview> {
+  return get<RoutingPreview>(`/tasks/${taskId}/routing-preview`, options);
 }
 
-export function fetchRoutingDecisions(taskId: number): Promise<RoutingDecision[]> {
-  return get<RoutingDecision[]>(`/tasks/${taskId}/routing-decisions`);
+export function fetchRoutingDecisions(
+  taskId: number,
+  options?: ApiRequestOptions
+): Promise<RoutingDecision[]> {
+  return get<RoutingDecision[]>(`/tasks/${taskId}/routing-decisions`, options);
 }
 
 /** Pins (`agent`) or clears (`null`) a task's manual routing override. */
 export function setTaskRouting(
   taskId: number,
-  agent: string | null
+  agent: string | null,
+  options?: ApiRequestOptions
 ): Promise<{ taskId: number; agentOverride: string | null }> {
-  return put(`/tasks/${taskId}/routing`, { agent });
+  return put(`/tasks/${taskId}/routing`, { agent }, options);
 }
 
-export function fetchGraph(): Promise<GraphData> {
-  return get<GraphData>("/graph");
+export function fetchGraph(options?: ApiRequestOptions): Promise<GraphData> {
+  return get<GraphData>("/graph", options);
 }
 
-export function fetchGraphWorkspace(): Promise<GraphWorkspace> {
-  return get<GraphWorkspace>("/graph/workspace");
+export function fetchGraphWorkspace(options?: ApiRequestOptions): Promise<GraphWorkspace> {
+  return get<GraphWorkspace>("/graph/workspace", options);
 }
 
-export function saveGraphWorkspace(workspace: GraphWorkspace): Promise<void> {
+export function saveGraphWorkspace(
+  workspace: GraphWorkspace,
+  options?: ApiRequestOptions
+): Promise<void> {
   const body: GraphWorkspace = {
     version: workspace.version,
     nodes: workspace.nodes,
     customNodes: workspace.customNodes,
     edges: workspace.edges,
   };
-  return put<void>("/graph/workspace", body);
+  return put<void>("/graph/workspace", body, options);
 }
 
-export function fetchConfig(): Promise<ConfigData> {
-  return get<ConfigData>("/config");
+export function fetchConfig(options?: ApiRequestOptions): Promise<ConfigData> {
+  return get<ConfigData>("/config", options);
 }
 
-export function saveConfig(config: ConfigData): Promise<void> {
-  return put<void>("/config", config);
+export function saveConfig(config: ConfigData, options?: ApiRequestOptions): Promise<void> {
+  return put<void>("/config", config, options);
 }
 
 // --- External tools / MCP ----------------------------------------------------
 
-export function fetchMcpServers(): Promise<McpServerView[]> {
-  return get<McpServerView[]>("/mcp/servers");
+export function fetchMcpServers(options?: ApiRequestOptions): Promise<McpServerView[]> {
+  return get<McpServerView[]>("/mcp/servers", options);
 }
 
-export function createMcpServer(id: string, config: McpServerConfig): Promise<McpServerView> {
-  return post<McpServerView>("/mcp/servers", { id, ...config });
+export function createMcpServer(
+  id: string,
+  config: McpServerConfig,
+  options?: ApiRequestOptions
+): Promise<McpServerView> {
+  return post<McpServerView>("/mcp/servers", { id, ...config }, options);
 }
 
-export function updateMcpServer(id: string, config: McpServerConfig): Promise<McpServerView> {
-  return put<McpServerView>(`/mcp/servers/${encodeURIComponent(id)}`, config);
+export function updateMcpServer(
+  id: string,
+  config: McpServerConfig,
+  options?: ApiRequestOptions
+): Promise<McpServerView> {
+  return put<McpServerView>(`/mcp/servers/${encodeURIComponent(id)}`, config, options);
 }
 
-export function deleteMcpServer(id: string): Promise<void> {
-  return remove(`/mcp/servers/${encodeURIComponent(id)}`);
+export function deleteMcpServer(id: string, options?: ApiRequestOptions): Promise<void> {
+  return remove(`/mcp/servers/${encodeURIComponent(id)}`, options);
 }
 
-export function testMcpServer(id: string): Promise<McpServerView> {
-  return post<McpServerView>(`/mcp/servers/${encodeURIComponent(id)}/test`);
+export function testMcpServer(id: string, options?: ApiRequestOptions): Promise<McpServerView> {
+  return post<McpServerView>(
+    `/mcp/servers/${encodeURIComponent(id)}/test`,
+    undefined,
+    operationOptions(options, "discovery", "read")
+  );
 }
 
-export function fetchMcpTools(id: string): Promise<McpTool[]> {
-  return get<McpTool[]>(`/mcp/servers/${encodeURIComponent(id)}/tools`);
+export function fetchMcpTools(id: string, options?: ApiRequestOptions): Promise<McpTool[]> {
+  return get<McpTool[]>(
+    `/mcp/servers/${encodeURIComponent(id)}/tools`,
+    operationOptions(options, "discovery", "read")
+  );
 }
 
-export function fetchRoleTools(roleId: string): Promise<EffectiveToolPermission[]> {
-  return get<EffectiveToolPermission[]>(`/roles/${encodeURIComponent(roleId)}/tools`);
+export function fetchRoleTools(
+  roleId: string,
+  options?: ApiRequestOptions
+): Promise<EffectiveToolPermission[]> {
+  return get<EffectiveToolPermission[]>(`/roles/${encodeURIComponent(roleId)}/tools`, options);
 }
 
-export function fetchAgentTools(agent: string): Promise<EffectiveToolPermission[]> {
-  return get<EffectiveToolPermission[]>(`/agents/${encodeURIComponent(agent)}/tools`);
+export function fetchAgentTools(
+  agent: string,
+  options?: ApiRequestOptions
+): Promise<EffectiveToolPermission[]> {
+  return get<EffectiveToolPermission[]>(`/agents/${encodeURIComponent(agent)}/tools`, options);
 }
 
-export function fetchAgents(): Promise<AgentStatusInfo[]> {
-  return get<AgentStatusInfo[]>("/agents");
+export function fetchAgents(options?: ApiRequestOptions): Promise<AgentStatusInfo[]> {
+  return get<AgentStatusInfo[]>("/agents", options);
 }
 
-export function fetchRoles(): Promise<RoleInfo[]> {
-  return get<RoleInfo[]>("/roles");
+export function fetchRoles(options?: ApiRequestOptions): Promise<RoleInfo[]> {
+  return get<RoleInfo[]>("/roles", options);
 }
 
 export interface RoleCreateRequest {
@@ -435,8 +714,11 @@ export interface RoleCreateRequest {
   policyPreset?: RolePolicyPreset;
 }
 
-export function createRole(request: RoleCreateRequest): Promise<RoleInfo> {
-  return post<RoleInfo>("/roles", request);
+export function createRole(
+  request: RoleCreateRequest,
+  options?: ApiRequestOptions
+): Promise<RoleInfo> {
+  return post<RoleInfo>("/roles", request, options);
 }
 
 export function updateRole(
@@ -447,9 +729,10 @@ export function updateRole(
     executionClass: ExecutionClass;
     instructions?: string;
     policyPreset?: RolePolicyPreset;
-  }
+  },
+  options?: ApiRequestOptions
 ): Promise<RoleInfo> {
-  return put<RoleInfo>(`/roles/${encodeURIComponent(id)}`, body);
+  return put<RoleInfo>(`/roles/${encodeURIComponent(id)}`, body, options);
 }
 
 /**
@@ -457,49 +740,74 @@ export function updateRole(
  * roles: the policy is Factory's enforcement boundary, independent of the
  * role's instructions.
  */
-export function setRolePolicy(roleId: string, preset: RolePolicyPreset | null): Promise<RoleInfo> {
-  return put<RoleInfo>(`/roles/${encodeURIComponent(roleId)}/policy`, { preset });
+export function setRolePolicy(
+  roleId: string,
+  preset: RolePolicyPreset | null,
+  options?: ApiRequestOptions
+): Promise<RoleInfo> {
+  return put<RoleInfo>(`/roles/${encodeURIComponent(roleId)}/policy`, { preset }, options);
 }
 
-export function deleteRole(id: string): Promise<void> {
-  return remove(`/roles/${encodeURIComponent(id)}`);
+export function deleteRole(id: string, options?: ApiRequestOptions): Promise<void> {
+  return remove(`/roles/${encodeURIComponent(id)}`, options);
 }
 
 export function addRoleAssignment(
   roleId: string,
   agent: string,
-  preferred = false
+  preferred = false,
+  options?: ApiRequestOptions
 ): Promise<RoleInfo> {
-  return post<RoleInfo>(`/roles/${encodeURIComponent(roleId)}/assignments`, { agent, preferred });
-}
-
-export function removeRoleAssignment(roleId: string, agent: string): Promise<RoleInfo> {
-  return remove<RoleInfo>(
-    `/roles/${encodeURIComponent(roleId)}/assignments/${encodeURIComponent(agent)}`
+  return post<RoleInfo>(
+    `/roles/${encodeURIComponent(roleId)}/assignments`,
+    { agent, preferred },
+    options
   );
 }
 
-export function setPreferredAssignment(roleId: string, agent: string): Promise<RoleInfo> {
-  return put<RoleInfo>(`/roles/${encodeURIComponent(roleId)}/preferred`, { agent });
+export function removeRoleAssignment(
+  roleId: string,
+  agent: string,
+  options?: ApiRequestOptions
+): Promise<RoleInfo> {
+  return remove<RoleInfo>(
+    `/roles/${encodeURIComponent(roleId)}/assignments/${encodeURIComponent(agent)}`,
+    options
+  );
 }
 
-export function fetchAgentSessions(agent: string): Promise<AgentSession[]> {
-  return get<AgentSession[]>(`/agents/${encodeURIComponent(agent)}/sessions`);
+export function setPreferredAssignment(
+  roleId: string,
+  agent: string,
+  options?: ApiRequestOptions
+): Promise<RoleInfo> {
+  return put<RoleInfo>(`/roles/${encodeURIComponent(roleId)}/preferred`, { agent }, options);
+}
+
+export function fetchAgentSessions(
+  agent: string,
+  options?: ApiRequestOptions
+): Promise<AgentSession[]> {
+  return get<AgentSession[]>(`/agents/${encodeURIComponent(agent)}/sessions`, options);
 }
 
 export function startInteractiveAgentSession(
   agent: string,
-  size: { cols: number; rows: number } = { cols: 100, rows: 28 }
+  size: { cols: number; rows: number } = { cols: 100, rows: 28 },
+  options?: ApiRequestOptions
 ): Promise<AgentSession> {
-  return post<AgentSession>(`/agents/${encodeURIComponent(agent)}/sessions`, size);
+  return post<AgentSession>(`/agents/${encodeURIComponent(agent)}/sessions`, size, options);
 }
 
-export function stopInteractiveAgentSession(id: number): Promise<void> {
-  return remove(`/sessions/${id}`);
+export function stopInteractiveAgentSession(
+  id: number,
+  options?: ApiRequestOptions
+): Promise<void> {
+  return remove(`/sessions/${id}`, options);
 }
 
-export function fetchAgentSession(id: number): Promise<AgentSession> {
-  return get<AgentSession>(`/sessions/${id}`);
+export function fetchAgentSession(id: number, options?: ApiRequestOptions): Promise<AgentSession> {
+  return get<AgentSession>(`/sessions/${id}`, options);
 }
 
 export function agentSessionStreamUrl(id: number): string {
@@ -519,17 +827,20 @@ export function progress(counts: { completed: number; total: number }): number {
 // --- Performance evaluation --------------------------------------------------
 
 export function fetchPerformanceOverview(
-  filters: PerformanceFilters = {}
+  filters: PerformanceFilters = {},
+  options?: ApiRequestOptions
 ): Promise<PerformanceOverview> {
-  return get<PerformanceOverview>(`/performance/agents${performanceQuery(filters)}`);
+  return get<PerformanceOverview>(`/performance/agents${performanceQuery(filters)}`, options);
 }
 
 export function fetchAgentPerformance(
   agent: string,
-  filters: PerformanceFilters = {}
+  filters: PerformanceFilters = {},
+  options?: ApiRequestOptions
 ): Promise<AgentPerformanceDetail> {
   return get<AgentPerformanceDetail>(
-    `/performance/agents/${encodeURIComponent(agent)}${performanceQuery(filters)}`
+    `/performance/agents/${encodeURIComponent(agent)}${performanceQuery(filters)}`,
+    options
   );
 }
 

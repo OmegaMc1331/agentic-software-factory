@@ -13,6 +13,7 @@ import {
   fetchMcpTools,
   fetchRecipes,
   fetchRoles,
+  mcpDiscoveryRequestTimeoutMs,
   removeRoleAssignment,
   saveConfig,
   setPreferredAssignment,
@@ -21,7 +22,7 @@ import {
   updateRecipe,
   updateRole,
 } from "../api";
-import type { ConfigData, McpServerView, Recipe, RoleInfo } from "../types";
+import type { ConfigData, McpServerView, McpTool, Recipe, RoleInfo } from "../types";
 import { SettingsView } from "./Settings";
 
 vi.mock("../api", () => ({
@@ -37,6 +38,7 @@ vi.mock("../api", () => ({
   deleteMcpServer: vi.fn(),
   testMcpServer: vi.fn(),
   fetchMcpTools: vi.fn(),
+  mcpDiscoveryRequestTimeoutMs: vi.fn(),
   createRecipe: vi.fn(),
   updateRecipe: vi.fn(),
   deleteRecipe: vi.fn(),
@@ -96,6 +98,11 @@ beforeEach(() => {
   vi.mocked(updateMcpServer).mockReset();
   vi.mocked(deleteMcpServer).mockReset().mockResolvedValue();
   vi.mocked(testMcpServer).mockReset();
+  vi.mocked(mcpDiscoveryRequestTimeoutMs)
+    .mockReset()
+    .mockImplementation((configured) =>
+      Math.min(605_000, Math.max(15_000, (configured ?? 10_000) + 5_000))
+    );
   vi.mocked(saveConfig).mockReset().mockResolvedValue();
   vi.mocked(addRoleAssignment).mockReset().mockResolvedValue(workerRole);
   vi.mocked(removeRoleAssignment).mockReset().mockResolvedValue(workerRole);
@@ -525,9 +532,10 @@ describe("Settings MCP servers", () => {
 
     expect(await screen.findByText(/Connected/)).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Test connection" }));
-    await waitFor(() => expect(testMcpServer).toHaveBeenCalledWith("docs"));
+    await waitFor(() => expect(testMcpServer).toHaveBeenCalledWith("docs", { timeoutMs: 15_000 }));
     fireEvent.click(screen.getByRole("button", { name: "Inspect tools" }));
     expect(await screen.findByText("docs.search")).toBeTruthy();
+    expect(fetchMcpTools).toHaveBeenCalledWith("docs", { timeoutMs: 15_000 });
     const mcpSection = screen.getByLabelText("External Tools MCP");
     fireEvent.click(within(mcpSection).getByRole("button", { name: "Edit" }));
     expect((screen.getByLabelText("Server id") as HTMLInputElement).value).toBe("docs");
@@ -558,6 +566,48 @@ describe("Settings MCP servers", () => {
         })
       )
     );
+  });
+
+  it("shows MCP discovery pending state and ignores duplicate actions", async () => {
+    vi.mocked(fetchMcpServers).mockResolvedValue([server]);
+    let resolveTest!: (value: McpServerView) => void;
+    vi.mocked(testMcpServer).mockReturnValue(
+      new Promise<McpServerView>((resolve) => {
+        resolveTest = resolve;
+      })
+    );
+
+    render(<SettingsView />);
+    const testButton = await screen.findByRole("button", { name: "Test connection" });
+    fireEvent.click(testButton);
+    fireEvent.click(testButton);
+
+    expect(await screen.findByRole("button", { name: "Testing…" })).toBeTruthy();
+    expect(testMcpServer).toHaveBeenCalledTimes(1);
+    expect(testMcpServer).toHaveBeenCalledWith("docs", { timeoutMs: 15_000 });
+    expect(
+      (screen.getByRole("button", { name: "Inspect tools" }) as HTMLButtonElement).disabled
+    ).toBe(true);
+
+    resolveTest(server);
+    expect(await screen.findByRole("button", { name: "Test connection" })).toBeTruthy();
+
+    let resolveTools!: (tools: McpTool[]) => void;
+    vi.mocked(fetchMcpTools).mockReturnValue(
+      new Promise<McpTool[]>((resolve) => {
+        resolveTools = resolve;
+      })
+    );
+    const inspectButton = screen.getByRole("button", { name: "Inspect tools" });
+    fireEvent.click(inspectButton);
+    fireEvent.click(inspectButton);
+
+    expect(await screen.findByRole("button", { name: "Inspecting…" })).toBeTruthy();
+    expect(fetchMcpTools).toHaveBeenCalledTimes(1);
+    expect(fetchMcpTools).toHaveBeenCalledWith("docs", { timeoutMs: 15_000 });
+
+    resolveTools([]);
+    expect(await screen.findByRole("button", { name: "Inspect tools" })).toBeTruthy();
   });
 });
 

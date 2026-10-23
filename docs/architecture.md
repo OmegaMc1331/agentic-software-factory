@@ -81,6 +81,32 @@ operations are short and never span external I/O. Invocation guards make cancell
 terminal and auditable. Results are bounded and remain marked external data rather
 than repository truth. See [External Tools / MCP](mcp.md).
 
+## Dashboard request deadlines
+
+The dashboard applies a deadline per semantic API operation rather than one global
+HTTP timeout:
+
+| Policy            | Deadline | Used by                                                                   |
+| ----------------- | -------: | ------------------------------------------------------------------------- |
+| default           |      5 s | ordinary reads and mutations, including workflow 202/204 acknowledgements |
+| discovery         |     15 s | MCP connection tests and tool discovery                                   |
+| externalOperation |    120 s | GitHub status, PR previews, Issue imports, and pull request creation      |
+
+MCP discovery uses the larger of 15 s and the server's configured discovery timeout
+plus 5 s, capped at 605 s. The backend's maximum MCP timeout is 600 s. Settings passes
+that derived value for the specific server being tested or inspected.
+
+A deadline only bounds how long the dashboard waits. It does not cancel server-side
+work. After an uncertain write timeout, the dashboard does not retry the mutation
+automatically. Pull request creation performs one delivery-status reconciliation,
+blocks retry while delivery is `pushing` or `creating_pr`, and only offers retry when
+the persisted state is `failed` or confirms that no pull request exists. An
+unconfirmed status remains blocked.
+
+All requests remain same-origin, mutations retain CSRF protection, and one session
+refresh is attempted for 401/403 responses. Network failures and timeouts are never
+retried automatically.
+
 ## Repository Context Engine
 
 `factory-context` builds a bounded, persisted index of the repository — paths,

@@ -6,10 +6,18 @@ import {
   fetchPrPreview,
   fetchRoles,
   fetchRun,
+  isUncertainApiError,
   saveRunAsRecipe,
   updateWorkflowTeam,
 } from "../api";
-import type { DeliveryReport, GraphNode, RoleInfo, RunDetail, RunMeta } from "../types";
+import type {
+  DeliveryReport,
+  GitHubDeliveryRecord,
+  GraphNode,
+  RoleInfo,
+  RunDetail,
+  RunMeta,
+} from "../types";
 import { WorkflowInspector } from "./WorkflowInspector";
 
 vi.mock("../api", () => ({
@@ -20,6 +28,7 @@ vi.mock("../api", () => ({
   fetchDelivery: vi.fn(),
   fetchPrPreview: vi.fn(),
   createPullRequest: vi.fn(),
+  isUncertainApiError: vi.fn(),
 }));
 
 const team = {
@@ -173,6 +182,52 @@ const deliveryReady: DeliveryReport = {
   },
 };
 
+const readyPreview = {
+  runId: 12,
+  repository: "OmegaMc1331/example",
+  base: "main",
+  head: "factory/run-12",
+  title: "Fix refresh token race",
+  body: "## Summary\n\nResolve GitHub Issue #42: Fix refresh token race\n\nCloses #42",
+  draft: false,
+  issueNumber: 42,
+  issueUrl: "https://github.com/OmegaMc1331/example/issues/42",
+  existing: null,
+  eligible: true,
+  blockers: [],
+};
+
+const publishedDelivery: DeliveryReport = {
+  ...deliveryReady,
+  state: "published",
+  persistedState: "published",
+  pullRequest: {
+    number: 58,
+    url: "https://github.com/OmegaMc1331/example/pull/58",
+    state: "OPEN",
+    isDraft: false,
+  },
+};
+
+const publishedRecord: GitHubDeliveryRecord = {
+  runId: 12,
+  state: "published",
+  repository: "OmegaMc1331/example",
+  remote: "origin",
+  baseBranch: "main",
+  headBranch: "factory/run-12",
+  pushedHead: "abc123",
+  pullRequest: {
+    number: 58,
+    url: "https://github.com/OmegaMc1331/example/pull/58",
+    state: "OPEN",
+    isDraft: false,
+  },
+  error: null,
+  createdAt: "2026-08-21T10:00:00Z",
+  updatedAt: "2026-08-21T10:00:00Z",
+};
+
 beforeEach(() => {
   vi.mocked(fetchRun).mockReset().mockResolvedValue(detail);
   vi.mocked(saveRunAsRecipe)
@@ -193,6 +248,7 @@ beforeEach(() => {
   vi.mocked(fetchDelivery).mockReset().mockResolvedValue(deliveryNotReady);
   vi.mocked(fetchPrPreview).mockReset();
   vi.mocked(createPullRequest).mockReset();
+  vi.mocked(isUncertainApiError).mockReset().mockReturnValue(false);
   vi.spyOn(window, "confirm").mockReturnValue(true);
 });
 
@@ -509,6 +565,144 @@ describe("Workflow inspector", () => {
     expect(screen.queryByRole("button", { name: "Create Pull Request" })).toBeNull();
     expect(fetchPrPreview).not.toHaveBeenCalled();
     expect(createPullRequest).not.toHaveBeenCalled();
+  });
+
+  it("reconciles an uncertain pull request before allowing another submission", async () => {
+    vi.mocked(fetchRun).mockResolvedValue({
+      ...detail,
+      run: { ...detail.run, status: "completed" },
+    });
+    vi.mocked(fetchDelivery).mockResolvedValue(deliveryReady);
+    vi.mocked(fetchPrPreview).mockResolvedValue(readyPreview);
+    const timeout = new Error(
+      "The request timed out. The operation may still be running or may have completed. Check its status before retrying."
+    );
+    vi.mocked(createPullRequest).mockRejectedValue(timeout);
+    vi.mocked(isUncertainApiError).mockReturnValue(true);
+    const onTeamUpdated = vi.fn();
+    render(
+      <WorkflowInspector
+        node={{ ...node, meta: { ...meta, status: "completed" } }}
+        onClose={vi.fn()}
+        onStart={vi.fn()}
+        onCancel={vi.fn()}
+        onRetry={vi.fn()}
+        onTeamUpdated={onTeamUpdated}
+      />
+    );
+
+    fireEvent.click(await screen.findByRole("button", { name: "Create Pull Request" }));
+    await screen.findByLabelText("Title");
+    vi.mocked(fetchDelivery).mockResolvedValueOnce(publishedDelivery);
+    fireEvent.click(screen.getByRole("button", { name: "Create Pull Request" }));
+
+    await waitFor(() => expect(onTeamUpdated).toHaveBeenCalled());
+    expect(createPullRequest).toHaveBeenCalledTimes(1);
+    expect(fetchDelivery).toHaveBeenCalledTimes(2);
+    expect(screen.queryByText(timeout.message)).toBeNull();
+    expect(screen.queryByRole("button", { name: "Retry delivery" })).toBeNull();
+  });
+
+  it("does not offer retry while an uncertain delivery is still in progress", async () => {
+    vi.mocked(fetchRun).mockResolvedValue({
+      ...detail,
+      run: { ...detail.run, status: "completed" },
+    });
+    vi.mocked(fetchDelivery).mockResolvedValue(deliveryReady);
+    vi.mocked(fetchPrPreview).mockResolvedValue(readyPreview);
+    vi.mocked(createPullRequest).mockRejectedValue(new Error("Request timed out."));
+    vi.mocked(isUncertainApiError).mockReturnValue(true);
+    render(
+      <WorkflowInspector
+        node={{ ...node, meta: { ...meta, status: "completed" } }}
+        onClose={vi.fn()}
+        onStart={vi.fn()}
+        onCancel={vi.fn()}
+        onRetry={vi.fn()}
+      />
+    );
+
+    fireEvent.click(await screen.findByRole("button", { name: "Create Pull Request" }));
+    await screen.findByLabelText("Title");
+    vi.mocked(fetchDelivery).mockResolvedValueOnce({
+      ...deliveryReady,
+      state: "pushing",
+      persistedState: "pushing",
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Create Pull Request" }));
+
+    expect(await screen.findByText(/Delivery is still in progress/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Retry delivery" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Check delivery status" })).toBeTruthy();
+    expect(createPullRequest).toHaveBeenCalledTimes(1);
+  });
+
+  it("blocks retry when delivery status cannot be confirmed", async () => {
+    vi.mocked(fetchRun).mockResolvedValue({
+      ...detail,
+      run: { ...detail.run, status: "completed" },
+    });
+    vi.mocked(fetchDelivery).mockResolvedValue(deliveryReady);
+    vi.mocked(fetchPrPreview).mockResolvedValue(readyPreview);
+    vi.mocked(createPullRequest).mockRejectedValue(new Error("Request timed out."));
+    vi.mocked(isUncertainApiError).mockReturnValue(true);
+    render(
+      <WorkflowInspector
+        node={{ ...node, meta: { ...meta, status: "completed" } }}
+        onClose={vi.fn()}
+        onStart={vi.fn()}
+        onCancel={vi.fn()}
+        onRetry={vi.fn()}
+      />
+    );
+
+    fireEvent.click(await screen.findByRole("button", { name: "Create Pull Request" }));
+    await screen.findByLabelText("Title");
+    vi.mocked(fetchDelivery).mockRejectedValueOnce(new Error("Factory API is unavailable."));
+    fireEvent.click(screen.getByRole("button", { name: "Create Pull Request" }));
+
+    expect(await screen.findByText(/Delivery status could not be confirmed/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Retry delivery" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Check delivery status" })).toBeTruthy();
+    expect(createPullRequest).toHaveBeenCalledTimes(1);
+  });
+
+  it("prevents repeated clicks from creating duplicate pull requests", async () => {
+    vi.mocked(fetchRun).mockResolvedValue({
+      ...detail,
+      run: { ...detail.run, status: "completed" },
+    });
+    vi.mocked(fetchDelivery).mockResolvedValue(deliveryReady);
+    vi.mocked(fetchPrPreview).mockResolvedValue(readyPreview);
+    let resolveCreate!: (record: GitHubDeliveryRecord) => void;
+    vi.mocked(createPullRequest).mockReturnValue(
+      new Promise<GitHubDeliveryRecord>((resolve) => {
+        resolveCreate = resolve;
+      })
+    );
+    render(
+      <WorkflowInspector
+        node={{ ...node, meta: { ...meta, status: "completed" } }}
+        onClose={vi.fn()}
+        onStart={vi.fn()}
+        onCancel={vi.fn()}
+        onRetry={vi.fn()}
+      />
+    );
+
+    fireEvent.click(await screen.findByRole("button", { name: "Create Pull Request" }));
+    await screen.findByLabelText("Title");
+    const createButton = screen.getByRole("button", { name: "Create Pull Request" });
+    fireEvent.click(createButton);
+    fireEvent.click(createButton);
+
+    expect(await screen.findByRole("button", { name: "Creating pull request…" })).toBeTruthy();
+    expect(createPullRequest).toHaveBeenCalledTimes(1);
+
+    resolveCreate(publishedRecord);
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: "Creating pull request…" })).toBeNull()
+    );
   });
 
   it("shows No Recipe for runs created before recipes existed", async () => {

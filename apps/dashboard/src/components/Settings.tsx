@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   addRoleAssignment,
   createMcpServer,
@@ -12,6 +12,7 @@ import {
   fetchMcpTools,
   fetchRecipes,
   fetchRoles,
+  mcpDiscoveryRequestTimeoutMs,
   removeRoleAssignment,
   saveConfig,
   setPreferredAssignment,
@@ -145,7 +146,11 @@ export function SettingsView() {
   const [mcpServers, setMcpServers] = useState<McpServerView[]>([]);
   const [mcpDraft, setMcpDraft] = useState<McpDraft | null>(null);
   const [mcpTools, setMcpTools] = useState<Record<string, McpTool[]>>({});
-  const [mcpBusy, setMcpBusy] = useState<string | null>(null);
+  const [mcpBusy, setMcpBusy] = useState<{
+    id: string;
+    action: "save" | "test" | "inspect" | "delete";
+  } | null>(null);
+  const mcpActionPending = useRef(false);
   const [draft, setDraft] = useState<AgentDraft | null>(null);
   const [editingRole, setEditingRole] = useState<RoleInfo | null>(null);
   const [roleSelection, setRoleSelection] = useState<Record<string, string>>({});
@@ -257,7 +262,7 @@ export function SettingsView() {
   };
 
   const saveMcpDraft = async () => {
-    if (!mcpDraft) return;
+    if (!mcpDraft || mcpActionPending.current) return;
     const id = mcpDraft.id.trim();
     if (!id) {
       setError("MCP server id is required.");
@@ -271,7 +276,8 @@ export function SettingsView() {
       setError("A URL is required for an HTTP MCP server.");
       return;
     }
-    setMcpBusy(id);
+    mcpActionPending.current = true;
+    setMcpBusy({ id, action: "save" });
     setError(null);
     try {
       if (mcpDraft.originalId) {
@@ -285,33 +291,46 @@ export function SettingsView() {
     } catch (reason) {
       setError((reason as Error).message);
     } finally {
+      mcpActionPending.current = false;
       setMcpBusy(null);
     }
   };
 
   const testMcp = async (id: string) => {
-    setMcpBusy(id);
+    if (mcpActionPending.current) return;
+    const server = mcpServers.find((candidate) => candidate.id === id);
+    mcpActionPending.current = true;
+    setMcpBusy({ id, action: "test" });
     setError(null);
     try {
-      const tested = await testMcpServer(id);
-      setMcpServers((current) => current.map((server) => (server.id === id ? tested : server)));
+      const tested = await testMcpServer(id, {
+        timeoutMs: mcpDiscoveryRequestTimeoutMs(server?.discoveryTimeoutMs),
+      });
+      setMcpServers((current) => current.map((entry) => (entry.id === id ? tested : entry)));
       if (tested.status === "connected") setSaved(`${id} connected; ${tested.toolCount} tools.`);
     } catch (reason) {
       setError((reason as Error).message);
     } finally {
+      mcpActionPending.current = false;
       setMcpBusy(null);
     }
   };
 
   const inspectMcp = async (id: string) => {
-    setMcpBusy(id);
+    if (mcpActionPending.current) return;
+    const server = mcpServers.find((candidate) => candidate.id === id);
+    mcpActionPending.current = true;
+    setMcpBusy({ id, action: "inspect" });
     setError(null);
     try {
-      const tools = await fetchMcpTools(id);
+      const tools = await fetchMcpTools(id, {
+        timeoutMs: mcpDiscoveryRequestTimeoutMs(server?.discoveryTimeoutMs),
+      });
       setMcpTools((current) => ({ ...current, [id]: tools }));
     } catch (reason) {
       setError((reason as Error).message);
     } finally {
+      mcpActionPending.current = false;
       setMcpBusy(null);
     }
   };
@@ -560,9 +579,14 @@ export function SettingsView() {
             </label>
             <div className="settings-actions">
               <button className="button" type="submit" disabled={mcpBusy !== null}>
-                Save server
+                {mcpBusy?.action === "save" ? "Saving…" : "Save server"}
               </button>
-              <button className="button" type="button" onClick={() => setMcpDraft(null)}>
+              <button
+                className="button"
+                type="button"
+                onClick={() => setMcpDraft(null)}
+                disabled={mcpBusy !== null}
+              >
                 Cancel
               </button>
             </div>
@@ -603,16 +627,22 @@ export function SettingsView() {
                     <button
                       className="button"
                       disabled={mcpBusy !== null}
+                      aria-busy={mcpBusy?.id === server.id && mcpBusy.action === "test"}
                       onClick={() => void testMcp(server.id)}
                     >
-                      Test connection
+                      {mcpBusy?.id === server.id && mcpBusy.action === "test"
+                        ? "Testing…"
+                        : "Test connection"}
                     </button>
                     <button
                       className="button"
                       disabled={mcpBusy !== null}
+                      aria-busy={mcpBusy?.id === server.id && mcpBusy.action === "inspect"}
                       onClick={() => void inspectMcp(server.id)}
                     >
-                      Inspect tools
+                      {mcpBusy?.id === server.id && mcpBusy.action === "inspect"
+                        ? "Inspecting…"
+                        : "Inspect tools"}
                     </button>
                     <button className="button" onClick={() => setMcpDraft(mcpDraftFrom(server))}>
                       Edit
@@ -620,14 +650,18 @@ export function SettingsView() {
                     <button
                       className="button"
                       onClick={() => {
+                        if (mcpActionPending.current) return;
                         if (!window.confirm(`Remove the ${server.id} MCP server?`)) return;
-                        setMcpBusy(server.id);
+                        mcpActionPending.current = true;
+                        setMcpBusy({ id: server.id, action: "delete" });
                         deleteMcpServer(server.id)
                           .then(() => {
+                            mcpActionPending.current = false;
                             setMcpBusy(null);
                             reload();
                           })
                           .catch((reason: Error) => {
+                            mcpActionPending.current = false;
                             setMcpBusy(null);
                             setError(reason.message);
                           });
