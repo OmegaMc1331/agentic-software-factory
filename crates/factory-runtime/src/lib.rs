@@ -1,8 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc as std_mpsc, Arc, Mutex};
+use std::sync::{mpsc as std_mpsc, Arc, Mutex, Weak};
 use std::time::Instant;
 
 use factory_core::{Factory, FactoryError, FACTORY_DIR};
@@ -10,13 +10,16 @@ use factory_db::FactoryDb;
 use factory_types::{AgentSession, AgentSessionMode, RecipeSnapshot, Run, WorkflowTeam};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use thiserror::Error;
-use tokio::sync::mpsc;
+use tokio::sync::Notify;
 
 mod project_lock;
 
 use project_lock::ProjectLock;
 
 const MAX_TERMINAL_HISTORY_BYTES: usize = 1_000_000;
+const MAX_TERMINAL_SUBSCRIBERS: usize = 8;
+const MAX_TERMINAL_SUBSCRIBER_BYTES: usize = 2 * 1024 * 1024;
+const MAX_TERMINAL_SUBSCRIBER_CHUNKS: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OperationKind {
@@ -38,6 +41,8 @@ pub enum RuntimeError {
     NotActive(i64),
     #[error("interactive session {0} is not active in this Factory process")]
     TerminalNotActive(i64),
+    #[error("interactive session {0} already has the maximum number of terminal subscribers")]
+    TerminalSubscribersFull(i64),
     #[error("interactive terminal error: {0}")]
     Terminal(String),
     #[error(
@@ -78,18 +83,253 @@ struct InteractiveTerminal {
     writer: Mutex<Option<Box<dyn Write + Send>>>,
     killer: Mutex<Box<dyn portable_pty::ChildKiller + Send + Sync>>,
     stopping: AtomicBool,
-    output: Mutex<TerminalOutput>,
+    output: Arc<Mutex<TerminalOutput>>,
 }
 
 #[derive(Default)]
 struct TerminalOutput {
     history: Vec<u8>,
-    subscribers: Vec<mpsc::UnboundedSender<Vec<u8>>>,
+    subscribers: Vec<TerminalSubscriber>,
+    next_subscriber_id: u64,
+    closed: bool,
+}
+
+struct TerminalSubscriber {
+    id: u64,
+    queue: Arc<TerminalSubscriberQueue>,
+}
+
+struct TerminalSubscriberQueue {
+    state: Mutex<TerminalSubscriberQueueState>,
+    notify: Notify,
+}
+
+#[derive(Default)]
+struct TerminalSubscriberQueueState {
+    chunks: VecDeque<Arc<[u8]>>,
+    bytes: usize,
+    closed: bool,
+    overflowed: bool,
 }
 
 pub struct TerminalSubscription {
     pub snapshot: Vec<u8>,
-    pub receiver: mpsc::UnboundedReceiver<Vec<u8>>,
+    pub receiver: TerminalReceiver,
+}
+
+pub struct TerminalReceiver {
+    queue: Arc<TerminalSubscriberQueue>,
+    cleanup: Option<SubscriberCleanup>,
+}
+
+struct SubscriberCleanup {
+    output: Weak<Mutex<TerminalOutput>>,
+    id: u64,
+}
+
+enum TerminalPoll {
+    Chunk(Arc<[u8]>),
+    Empty,
+    Closed,
+}
+
+#[cfg(test)]
+enum TerminalTryRecvError {
+    Empty,
+    Disconnected,
+}
+
+#[derive(Debug)]
+enum TerminalSubscribeError {
+    Full,
+}
+
+impl TerminalSubscriberQueue {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(TerminalSubscriberQueueState::default()),
+            notify: Notify::new(),
+        }
+    }
+
+    fn enqueue(&self, chunk: Arc<[u8]>) -> bool {
+        let enqueued = {
+            let mut state = self.state.lock().expect("terminal queue poisoned");
+            if state.closed {
+                return false;
+            }
+            let over_bytes = state
+                .bytes
+                .checked_add(chunk.len())
+                .is_none_or(|bytes| bytes > MAX_TERMINAL_SUBSCRIBER_BYTES);
+            let over_chunks = state.chunks.len() >= MAX_TERMINAL_SUBSCRIBER_CHUNKS;
+            if chunk.len() > MAX_TERMINAL_SUBSCRIBER_BYTES || over_bytes || over_chunks {
+                state.overflowed = true;
+                state.closed = true;
+                state.chunks.clear();
+                state.bytes = 0;
+                false
+            } else {
+                state.bytes += chunk.len();
+                state.chunks.push_back(chunk);
+                true
+            }
+        };
+        self.notify.notify_one();
+        enqueued
+    }
+
+    fn close(&self) {
+        self.state.lock().expect("terminal queue poisoned").closed = true;
+        self.notify.notify_one();
+    }
+
+    fn discard(&self) {
+        {
+            let mut state = self.state.lock().expect("terminal queue poisoned");
+            state.closed = true;
+            state.chunks.clear();
+            state.bytes = 0;
+        }
+        self.notify.notify_one();
+    }
+
+    fn poll(&self) -> TerminalPoll {
+        let mut state = self.state.lock().expect("terminal queue poisoned");
+        if let Some(chunk) = state.chunks.pop_front() {
+            state.bytes -= chunk.len();
+            TerminalPoll::Chunk(chunk)
+        } else if state.closed {
+            TerminalPoll::Closed
+        } else {
+            TerminalPoll::Empty
+        }
+    }
+
+    fn overflowed(&self) -> bool {
+        self.state
+            .lock()
+            .expect("terminal queue poisoned")
+            .overflowed
+    }
+}
+
+impl TerminalReceiver {
+    pub async fn recv(&mut self) -> Option<Arc<[u8]>> {
+        loop {
+            match self.queue.poll() {
+                TerminalPoll::Chunk(chunk) => return Some(chunk),
+                TerminalPoll::Closed => return None,
+                TerminalPoll::Empty => self.queue.notify.notified().await,
+            }
+        }
+    }
+
+    pub fn overflowed(&self) -> bool {
+        self.queue.overflowed()
+    }
+
+    #[cfg(test)]
+    fn try_recv(&mut self) -> Result<Arc<[u8]>, TerminalTryRecvError> {
+        match self.queue.poll() {
+            TerminalPoll::Chunk(chunk) => Ok(chunk),
+            TerminalPoll::Empty => Err(TerminalTryRecvError::Empty),
+            TerminalPoll::Closed => Err(TerminalTryRecvError::Disconnected),
+        }
+    }
+}
+
+impl Drop for TerminalReceiver {
+    fn drop(&mut self) {
+        self.queue.discard();
+        let Some(cleanup) = self.cleanup.take() else {
+            return;
+        };
+        let Some(output) = cleanup.output.upgrade() else {
+            return;
+        };
+        if let Ok(mut output) = output.lock() {
+            output.remove_subscriber(cleanup.id);
+        };
+    }
+}
+
+impl TerminalOutput {
+    fn publish(&mut self, chunk: &[u8]) {
+        if self.closed || chunk.is_empty() {
+            return;
+        }
+        self.history.extend_from_slice(chunk);
+        if self.history.len() > MAX_TERMINAL_HISTORY_BYTES {
+            let overflow = self.history.len() - MAX_TERMINAL_HISTORY_BYTES;
+            self.history.drain(..overflow);
+        }
+        if self.subscribers.is_empty() {
+            return;
+        }
+        let chunk: Arc<[u8]> = Arc::from(chunk);
+        self.subscribers
+            .retain(|subscriber| subscriber.queue.enqueue(chunk.clone()));
+    }
+
+    fn remove_subscriber(&mut self, id: u64) {
+        if let Some(index) = self
+            .subscribers
+            .iter()
+            .position(|subscriber| subscriber.id == id)
+        {
+            let subscriber = self.subscribers.remove(index);
+            subscriber.queue.discard();
+        }
+    }
+
+    fn close_subscribers(&mut self) {
+        self.closed = true;
+        for subscriber in self.subscribers.drain(..) {
+            subscriber.queue.close();
+        }
+    }
+}
+
+fn subscribe_terminal_output(
+    output: &Arc<Mutex<TerminalOutput>>,
+) -> Result<TerminalSubscription, TerminalSubscribeError> {
+    let mut state = output.lock().expect("terminal output poisoned");
+    let snapshot = state.history.clone();
+    if state.closed {
+        let queue = Arc::new(TerminalSubscriberQueue::new());
+        queue.close();
+        return Ok(TerminalSubscription {
+            snapshot,
+            receiver: TerminalReceiver {
+                queue,
+                cleanup: None,
+            },
+        });
+    }
+    if state.subscribers.len() >= MAX_TERMINAL_SUBSCRIBERS {
+        return Err(TerminalSubscribeError::Full);
+    }
+    let id = state.next_subscriber_id;
+    state.next_subscriber_id = state
+        .next_subscriber_id
+        .checked_add(1)
+        .expect("terminal subscriber id overflow");
+    let queue = Arc::new(TerminalSubscriberQueue::new());
+    state.subscribers.push(TerminalSubscriber {
+        id,
+        queue: queue.clone(),
+    });
+    Ok(TerminalSubscription {
+        snapshot,
+        receiver: TerminalReceiver {
+            queue,
+            cleanup: Some(SubscriberCleanup {
+                output: Arc::downgrade(output),
+                id,
+            }),
+        },
+    })
 }
 
 impl Runtime {
@@ -187,7 +427,7 @@ impl Runtime {
             writer: Mutex::new(Some(writer)),
             killer: Mutex::new(killer),
             stopping: AtomicBool::new(false),
-            output: Mutex::new(TerminalOutput::default()),
+            output: Arc::new(Mutex::new(TerminalOutput::default())),
         });
         self.terminals
             .lock()
@@ -205,12 +445,8 @@ impl Runtime {
         let terminal = terminals
             .get(&session_id)
             .ok_or(RuntimeError::TerminalNotActive(session_id))?;
-        let mut output = terminal.output.lock().expect("terminal output poisoned");
-        let (sender, receiver) = mpsc::unbounded_channel();
-        output.subscribers.push(sender);
-        Ok(TerminalSubscription {
-            snapshot: output.history.clone(),
-            receiver,
+        subscribe_terminal_output(&terminal.output).map_err(|TerminalSubscribeError::Full| {
+            RuntimeError::TerminalSubscribersFull(session_id)
         })
     }
 
@@ -467,8 +703,7 @@ impl Runtime {
                 .output
                 .lock()
                 .expect("terminal output poisoned")
-                .subscribers
-                .clear();
+                .close_subscribers();
             let _ = output_complete.send(());
         });
 
@@ -545,15 +780,11 @@ fn terminal_size(cols: u16, rows: u16) -> PtySize {
 }
 
 fn publish_terminal_output(terminal: &InteractiveTerminal, chunk: &[u8]) {
-    let mut output = terminal.output.lock().expect("terminal output poisoned");
-    output.history.extend_from_slice(chunk);
-    if output.history.len() > MAX_TERMINAL_HISTORY_BYTES {
-        let overflow = output.history.len() - MAX_TERMINAL_HISTORY_BYTES;
-        output.history.drain(..overflow);
-    }
-    output
-        .subscribers
-        .retain(|subscriber| subscriber.send(chunk.to_vec()).is_ok());
+    terminal
+        .output
+        .lock()
+        .expect("terminal output poisoned")
+        .publish(chunk);
 }
 
 #[cfg(test)]
@@ -575,6 +806,297 @@ mod tests {
             let _ = std::io::Read::read(&mut std::io::stdin(), &mut [0_u8; 1]);
             std::process::exit(0);
         }
+    }
+
+    #[test]
+    fn pty_stream_child() {
+        if std::env::var("FACTORY_PTY_STREAM").as_deref() != Ok("1") {
+            return;
+        }
+        let mut input = [0_u8; 1];
+        let mut stdout = std::io::stdout();
+        stdout.write_all(b"STREAM_READY\r\n").unwrap();
+        stdout.flush().unwrap();
+        let _ = std::io::Read::read(&mut std::io::stdin(), &mut input);
+        let block = vec![b'x'; 8192];
+        for _ in 0..480 {
+            stdout.write_all(&block).unwrap();
+        }
+        stdout.write_all(b"STREAM_DONE").unwrap();
+        stdout.flush().unwrap();
+        loop {
+            if std::io::Read::read(&mut std::io::stdin(), &mut input).is_err() {
+                std::process::exit(1);
+            }
+            if input[0] == b'r' {
+                break;
+            }
+        }
+        stdout.write_all(b"STREAM_ALIVE").unwrap();
+        stdout.flush().unwrap();
+        std::process::exit(0);
+    }
+
+    fn new_terminal_output() -> Arc<Mutex<TerminalOutput>> {
+        Arc::new(Mutex::new(TerminalOutput::default()))
+    }
+
+    fn subscribe(output: &Arc<Mutex<TerminalOutput>>) -> TerminalSubscription {
+        subscribe_terminal_output(output).unwrap()
+    }
+
+    fn publish(output: &Arc<Mutex<TerminalOutput>>, chunk: &[u8]) {
+        output
+            .lock()
+            .expect("terminal output poisoned")
+            .publish(chunk);
+    }
+
+    fn drain(receiver: &mut TerminalReceiver) -> Vec<u8> {
+        let mut output = Vec::new();
+        loop {
+            match receiver.try_recv() {
+                Ok(chunk) => output.extend_from_slice(&chunk),
+                Err(TerminalTryRecvError::Empty | TerminalTryRecvError::Disconnected) => {
+                    return output
+                }
+            }
+        }
+    }
+
+    fn subscriber_count(output: &Arc<Mutex<TerminalOutput>>) -> usize {
+        output
+            .lock()
+            .expect("terminal output poisoned")
+            .subscribers
+            .len()
+    }
+
+    #[test]
+    fn terminal_subscribers_receive_identical_binary_output_in_order() {
+        let output = new_terminal_output();
+        let mut first = subscribe(&output);
+        let mut second = subscribe(&output);
+        let chunks: [&[u8]; 4] = [
+            b"\x1b[31mred\x1b[0m",
+            &[0, 1, 2, 3, 255],
+            b"partial-\xe2\x94",
+            b"\x80-complete\r\n",
+        ];
+        for chunk in chunks {
+            publish(&output, chunk);
+        }
+        assert_eq!(drain(&mut first.receiver), chunks.concat());
+        assert_eq!(drain(&mut second.receiver), chunks.concat());
+        assert!(!first.receiver.overflowed());
+        assert!(!second.receiver.overflowed());
+    }
+
+    #[test]
+    fn terminal_snapshot_and_live_output_do_not_overlap() {
+        let output = new_terminal_output();
+        publish(&output, b"before-live");
+        let mut subscription = subscribe(&output);
+        assert_eq!(subscription.snapshot, b"before-live");
+        publish(&output, b"-after-live");
+        assert_eq!(drain(&mut subscription.receiver), b"-after-live");
+        assert_eq!(
+            output.lock().expect("terminal output poisoned").history,
+            b"before-live-after-live"
+        );
+    }
+
+    #[test]
+    fn terminal_subscriber_queue_enforces_byte_capacity() {
+        let output = new_terminal_output();
+        let mut subscription = subscribe(&output);
+        let chunk = vec![b'a'; 100_000];
+        for _ in 0..20 {
+            publish(&output, &chunk);
+        }
+        {
+            let output = output.lock().expect("terminal output poisoned");
+            let queue = output.subscribers[0]
+                .queue
+                .state
+                .lock()
+                .expect("terminal queue poisoned");
+            assert_eq!(queue.bytes, 2_000_000);
+            assert_eq!(queue.chunks.len(), 20);
+        }
+        publish(&output, &chunk);
+        assert!(subscription.receiver.overflowed());
+        assert_eq!(subscriber_count(&output), 0);
+        assert!(drain(&mut subscription.receiver).is_empty());
+    }
+
+    #[test]
+    fn oversized_terminal_chunk_is_rejected_without_truncation() {
+        let output = new_terminal_output();
+        let mut subscription = subscribe(&output);
+        publish(&output, &vec![b'x'; MAX_TERMINAL_SUBSCRIBER_BYTES + 1]);
+        assert!(subscription.receiver.overflowed());
+        assert_eq!(subscriber_count(&output), 0);
+        assert!(drain(&mut subscription.receiver).is_empty());
+    }
+
+    #[test]
+    fn terminal_subscriber_queue_enforces_message_capacity() {
+        let output = new_terminal_output();
+        let subscription = subscribe(&output);
+        for index in 0..MAX_TERMINAL_SUBSCRIBER_CHUNKS {
+            publish(&output, &[index as u8]);
+        }
+        {
+            let output = output.lock().expect("terminal output poisoned");
+            let queue = output.subscribers[0]
+                .queue
+                .state
+                .lock()
+                .expect("terminal queue poisoned");
+            assert_eq!(queue.chunks.len(), MAX_TERMINAL_SUBSCRIBER_CHUNKS);
+            assert_eq!(queue.bytes, MAX_TERMINAL_SUBSCRIBER_CHUNKS);
+        }
+        publish(&output, b"overflow");
+        assert!(subscription.receiver.overflowed());
+        assert_eq!(subscriber_count(&output), 0);
+    }
+
+    #[test]
+    fn slow_terminal_subscriber_is_evicted_while_healthy_subscriber_continues() {
+        let output = new_terminal_output();
+        let mut slow = subscribe(&output);
+        let mut healthy = subscribe(&output);
+        let chunk = vec![b'z'; 8192];
+        let mut received = Vec::new();
+        for _ in 0..480 {
+            publish(&output, &chunk);
+            received.extend_from_slice(&drain(&mut healthy.receiver));
+        }
+        assert!(slow.receiver.overflowed());
+        assert!(!healthy.receiver.overflowed());
+        assert_eq!(subscriber_count(&output), 1);
+        assert_eq!(received.len(), 480 * 8192);
+        assert!(received.iter().all(|byte| *byte == b'z'));
+        assert!(drain(&mut slow.receiver).is_empty());
+    }
+
+    #[test]
+    fn dropping_terminal_subscription_releases_its_queue() {
+        let output = new_terminal_output();
+        let subscription = subscribe(&output);
+        publish(&output, &vec![b'q'; 1_000_000]);
+        assert_eq!(subscriber_count(&output), 1);
+        drop(subscription);
+        assert_eq!(subscriber_count(&output), 0);
+    }
+
+    #[test]
+    fn terminal_close_drains_queued_output_before_disconnecting() {
+        let output = new_terminal_output();
+        let mut subscription = subscribe(&output);
+        publish(&output, b"final-output");
+        output
+            .lock()
+            .expect("terminal output poisoned")
+            .close_subscribers();
+        assert_eq!(drain(&mut subscription.receiver), b"final-output");
+        assert!(matches!(
+            subscription.receiver.try_recv(),
+            Err(TerminalTryRecvError::Disconnected)
+        ));
+        assert!(!subscription.receiver.overflowed());
+    }
+
+    #[test]
+    fn subscribing_after_terminal_close_returns_the_snapshot_and_disconnects() {
+        let output = new_terminal_output();
+        publish(&output, b"final-output");
+        output
+            .lock()
+            .expect("terminal output poisoned")
+            .close_subscribers();
+        publish(&output, b"ignored-after-close");
+        let mut subscription = subscribe(&output);
+        assert_eq!(subscription.snapshot, b"final-output");
+        assert_eq!(subscriber_count(&output), 0);
+        assert!(matches!(
+            subscription.receiver.try_recv(),
+            Err(TerminalTryRecvError::Disconnected)
+        ));
+        assert!(!subscription.receiver.overflowed());
+    }
+
+    #[test]
+    fn reconnect_receives_only_the_bounded_history_window() {
+        let output = new_terminal_output();
+        let all: Vec<u8> = (0..2_000_000).map(|index| (index % 251) as u8).collect();
+        publish(&output, &all);
+        let subscription = subscribe(&output);
+        assert_eq!(subscription.snapshot.len(), MAX_TERMINAL_HISTORY_BYTES);
+        assert_eq!(
+            subscription.snapshot,
+            all[all.len() - MAX_TERMINAL_HISTORY_BYTES..]
+        );
+    }
+
+    #[test]
+    fn terminal_history_remains_bounded_under_high_volume() {
+        let output = new_terminal_output();
+        let chunk = vec![b'h'; 8192];
+        for _ in 0..500 {
+            publish(&output, &chunk);
+        }
+        let history = output
+            .lock()
+            .expect("terminal output poisoned")
+            .history
+            .len();
+        assert_eq!(history, MAX_TERMINAL_HISTORY_BYTES);
+    }
+
+    #[test]
+    fn terminal_subscriber_limit_is_enforced_and_releases_on_drop() {
+        let output = new_terminal_output();
+        let mut subscriptions = Vec::new();
+        for _ in 0..MAX_TERMINAL_SUBSCRIBERS {
+            subscriptions.push(subscribe(&output));
+        }
+        assert!(matches!(
+            subscribe_terminal_output(&output),
+            Err(TerminalSubscribeError::Full)
+        ));
+        subscriptions.pop();
+        let replacement = subscribe_terminal_output(&output).unwrap();
+        assert_eq!(subscriber_count(&output), MAX_TERMINAL_SUBSCRIBERS);
+        drop(replacement);
+        drop(subscriptions);
+        assert_eq!(subscriber_count(&output), 0);
+    }
+
+    #[test]
+    fn concurrent_terminal_subscription_and_publication_do_not_deadlock() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let output = new_terminal_output();
+        let done = Arc::new(AtomicBool::new(false));
+        let publisher_output = output.clone();
+        let publisher_done = done.clone();
+        let publisher = std::thread::spawn(move || {
+            let chunk = vec![b'p'; 8192];
+            for _ in 0..2_000 {
+                publish(&publisher_output, &chunk);
+            }
+            publisher_done.store(true, Relaxed);
+        });
+        while !done.load(Relaxed) {
+            let subscription = subscribe(&output);
+            publish(&output, b"racing-output");
+            drop(subscription);
+        }
+        publisher.join().unwrap();
+        assert_eq!(subscriber_count(&output), 0);
     }
 
     #[test]
@@ -626,7 +1148,7 @@ mod tests {
         let mut answered_cursor_query = false;
         for _ in 0..100 {
             while let Ok(chunk) = subscription.receiver.try_recv() {
-                output.extend(chunk);
+                output.extend_from_slice(&chunk);
             }
             if !answered_cursor_query && output.windows(4).any(|window| window == b"\x1b[6n") {
                 runtime.write_terminal(session.id, b"\x1b[1;1R").unwrap();
@@ -689,7 +1211,7 @@ mod tests {
         let mut answered_cursor_query = false;
         for _ in 0..100 {
             while let Ok(chunk) = subscription.receiver.try_recv() {
-                output.extend(chunk);
+                output.extend_from_slice(&chunk);
             }
             if !answered_cursor_query && output.windows(4).any(|window| window == b"\x1b[6n") {
                 runtime.write_terminal(session.id, b"\x1b[1;1R").unwrap();
@@ -718,5 +1240,122 @@ mod tests {
         }
         assert_ne!(saved.status, "running");
         assert!(saved.stdout.unwrap_or_default().contains("BATCH_PTY_OK"));
+    }
+
+    #[test]
+    fn slow_terminal_subscriber_does_not_stop_the_pty_or_healthy_stream() {
+        let dir = TempDir::new().unwrap();
+        Factory::init(dir.path()).unwrap();
+        let test_executable = std::env::current_exe().unwrap();
+        #[cfg(windows)]
+        let command = {
+            let bin = dir.path().join("fake-stream-bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            let native = bin.join("fake-agent.exe");
+            std::fs::copy(&test_executable, &native).unwrap();
+            let shim = bin.join("fake-agent.cmd");
+            std::fs::write(&shim, "@ECHO off\r\n\"%dp0%\\fake-agent.exe\" %*\r\n").unwrap();
+            shim.to_string_lossy().into_owned()
+        };
+        #[cfg(not(windows))]
+        let command = test_executable.to_string_lossy().into_owned();
+        let interactive_args = vec![
+            "--exact".into(),
+            "tests::pty_stream_child".into(),
+            "--nocapture".into(),
+        ];
+        let mut config = Config::default();
+        config.agents.insert(
+            "terminal-stream-test".into(),
+            AgentEntry {
+                kind: Some(AgentKind::Custom),
+                command,
+                args: Vec::new(),
+                env: BTreeMap::from([("FACTORY_PTY_STREAM".into(), "1".into())]),
+                prompt_transport: Some(PromptTransport::Disabled),
+                interactive_args: Some(interactive_args),
+                capabilities: Vec::new(),
+                max_concurrency: None,
+            },
+        );
+        config.write_atomic(dir.path()).unwrap();
+
+        let runtime = Runtime::new(dir.path()).unwrap();
+        let session = runtime
+            .start_interactive_session("terminal-stream-test", 90, 24)
+            .unwrap();
+        let slow = runtime.subscribe_terminal(session.id).unwrap();
+        let mut healthy = runtime.subscribe_terminal(session.id).unwrap();
+
+        let deadline = Instant::now() + std::time::Duration::from_secs(30);
+        let mut output = healthy.snapshot;
+        let mut answered_cursor_query = false;
+        let mut started = false;
+        let mut resumed = false;
+        loop {
+            let mut received = 0;
+            while let Ok(chunk) = healthy.receiver.try_recv() {
+                output.extend_from_slice(&chunk);
+                received += 1;
+            }
+            if !answered_cursor_query && output.windows(4).any(|window| window == b"\x1b[6n") {
+                runtime.write_terminal(session.id, b"\x1b[1;1R").unwrap();
+                answered_cursor_query = true;
+            }
+            if !started && output.windows(12).any(|window| window == b"STREAM_READY") {
+                runtime.write_terminal(session.id, b"g\r").unwrap();
+                started = true;
+            }
+            if output.windows(12).any(|window| window == b"STREAM_ALIVE") {
+                break;
+            }
+            if !resumed && output.windows(11).any(|window| window == b"STREAM_DONE") {
+                runtime.write_terminal(session.id, b"r\r").unwrap();
+                resumed = true;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "PTY stream did not complete; received {} bytes: {:?}",
+                output.len(),
+                String::from_utf8_lossy(&output)
+            );
+            if received == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+
+        assert!(started);
+        assert!(slow.receiver.overflowed());
+        assert!(!healthy.receiver.overflowed());
+        assert!(output.iter().filter(|byte| **byte == b'x').count() >= 480 * 8192);
+        assert!(resumed);
+
+        let close_deadline = Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match healthy.receiver.try_recv() {
+                Ok(_) => {}
+                Err(TerminalTryRecvError::Disconnected) => break,
+                Err(TerminalTryRecvError::Empty) => {
+                    assert!(
+                        Instant::now() < close_deadline,
+                        "terminal subscription did not close after process exit"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+        }
+
+        let db = FactoryDb::open(&dir.path().join(".factory").join("db.sqlite3")).unwrap();
+        let mut saved = db.get_agent_session(session.id).unwrap().unwrap();
+        for _ in 0..200 {
+            if saved.status != "running" {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            saved = db.get_agent_session(session.id).unwrap().unwrap();
+        }
+        assert_eq!(saved.status, "success");
+        assert!(saved.stdout.unwrap_or_default().contains("STREAM_ALIVE"));
+        drop(slow.receiver);
     }
 }

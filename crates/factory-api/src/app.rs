@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{CloseCode, CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path as UrlPath, State};
 use axum::http::StatusCode;
 use axum::middleware;
@@ -31,6 +31,11 @@ use crate::types::{
     AgentSessionResponse, GraphEdge, GraphNode, GraphResponse, RetryResponse, RunDetail,
     RunSummary, StageStatus, TaskCounts,
 };
+
+const TERMINAL_SOCKET_SEND_TIMEOUT: Duration = Duration::from_secs(15);
+const TERMINAL_BACKPRESSURE_CLOSE_CODE: CloseCode = 1013;
+const TERMINAL_BACKPRESSURE_CLOSE_REASON: &str =
+    "terminal output paused because this client fell behind";
 
 pub struct ApiState {
     pub db: Mutex<FactoryDb>,
@@ -128,6 +133,7 @@ impl From<RuntimeError> for ApiError {
             RuntimeError::AlreadyActive(_) => StatusCode::CONFLICT,
             RuntimeError::NotActive(_) => StatusCode::CONFLICT,
             RuntimeError::TerminalNotActive(_) => StatusCode::CONFLICT,
+            RuntimeError::TerminalSubscribersFull(_) => StatusCode::SERVICE_UNAVAILABLE,
             RuntimeError::Terminal(_) => StatusCode::BAD_REQUEST,
             RuntimeError::Factory(factory_core::FactoryError::RunNotFound(_))
             | RuntimeError::Factory(factory_core::FactoryError::TaskNotFound(_)) => {
@@ -1628,13 +1634,11 @@ async fn terminal_socket(
     mut subscription: TerminalSubscription,
 ) {
     if !subscription.snapshot.is_empty()
-        && socket
-            .send(Message::Binary(subscription.snapshot))
-            .await
-            .is_err()
+        && !send_terminal_message(&mut socket, Message::Binary(subscription.snapshot)).await
     {
         return;
     }
+    let mut output_closed = false;
     loop {
         tokio::select! {
             incoming = socket.recv() => {
@@ -1642,7 +1646,14 @@ async fn terminal_socket(
                 match message {
                     Message::Text(text) => {
                         let Ok(command) = serde_json::from_str::<TerminalCommand>(&text) else {
-                            let _ = socket.send(Message::Text("invalid terminal command".into())).await;
+                            if !send_terminal_message(
+                                &mut socket,
+                                Message::Text("invalid terminal command".into()),
+                            )
+                            .await
+                            {
+                                break;
+                            }
                             continue;
                         };
                         let result = match command {
@@ -1650,23 +1661,65 @@ async fn terminal_socket(
                             TerminalCommand::Resize { cols, rows } => state.runtime.resize_terminal(session_id, cols, rows),
                         };
                         if let Err(error) = result {
-                            let _ = socket.send(Message::Text(error.to_string())).await;
+                            let _ = send_terminal_message(
+                                &mut socket,
+                                Message::Text(error.to_string()),
+                            )
+                            .await;
                             break;
                         }
                     }
                     Message::Close(_) => break,
                     Message::Ping(payload) => {
-                        if socket.send(Message::Pong(payload)).await.is_err() { break; }
+                        if !send_terminal_message(&mut socket, Message::Pong(payload)).await {
+                            break;
+                        }
                     }
                     Message::Binary(_) | Message::Pong(_) => {}
                 }
             }
             output = subscription.receiver.recv() => {
-                let Some(output) = output else { break; };
-                if socket.send(Message::Binary(output)).await.is_err() { break; }
+                let Some(output) = output else {
+                    output_closed = true;
+                    break;
+                };
+                if !send_terminal_message(
+                    &mut socket,
+                    Message::Binary(output.as_ref().to_vec()),
+                )
+                .await
+                {
+                    break;
+                }
             }
         }
     }
+    if subscription.receiver.overflowed() {
+        let _ = send_terminal_message(&mut socket, terminal_backpressure_close()).await;
+    } else if output_closed {
+        let _ = send_terminal_message(
+            &mut socket,
+            Message::Close(Some(CloseFrame {
+                code: 1000,
+                reason: "terminal session ended".into(),
+            })),
+        )
+        .await;
+    }
+}
+
+async fn send_terminal_message(socket: &mut WebSocket, message: Message) -> bool {
+    matches!(
+        tokio::time::timeout(TERMINAL_SOCKET_SEND_TIMEOUT, socket.send(message)).await,
+        Ok(Ok(()))
+    )
+}
+
+fn terminal_backpressure_close() -> Message {
+    Message::Close(Some(CloseFrame {
+        code: TERMINAL_BACKPRESSURE_CLOSE_CODE,
+        reason: TERMINAL_BACKPRESSURE_CLOSE_REASON.into(),
+    }))
 }
 
 async fn list_agent_sessions(

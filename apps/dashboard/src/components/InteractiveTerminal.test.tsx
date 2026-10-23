@@ -19,6 +19,8 @@ vi.mock("@xterm/xterm", () => ({
 
     write() {}
 
+    writeln() {}
+
     dispose() {}
 
     focus() {}
@@ -42,6 +44,7 @@ vi.mock("@xterm/addon-fit", () => ({
 class FakeWebSocket {
   static instances: FakeWebSocket[] = [];
   readonly url: string;
+  onclose: ((event: CloseEvent) => void) | null = null;
 
   constructor(url: string) {
     this.url = url;
@@ -51,6 +54,10 @@ class FakeWebSocket {
   send() {}
 
   close() {}
+
+  closeFromServer(code: number, reason = "") {
+    this.onclose?.({ code, reason } as CloseEvent);
+  }
 }
 
 afterEach(() => {
@@ -76,6 +83,7 @@ describe("InteractiveTerminal authentication", () => {
         active
         output=""
         onDisconnect={vi.fn()}
+        onBackpressure={vi.fn()}
         onError={vi.fn()}
       />
     );
@@ -103,11 +111,98 @@ describe("InteractiveTerminal authentication", () => {
         active
         output=""
         onDisconnect={vi.fn()}
+        onBackpressure={vi.fn()}
         onError={onError}
       />
     );
 
     await waitFor(() => expect(onError).toHaveBeenCalledWith("session rejected"));
     expect(FakeWebSocket.instances).toHaveLength(0);
+  });
+
+  it("reports a slow-subscriber close without treating it as normal completion", async () => {
+    vi.mocked(refreshFactorySession).mockResolvedValue("session-csrf");
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    const onDisconnect = vi.fn();
+    const onBackpressure = vi.fn();
+
+    render(
+      <InteractiveTerminal
+        sessionId={12}
+        active
+        output=""
+        onDisconnect={onDisconnect}
+        onBackpressure={onBackpressure}
+        onError={vi.fn()}
+      />
+    );
+
+    await waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
+    act(() => {
+      FakeWebSocket.instances[0].closeFromServer(1013, "terminal output paused");
+    });
+
+    expect(onBackpressure).toHaveBeenCalledWith(
+      expect.stringContaining("Reconnect to load the retained terminal history")
+    );
+    expect(onDisconnect).not.toHaveBeenCalled();
+    expect(FakeWebSocket.instances).toHaveLength(1);
+  });
+
+  it("reports a normal terminal close as a disconnect", async () => {
+    vi.mocked(refreshFactorySession).mockResolvedValue("session-csrf");
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    const onDisconnect = vi.fn();
+    const onBackpressure = vi.fn();
+
+    render(
+      <InteractiveTerminal
+        sessionId={12}
+        active
+        output=""
+        onDisconnect={onDisconnect}
+        onBackpressure={onBackpressure}
+        onError={vi.fn()}
+      />
+    );
+
+    await waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
+    act(() => {
+      FakeWebSocket.instances[0].closeFromServer(1000, "terminal session ended");
+    });
+
+    expect(onDisconnect).toHaveBeenCalledOnce();
+    expect(onBackpressure).not.toHaveBeenCalled();
+  });
+
+  it("opens a fresh WebSocket when the user explicitly reconnects", async () => {
+    vi.mocked(refreshFactorySession).mockResolvedValue("session-csrf");
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    const { rerender } = render(
+      <InteractiveTerminal
+        sessionId={12}
+        active
+        output=""
+        reconnectKey={0}
+        onDisconnect={vi.fn()}
+        onBackpressure={vi.fn()}
+        onError={vi.fn()}
+      />
+    );
+
+    await waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
+    rerender(
+      <InteractiveTerminal
+        sessionId={12}
+        active
+        output=""
+        reconnectKey={1}
+        onDisconnect={vi.fn()}
+        onBackpressure={vi.fn()}
+        onError={vi.fn()}
+      />
+    );
+
+    await waitFor(() => expect(FakeWebSocket.instances).toHaveLength(2));
   });
 });

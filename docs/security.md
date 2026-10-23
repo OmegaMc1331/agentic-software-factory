@@ -102,6 +102,13 @@ Terminal input and resize are accepted only for a Factory-owned interactive sess
 Automated Planner, Worker, and Reviewer sessions remain non-interactive. Arbitrary
 command execution through the dashboard API is not supported.
 
+Interactive terminal subscriptions are independently bounded and never pause the PTY.
+A slow WebSocket is removed with close code `1013`; its queued bytes are released while
+healthy subscribers and session persistence continue. The retained reconnect snapshot
+is capped at 1,000,000 bytes, and each subscriber queue is capped at 2,097,152 bytes /
+256 chunks with at most 8 subscribers per terminal. See
+[Architecture](architecture.md#interactive-terminal-backpressure).
+
 ## External tools / MCP
 
 MCP server configuration does not grant access. A role must explicitly allow a

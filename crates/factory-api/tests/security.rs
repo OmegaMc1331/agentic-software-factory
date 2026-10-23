@@ -5,11 +5,14 @@ use std::time::Duration;
 
 use axum::http::{header, HeaderValue};
 use factory_types::{AgentSession, AgentSessionMode};
+use futures_util::{SinkExt, StreamExt};
 use tempfile::TempDir;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Error as WsError;
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 const SESSION_TTL: Duration = Duration::from_secs(12 * 60 * 60);
 
@@ -183,6 +186,28 @@ fn pty_security_child() {
     }
 }
 
+#[test]
+fn pty_terminal_child() {
+    if std::env::var("FACTORY_API_TERMINAL_CHILD").as_deref() != Ok("1") {
+        return;
+    }
+    let mut stdout = std::io::stdout();
+    stdout.write_all(b"API_TERMINAL_READY\r\n").unwrap();
+    stdout.flush().unwrap();
+    let mut input = [0_u8; 1];
+    loop {
+        if std::io::Read::read(&mut std::io::stdin(), &mut input).is_err() {
+            std::process::exit(1);
+        }
+        if input[0] == b'i' {
+            stdout.write_all(b"API_TERMINAL_INPUT\r\n").unwrap();
+            stdout.flush().unwrap();
+            break;
+        }
+    }
+    std::thread::sleep(Duration::from_secs(2));
+}
+
 fn configure_console_agent(root: &std::path::Path) {
     let command = std::env::current_exe()
         .unwrap()
@@ -200,6 +225,29 @@ interactive_args = ["--exact", "pty_security_child", "--nocapture"]
 
 [agents.console-test.env]
 FACTORY_SECURITY_PTY_CHILD = "1"
+"#
+        ),
+    )
+    .unwrap();
+}
+
+fn configure_terminal_stream_agent(root: &std::path::Path) {
+    let command = std::env::current_exe()
+        .unwrap()
+        .to_string_lossy()
+        .replace('\\', "\\\\");
+    std::fs::write(
+        root.join(".factory").join("config.toml"),
+        format!(
+            r#"
+[agents.terminal-stream-test]
+kind = "custom"
+command = "{command}"
+prompt_transport = "disabled"
+interactive_args = ["--exact", "pty_terminal_child", "--nocapture"]
+
+[agents.terminal-stream-test.env]
+FACTORY_API_TERMINAL_CHILD = "1"
 "#
         ),
     )
@@ -241,12 +289,14 @@ preferred = true
     .unwrap();
 }
 
-async fn connect_terminal(
+type TerminalSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
+
+async fn open_terminal(
     address: SocketAddr,
     session_id: i64,
     cookie: Option<&str>,
     origin: &str,
-) -> Result<u16, Box<WsError>> {
+) -> Result<(TerminalSocket, u16), Box<WsError>> {
     let mut request = format!("ws://{address}/api/sessions/{session_id}/terminal")
         .into_client_request()
         .unwrap();
@@ -262,8 +312,53 @@ async fn connect_terminal(
             .headers_mut()
             .insert(header::COOKIE, HeaderValue::from_str(cookie).unwrap());
     }
-    let (_socket, response) = connect_async(request).await.map_err(Box::new)?;
-    Ok(response.status().as_u16())
+    let (socket, response) = connect_async(request).await.map_err(Box::new)?;
+    Ok((socket, response.status().as_u16()))
+}
+
+async fn connect_terminal(
+    address: SocketAddr,
+    session_id: i64,
+    cookie: Option<&str>,
+    origin: &str,
+) -> Result<u16, Box<WsError>> {
+    let (socket, status) = open_terminal(address, session_id, cookie, origin).await?;
+    drop(socket);
+    Ok(status)
+}
+
+async fn terminal_output_until(socket: &mut TerminalSocket, marker: &[u8]) -> Vec<u8> {
+    let mut output = Vec::new();
+    let mut answered_cursor_query = false;
+    while !output.windows(marker.len()).any(|window| window == marker) {
+        let message = tokio::time::timeout(Duration::from_secs(10), socket.next())
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "terminal WebSocket timed out after {} bytes: {:?}",
+                    output.len(),
+                    String::from_utf8_lossy(&output)
+                )
+            })
+            .expect("terminal WebSocket closed")
+            .expect("terminal WebSocket failed");
+        match message {
+            Message::Binary(data) => output.extend_from_slice(&data),
+            Message::Close(frame) => panic!("terminal WebSocket closed early: {frame:?}"),
+            Message::Text(text) => panic!("unexpected terminal text: {text}"),
+            Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {}
+        }
+        if !answered_cursor_query && output.windows(4).any(|window| window == b"\x1b[6n") {
+            socket
+                .send(Message::Text(
+                    r#"{"type":"input","data":"\u001b[1;1R"}"#.into(),
+                ))
+                .await
+                .unwrap();
+            answered_cursor_query = true;
+        }
+    }
+    output
 }
 
 fn ws_status(result: Result<u16, Box<WsError>>) -> u16 {
@@ -500,6 +595,45 @@ async fn authorized_websocket_handshakes_succeed_and_unauthorized_ones_fail_befo
         403
     );
 
+    let _ = state.runtime.stop_interactive_session(session.id);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn authorized_terminal_websocket_streams_output_and_accepts_input_and_resize() {
+    let dir = TempDir::new().unwrap();
+    init_root(dir.path());
+    configure_terminal_stream_agent(dir.path());
+    let state = make_state(dir.path());
+    let server = TestServer::start(state.clone());
+    let origin = format!("http://{}", server.address);
+    let (_, cookies) = bootstrap(server.address, &origin).await;
+    let session = state
+        .runtime
+        .start_interactive_session("terminal-stream-test", 90, 24)
+        .unwrap();
+    let (mut socket, status) =
+        open_terminal(server.address, session.id, Some(&cookies.header), &origin)
+            .await
+            .unwrap();
+    assert_eq!(status, 101);
+
+    let initial = terminal_output_until(&mut socket, b"API_TERMINAL_READY").await;
+    assert!(String::from_utf8_lossy(&initial).contains("API_TERMINAL_READY"));
+
+    socket
+        .send(Message::Text(
+            r#"{"type":"resize","cols":120,"rows":40}"#.into(),
+        ))
+        .await
+        .unwrap();
+    socket
+        .send(Message::Text(r#"{"type":"input","data":"i\r"}"#.into()))
+        .await
+        .unwrap();
+    let echoed = terminal_output_until(&mut socket, b"API_TERMINAL_INPUT").await;
+    assert!(String::from_utf8_lossy(&echoed).contains("API_TERMINAL_INPUT"));
+
+    socket.close(None).await.unwrap();
     let _ = state.runtime.stop_interactive_session(session.id);
 }
 

@@ -1,17 +1,25 @@
 import { useEffect, useRef } from "react";
 import { agentTerminalSocketUrl, refreshFactorySession } from "../api";
 
+const TERMINAL_BACKPRESSURE_CLOSE_CODE = 1013;
+const TERMINAL_BACKPRESSURE_MESSAGE =
+  "Terminal output paused because this client fell behind. Reconnect to load the retained terminal history.";
+
 export function InteractiveTerminal({
   sessionId,
   active,
   output,
+  reconnectKey = 0,
   onDisconnect,
+  onBackpressure,
   onError,
 }: {
   sessionId: number;
   active: boolean;
   output: string;
+  reconnectKey?: number;
   onDisconnect: () => void;
+  onBackpressure: (message: string) => void;
   onError: (message: string) => void;
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -92,7 +100,14 @@ export function InteractiveTerminal({
             terminal.writeln(`\r\n${String(event.data)}`);
           }
         };
-        socket.onclose = onDisconnect;
+        socket.onclose = (event) => {
+          if (event.code === TERMINAL_BACKPRESSURE_CLOSE_CODE) {
+            terminal.writeln(`\r\n${TERMINAL_BACKPRESSURE_MESSAGE}`);
+            onBackpressure(TERMINAL_BACKPRESSURE_MESSAGE);
+          } else {
+            onDisconnect();
+          }
+        };
         socket.onerror = () => {
           terminal.writeln("\r\nTerminal connection lost.");
           onError("The interactive terminal connection failed.");
@@ -141,7 +156,7 @@ export function InteractiveTerminal({
       disposed = true;
       cleanup();
     };
-  }, [active, onDisconnect, onError, output, sessionId]);
+  }, [active, onBackpressure, onDisconnect, onError, output, reconnectKey, sessionId]);
 
   return (
     <div className="interactive-terminal" ref={containerRef} aria-label="Interactive terminal" />

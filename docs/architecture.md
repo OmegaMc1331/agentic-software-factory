@@ -358,6 +358,43 @@ through SSE. Interactive output is the PTY's combined terminal byte stream and u
 session-scoped WebSocket for input, output, and resize. Windows uses ConPTY; Linux and
 macOS use the platform PTY through `portable-pty`.
 
+### Interactive terminal backpressure
+
+The runtime retains at most **1,000,000 bytes** of terminal history per session. That
+history is the reconnect snapshot; it is not a complete terminal-lifetime log. Each
+WebSocket subscriber has an independent bounded queue:
+
+- **2,097,152 bytes** of queued output.
+- **256** queued chunks.
+- At most **8** subscribers per live terminal.
+
+The queue limits are deliberately redundant. The PTY reader uses 8 KiB chunks, so 256
+chunks normally reaches the 2 MiB byte limit first. If future code emits larger chunks,
+the byte check still bounds memory. A single chunk larger than the byte limit is never
+partially delivered: the subscriber is evicted instead, preserving the binary stream
+without silent truncation.
+
+Publication from the PTY reader locks the terminal output only long enough to append
+history, enqueue one shared chunk per subscriber, and remove overflowed subscribers.
+Chunk data is reference-counted across subscribers, and publication uses non-blocking
+queue insertion. A slow subscriber cannot block the PTY reader, other subscribers,
+terminal input, resize, cancellation, process exit, or persistence.
+
+When a queue reaches either limit, the runtime marks it overflowed, discards that
+subscriber's queued chunks, and removes it from the publisher. Bytes already written to
+the socket are unaffected, but dropped queued bytes are not replayed. The API closes the
+WebSocket with code **1013** and a bounded reason. The terminal process continues
+running. A reconnect creates a fresh queue and replays the retained history window;
+output older than that window is not recoverable. Dropping a subscription removes it
+and releases its queue promptly.
+
+The application-level bound per live terminal is therefore conservatively 1 MiB of
+history plus 16 MiB of subscriber queues, plus transient reconnect snapshots (up to
+1 MiB each), plus one in-flight WebSocket chunk per connection. WebSocket sends time out
+after 15 seconds so a stalled network consumer cannot hold an in-flight chunk
+indefinitely. OS socket buffers, the SQLite cache, and other components are outside this
+model, so this is not a strict whole-process memory bound.
+
 ## API boundary
 
 The complete endpoint reference lives in [api.md](api.md): workflows, tasks,

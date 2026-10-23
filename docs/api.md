@@ -147,6 +147,15 @@ include `outputMeta`, which reports the per-stream byte limit, total emitted and
 bytes, and truncation flags; `stdout`/`stderr` retain the bounded head and tail. See
 [Security](security.md).
 
+The terminal WebSocket first sends the retained history snapshot (up to 1,000,000
+bytes), then live PTY output as binary frames. Each connection has a bounded queue of
+2,097,152 bytes / 256 chunks, and a terminal accepts at most 8 subscribers. A client
+that cannot keep up is disconnected with WebSocket close code **1013**; other
+subscribers and the PTY continue. A ninth concurrent subscriber is rejected with
+HTTP `503`. Reconnect to receive a fresh subscription and the currently retained
+history. Output older than the retained window is not recoverable.
+See [Architecture](architecture.md#interactive-terminal-backpressure).
+
 ## Graph and configuration
 
 | Method | Route | Purpose |

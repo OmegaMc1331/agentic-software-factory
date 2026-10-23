@@ -132,6 +132,8 @@ export function AgentConsole({
   const [connectionTarget, setConnectionTarget] = useState("");
   const [startingInteractive, setStartingInteractive] = useState(false);
   const [performance, setPerformance] = useState<AgentPerformanceDetail | null>(null);
+  const [terminalReconnectKey, setTerminalReconnectKey] = useState(0);
+  const [terminalPaused, setTerminalPaused] = useState(false);
   const outputRef = useRef<HTMLDivElement>(null);
 
   const reloadSessions = useCallback(() => {
@@ -147,6 +149,11 @@ export function AgentConsole({
       })
       .catch((reason: Error) => setError(reason.message));
   }, [agentName]);
+
+  const handleTerminalBackpressure = useCallback((message: string) => {
+    setTerminalPaused(true);
+    setError(message);
+  }, []);
 
   useEffect(() => {
     reloadSessions();
@@ -168,6 +175,16 @@ export function AgentConsole({
   const sessionId = session?.id;
   const sessionStatus = session?.status;
   const sessionInteractive = session ? isInteractive(session) : false;
+
+  useEffect(() => {
+    setTerminalPaused(false);
+  }, [sessionId]);
+
+  useEffect(() => {
+    if (sessionStatus && !["running", "active"].includes(sessionStatus)) {
+      setTerminalPaused(false);
+    }
+  }, [sessionStatus]);
 
   useEffect(() => {
     if (
@@ -418,11 +435,25 @@ export function AgentConsole({
                     sessionId={session.id}
                     active={["running", "active"].includes(session.status)}
                     output={session.stdout ?? ""}
+                    reconnectKey={terminalReconnectKey}
                     onDisconnect={reloadSessions}
+                    onBackpressure={handleTerminalBackpressure}
                     onError={setError}
                   />
                   <div className="agent-console-terminal-actions">
                     <span>PTY-backed interactive session</span>
+                    {terminalPaused && (
+                      <button
+                        className="button"
+                        onClick={() => {
+                          setTerminalPaused(false);
+                          setError(null);
+                          setTerminalReconnectKey((current) => current + 1);
+                        }}
+                      >
+                        Reconnect terminal
+                      </button>
+                    )}
                     {["running", "active"].includes(session.status) && (
                       <button className="button" onClick={stopInteractive}>
                         Stop session
