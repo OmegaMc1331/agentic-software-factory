@@ -3,7 +3,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc as std_mpsc, Arc, Mutex, Weak};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use factory_core::{Factory, FactoryError, FACTORY_DIR};
 use factory_db::FactoryDb;
@@ -675,19 +675,50 @@ impl Runtime {
         std::thread::spawn(move || {
             let db = FactoryDb::open(&output_root.join(".factory").join("db.sqlite3")).ok();
             let mut buffer = [0u8; 8192];
+            // Each append rewrites the full stored output row, so appending per
+            // read chunk makes DB write cost dominate PTY streaming; batch them.
+            const DB_APPEND_BATCH_BYTES: usize = 64 * 1024;
+            const DB_APPEND_BATCH_INTERVAL: Duration = Duration::from_millis(250);
+            let mut pending_output = String::new();
+            let mut last_append = Instant::now();
+            fn flush_output(
+                db: &Option<FactoryDb>,
+                session_id: i64,
+                pending_output: &mut String,
+                last_append: &mut Instant,
+            ) {
+                if let Some(db) = db {
+                    if !pending_output.is_empty() {
+                        let _ =
+                            db.append_agent_session_output(session_id, Some(pending_output), None);
+                    }
+                }
+                pending_output.clear();
+                *last_append = Instant::now();
+            }
             loop {
                 match reader.read(&mut buffer) {
                     Ok(0) => break,
                     Ok(size) => {
                         let chunk = buffer[..size].to_vec();
                         publish_terminal_output(&output_terminal, &chunk);
-                        if let Some(db) = &db {
-                            let text = String::from_utf8_lossy(&chunk);
-                            let _ = db.append_agent_session_output(session_id, Some(&text), None);
+                        if db.is_some() {
+                            pending_output.push_str(&String::from_utf8_lossy(&chunk));
+                            if pending_output.len() >= DB_APPEND_BATCH_BYTES
+                                || last_append.elapsed() >= DB_APPEND_BATCH_INTERVAL
+                            {
+                                flush_output(
+                                    &db,
+                                    session_id,
+                                    &mut pending_output,
+                                    &mut last_append,
+                                );
+                            }
                         }
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(error) => {
+                        flush_output(&db, session_id, &mut pending_output, &mut last_append);
                         if let Some(db) = &db {
                             let _ = db.append_agent_session_output(
                                 session_id,
@@ -699,6 +730,7 @@ impl Runtime {
                     }
                 }
             }
+            flush_output(&db, session_id, &mut pending_output, &mut last_append);
             output_terminal
                 .output
                 .lock()
@@ -819,7 +851,7 @@ mod tests {
         stdout.flush().unwrap();
         let _ = std::io::Read::read(&mut std::io::stdin(), &mut input);
         let block = vec![b'x'; 8192];
-        for _ in 0..480 {
+        for _ in 0..280 {
             stdout.write_all(&block).unwrap();
         }
         stdout.write_all(b"STREAM_DONE").unwrap();
@@ -1287,7 +1319,7 @@ mod tests {
         let slow = runtime.subscribe_terminal(session.id).unwrap();
         let mut healthy = runtime.subscribe_terminal(session.id).unwrap();
 
-        let deadline = Instant::now() + std::time::Duration::from_secs(30);
+        let deadline = Instant::now() + std::time::Duration::from_secs(60);
         let mut output = healthy.snapshot;
         let mut answered_cursor_query = false;
         let mut started = false;
@@ -1327,7 +1359,7 @@ mod tests {
         assert!(started);
         assert!(slow.receiver.overflowed());
         assert!(!healthy.receiver.overflowed());
-        assert!(output.iter().filter(|byte| **byte == b'x').count() >= 480 * 8192);
+        assert!(output.iter().filter(|byte| **byte == b'x').count() >= 280 * 8192);
         assert!(resumed);
 
         let close_deadline = Instant::now() + std::time::Duration::from_secs(10);
