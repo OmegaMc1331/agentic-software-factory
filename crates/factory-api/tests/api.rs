@@ -328,6 +328,38 @@ async fn live_server_handles_sequential_api_requests() {
     assert!(server.await.unwrap_err().is_cancelled());
 }
 
+async fn put_config(app: axum::Router, config: serde_json::Value) -> axum::http::Response<Body> {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/config")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let etag = response
+        .headers()
+        .get("etag")
+        .expect("configuration revision ETag")
+        .to_str()
+        .unwrap()
+        .to_string();
+    app.oneshot(
+        Request::builder()
+            .method("PUT")
+            .uri("/api/config")
+            .header("content-type", "application/json")
+            .header("if-match", etag)
+            .body(Body::from(config.to_string()))
+            .unwrap(),
+    )
+    .await
+    .unwrap()
+}
+
 #[tokio::test]
 async fn config_round_trips_through_put_and_get() {
     let dir = TempDir::new().unwrap();
@@ -344,18 +376,7 @@ async fn config_round_trips_through_put_and_get() {
             { "role": "planner", "agent": "codex", "preferred": true }
         ]
     });
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/api/config")
-                .header("content-type", "application/json")
-                .body(Body::from(config.to_string()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let response = put_config(app.clone(), config).await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
     let config = factory_core::Config::load(dir.path()).unwrap();
@@ -405,18 +426,7 @@ async fn editing_agent_config_preserves_structured_fields_and_rejects_invalid_wr
             { "role": "planner", "agent": "codex", "preferred": true }
         ]
     });
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/api/config")
-                .header("content-type", "application/json")
-                .body(Body::from(initial.to_string()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let response = put_config(app.clone(), initial).await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
     let renamed = json!({
@@ -437,18 +447,7 @@ async fn editing_agent_config_preserves_structured_fields_and_rejects_invalid_wr
             { "role": "planner", "agent": "renamed-codex", "preferred": true }
         ]
     });
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/api/config")
-                .header("content-type", "application/json")
-                .body(Body::from(renamed.to_string()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let response = put_config(app.clone(), renamed).await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
     let config = Config::load(dir.path()).unwrap();
@@ -485,17 +484,7 @@ async fn editing_agent_config_preserves_structured_fields_and_rejects_invalid_wr
             { "role": "planner", "agent": "renamed-codex", "preferred": true }
         ]
     });
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/api/config")
-                .header("content-type", "application/json")
-                .body(Body::from(invalid.to_string()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let response = put_config(app, invalid).await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
     let config = Config::load(dir.path()).unwrap();
@@ -521,18 +510,7 @@ async fn role_assignment_can_be_reassigned_to_another_configured_agent() {
             { "role": "planner", "agent": "codex", "preferred": true }
         ]
     });
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/api/config")
-                .header("content-type", "application/json")
-                .body(Body::from(config.to_string()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let response = put_config(app.clone(), config).await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
     let reassigned = json!({
@@ -545,17 +523,7 @@ async fn role_assignment_can_be_reassigned_to_another_configured_agent() {
             { "role": "planner", "agent": "opencode", "preferred": true }
         ]
     });
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/api/config")
-                .header("content-type", "application/json")
-                .body(Body::from(reassigned.to_string()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let response = put_config(app, reassigned).await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
     let config = factory_core::Config::load(dir.path()).unwrap();
@@ -576,18 +544,7 @@ async fn rejects_invalid_configuration_writes() {
         "roles": {},
         "role_assignments": [ { "role": "planner", "agent": "ghost" } ]
     });
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/api/config")
-                .header("content-type", "application/json")
-                .body(Body::from(config.to_string()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let response = put_config(app.clone(), config).await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let text = body_text(response).await;
     assert!(text.contains("unknown agent 'ghost'"));

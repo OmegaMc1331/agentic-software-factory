@@ -6,13 +6,13 @@ use std::time::Duration;
 
 use axum::extract::ws::{CloseCode, CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path as UrlPath, State};
-use axum::http::StatusCode;
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
-use factory_core::{Agents, Config, ConfigError, RoleAssignment};
+use factory_core::{update_config, Agents, Config, ConfigError, RoleAssignment, UpdateError};
 use factory_db::FactoryDb;
 use factory_mcp::{McpFailureKind, McpServerConfig, McpServerStatus, McpServerView, ToolRegistry};
 use factory_runtime::{Runtime, RuntimeError, TerminalSubscription};
@@ -737,33 +737,86 @@ async fn get_agents(
     Ok(Json(agents.list()))
 }
 
-async fn get_config(State(state): State<SharedState>) -> Result<Json<Config>, ApiError> {
-    let config = Config::load(&state.root)?;
-    Ok(Json(config))
+async fn get_config(State(state): State<SharedState>) -> Result<Response, ApiError> {
+    let (config, revision) = Config::load_with_revision(&state.root)?;
+    Ok(([(header::ETAG, etag(&revision))], Json(config)).into_response())
 }
 
 async fn put_config(
     State(state): State<SharedState>,
+    headers: HeaderMap,
     body: Result<Json<Config>, axum::extract::rejection::JsonRejection>,
-) -> Result<StatusCode, ApiError> {
-    let mut config = body
+) -> Result<Response, ApiError> {
+    let mut submitted = body
         .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "invalid JSON body"))?
         .0;
-    config.normalize();
-    save_config(&state, &config)?;
-    Ok(StatusCode::NO_CONTENT)
+    submitted.normalize();
+    let expected = if_match_revision(&headers).ok_or_else(|| {
+        ApiError::new(
+            StatusCode::PRECONDITION_REQUIRED,
+            "PUT /api/config requires an If-Match header carrying the configuration revision \
+             returned by GET /api/config; reload the configuration and retry",
+        )
+    })?;
+    let root = state.root.clone();
+    let (_, revision) = mutate_config(&state, move |current| {
+        let current_revision = Config::persisted_revision(&root)?;
+        if !if_match_matches(&expected, &current_revision) {
+            return Err(ApiError::new(
+                StatusCode::PRECONDITION_FAILED,
+                "the configuration was modified after it was loaded; reload the latest \
+                 configuration, reapply your changes, and save again",
+            ));
+        }
+        *current = submitted;
+        Ok(())
+    })?;
+    Ok(([(header::ETAG, etag(&revision))], StatusCode::NO_CONTENT).into_response())
+}
+
+/// The raw `If-Match` value, trimmed. `*` keeps its RFC semantics (any
+/// current representation); concrete revisions are compared unquoted.
+fn if_match_revision(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(header::IF_MATCH)?
+        .to_str()
+        .ok()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn if_match_matches(expected: &str, current: &str) -> bool {
+    expected == "*"
+        || expected == current
+        || expected == format!("\"{current}\"")
+        || format!("\"{expected}\"") == current
+}
+
+fn etag(revision: &str) -> String {
+    format!("\"{revision}\"")
 }
 
 fn load_config(state: &SharedState) -> Result<Config, ApiError> {
     Ok(Config::load(&state.root)?)
 }
 
-fn save_config(state: &SharedState, config: &Config) -> Result<(), ApiError> {
-    config
-        .validate()
-        .map_err(|reason| ApiError::new(StatusCode::BAD_REQUEST, reason))?;
-    config.write_atomic(&state.root).map_err(ApiError::from)?;
-    Ok(())
+/// Runs one configuration mutation through the coordinated
+/// load -> mutate -> validate -> write sequence in `factory_core::update_config`.
+/// Domain checks belong inside `mutate`, so they run against the latest
+/// configuration while the project's mutation lock is held. Returns the
+/// freshly written configuration and its new revision.
+fn mutate_config(
+    state: &SharedState,
+    mutate: impl FnOnce(&mut Config) -> Result<(), ApiError>,
+) -> Result<(Config, String), ApiError> {
+    update_config(&state.root, mutate)
+        .map(|outcome| (outcome.config, outcome.revision))
+        .map_err(|error| match error {
+            UpdateError::Mutation(error) => error,
+            UpdateError::Validation(reason) => ApiError::new(StatusCode::BAD_REQUEST, reason),
+            UpdateError::Persistence(error) => ApiError::from(error),
+        })
 }
 
 #[derive(Debug, Deserialize)]
@@ -812,15 +865,20 @@ async fn create_mcp_server(
         .filter(|id| !id.is_empty())
         .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "MCP server id is required"))?
         .to_string();
-    let mut config = load_config(&state)?;
-    if config.mcp.contains_key(&id) {
-        return Err(ApiError::new(
-            StatusCode::CONFLICT,
-            format!("MCP server '{id}' already exists"),
-        ));
-    }
-    config.mcp.insert(id.clone(), request.config);
-    save_config(&state, &config)?;
+    let config = {
+        let server_id = id.clone();
+        let (config, _) = mutate_config(&state, move |current| {
+            if current.mcp.contains_key(&server_id) {
+                return Err(ApiError::new(
+                    StatusCode::CONFLICT,
+                    format!("MCP server '{server_id}' already exists"),
+                ));
+            }
+            current.mcp.insert(server_id, request.config);
+            Ok(())
+        })?;
+        config
+    };
     let server = config.mcp.get(&id).expect("inserted MCP server");
     Ok((
         StatusCode::CREATED,
@@ -842,15 +900,19 @@ async fn update_mcp_server(
     let request = body
         .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "invalid MCP server JSON body"))?
         .0;
-    let mut config = load_config(&state)?;
-    if !config.mcp.contains_key(&id) {
-        return Err(ApiError::new(
-            StatusCode::NOT_FOUND,
-            format!("MCP server '{id}' not found"),
-        ));
-    }
-    config.mcp.insert(id.clone(), request.config);
-    save_config(&state, &config)?;
+    let (config, _) = {
+        let server_id = id.clone();
+        mutate_config(&state, move |current| {
+            if !current.mcp.contains_key(&server_id) {
+                return Err(ApiError::new(
+                    StatusCode::NOT_FOUND,
+                    format!("MCP server '{server_id}' not found"),
+                ));
+            }
+            current.mcp.insert(server_id, request.config);
+            Ok(())
+        })?
+    };
     let db = state.db.lock().expect("db mutex poisoned");
     db.remove_mcp_server_cache(&id)?;
     let server = config.mcp.get(&id).expect("updated MCP server");
@@ -867,14 +929,18 @@ async fn delete_mcp_server(
     State(state): State<SharedState>,
     UrlPath(id): UrlPath<String>,
 ) -> Result<StatusCode, ApiError> {
-    let mut config = load_config(&state)?;
-    if config.mcp.remove(&id).is_none() {
-        return Err(ApiError::new(
-            StatusCode::NOT_FOUND,
-            format!("MCP server '{id}' not found"),
-        ));
+    {
+        let server_id = id.clone();
+        mutate_config(&state, move |current| {
+            if current.mcp.remove(&server_id).is_none() {
+                return Err(ApiError::new(
+                    StatusCode::NOT_FOUND,
+                    format!("MCP server '{server_id}' not found"),
+                ));
+            }
+            Ok(())
+        })?;
     }
-    save_config(&state, &config)?;
     let db = state.db.lock().expect("db mutex poisoned");
     db.remove_mcp_server_cache(&id)?;
     Ok(StatusCode::NO_CONTENT)
@@ -1071,7 +1137,6 @@ async fn create_role(
     let request = body
         .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "invalid JSON body"))?
         .0;
-    let mut config = load_config(&state)?;
     let id = request
         .id
         .clone()
@@ -1088,40 +1153,45 @@ async fn create_role(
             format!("role '{id}' is a built-in core role and cannot be redefined"),
         ));
     }
-    if config.roles.contains_key(&id) {
-        return Err(ApiError::new(
-            StatusCode::CONFLICT,
-            format!("role '{id}' already exists"),
-        ));
-    }
-    config.roles.insert(
-        id.clone(),
-        factory_core::RoleDefinitionEntry {
-            name: Some(request.name.trim().to_string()),
-            description: Some(request.description.trim().to_string()),
-            execution_class: Some(request.execution_class),
-            instructions: request.instructions.trim().to_string(),
-            agent: None,
-        },
-    );
-    let preferred_agent = request.preferred_agent.as_deref();
-    if preferred_agent.is_some() {
-        config
-            .role_assignments
-            .retain(|assignment| !(assignment.role == id && assignment.preferred));
-    }
-    for agent in &request.agents {
-        config.role_assignments.push(RoleAssignment {
-            role: id.clone(),
-            agent: agent.clone(),
-            preferred: preferred_agent == Some(agent.as_str()),
-        });
-    }
-    if let Some(preset_name) = request.policy_preset.as_deref() {
-        let preset = parse_policy_preset(preset_name)?;
-        config.policies.role_mut(&id).preset = Some(preset);
-    }
-    save_config(&state, &config)?;
+    let (config, _) = {
+        let role_id = id.clone();
+        mutate_config(&state, move |current| {
+            if current.roles.contains_key(&role_id) {
+                return Err(ApiError::new(
+                    StatusCode::CONFLICT,
+                    format!("role '{role_id}' already exists"),
+                ));
+            }
+            current.roles.insert(
+                role_id.clone(),
+                factory_core::RoleDefinitionEntry {
+                    name: Some(request.name.trim().to_string()),
+                    description: Some(request.description.trim().to_string()),
+                    execution_class: Some(request.execution_class),
+                    instructions: request.instructions.trim().to_string(),
+                    agent: None,
+                },
+            );
+            let preferred_agent = request.preferred_agent.as_deref();
+            if preferred_agent.is_some() {
+                current
+                    .role_assignments
+                    .retain(|assignment| !(assignment.role == role_id && assignment.preferred));
+            }
+            for agent in &request.agents {
+                current.role_assignments.push(RoleAssignment {
+                    role: role_id.clone(),
+                    agent: agent.clone(),
+                    preferred: preferred_agent == Some(agent.as_str()),
+                });
+            }
+            if let Some(preset_name) = request.policy_preset.as_deref() {
+                let preset = parse_policy_preset(preset_name)?;
+                current.policies.role_mut(&role_id).preset = Some(preset);
+            }
+            Ok(())
+        })?
+    };
     Ok((StatusCode::CREATED, Json(role_info(&config, &id)?)))
 }
 
@@ -1146,33 +1216,37 @@ async fn update_role(
     let request = body
         .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "invalid JSON body"))?
         .0;
-    let mut config = load_config(&state)?;
     if factory_core::is_core_role(&id) {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
             "built-in core roles cannot be redefined; manage their assignments instead",
         ));
     }
-    let Some(entry) = config.roles.get_mut(&id) else {
-        return Err(ApiError::new(
-            StatusCode::NOT_FOUND,
-            format!("role '{id}' not found"),
-        ));
+    let (config, _) = {
+        let role_id = id.clone();
+        mutate_config(&state, move |current| {
+            let Some(entry) = current.roles.get_mut(&role_id) else {
+                return Err(ApiError::new(
+                    StatusCode::NOT_FOUND,
+                    format!("role '{role_id}' not found"),
+                ));
+            };
+            *entry = factory_core::RoleDefinitionEntry {
+                name: Some(request.name.trim().to_string()),
+                description: Some(request.description.trim().to_string()),
+                execution_class: Some(request.execution_class),
+                instructions: request.instructions.trim().to_string(),
+                agent: None,
+            };
+            // Absent preset leaves the policy untouched (clearing goes through
+            // PUT /api/roles/:id/policy, which distinguishes null from absent).
+            if let Some(preset_name) = request.policy_preset.as_deref() {
+                let preset = parse_policy_preset(preset_name)?;
+                current.policies.role_mut(&role_id).preset = Some(preset);
+            }
+            Ok(())
+        })?
     };
-    *entry = factory_core::RoleDefinitionEntry {
-        name: Some(request.name.trim().to_string()),
-        description: Some(request.description.trim().to_string()),
-        execution_class: Some(request.execution_class),
-        instructions: request.instructions.trim().to_string(),
-        agent: None,
-    };
-    // Absent preset leaves the policy untouched (clearing goes through
-    // PUT /api/roles/:id/policy, which distinguishes null from absent).
-    if let Some(preset_name) = request.policy_preset.as_deref() {
-        let preset = parse_policy_preset(preset_name)?;
-        config.policies.role_mut(&id).preset = Some(preset);
-    }
-    save_config(&state, &config)?;
     Ok(Json(role_info(&config, &id)?))
 }
 
@@ -1180,47 +1254,51 @@ async fn delete_role(
     State(state): State<SharedState>,
     UrlPath(id): UrlPath<String>,
 ) -> Result<StatusCode, ApiError> {
-    let mut config = load_config(&state)?;
     if factory_core::is_core_role(&id) {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
             "built-in core roles cannot be deleted; remove their assignments instead",
         ));
     }
-    if !config.roles.contains_key(&id) {
-        return Err(ApiError::new(
-            StatusCode::NOT_FOUND,
-            format!("role '{id}' not found"),
-        ));
-    }
-    {
-        let db = state.db.lock().expect("db mutex poisoned");
-        if role_in_use(&db, &id)? {
+    let lock_state = state.clone();
+    mutate_config(&state, move |current| {
+        if !current.roles.contains_key(&id) {
             return Err(ApiError::new(
-                StatusCode::CONFLICT,
-                format!("role '{id}' is used by an active workflow and cannot be deleted"),
+                StatusCode::NOT_FOUND,
+                format!("role '{id}' not found"),
             ));
         }
-    }
-    let recipes = factory_core::RecipeCatalog::load(&state.root)?;
-    if let Some(recipe) = recipes.list().into_iter().find(|recipe| {
-        recipe.roles.iter().any(|role| role == &id) || recipe.policy_presets.contains_key(&id)
-    }) {
-        return Err(ApiError::new(
-            StatusCode::CONFLICT,
-            format!(
-                "role '{id}' is referenced by persisted recipe '{}' and cannot be deleted; remove it from that recipe first",
-                recipe.id
-            ),
-        ));
-    }
-    config.roles.remove(&id);
-    config
-        .role_assignments
-        .retain(|assignment| assignment.role != id);
-    // A deleted role must not keep a policy scope around.
-    config.policies.roles.remove(&id);
-    save_config(&state, &config)?;
+        // Rechecked under the configuration lock so a concurrent grant of the
+        // role cannot be erased by a stale deletion request.
+        {
+            let db = lock_state.db.lock().expect("db mutex poisoned");
+            if role_in_use(&db, &id)? {
+                return Err(ApiError::new(
+                    StatusCode::CONFLICT,
+                    format!("role '{id}' is used by an active workflow and cannot be deleted"),
+                ));
+            }
+        }
+        let recipes = factory_core::RecipeCatalog::load(&lock_state.root)?;
+        if let Some(recipe) = recipes.list().into_iter().find(|recipe| {
+            recipe.roles.iter().any(|role| role == &id) || recipe.policy_presets.contains_key(&id)
+        }) {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                format!(
+                    "role '{id}' is referenced by persisted recipe '{}' and cannot be deleted; remove it from that recipe first",
+                    recipe.id
+                ),
+            ));
+        }
+        current.roles.remove(&id);
+        current
+            .role_assignments
+            .retain(|assignment| assignment.role != id);
+        // A deleted role must not keep a policy scope around.
+        current.policies.roles.remove(&id);
+        Ok(())
+    })?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1240,45 +1318,48 @@ async fn add_role_assignment(
     let request = body
         .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "invalid JSON body"))?
         .0;
-    let mut config = load_config(&state)?;
-    if config.role_infos().iter().all(|role| role.id != id) {
-        return Err(ApiError::new(
-            StatusCode::NOT_FOUND,
-            format!("role '{id}' not found"),
-        ));
-    }
-    if !config.agents.contains_key(&request.agent) {
-        return Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
-            format!("unknown agent '{}'", request.agent),
-        ));
-    }
-    if config
-        .role_assignments
-        .iter()
-        .any(|assignment| assignment.role == id && assignment.agent == request.agent)
-    {
-        return Err(ApiError::new(
-            StatusCode::CONFLICT,
-            format!(
-                "agent '{}' is already assigned to role '{id}'",
-                request.agent
-            ),
-        ));
-    }
-    if request.preferred {
-        config.role_assignments.iter_mut().for_each(|assignment| {
-            if assignment.role == id {
-                assignment.preferred = false;
-            }
-        });
-    }
-    config.role_assignments.push(RoleAssignment {
-        role: id.clone(),
-        agent: request.agent,
-        preferred: request.preferred,
-    });
-    save_config(&state, &config)?;
+    let (config, _) =
+        {
+            let role_id = id.clone();
+            mutate_config(&state, move |current| {
+                if current.role_infos().iter().all(|role| role.id != role_id) {
+                    return Err(ApiError::new(
+                        StatusCode::NOT_FOUND,
+                        format!("role '{role_id}' not found"),
+                    ));
+                }
+                if !current.agents.contains_key(&request.agent) {
+                    return Err(ApiError::new(
+                        StatusCode::BAD_REQUEST,
+                        format!("unknown agent '{}'", request.agent),
+                    ));
+                }
+                if current.role_assignments.iter().any(|assignment| {
+                    assignment.role == role_id && assignment.agent == request.agent
+                }) {
+                    return Err(ApiError::new(
+                        StatusCode::CONFLICT,
+                        format!(
+                            "agent '{}' is already assigned to role '{role_id}'",
+                            request.agent
+                        ),
+                    ));
+                }
+                if request.preferred {
+                    current.role_assignments.iter_mut().for_each(|assignment| {
+                        if assignment.role == role_id {
+                            assignment.preferred = false;
+                        }
+                    });
+                }
+                current.role_assignments.push(RoleAssignment {
+                    role: role_id,
+                    agent: request.agent,
+                    preferred: request.preferred,
+                });
+                Ok(())
+            })?
+        };
     Ok(Json(role_info(&config, &id)?))
 }
 
@@ -1286,18 +1367,22 @@ async fn remove_role_assignment(
     State(state): State<SharedState>,
     UrlPath((id, agent)): UrlPath<(String, String)>,
 ) -> Result<Json<factory_core::RoleInfo>, ApiError> {
-    let mut config = load_config(&state)?;
-    let before = config.role_assignments.len();
-    config
-        .role_assignments
-        .retain(|assignment| !(assignment.role == id && assignment.agent == agent));
-    if config.role_assignments.len() == before {
-        return Err(ApiError::new(
-            StatusCode::NOT_FOUND,
-            format!("agent '{agent}' is not assigned to role '{id}'"),
-        ));
-    }
-    save_config(&state, &config)?;
+    let (config, _) = {
+        let role_id = id.clone();
+        mutate_config(&state, move |current| {
+            let before = current.role_assignments.len();
+            current
+                .role_assignments
+                .retain(|assignment| !(assignment.role == role_id && assignment.agent == agent));
+            if current.role_assignments.len() == before {
+                return Err(ApiError::new(
+                    StatusCode::NOT_FOUND,
+                    format!("agent '{agent}' is not assigned to role '{role_id}'"),
+                ));
+            }
+            Ok(())
+        })?
+    };
     Ok(Json(role_info(&config, &id)?))
 }
 
@@ -1315,24 +1400,31 @@ async fn set_preferred_assignment(
     let request = body
         .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "invalid JSON body"))?
         .0;
-    let mut config = load_config(&state)?;
-    let mut found = false;
-    for assignment in &mut config.role_assignments {
-        if assignment.role != id {
-            continue;
-        }
-        assignment.preferred = assignment.agent == request.agent;
-        if assignment.preferred {
-            found = true;
-        }
-    }
-    if !found {
-        return Err(ApiError::new(
-            StatusCode::NOT_FOUND,
-            format!("agent '{}' is not assigned to role '{id}'", request.agent),
-        ));
-    }
-    save_config(&state, &config)?;
+    let (config, _) = {
+        let role_id = id.clone();
+        mutate_config(&state, move |current| {
+            let mut found = false;
+            for assignment in &mut current.role_assignments {
+                if assignment.role != role_id {
+                    continue;
+                }
+                assignment.preferred = assignment.agent == request.agent;
+                if assignment.preferred {
+                    found = true;
+                }
+            }
+            if !found {
+                return Err(ApiError::new(
+                    StatusCode::NOT_FOUND,
+                    format!(
+                        "agent '{}' is not assigned to role '{role_id}'",
+                        request.agent
+                    ),
+                ));
+            }
+            Ok(())
+        })?
+    };
     Ok(Json(role_info(&config, &id)?))
 }
 
@@ -1460,34 +1552,38 @@ async fn put_role_policy(
     let request = body
         .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "invalid JSON body"))?
         .0;
-    let mut config = load_config(&state)?;
-    if config.role_infos().iter().all(|role| role.id != id) {
-        return Err(ApiError::new(
-            StatusCode::NOT_FOUND,
-            format!("role '{id}' not found"),
-        ));
-    }
-    match request.preset.as_deref() {
-        Some(name) => {
-            let preset = parse_policy_preset(name)?;
-            config.policies.role_mut(&id).preset = Some(preset);
-        }
-        None => {
-            let mut now_empty = false;
-            if let Some(scope) = config.policies.roles.get_mut(&id) {
-                scope.preset = None;
-                now_empty = scope.filesystem.is_none()
-                    && scope.commands.is_none()
-                    && scope.network.is_none()
-                    && scope.environment.is_none()
-                    && scope.git.is_none();
+    let (config, _) = {
+        let role_id = id.clone();
+        mutate_config(&state, move |current| {
+            if current.role_infos().iter().all(|role| role.id != role_id) {
+                return Err(ApiError::new(
+                    StatusCode::NOT_FOUND,
+                    format!("role '{role_id}' not found"),
+                ));
             }
-            if now_empty {
-                config.policies.roles.remove(&id);
+            match request.preset.as_deref() {
+                Some(name) => {
+                    let preset = parse_policy_preset(name)?;
+                    current.policies.role_mut(&role_id).preset = Some(preset);
+                }
+                None => {
+                    let mut now_empty = false;
+                    if let Some(scope) = current.policies.roles.get_mut(&role_id) {
+                        scope.preset = None;
+                        now_empty = scope.filesystem.is_none()
+                            && scope.commands.is_none()
+                            && scope.network.is_none()
+                            && scope.environment.is_none()
+                            && scope.git.is_none();
+                    }
+                    if now_empty {
+                        current.policies.roles.remove(&role_id);
+                    }
+                }
             }
-        }
-    }
-    save_config(&state, &config)?;
+            Ok(())
+        })?
+    };
     Ok(Json(role_info(&config, &id)?))
 }
 

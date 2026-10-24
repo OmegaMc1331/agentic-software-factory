@@ -12,6 +12,7 @@ import {
   fetchMcpTools,
   fetchRecipes,
   fetchRoles,
+  isConfigConflictError,
   mcpDiscoveryRequestTimeoutMs,
   removeRoleAssignment,
   saveConfig,
@@ -161,10 +162,12 @@ export function SettingsView() {
   } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState<string | null>(null);
+  const [conflict, setConflict] = useState<string | null>(null);
 
   const reload = useCallback(() => {
     setError(null);
     setSaved(null);
+    setConflict(null);
     Promise.all([fetchConfig(), fetchAgents(), fetchRoles(), fetchRecipes(), fetchMcpServers()])
       .then(([nextConfig, list, nextRoles, nextRecipes, nextMcpServers]) => {
         setConfig(nextConfig);
@@ -203,11 +206,22 @@ export function SettingsView() {
       setSaved(null);
       try {
         await saveConfig(next);
+        setConflict(null);
         setSaved(note);
         reload();
         return true;
       } catch (reason) {
-        setError((reason as Error).message);
+        if (isConfigConflictError(reason)) {
+          // The configuration changed elsewhere after this page loaded. The
+          // server kept its newer version; the draft stays open for review.
+          setConflict(
+            "The configuration was modified elsewhere (another tab or window) after this " +
+              "page loaded. Your changes were not saved. Compare them with the latest " +
+              "configuration below, then reload and reapply what still applies."
+          );
+        } else {
+          setError((reason as Error).message);
+        }
         return false;
       }
     },
@@ -364,6 +378,26 @@ export function SettingsView() {
       </div>
       {error && <p className="error">{error}</p>}
       {saved && <p className="settings-saved">{saved}</p>}
+      {conflict && (
+        <div className="empty" role="alert" data-testid="config-conflict">
+          <p className="empty-title">Configuration changed elsewhere</p>
+          <p className="error">{conflict}</p>
+          <div className="empty-actions">
+            <button
+              className="button"
+              onClick={() => {
+                setConflict(null);
+                reload();
+              }}
+            >
+              Reload latest configuration
+            </button>
+            <button className="button" onClick={() => setConflict(null)}>
+              Keep my changes open
+            </button>
+          </div>
+        </div>
+      )}
 
       <section className="section">
         <h3 className="section-title">Routing</h3>

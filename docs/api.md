@@ -163,8 +163,39 @@ See [Architecture](architecture.md#interactive-terminal-backpressure).
 | GET | `/api/graph` | Agents, workflows, tasks, assignments, and semantic links |
 | GET | `/api/graph/workspace` | Saved visual layout and custom topology |
 | PUT | `/api/graph/workspace` | Validate and atomically save the graph workspace |
-| GET | `/api/config` | The agent and role configuration |
-| PUT | `/api/config` | Write a validated configuration atomically |
+| GET | `/api/config` | The agent and role configuration, with its revision as `ETag` |
+| PUT | `/api/config` | Conditionally replace the configuration (see below) |
+
+### Configuration concurrency
+
+All configuration mutations (roles, assignments, policies, MCP servers, and
+full replacement) run as one coordinated load → check → mutate → validate →
+write operation, serialized per project, so concurrent requests can no longer
+silently drop each other's changes. Two concurrent additions of different MCP
+servers both land; two concurrent creations of the same server yield one
+success and one `409 Conflict`.
+
+`PUT /api/config` replaces the whole document, so it requires the revision
+returned by `GET /api/config`:
+
+```text
+If-Match: "<revision>"
+```
+
+- `412 Precondition Failed` — the configuration changed since it was loaded.
+  Reload it, reapply your changes, and save again; the newer file is untouched.
+- `428 Precondition Required` — the `If-Match` header is missing.
+- `If-Match: *` keeps its RFC meaning ("any current representation") and is the
+  documented escape hatch for scripted full-document replacement.
+
+Writes go through a uniquely named temporary file in `.factory/` and are
+renamed into place, so a failed write never leaves a partial `config.toml`.
+The revision is a deterministic hash of the persisted file, changes on every
+successful write, and stays stable when no write occurs. Revisions never
+expose configuration content. Writers outside this Factory process (for
+example a hand-edited `config.toml`) are not lock-coordinated: they are
+detected through the revision check on the next full replacement, and targeted
+mutations reload the file inside their critical section.
 
 ## GitHub
 

@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use factory_agent::{
     runtime_path_entries, AgentCapabilities, AgentConfig, AgentError, AgentKind, AgentRequest,
@@ -8,7 +9,9 @@ use factory_agent::{
 use factory_policy::{EffectivePolicy, PoliciesConfig};
 use factory_types::{RoutingMode, WorkflowTeam};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
+use uuid::Uuid;
 
 use crate::roles::{
     self, is_core_role, is_pipeline_role, RoleCatalog, RoleDefinition, RoleKind,
@@ -240,7 +243,20 @@ impl Config {
         }
         let backup = path.with_extension("toml.bak");
         std::fs::write(&backup, &original).map_err(|e| ConfigError::Write(backup.clone(), e))?;
-        config.write_atomic(root)?;
+        let migrated = config.clone();
+        update_config(root, |current| -> Result<(), String> {
+            *current = migrated;
+            Ok(())
+        })
+        .map_err(|error| match error {
+            UpdateError::Mutation(reason) => {
+                ConfigError::Write(path, std::io::Error::other(reason))
+            }
+            UpdateError::Validation(reason) => {
+                ConfigError::Write(path, std::io::Error::other(reason))
+            }
+            UpdateError::Persistence(error) => error,
+        })?;
         Ok(config)
     }
 
@@ -736,11 +752,132 @@ impl Config {
         }
         let text = toml::to_string_pretty(self)
             .map_err(|e| ConfigError::Serialize(path.clone(), Box::new(e)))?;
-        let tmp = path.with_extension(format!("toml.tmp{}", std::process::id()));
-        std::fs::write(&tmp, text).map_err(|e| ConfigError::Write(tmp.clone(), e))?;
-        std::fs::rename(&tmp, &path).map_err(|e| ConfigError::Write(path.clone(), e))?;
+        write_config_text(&path, &text)?;
         Ok(path)
     }
+
+    /// Loads the configuration together with the revision of the exact bytes
+    /// persisted on disk. The revision changes only when the file content
+    /// changes, so it can back ETag/If-Match optimistic concurrency.
+    pub fn load_with_revision(root: &Path) -> Result<(Config, String), ConfigError> {
+        let path = Self::path(root);
+        let bytes = std::fs::read(&path).map_err(|e| ConfigError::Read(path.clone(), e))?;
+        let text = String::from_utf8(bytes.clone())
+            .map_err(|e| ConfigError::Read(path.clone(), std::io::Error::other(e.utf8_error())))?;
+        let mut config: Config =
+            toml::from_str(&text).map_err(|e| ConfigError::Parse(path, Box::new(e)))?;
+        config.normalize();
+        Ok((config, revision_of(&bytes)))
+    }
+
+    /// The deterministic revision of the currently persisted configuration.
+    pub fn persisted_revision(root: &Path) -> Result<String, ConfigError> {
+        let bytes =
+            std::fs::read(Self::path(root)).map_err(|e| ConfigError::Read(Self::path(root), e))?;
+        Ok(revision_of(&bytes))
+    }
+}
+
+/// The outcome of one coordinated configuration mutation: the freshly written
+/// configuration and the revision of the bytes now on disk.
+#[derive(Debug)]
+pub struct UpdateOutcome<T> {
+    pub value: T,
+    pub config: Config,
+    pub revision: String,
+}
+
+#[derive(Debug, Error)]
+pub enum UpdateError<E> {
+    /// The mutation itself refused to run; the file is unchanged.
+    #[error("{0}")]
+    Mutation(E),
+    /// The resulting configuration failed validation; the file is unchanged.
+    #[error("invalid configuration: {0}")]
+    Validation(String),
+    #[error(transparent)]
+    Persistence(ConfigError),
+}
+
+impl<E> From<ConfigError> for UpdateError<E> {
+    fn from(error: ConfigError) -> Self {
+        UpdateError::Persistence(error)
+    }
+}
+
+static CONFIG_LOCKS: LazyLock<Mutex<BTreeMap<PathBuf, Arc<Mutex<()>>>>> =
+    LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+fn config_lock(root: &Path) -> Arc<Mutex<()>> {
+    let key = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let mut locks = CONFIG_LOCKS
+        .lock()
+        .expect("configuration lock registry poisoned");
+    locks
+        .entry(key)
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
+/// Runs one coordinated configuration mutation:
+/// LOAD -> VALIDATE CURRENT STATE -> MUTATE -> VALIDATE NEW STATE -> WRITE.
+/// Mutations for the same project root serialize on a per-root lock, always
+/// read the latest persisted configuration inside the critical section, and
+/// leave the previous file untouched when the mutation or validation fails.
+/// The lock is process-wide; writers in other processes are detected (not
+/// prevented) through revision-based conflict checks.
+pub fn update_config<T, E>(
+    root: &Path,
+    mutate: impl FnOnce(&mut Config) -> Result<T, E>,
+) -> Result<UpdateOutcome<T>, UpdateError<E>> {
+    let lock = config_lock(root);
+    let _guard = lock.lock().expect("configuration mutex poisoned");
+    let mut config = Config::load(root)?;
+    let value = mutate(&mut config).map_err(UpdateError::Mutation)?;
+    if let Err(reason) = config.validate() {
+        return Err(UpdateError::Validation(reason));
+    }
+    let revision = write_validated(root, &config)?;
+    Ok(UpdateOutcome {
+        value,
+        config,
+        revision,
+    })
+}
+
+/// Validates and atomically replaces config.toml under the project's mutation
+/// lock. Returns the revision of the persisted bytes.
+fn write_validated(root: &Path, config: &Config) -> Result<String, ConfigError> {
+    config.write_atomic(root)?;
+    Config::persisted_revision(root)
+}
+
+/// Writes the serialized configuration through a uniquely named temporary
+/// file in the destination directory, created exclusively, flushed to disk,
+/// and renamed over the destination. A failed write removes the temporary
+/// file; the previous configuration stays in place until the rename.
+fn write_config_text(path: &Path, text: &str) -> Result<(), ConfigError> {
+    let tmp = path.with_extension(format!("toml.{}.tmp", Uuid::new_v4().simple()));
+    let write = (|| -> Result<(), ConfigError> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .map_err(|e| ConfigError::Write(tmp.clone(), e))?;
+        use std::io::Write as _;
+        file.write_all(text.as_bytes())
+            .and_then(|_| file.sync_all())
+            .map_err(|e| ConfigError::Write(tmp.clone(), e))?;
+        std::fs::rename(&tmp, path).map_err(|e| ConfigError::Write(path.to_path_buf(), e))
+    })();
+    if write.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    write
+}
+
+fn revision_of(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 pub fn default_config_text() -> String {
@@ -1393,6 +1530,108 @@ mod tests {
         };
         let error = config.validate_team(&team).unwrap_err();
         assert!(error.contains("not assigned"), "unexpected: {error}");
+    }
+
+    #[test]
+    fn update_config_serializes_mutations_and_bumps_the_revision() {
+        let root = tempfile::tempdir().unwrap();
+        let path = Config::path(root.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, default_config_text()).unwrap();
+        let before = Config::persisted_revision(root.path()).unwrap();
+
+        let outcome = update_config(root.path(), |current| {
+            assert!(current.agents.contains_key("codex"));
+            current.agents.insert("gemini".into(), agent_entry());
+            Ok::<(), String>(())
+        })
+        .unwrap();
+
+        assert!(outcome.config.agents.contains_key("gemini"));
+        assert_ne!(outcome.revision, before);
+        assert_eq!(
+            Config::persisted_revision(root.path()).unwrap(),
+            outcome.revision
+        );
+        let reloaded = Config::load(root.path()).unwrap();
+        assert!(reloaded.agents.contains_key("gemini"));
+        assert!(toml::from_str::<Config>(&std::fs::read_to_string(&path).unwrap()).is_ok());
+    }
+
+    #[test]
+    fn update_config_rejects_failed_mutations_and_invalid_states_without_writing() {
+        let root = tempfile::tempdir().unwrap();
+        let path = Config::path(root.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, default_config_text()).unwrap();
+        let before = Config::persisted_revision(root.path()).unwrap();
+
+        let error = update_config(root.path(), |_current| {
+            Err::<(), String>(String::from("reserved"))
+        })
+        .unwrap_err();
+        assert!(matches!(error, UpdateError::Mutation(message) if message == "reserved"));
+        assert_eq!(Config::persisted_revision(root.path()).unwrap(), before);
+
+        let error = update_config(root.path(), |current| {
+            current.agents.insert(
+                "broken".into(),
+                AgentEntry {
+                    command: String::new(),
+                    ..agent_entry()
+                },
+            );
+            Ok::<(), String>(())
+        })
+        .unwrap_err();
+        assert!(
+            matches!(error, UpdateError::Validation(reason) if reason.contains("empty command"))
+        );
+        assert_eq!(Config::persisted_revision(root.path()).unwrap(), before);
+        assert!(!Config::load(root.path())
+            .unwrap()
+            .agents
+            .contains_key("broken"));
+
+        let leftovers: Vec<_> = std::fs::read_dir(root.path().join(".factory"))
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty());
+    }
+
+    #[test]
+    fn concurrent_update_config_calls_all_land() {
+        let root = tempfile::tempdir().unwrap();
+        let path = Config::path(root.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, default_config_text()).unwrap();
+
+        let guards: Vec<_> = (0..8)
+            .map(|index| {
+                let root = root.path().to_path_buf();
+                std::thread::spawn(move || {
+                    update_config(&root, |current| {
+                        current
+                            .agents
+                            .insert(format!("agent{index}"), agent_entry());
+                        Ok::<(), String>(())
+                    })
+                })
+            })
+            .collect();
+        for guard in guards {
+            assert!(guard.join().unwrap().is_ok());
+        }
+
+        let config = Config::load(root.path()).unwrap();
+        for index in 0..8 {
+            assert!(
+                config.agents.contains_key(&format!("agent{index}")),
+                "agent {index} was lost"
+            );
+        }
     }
 
     #[test]

@@ -65,6 +65,10 @@ function stubFetch(
   return fetchMock;
 }
 
+function fullConfig() {
+  return { agents: {}, roles: {}, role_assignments: [] };
+}
+
 describe("Factory API client", () => {
   it("returns JSON from a successful read", async () => {
     const fetchMock = stubFetch(async () => jsonResponse([{ id: 1, objective: "test" }]));
@@ -453,5 +457,123 @@ describe("Factory API client", () => {
     resolveSession(sessionResponse());
     await expect(Promise.all([first, second])).resolves.toEqual([{ id: 1 }, { id: 2 }]);
     expect(postCalls).toBe(2);
+  });
+
+  it("loads configuration with its revision and retains it for saving", async () => {
+    const fetchMock = stubFetch(async () => {
+      const body = JSON.stringify({ agents: {}, roles: {}, role_assignments: [] });
+      return new Response(body, {
+        status: 200,
+        headers: { "Content-Type": "application/json", ETag: '"rev-1"' },
+      });
+    });
+
+    const snapshot = await api.fetchConfigWithRevision();
+
+    expect(snapshot.revision).toBe('"rev-1"');
+    expect(snapshot.config).toEqual({ agents: {}, roles: {}, role_assignments: [] });
+    expect(api.currentConfigRevision()).toBe('"rev-1"');
+    expect(fetchMock).toHaveBeenCalledWith("/api/config", expect.anything());
+  });
+
+  it("rejects a configuration response without a revision", async () => {
+    stubFetch(async () => jsonResponse({ agents: {} }));
+
+    const error = await api.fetchConfigWithRevision().catch((reason: unknown) => reason);
+
+    expect(error).toBeInstanceOf(api.FactoryApiError);
+    expect(error).toMatchObject({ kind: "invalid-response" });
+  });
+
+  it("sends the stored revision as If-Match on save and adopts the new revision", async () => {
+    const config = fullConfig();
+    const captured: { headers: Headers | null } = { headers: null };
+    const fetchMock = stubFetch((url, init) => {
+      if (url === "/api/auth/session") return Promise.resolve(sessionResponse());
+      if (init.method === "GET") {
+        return Promise.resolve(
+          new Response(JSON.stringify(config), {
+            status: 200,
+            headers: { "Content-Type": "application/json", ETag: '"rev-1"' },
+          })
+        );
+      }
+      captured.headers = new Headers(init.headers);
+      return Promise.resolve(new Response(null, { status: 204, headers: { ETag: '"rev-2"' } }));
+    });
+
+    await api.fetchConfigWithRevision();
+    (fetchMock as ReturnType<typeof vi.fn>).mockClear();
+    await api.saveConfig(config);
+
+    expect(captured.headers).not.toBeNull();
+    expect(captured.headers?.get("If-Match")).toBe('"rev-1"');
+    expect(captured.headers?.get("X-Factory-CSRF")).toBe("csrf-1");
+    expect(api.currentConfigRevision()).toBe('"rev-2"');
+  });
+
+  it("refuses to save a configuration that was never loaded", async () => {
+    stubFetch(async () => sessionResponse());
+
+    const error = await api.saveConfig(fullConfig()).catch((reason: unknown) => reason);
+
+    expect(error).toBeInstanceOf(api.FactoryApiError);
+    expect(error).toMatchObject({ kind: "invalid-request" });
+  });
+
+  it("surfaces a 412 revision conflict as a configuration conflict", async () => {
+    stubFetch((url, init) => {
+      if (url === "/api/auth/session") return Promise.resolve(sessionResponse());
+      if (init.method === "GET") {
+        return Promise.resolve(
+          new Response(JSON.stringify({ agents: {} }), {
+            status: 200,
+            headers: { "Content-Type": "application/json", ETag: '"rev-1"' },
+          })
+        );
+      }
+      return Promise.resolve(
+        jsonResponse({ error: "the configuration was modified after it was loaded" }, 412)
+      );
+    });
+    await api.fetchConfigWithRevision();
+
+    const error = await api.saveConfig(fullConfig()).catch((reason: unknown) => reason);
+
+    expect(error).toBeInstanceOf(api.FactoryApiError);
+    expect(error).toMatchObject({ kind: "http", status: 412 });
+    expect(api.isConfigConflictError(error)).toBe(true);
+    expect(api.currentConfigRevision()).toBe('"rev-1"');
+  });
+
+  it("treats a 428 missing-precondition response as a configuration conflict", async () => {
+    stubFetch((url, init) => {
+      if (url === "/api/auth/session") return Promise.resolve(sessionResponse());
+      if (init.method === "GET") {
+        return Promise.resolve(
+          new Response(JSON.stringify({ agents: {} }), {
+            status: 200,
+            headers: { "Content-Type": "application/json", ETag: '"rev-1"' },
+          })
+        );
+      }
+      return Promise.resolve(
+        jsonResponse({ error: "If-Match with the configuration revision is required" }, 428)
+      );
+    });
+    await api.fetchConfigWithRevision();
+
+    const error = await api.saveConfig(fullConfig()).catch((reason: unknown) => reason);
+
+    expect(api.isConfigConflictError(error)).toBe(true);
+  });
+
+  it("does not classify unrelated failures as configuration conflicts", () => {
+    const timeoutError = new api.FactoryApiError("timed out", "timeout", { uncertain: true });
+    const httpError = new api.FactoryApiError("bad request", "http", { status: 400 });
+
+    expect(api.isConfigConflictError(timeoutError)).toBe(false);
+    expect(api.isConfigConflictError(httpError)).toBe(false);
+    expect(api.isConfigConflictError(new Error("plain"))).toBe(false);
   });
 });

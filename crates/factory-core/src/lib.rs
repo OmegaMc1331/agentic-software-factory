@@ -10,8 +10,9 @@ pub mod routing;
 pub mod workflow;
 
 pub use config::{
-    default_config_text, AgentEntry, AgentInfo, AgentResolutionError, Agents, Config, ConfigError,
-    RoleAssignment, RoleAssignmentInfo, RoleDefinitionEntry, RoleInfo, RoutingConfig,
+    default_config_text, update_config, AgentEntry, AgentInfo, AgentResolutionError, Agents,
+    Config, ConfigError, RoleAssignment, RoleAssignmentInfo, RoleDefinitionEntry, RoleInfo,
+    RoutingConfig, UpdateError, UpdateOutcome,
 };
 pub use factory::{
     Factory, FactoryError, MarkOutcome, RunOutcome, WorkflowResult, FACTORY_DIR, MAX_TASK_ATTEMPTS,

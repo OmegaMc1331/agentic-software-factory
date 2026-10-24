@@ -336,6 +336,14 @@ async function request<T>(
   init?: RequestInit,
   options?: ApiRequestOptions
 ): Promise<T> {
+  return (await requestFull<T>(path, init, options)).value;
+}
+
+async function requestFull<T>(
+  path: string,
+  init?: RequestInit,
+  options?: ApiRequestOptions
+): Promise<{ value: T; headers: Headers }> {
   const method = (init?.method ?? "GET").toUpperCase();
   const mutating = !["GET", "HEAD", "OPTIONS"].includes(method);
   const effect = options?.effect ?? (mutating ? "write" : "read");
@@ -377,9 +385,10 @@ async function request<T>(
           throw abortFailure(deadline, uncertain) ?? error;
         }
       }
-      if (response.status === 204) return undefined as T;
+      if (response.status === 204) return { value: undefined as T, headers: response.headers };
       try {
-        return (await response.json()) as T;
+        const value = (await response.json()) as T;
+        return { value, headers: response.headers };
       } catch {
         throw abortFailure(deadline, uncertain) ?? invalidResponseError();
       }
@@ -631,12 +640,78 @@ export function saveGraphWorkspace(
   return put<void>("/graph/workspace", body, options);
 }
 
-export function fetchConfig(options?: ApiRequestOptions): Promise<ConfigData> {
-  return get<ConfigData>("/config", options);
+// --- Configuration ------------------------------------------------------------
+
+/**
+ * A configuration snapshot together with the server revision it was loaded
+ * at. The revision backs the If-Match precondition on full-document saves.
+ */
+export interface ConfigSnapshot {
+  config: ConfigData;
+  revision: string;
 }
 
-export function saveConfig(config: ConfigData, options?: ApiRequestOptions): Promise<void> {
-  return put<void>("/config", config, options);
+let configRevision: string | null = null;
+
+function revisionFromHeaders(headers: Headers): string | null {
+  return headers.get("ETag") ?? headers.get("etag");
+}
+
+/** Loads the configuration and retains its revision for the next save. */
+export async function fetchConfigWithRevision(
+  options?: ApiRequestOptions
+): Promise<ConfigSnapshot> {
+  const { value, headers } = await requestFull<ConfigData>("/config", undefined, options);
+  const revision = revisionFromHeaders(headers);
+  if (!revision) {
+    throw new FactoryApiError(
+      "Factory API returned no configuration revision.",
+      "invalid-response"
+    );
+  }
+  configRevision = revision;
+  return { config: value, revision };
+}
+
+/** The revision of the most recently loaded configuration, if any. */
+export function currentConfigRevision(): string | null {
+  return configRevision;
+}
+
+export function fetchConfig(options?: ApiRequestOptions): Promise<ConfigData> {
+  return fetchConfigWithRevision(options).then((snapshot) => snapshot.config);
+}
+
+/**
+ * Whether an error is a configuration revision conflict (HTTP 412) or a
+ * missing-precondition rejection (HTTP 428). Callers must reload the latest
+ * configuration and reapply their changes instead of retrying blindly.
+ */
+export function isConfigConflictError(error: unknown): boolean {
+  return error instanceof FactoryApiError && (error.status === 412 || error.status === 428);
+}
+
+/**
+ * Replaces the full configuration. The server enforces the revision captured
+ * by the last `fetchConfig`/`fetchConfigWithRevision` call: a stale snapshot
+ * is rejected with HTTP 412 instead of silently overwriting newer changes.
+ */
+export async function saveConfig(config: ConfigData, options?: ApiRequestOptions): Promise<void> {
+  const revision = configRevision;
+  if (!revision) {
+    throw new FactoryApiError("Load the configuration before saving it.", "invalid-request");
+  }
+  const { headers } = await requestFull<void>(
+    "/config",
+    {
+      method: "PUT",
+      headers: { "Content-Type": "application/json", "If-Match": revision },
+      body: JSON.stringify(config),
+    },
+    options
+  );
+  const next = revisionFromHeaders(headers);
+  if (next) configRevision = next;
 }
 
 // --- External tools / MCP ----------------------------------------------------
