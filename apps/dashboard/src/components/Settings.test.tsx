@@ -13,7 +13,6 @@ import {
   fetchMcpTools,
   fetchRecipes,
   fetchRoles,
-  isConfigConflictError,
   mcpDiscoveryRequestTimeoutMs,
   removeRoleAssignment,
   saveConfig,
