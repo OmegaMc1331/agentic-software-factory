@@ -10,6 +10,7 @@ pub mod recipe;
 pub mod routing;
 pub mod run;
 pub mod session;
+pub mod stats;
 pub mod task;
 pub mod team;
 
@@ -34,5 +35,6 @@ pub use recipe::{Recipe, RecipeDelivery, RecipeRouting, RecipeSnapshot};
 pub use routing::{RoutingCandidateScore, RoutingDecision, RoutingMode, RoutingPreview};
 pub use run::{Run, RunStatus};
 pub use session::{AgentOutputMetadata, AgentSession, AgentSessionMode, SessionPolicyAudit};
+pub use stats::median_u64;
 pub use task::{Task, TaskState};
 pub use team::WorkflowTeam;

@@ -451,7 +451,7 @@ impl FactoryDb {
                 .iter()
                 .filter(|invocation| !matches!(invocation.status.as_str(), "success" | "running"))
                 .count(),
-            median_duration_ms: durations.get(durations.len() / 2).copied(),
+            median_duration_ms: factory_types::median_u64(&durations),
         })
     }
 
@@ -3642,6 +3642,123 @@ mod tests {
         assert!(db
             .try_acquire_mcp_server_slot("docs", 1, "2026-01-01T00:00:00Z")
             .unwrap());
+    }
+
+    fn record_invocation(db: &FactoryDb, tool: &str, status: &str, duration_ms: Option<u64>) {
+        let invocation = db
+            .start_tool_invocation(&ToolInvocation {
+                id: 0,
+                run_id: None,
+                task_id: None,
+                attempt_id: None,
+                session_id: None,
+                agent: "codex".into(),
+                role: "worker".into(),
+                server: "docs".into(),
+                tool: tool.into(),
+                classification: ToolClassification::Read,
+                status: "running".into(),
+                started_at: "2026-01-01T00:00:00Z".into(),
+                duration_ms: None,
+                input_summary: "input omitted".into(),
+                output_summary: None,
+                error: None,
+            })
+            .unwrap();
+        if let Some(duration) = duration_ms {
+            db.finish_tool_invocation(invocation.id, status, duration, None, None)
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn tool_metrics_median_matches_the_conventional_median() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = FactoryDb::open(&dir.path().join("test.db")).unwrap();
+
+        let empty = db.tool_metrics().unwrap();
+        assert_eq!(empty.median_duration_ms, None);
+        assert_eq!(empty.calls, 0);
+
+        record_invocation(&db, "search", "success", Some(120));
+        let single = db.tool_metrics().unwrap();
+        assert_eq!(single.median_duration_ms, Some(120));
+        assert_eq!(single.calls, 1);
+        assert_eq!(single.successes, 1);
+        assert_eq!(single.failures, 0);
+
+        // The regression this hotfix exists for: an even-sized sample
+        // previously returned the upper-middle element (30) instead of the
+        // mean of the two central values.
+        let regression = tempfile::tempdir().unwrap();
+        let db = FactoryDb::open(&regression.path().join("test.db")).unwrap();
+        for (tool, duration) in [("fetch", 10), ("fetch", 40), ("fetch", 20), ("fetch", 30)] {
+            record_invocation(&db, tool, "success", Some(duration));
+        }
+        let metrics = db.tool_metrics().unwrap();
+        assert_eq!(metrics.median_duration_ms, Some(25));
+        assert_eq!(metrics.calls, 4);
+        assert_eq!(metrics.successes, 4);
+        assert_eq!(metrics.failures, 0);
+        assert_eq!(
+            db.tool_metrics().unwrap(),
+            metrics,
+            "repeated calls are stable"
+        );
+    }
+
+    #[test]
+    fn tool_metrics_median_covers_odd_identical_and_rounding_cases() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = FactoryDb::open(&dir.path().join("test.db")).unwrap();
+
+        record_invocation(&db, "search", "success", Some(30));
+        record_invocation(&db, "search", "success", Some(10));
+        record_invocation(&db, "search", "success", Some(20));
+        assert_eq!(db.tool_metrics().unwrap().median_duration_ms, Some(20));
+
+        let other = tempfile::tempdir().unwrap();
+        let db = FactoryDb::open(&other.path().join("test.db")).unwrap();
+        record_invocation(&db, "search", "success", Some(7));
+        record_invocation(&db, "search", "success", Some(7));
+        assert_eq!(db.tool_metrics().unwrap().median_duration_ms, Some(7));
+        record_invocation(&db, "search", "success", Some(7));
+        record_invocation(&db, "search", "success", Some(7));
+        assert_eq!(db.tool_metrics().unwrap().median_duration_ms, Some(7));
+
+        let rounding = tempfile::tempdir().unwrap();
+        let db = FactoryDb::open(&rounding.path().join("test.db")).unwrap();
+        record_invocation(&db, "search", "success", Some(0));
+        record_invocation(&db, "search", "success", Some(1));
+        assert_eq!(db.tool_metrics().unwrap().median_duration_ms, Some(1));
+    }
+
+    #[test]
+    fn tool_metrics_preserves_eligibility_and_counting_semantics() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = FactoryDb::open(&dir.path().join("test.db")).unwrap();
+
+        // Failed invocations with recorded durations keep contributing to
+        // the median (pre-existing eligibility), while unfinished invocations
+        // without a duration never do and count as neither success nor
+        // failure.
+        record_invocation(&db, "search", "success", Some(10));
+        record_invocation(&db, "search", "tool_failure", Some(30));
+        record_invocation(&db, "search", "timeout", Some(50));
+        record_invocation(&db, "search", "success", None);
+        let metrics = db.tool_metrics().unwrap();
+        assert_eq!(metrics.median_duration_ms, Some(30));
+        assert_eq!(metrics.calls, 4);
+        assert_eq!(metrics.successes, 1);
+        assert_eq!(metrics.failures, 2);
+
+        let zero = tempfile::tempdir().unwrap();
+        let db = FactoryDb::open(&zero.path().join("test.db")).unwrap();
+        record_invocation(&db, "search", "success", Some(0));
+        record_invocation(&db, "search", "success", Some(0));
+        let metrics = db.tool_metrics().unwrap();
+        assert_eq!(metrics.median_duration_ms, Some(0));
+        assert_eq!(metrics.calls, 2);
     }
 
     #[test]

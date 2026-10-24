@@ -309,3 +309,64 @@ async fn performance_endpoints_are_read_only() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
 }
+
+#[tokio::test]
+async fn performance_overview_reports_the_corrected_mcp_duration_median() {
+    let dir = TempDir::new().unwrap();
+    init_root(dir.path());
+    let state = make_state(dir.path());
+    seed_history(&state);
+    {
+        let db = state.db.lock().unwrap();
+        for duration in [10u64, 20, 30, 40] {
+            let invocation = db
+                .start_tool_invocation(&factory_types::ToolInvocation {
+                    id: 0,
+                    run_id: None,
+                    task_id: None,
+                    attempt_id: None,
+                    session_id: None,
+                    agent: "codex".into(),
+                    role: "worker".into(),
+                    server: "docs".into(),
+                    tool: "search".into(),
+                    classification: factory_types::ToolClassification::Read,
+                    status: "running".into(),
+                    started_at: "2026-08-20T08:00:00Z".into(),
+                    duration_ms: None,
+                    input_summary: "input omitted".into(),
+                    output_summary: None,
+                    error: None,
+                })
+                .unwrap();
+            db.finish_tool_invocation(invocation.id, "success", duration, None, None)
+                .unwrap();
+        }
+    }
+    let app = common::authenticated_app(state).await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/performance/agents")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let value: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+
+    // Even-sized MCP duration samples must expose the mean of the two
+    // central values, not the upper-middle element.
+    assert_eq!(value["toolOperations"]["calls"], 4);
+    assert_eq!(value["toolOperations"]["successes"], 4);
+    assert_eq!(value["toolOperations"]["failures"], 0);
+    assert_eq!(value["toolOperations"]["medianDurationMs"], 25);
+
+    // Agent performance metrics are untouched by the MCP telemetry fix.
+    let codex = &value["agents"].as_array().unwrap()[0];
+    assert_eq!(codex["agent"], "codex");
+    assert_eq!(codex["metrics"]["executionDuration"]["medianMs"], 94_000);
+    assert_eq!(codex["metrics"]["attempts"], 2);
+}

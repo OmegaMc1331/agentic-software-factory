@@ -59,11 +59,13 @@ pub fn wilson_95(successes: u64, total: u64) -> (f64, f64) {
     )
 }
 
-/// Median and p95 of a duration sample, in milliseconds. The median of an
-/// even-sized sample is the mean of the two central values (rounded to the
-/// nearest millisecond); p95 uses the nearest-rank method. Samples derived
-/// from attempt wall-time rather than session timers are counted separately
-/// in `approximate_samples` so consumers can disclose the approximation.
+/// Median and p95 of a duration sample, in milliseconds. The median is the
+/// conventional one — middle element for odd sizes, mean of the two central
+/// elements for even sizes — rounded to the nearest millisecond with an exact
+/// half rounded up (see `factory_types::median_u64`); p95 uses the
+/// nearest-rank method. Samples derived from attempt wall-time rather than
+/// session timers are counted separately in `approximate_samples` so
+/// consumers can disclose the approximation.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DurationStats {
@@ -89,15 +91,7 @@ impl DurationStats {
 }
 
 fn median(sorted: &[u64]) -> Option<u64> {
-    if sorted.is_empty() {
-        return None;
-    }
-    let middle = sorted.len() / 2;
-    Some(if sorted.len() % 2 == 1 {
-        sorted[middle]
-    } else {
-        (sorted[middle - 1] + sorted[middle]) / 2
-    })
+    factory_types::median_u64(sorted)
 }
 
 fn p95(sorted: &[u64]) -> Option<u64> {
