@@ -1,3 +1,4 @@
+use std::io::{IsTerminal, Read};
 use std::path::Path;
 use std::process::Command as ProcessCommand;
 use std::sync::Arc;
@@ -9,6 +10,8 @@ use factory_core::{Agents, Config, Factory, FACTORY_DIR};
 use factory_db::FactoryDb;
 use factory_types::TaskState;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+const MAX_MCP_INPUT_BYTES: usize = 1_048_576;
 
 fn main() -> Result<()> {
     dotenvy::dotenv().ok();
@@ -102,9 +105,12 @@ enum McpCommand {
     Call {
         /// Qualified tool name (`server.tool`)
         tool: String,
-        /// Tool arguments as one JSON object
+        /// Tool arguments as one inline JSON object
+        #[arg(long, conflicts_with = "input_stdin")]
+        input_json: Option<String>,
+        /// Read the tool arguments JSON object from standard input
         #[arg(long)]
-        input_json: String,
+        input_stdin: bool,
     },
 }
 
@@ -151,7 +157,11 @@ impl Cli {
                 status(&root)?;
             }
             Command::Mcp(command) => match command {
-                McpCommand::Call { tool, input_json } => mcp_call(tool, input_json)?,
+                McpCommand::Call {
+                    tool,
+                    input_json,
+                    input_stdin,
+                } => mcp_call(tool, input_json.as_deref(), *input_stdin)?,
             },
             Command::Dev(command) => match command {
                 DevCommand::Agents => agents(&root)?,
@@ -177,11 +187,20 @@ impl Cli {
     }
 }
 
-fn mcp_call(tool: &str, input_json: &str) -> Result<()> {
-    const MAX_INPUT_BYTES: usize = 1_048_576;
-    if input_json.len() > MAX_INPUT_BYTES {
-        bail!("MCP tool input exceeds the {MAX_INPUT_BYTES}-byte limit");
-    }
+fn mcp_call(tool: &str, input_json: Option<&str>, input_stdin: bool) -> Result<()> {
+    let (source, raw_input) = match (input_stdin, input_json) {
+        (true, _) => ("--input-stdin", read_stdin_input()?),
+        (false, Some(json)) => {
+            if json.len() > MAX_MCP_INPUT_BYTES {
+                bail!("MCP tool input exceeds the {MAX_MCP_INPUT_BYTES}-byte limit");
+            }
+            ("--input-json", json.as_bytes().to_vec())
+        }
+        (false, None) => {
+            bail!("provide exactly one input source: --input-json <JSON object> or --input-stdin")
+        }
+    };
+    let input = parse_tool_input(source, &raw_input)?;
     let root = std::env::var_os("FACTORY_MCP_ROOT")
         .map(std::path::PathBuf::from)
         .context("this command requires a Factory task tool grant")?;
@@ -191,11 +210,6 @@ fn mcp_call(tool: &str, input_json: &str) -> Result<()> {
     // ensure it cannot reach any MCP child process through inheritance.
     std::env::remove_var("FACTORY_MCP_GRANT");
     factory_root(&root)?;
-    let input: serde_json::Value =
-        serde_json::from_str(input_json).context("--input-json must be valid JSON")?;
-    if !input.is_object() {
-        bail!("--input-json must be a JSON object");
-    }
     let config = Config::load(&root)?;
     let registry = factory_mcp::ToolRegistry::new(&root, config.mcp.clone());
     let grant = registry
@@ -209,6 +223,47 @@ fn mcp_call(tool: &str, input_json: &str) -> Result<()> {
         .block_on(registry.execute_grant(&token, tool, input, &policy))?;
     println!("{}", output.rendered);
     Ok(())
+}
+
+fn read_stdin_input() -> Result<Vec<u8>> {
+    let stdin = std::io::stdin();
+    if stdin.is_terminal() {
+        bail!(
+            "--input-stdin expects the JSON object on standard input; \
+             pipe or redirect it instead of typing it in a terminal"
+        );
+    }
+    let mut handle = stdin.lock();
+    let mut input = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let read = match handle.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(count) => count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error).context("cannot read tool input from standard input"),
+        };
+        input.extend_from_slice(&chunk[..read]);
+        if input.len() > MAX_MCP_INPUT_BYTES {
+            bail!("MCP tool input exceeds the {MAX_MCP_INPUT_BYTES}-byte limit");
+        }
+    }
+    Ok(input)
+}
+
+fn parse_tool_input(source: &str, raw: &[u8]) -> Result<serde_json::Value> {
+    let text = std::str::from_utf8(raw).map_err(|_| {
+        anyhow::anyhow!("{source} must be valid UTF-8: encode the JSON document as UTF-8")
+    })?;
+    if text.trim().is_empty() {
+        bail!("{source} must not be empty: provide exactly one JSON object");
+    }
+    let input: serde_json::Value = serde_json::from_str(text)
+        .with_context(|| format!("{source} must be one valid JSON object"))?;
+    if !input.is_object() {
+        bail!("{source} must be a JSON object");
+    }
+    Ok(input)
 }
 
 fn factory_root(root: &Path) -> Result<()> {
@@ -589,5 +644,67 @@ mod tests {
             Command::Status
         ));
         assert!(Cli::try_parse_from(["factory", "run", "objective"]).is_err());
+    }
+
+    #[test]
+    fn mcp_call_input_flags_are_mutually_exclusive() {
+        assert!(Cli::try_parse_from([
+            "factory",
+            "mcp",
+            "call",
+            "a.b",
+            "--input-json",
+            "{}",
+            "--input-stdin"
+        ])
+        .is_err());
+        match Cli::try_parse_from(["factory", "mcp", "call", "a.b", "--input-stdin"])
+            .unwrap()
+            .command
+        {
+            Command::Mcp(McpCommand::Call {
+                input_json,
+                input_stdin,
+                ..
+            }) => {
+                assert!(input_json.is_none());
+                assert!(input_stdin);
+            }
+            _ => panic!("expected an mcp call command"),
+        }
+    }
+
+    #[test]
+    fn tool_input_validation_is_shared_and_strict() {
+        assert!(parse_tool_input("--input-json", b"{}").unwrap().is_object());
+        assert!(parse_tool_input("--input-stdin", b"  {\n\"a\": 1}\r\n").is_ok());
+        assert!(parse_tool_input("--input-stdin", b"{\"a\":\"\\u00e9\"}").is_ok());
+        for rejected in [
+            &b""[..],
+            b"   \r\n",
+            b"{\"query\": ",
+            b"[1, 2, 3]",
+            b"\"text\"",
+            b"42",
+            b"null",
+            b"true",
+            b"{} trailing",
+            b"{\"a\":\xff}",
+        ] {
+            assert!(
+                parse_tool_input("--input-stdin", rejected).is_err(),
+                "should reject {rejected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_input_errors_do_not_echo_the_payload() {
+        let error = parse_tool_input("--input-stdin", b"{\"secret\":\"needle\" oops")
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains("needle"));
+        assert!(!error.contains("secret"));
+        assert!(error.contains("JSON"));
     }
 }

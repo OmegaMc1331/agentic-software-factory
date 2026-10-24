@@ -191,11 +191,80 @@ Search repository code.
 ```
 
 Coding agents invoke a catalogued tool through the provider-neutral command printed
-in that section:
+in that section. Tool input is one JSON object, passed inline for small arguments
+or over standard input for large ones:
 
 ```bash
 factory mcp call github.search_code --input-json '{"query":"ToolRegistry"}'
+
+factory mcp call github.search_code --input-stdin <<'JSON'
+{"query":"ToolRegistry"}
+JSON
 ```
+
+### Tool input transport
+
+`--input-json <JSON object>` keeps existing scripts and workflows working and
+suits small arguments. `--input-stdin` reads exactly one JSON object from
+standard input and suits large arguments: operating systems bound the process
+command line far below Factory's input limit (about 32 K characters on Windows),
+so large inline JSON can fail process creation with command-line-length errors
+before Factory even starts. Standard input avoids command-line length limits,
+quoting rules, and shell interpolation entirely, and works identically on
+Windows, Linux, and macOS without `cat`, `jq`, temporary files, or a particular
+shell.
+
+| Property | `--input-json` | `--input-stdin` |
+| --- | --- | --- |
+| Maximum input size | 1,048,576 bytes | 1,048,576 bytes |
+| Reads standard input | No | Yes (piped or redirected) |
+| Best for | Small arguments | Large or hard-to-quote arguments |
+
+Exactly one input source is allowed per invocation; providing both or neither
+fails with a usage error before any grant is consulted. Both transports share
+one validation path: the input must be non-empty UTF-8 containing exactly one
+JSON object. Trailing non-whitespace content, JSON arrays, primitives, `null`,
+empty input, invalid UTF-8, and input above 1,048,576 bytes are each rejected
+with a specific message and a nonzero exit status before any MCP server is
+launched, audited, or an authorized tool runs. Reading stops as soon as the
+limit is exceeded, so an unbounded producer cannot force unbounded buffering.
+Error messages never echo the submitted JSON, which may contain confidential
+data.
+
+Windows PowerShell examples:
+
+```powershell
+'{"query":"ToolRegistry"}' | factory mcp call github.search_code --input-stdin
+Get-Content payload.json -Raw | factory mcp call github.search_code --input-stdin
+```
+
+Portable parent-process integration with Rust `std::process` (works unchanged
+on every supported platform):
+
+```rust
+use std::io::Write;
+use std::process::{Command, Stdio};
+
+let mut child = Command::new("factory")
+    .args(["mcp", "call", "github.search_code", "--input-stdin"])
+    .current_dir(&task_worktree)
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()?;
+child.stdin.take().unwrap().write_all(br#"{"query":"ToolRegistry"}"#)?;
+let output = child.wait_with_output()?;
+```
+
+The parent closes the child's stdin handle after writing — dropping the handle
+is enough — so Factory sees end-of-file and can parse the complete document.
+
+Placing JSON in command-line arguments also exposes it to any local process
+able to list process command lines; standard input keeps tool arguments out of
+that list. This reduces exposure but is not a secrecy guarantee against a
+compromised operating system or user session. Do not raise operating-system
+command-line limits or disable security features to make large inline JSON
+work; use `--input-stdin` instead.
 
 The command cannot be used outside an active scoped task grant. This Factory-mediated
 bridge was chosen after inspecting native MCP controls for
@@ -292,6 +361,9 @@ text from becoming policy, but it cannot make a malicious external service truth
   operation, and objective relevance. Catalogs are intentionally bounded.
 - **Invalid schema:** update the MCP server or its advertised JSON Schema. Factory
   refuses malformed schemas and inputs that do not validate.
+- **Input rejected / command line too long:** pass the JSON object with
+  `--input-stdin` instead of `--input-json`. Input must be one non-empty UTF-8
+  JSON object of at most 1,048,576 bytes with no trailing content.
 - **Response too large:** reduce the server result. Raise `max_response_bytes` only
   after reviewing the exposure and never above the validated 1 MiB ceiling.
 - **Timeout:** inspect server logs and adjust the call/discovery timeout within the

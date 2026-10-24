@@ -76,7 +76,7 @@ async fn stdio_discovery_parses_schemas_and_annotations() {
     let root = project();
     let registry = registry(root.path(), config(1_000, 512_000));
     let tools = registry.discover_server("fake").await.unwrap();
-    assert_eq!(tools.len(), 11);
+    assert_eq!(tools.len(), 12);
     assert_eq!(
         tools
             .iter()
