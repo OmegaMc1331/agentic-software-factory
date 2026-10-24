@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc as std_mpsc, Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
+use factory_agent::Utf8StreamDecoder;
 use factory_core::{Factory, FactoryError, FACTORY_DIR};
 use factory_db::FactoryDb;
 use factory_types::{AgentSession, AgentSessionMode, RecipeSnapshot, Run, WorkflowTeam};
@@ -263,6 +264,16 @@ impl TerminalOutput {
         if self.history.len() > MAX_TERMINAL_HISTORY_BYTES {
             let overflow = self.history.len() - MAX_TERMINAL_HISTORY_BYTES;
             self.history.drain(..overflow);
+            // The retained byte window is later decoded as text, so drop a
+            // leading incomplete UTF-8 fragment the cut may have produced
+            // instead of letting it surface as a replacement character.
+            let leading_continuation = self
+                .history
+                .iter()
+                .take(3)
+                .take_while(|byte| **byte & 0b1100_0000 == 0b1000_0000)
+                .count();
+            self.history.drain(..leading_continuation);
         }
         if self.subscribers.is_empty() {
             return;
@@ -674,63 +685,12 @@ impl Runtime {
         let (output_complete, output_drained) = std_mpsc::channel();
         std::thread::spawn(move || {
             let db = FactoryDb::open(&output_root.join(".factory").join("db.sqlite3")).ok();
-            let mut buffer = [0u8; 8192];
-            // Each append rewrites the full stored output row, so appending per
-            // read chunk makes DB write cost dominate PTY streaming; batch them.
-            const DB_APPEND_BATCH_BYTES: usize = 64 * 1024;
-            const DB_APPEND_BATCH_INTERVAL: Duration = Duration::from_millis(250);
-            let mut pending_output = String::new();
-            let mut last_append = Instant::now();
-            fn flush_output(
-                db: &Option<FactoryDb>,
-                session_id: i64,
-                pending_output: &mut String,
-                last_append: &mut Instant,
-            ) {
-                if let Some(db) = db {
-                    if !pending_output.is_empty() {
-                        let _ =
-                            db.append_agent_session_output(session_id, Some(pending_output), None);
-                    }
-                }
-                pending_output.clear();
-                *last_append = Instant::now();
-            }
-            loop {
-                match reader.read(&mut buffer) {
-                    Ok(0) => break,
-                    Ok(size) => {
-                        let chunk = buffer[..size].to_vec();
-                        publish_terminal_output(&output_terminal, &chunk);
-                        if db.is_some() {
-                            pending_output.push_str(&String::from_utf8_lossy(&chunk));
-                            if pending_output.len() >= DB_APPEND_BATCH_BYTES
-                                || last_append.elapsed() >= DB_APPEND_BATCH_INTERVAL
-                            {
-                                flush_output(
-                                    &db,
-                                    session_id,
-                                    &mut pending_output,
-                                    &mut last_append,
-                                );
-                            }
-                        }
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(error) => {
-                        flush_output(&db, session_id, &mut pending_output, &mut last_append);
-                        if let Some(db) = &db {
-                            let _ = db.append_agent_session_output(
-                                session_id,
-                                None,
-                                Some(&format!("PTY read failed: {error}")),
-                            );
-                        }
-                        break;
-                    }
-                }
-            }
-            flush_output(&db, session_id, &mut pending_output, &mut last_append);
+            pump_terminal_output(
+                session_id,
+                &output_terminal.output,
+                db.as_ref(),
+                &mut reader,
+            );
             output_terminal
                 .output
                 .lock()
@@ -755,6 +715,10 @@ impl Runtime {
                 .take();
             let _ = output_drained.recv();
             if let Ok(db) = FactoryDb::open(&root.join(".factory").join("db.sqlite3")) {
+                // The retained history window — trimmed to UTF-8 boundaries —
+                // becomes the final transcript, enforcing the byte-window
+                // retention policy over the incrementally appended text
+                // without reintroducing invalid character boundaries.
                 let stdout = terminal
                     .output
                     .lock()
@@ -811,12 +775,94 @@ fn terminal_size(cols: u16, rows: u16) -> PtySize {
     }
 }
 
-fn publish_terminal_output(terminal: &InteractiveTerminal, chunk: &[u8]) {
-    terminal
-        .output
-        .lock()
-        .expect("terminal output poisoned")
-        .publish(chunk);
+/// Drains one PTY byte stream: forwards every raw chunk to subscribers and
+/// history, and persists UTF-8 text decoded incrementally so characters split
+/// across read boundaries reconstruct exactly. Incomplete trailing sequences
+/// stay in the decoder across database batch flushes and are finalized only
+/// when the stream definitively ends (EOF or a terminal read error).
+fn pump_terminal_output(
+    session_id: i64,
+    output: &Arc<Mutex<TerminalOutput>>,
+    db: Option<&FactoryDb>,
+    reader: &mut dyn Read,
+) {
+    let mut buffer = [0u8; 8192];
+    // Each append rewrites the full stored output row, so appending per
+    // read chunk makes DB write cost dominate PTY streaming; batch them.
+    const DB_APPEND_BATCH_BYTES: usize = 64 * 1024;
+    const DB_APPEND_BATCH_INTERVAL: Duration = Duration::from_millis(250);
+    let mut utf8_decoder = Utf8StreamDecoder::default();
+    let mut pending_output = String::new();
+    let mut last_append = Instant::now();
+    fn flush_output(
+        db: Option<&FactoryDb>,
+        session_id: i64,
+        pending_output: &mut String,
+        last_append: &mut Instant,
+    ) {
+        if let Some(db) = db {
+            if !pending_output.is_empty() {
+                let _ = db.append_agent_session_output(session_id, Some(pending_output), None);
+            }
+        }
+        pending_output.clear();
+        *last_append = Instant::now();
+    }
+    fn finalize_decoder(
+        db: Option<&FactoryDb>,
+        session_id: i64,
+        utf8_decoder: &mut Utf8StreamDecoder,
+        pending_output: &mut String,
+        last_append: &mut Instant,
+    ) {
+        pending_output.push_str(&utf8_decoder.finish());
+        flush_output(db, session_id, pending_output, last_append);
+    }
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(size) => {
+                let chunk = buffer[..size].to_vec();
+                output
+                    .lock()
+                    .expect("terminal output poisoned")
+                    .publish(&chunk);
+                if db.is_some() {
+                    pending_output.push_str(&utf8_decoder.push(&chunk));
+                    if pending_output.len() >= DB_APPEND_BATCH_BYTES
+                        || last_append.elapsed() >= DB_APPEND_BATCH_INTERVAL
+                    {
+                        flush_output(db, session_id, &mut pending_output, &mut last_append);
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                finalize_decoder(
+                    db,
+                    session_id,
+                    &mut utf8_decoder,
+                    &mut pending_output,
+                    &mut last_append,
+                );
+                if let Some(db) = db {
+                    let _ = db.append_agent_session_output(
+                        session_id,
+                        None,
+                        Some(&format!("PTY read failed: {error}")),
+                    );
+                }
+                break;
+            }
+        }
+    }
+    finalize_decoder(
+        db,
+        session_id,
+        &mut utf8_decoder,
+        &mut pending_output,
+        &mut last_append,
+    );
 }
 
 #[cfg(test)]
@@ -1389,5 +1435,237 @@ mod tests {
         assert_eq!(saved.status, "success");
         assert!(saved.stdout.unwrap_or_default().contains("STREAM_ALIVE"));
         drop(slow.receiver);
+    }
+
+    /// Yields predetermined byte slices so UTF-8 sequences are split across
+    /// read calls deterministically, unlike operating-system read boundaries.
+    /// Chunks larger than the caller's buffer are returned across successive
+    /// reads, mirroring real reader semantics.
+    struct SplittingReader {
+        chunks: std::collections::VecDeque<Vec<u8>>,
+    }
+
+    impl SplittingReader {
+        fn byte_by_byte(payload: &[u8]) -> Self {
+            Self {
+                chunks: payload.iter().map(|byte| vec![*byte]).collect(),
+            }
+        }
+
+        fn from_chunks(chunks: &[&[u8]]) -> Self {
+            Self {
+                chunks: chunks.iter().map(|chunk| chunk.to_vec()).collect(),
+            }
+        }
+    }
+
+    impl Read for SplittingReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            while let Some(chunk) = self.chunks.front_mut() {
+                if chunk.is_empty() {
+                    self.chunks.pop_front();
+                    continue;
+                }
+                let size = chunk.len().min(buffer.len());
+                buffer[..size].copy_from_slice(&chunk[..size]);
+                if size == chunk.len() {
+                    self.chunks.pop_front();
+                } else {
+                    let remainder = chunk.split_off(size);
+                    self.chunks[0] = remainder;
+                }
+                return Ok(size);
+            }
+            Ok(0)
+        }
+    }
+
+    struct FailingReader {
+        chunks: std::collections::VecDeque<Vec<u8>>,
+    }
+
+    impl Read for FailingReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            let Some(chunk) = self.chunks.front_mut() else {
+                return Err(std::io::Error::other("synthetic PTY failure"));
+            };
+            let size = chunk.len().min(buffer.len());
+            buffer[..size].copy_from_slice(&chunk[..size]);
+            if size == chunk.len() {
+                self.chunks.pop_front();
+            } else {
+                let remainder = chunk.split_off(size);
+                self.chunks[0] = remainder;
+            }
+            Ok(size)
+        }
+    }
+
+    fn transcript_session(db: &FactoryDb) -> i64 {
+        let session = AgentSession {
+            id: 0,
+            run_id: None,
+            task_id: None,
+            attempt_id: None,
+            role: "console".into(),
+            operation: None,
+            agent: "test-agent".into(),
+            mode: AgentSessionMode::Interactive,
+            command: "test-agent".into(),
+            status: "running".into(),
+            started_at: chrono::Utc::now().to_rfc3339(),
+            finished_at: None,
+            exit_code: None,
+            duration_ms: None,
+            stdout: Some(String::new()),
+            stderr: Some(String::new()),
+            policy_audit: None,
+            output_meta: None,
+        };
+        db.insert_agent_session(&session).unwrap().id
+    }
+
+    fn session_db() -> (TempDir, FactoryDb) {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join(".factory")).unwrap();
+        let db = FactoryDb::open(&dir.path().join(".factory/db.sqlite3")).unwrap();
+        (dir, db)
+    }
+
+    fn persisted_stdout(db: &FactoryDb, session_id: i64) -> String {
+        db.get_agent_session(session_id)
+            .unwrap()
+            .unwrap()
+            .stdout
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn terminal_transcript_reconstructs_multibyte_characters_split_across_reads() {
+        let payload = "éà日本語🎉🚀\r\n\x1b[31mansi\x1b[0m ✓\r\n";
+        for split_mode in 0..2 {
+            let (_dir, db) = session_db();
+            let session_id = transcript_session(&db);
+            let output = new_terminal_output();
+            let mut reader = if split_mode == 0 {
+                SplittingReader::byte_by_byte(payload.as_bytes())
+            } else {
+                SplittingReader::from_chunks(&[
+                    b"plain start, then ",
+                    &payload.as_bytes()[17..19],
+                    &payload.as_bytes()[19..21],
+                    &payload.as_bytes()[21..23],
+                    b" tail",
+                ])
+            };
+            pump_terminal_output(session_id, &output, Some(&db), &mut reader);
+            let transcript = persisted_stdout(&db, session_id);
+            if split_mode == 0 {
+                assert_eq!(
+                    transcript, payload,
+                    "byte-by-byte reads must not corrupt text"
+                );
+            } else {
+                assert!(transcript.starts_with("plain start, then "));
+                assert!(transcript.ends_with(" tail"));
+            }
+            assert!(!transcript.contains('\u{FFFD}'));
+            assert_eq!(
+                String::from_utf8(output.lock().unwrap().history.clone()).unwrap(),
+                transcript,
+                "persisted transcript must match the raw history"
+            );
+        }
+    }
+
+    #[test]
+    fn chunk_local_lossy_decoding_would_have_corrupted_the_same_stream() {
+        let payload = "🎉";
+        let (_dir, db) = session_db();
+        let session_id = transcript_session(&db);
+        let mut legacy = String::new();
+        for byte in payload.as_bytes() {
+            legacy.push_str(&String::from_utf8_lossy(&[*byte]));
+        }
+        assert_ne!(legacy, payload, "fixture must reproduce the original bug");
+        assert!(legacy.contains('\u{FFFD}'));
+
+        let output = new_terminal_output();
+        let mut reader = SplittingReader::byte_by_byte(payload.as_bytes());
+        pump_terminal_output(session_id, &output, Some(&db), &mut reader);
+        assert_eq!(persisted_stdout(&db, session_id), payload);
+    }
+
+    #[test]
+    fn terminal_transcript_survives_read_errors_and_flushes_incomplete_prefix() {
+        let (_dir, db) = session_db();
+        let session_id = transcript_session(&db);
+        let output = new_terminal_output();
+        let mut reader = FailingReader {
+            chunks: std::collections::VecDeque::from(vec![b"ok ".to_vec(), vec![0xf0, 0x9f]]),
+        };
+        pump_terminal_output(session_id, &output, Some(&db), &mut reader);
+        let session = db.get_agent_session(session_id).unwrap().unwrap();
+        assert_eq!(session.stdout.unwrap_or_default(), "ok \u{FFFD}");
+        assert!(session
+            .stderr
+            .unwrap_or_default()
+            .contains("PTY read failed: synthetic PTY failure"));
+    }
+
+    #[test]
+    fn terminal_transcript_keeps_characters_whole_across_batch_flushes() {
+        let (_dir, db) = session_db();
+        let session_id = transcript_session(&db);
+        let output = new_terminal_output();
+        let mut prefix = vec![b'>'; 70 * 1024];
+        prefix.extend_from_slice("🚀完".as_bytes());
+        let mut reader = SplittingReader::from_chunks(&[
+            &prefix[..40 * 1024],
+            &prefix[40 * 1024..70 * 1024 + 4],
+            &prefix[70 * 1024 + 4..],
+        ]);
+        pump_terminal_output(session_id, &output, Some(&db), &mut reader);
+        let transcript = persisted_stdout(&db, session_id);
+        assert_eq!(transcript.len(), prefix.len());
+        assert!(transcript.ends_with("🚀完"));
+        assert!(!transcript.contains('\u{FFFD}'));
+    }
+
+    #[test]
+    fn terminal_history_trimming_lands_on_utf8_boundaries() {
+        let output = new_terminal_output();
+        let filler = "日".repeat(1024);
+        for _ in 0..((MAX_TERMINAL_HISTORY_BYTES / filler.len()) + 2) {
+            publish(&output, filler.as_bytes());
+        }
+        let history = output.lock().unwrap().history.clone();
+        assert!(
+            history.len() <= MAX_TERMINAL_HISTORY_BYTES,
+            "retention limit must hold"
+        );
+        assert!(
+            std::str::from_utf8(&history).is_ok(),
+            "retained window must start on a character boundary"
+        );
+    }
+
+    #[test]
+    fn terminal_completion_snapshot_matches_incrementally_persisted_text() {
+        let (_dir, db) = session_db();
+        let session_id = transcript_session(&db);
+        let output = new_terminal_output();
+        let payload = format!("{}🎉", "é".repeat(90_000));
+        let mut reader = SplittingReader::from_chunks(&[
+            &payload.as_bytes()[..100_001],
+            &payload.as_bytes()[100_001..],
+        ]);
+        pump_terminal_output(session_id, &output, Some(&db), &mut reader);
+        let incremental = persisted_stdout(&db, session_id);
+        let snapshot = String::from_utf8(output.lock().unwrap().history.clone()).unwrap();
+        let _ = db.set_agent_session_output(session_id, Some(&snapshot), None);
+        assert_eq!(incremental, payload);
+        assert_eq!(persisted_stdout(&db, session_id), incremental);
+        assert!(!incremental.contains('\u{FFFD}'));
     }
 }

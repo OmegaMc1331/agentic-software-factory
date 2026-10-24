@@ -113,13 +113,20 @@ impl BoundedOutputCapture {
     }
 }
 
+/// Incrementally decodes an arbitrary byte stream into UTF-8 text, carrying
+/// an incomplete multibyte suffix across `push` calls so characters split
+/// between read boundaries reconstruct exactly. One instance per independent
+/// stream; see `finish` for end-of-stream finalization.
 #[derive(Debug, Default)]
-pub(crate) struct Utf8StreamDecoder {
+pub struct Utf8StreamDecoder {
     pending: Vec<u8>,
 }
 
 impl Utf8StreamDecoder {
-    pub(crate) fn push(&mut self, bytes: &[u8]) -> String {
+    /// Decodes all complete valid sequences, retains an incomplete trailing
+    /// sequence (at most four bytes), and emits one U+FFFD per genuinely
+    /// invalid sequence. Empty input returns empty text.
+    pub fn push(&mut self, bytes: &[u8]) -> String {
         let mut output = String::with_capacity(bytes.len());
         let leftover = if self.pending.is_empty() {
             decode_utf8(bytes, &mut output)
@@ -132,7 +139,9 @@ impl Utf8StreamDecoder {
         output
     }
 
-    pub(crate) fn finish(&mut self) -> String {
+    /// Finalizes the stream: an incomplete trailing sequence that never
+    /// completed is flushed as replacement text, and the decoder is reset.
+    pub fn finish(&mut self) -> String {
         if self.pending.is_empty() {
             return String::new();
         }
@@ -290,6 +299,98 @@ mod tests {
             text.push_str(&decoder.finish());
             assert_eq!(text, "aé日🎉z");
         }
+    }
+
+    #[test]
+    fn decoder_reconstructs_three_byte_characters_split_at_every_boundary() {
+        let encoded = "日".as_bytes();
+        assert_eq!(encoded.len(), 3);
+        for first in 1..encoded.len() {
+            let mut decoder = Utf8StreamDecoder::default();
+            let mut text = decoder.push(&encoded[..first]);
+            text.push_str(&decoder.push(&encoded[first..]));
+            text.push_str(&decoder.finish());
+            assert_eq!(text, "日");
+        }
+    }
+
+    #[test]
+    fn decoder_reconstructs_four_byte_characters_split_at_every_boundary() {
+        let encoded = "🚀".as_bytes();
+        assert_eq!(encoded.len(), 4);
+        for first in 1..encoded.len() {
+            for second in first..encoded.len() {
+                let mut decoder = Utf8StreamDecoder::default();
+                let mut text = decoder.push(&encoded[..first]);
+                text.push_str(&decoder.push(&encoded[first..second]));
+                text.push_str(&decoder.push(&encoded[second..]));
+                text.push_str(&decoder.finish());
+                assert_eq!(text, "🚀");
+            }
+        }
+    }
+
+    #[test]
+    fn decoder_tolerates_empty_chunks_between_partial_sequences() {
+        let mut decoder = Utf8StreamDecoder::default();
+        let mut text = decoder.push(&"🎉".as_bytes()[..2]);
+        assert_eq!(text, "", "an incomplete sequence emits nothing yet");
+        text.push_str(&decoder.push(b""));
+        text.push_str(&decoder.push(b""));
+        assert_eq!(text, "");
+        text.push_str(&decoder.push(&"🎉".as_bytes()[2..]));
+        assert_eq!(text, "🎉");
+        assert!(!text.contains('\u{FFFD}'));
+    }
+
+    #[test]
+    fn decoder_flushes_an_incomplete_sequence_once_at_eof() {
+        let mut decoder = Utf8StreamDecoder::default();
+        decoder.push(b"ok ");
+        let partial = decoder.push(&"🎉".as_bytes()[..2]);
+        assert_eq!(partial, "");
+        let flushed = decoder.finish();
+        assert_eq!(flushed, "\u{FFFD}");
+        assert_eq!(decoder.finish(), "", "finish resets the decoder");
+    }
+
+    #[test]
+    fn decoder_handles_invalid_bytes_deterministically_without_looping() {
+        let mut decoder = Utf8StreamDecoder::default();
+        let text = decoder.push(b"ok\xff\xfe\x80done");
+        assert_eq!(text, "ok\u{FFFD}\u{FFFD}\u{FFFD}done");
+        let tail = decoder.finish();
+        assert_eq!(tail, "");
+        let mut mixed = Utf8StreamDecoder::default();
+        let text = mixed.push(&[0xc3, 0xa9, 0xff, 0xe6, 0x97, 0xa5, 0xe6, 0x9c, 0xac]);
+        assert_eq!(text, "é\u{FFFD}日本");
+    }
+
+    #[test]
+    fn decoder_state_stays_isolated_between_streams() {
+        let encoded = "🎉é".as_bytes();
+        let mut stdout = Utf8StreamDecoder::default();
+        let mut stderr = Utf8StreamDecoder::default();
+        let mut out = stdout.push(&encoded[..2]);
+        let mut err = stderr.push(b"plain");
+        out.push_str(&stdout.push(&encoded[2..]));
+        err.push_str(&stderr.push(b" text"));
+        assert_eq!(out, "🎉é".to_string() + &stdout.finish());
+        assert_eq!(err, "plain text");
+        assert!(!out.contains('\u{FFFD}'));
+    }
+
+    #[test]
+    fn decoder_pending_bytes_stay_bounded_under_flooded_input() {
+        let mut decoder = Utf8StreamDecoder::default();
+        let mut rounds = 0;
+        for _ in 0..10_000 {
+            let text = decoder.push("日本語".as_bytes());
+            assert!(!text.contains('\u{FFFD}'));
+            rounds += 1;
+        }
+        assert_eq!(rounds, 10_000);
+        assert!(decoder.pending.is_empty());
     }
 
     #[test]
