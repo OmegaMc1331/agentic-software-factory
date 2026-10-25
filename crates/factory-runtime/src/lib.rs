@@ -1408,44 +1408,47 @@ mod tests {
             // subscriber that is supposed to survive the stream.
             let outcome = (move || {
                 let mut state = drain_state.lock().expect("terminal drain state poisoned");
+                // Markers are scanned incrementally over newly received bytes
+                // with an 11-byte overlap for markers straddling chunks; a
+                // rescan of the whole stream would make the drainer too slow
+                // to keep its queue below the eviction cap during a burst.
+                const OVERLAP: usize = 11;
+                let mut scanned = 0_usize;
                 loop {
                     let mut received = 0;
                     while let Ok(chunk) = healthy.receiver.try_recv() {
                         state.output.extend_from_slice(&chunk);
                         received += 1;
                     }
-                    if !state.answered_cursor_query
-                        && state.output.windows(4).any(|window| window == b"\x1b[6n")
-                    {
+                    let (query_seen, ready_seen, alive_seen, done_seen) = {
+                        let fresh = &state.output[scanned.saturating_sub(OVERLAP)..];
+                        (
+                            !state.answered_cursor_query
+                                && fresh.windows(4).any(|window| window == b"\x1b[6n"),
+                            !state.started
+                                && fresh.windows(12).any(|window| window == b"STREAM_READY"),
+                            fresh.windows(12).any(|window| window == b"STREAM_ALIVE"),
+                            !state.resumed
+                                && fresh.windows(11).any(|window| window == b"STREAM_DONE"),
+                        )
+                    };
+                    scanned = state.output.len();
+                    if query_seen {
                         drain_runtime
                             .write_terminal(drain_session_id, b"\x1b[1;1R")
                             .unwrap();
                         state.answered_cursor_query = true;
                     }
-                    if !state.started
-                        && state
-                            .output
-                            .windows(12)
-                            .any(|window| window == b"STREAM_READY")
-                    {
+                    if ready_seen {
                         drain_runtime
                             .write_terminal(drain_session_id, b"g\r")
                             .unwrap();
                         state.started = true;
                     }
-                    if state
-                        .output
-                        .windows(12)
-                        .any(|window| window == b"STREAM_ALIVE")
-                    {
+                    if alive_seen {
                         break;
                     }
-                    if !state.resumed
-                        && state
-                            .output
-                            .windows(11)
-                            .any(|window| window == b"STREAM_DONE")
-                    {
+                    if done_seen {
                         drain_runtime
                             .write_terminal(drain_session_id, b"r\r")
                             .unwrap();
@@ -1477,23 +1480,23 @@ mod tests {
             })();
             let _ = drained_tx.send(outcome);
         });
+        let drain_summary = |state: &Arc<Mutex<DrainState>>| {
+            state
+                .lock()
+                .expect("terminal drain state poisoned")
+                .summary()
+        };
         let healthy_overflowed = match drained_rx.recv_timeout(std::time::Duration::from_secs(75)) {
             Ok(Ok(healthy_overflowed)) => healthy_overflowed,
             Ok(Err(message)) => panic!("{message}"),
-            Err(std_mpsc::RecvTimeoutError::Timeout) => panic!(
-                "PTY stream did not complete; {}",
-                state
-                    .lock()
-                    .expect("terminal drain state poisoned")
-                    .summary()
-            ),
-            Err(std_mpsc::RecvTimeoutError::Disconnected) => panic!(
-                "terminal drain thread exited unexpectedly; {}",
-                state
-                    .lock()
-                    .expect("terminal drain state poisoned")
-                    .summary()
-            ),
+            Err(std_mpsc::RecvTimeoutError::Timeout) => {
+                let summary = drain_summary(&state);
+                panic!("PTY stream did not complete; {summary}")
+            }
+            Err(std_mpsc::RecvTimeoutError::Disconnected) => {
+                let summary = drain_summary(&state);
+                panic!("terminal drain thread exited unexpectedly; {summary}")
+            }
         };
         let (started, resumed, x_count) = {
             let state = state.lock().expect("terminal drain state poisoned");
