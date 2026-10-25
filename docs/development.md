@@ -243,9 +243,13 @@ checksum cannot establish publisher authenticity. Signing or provenance attestat
 would be a separate follow-up. Checksums are reproducible for a given archive byte
 sequence; they do not make separate builds byte-for-byte reproducible.
 
-[CI](../.github/workflows/ci.yml) runs Rust checks on Ubuntu and Windows, dashboard
-checks, an embedded release-style smoke test, installer tests, and cross-platform
-release checksum tests.
+[CI](../.github/workflows/ci.yml) runs the Rust gates on Ubuntu, Windows, and macOS
+for every pull request and push to `main`. The macOS runner (`macos-latest`) is
+Apple Silicon, so ordinary CI natively verifies `aarch64-apple-darwin` only; Intel
+(`x86_64-apple-darwin`) is compiled by the tag-triggered release workflow. Dashboard
+checks, the embedded release-style smoke test, and installer tests run on Ubuntu;
+release checksum tests run on all three platforms. Reproduce the Rust gates locally
+on macOS with the commands in [Quality gates](#quality-gates).
 
 ## Role-aware internals
 
