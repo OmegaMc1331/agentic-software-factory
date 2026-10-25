@@ -851,8 +851,9 @@ async fn slow_pr_create_is_acknowledged_active_and_never_duplicated() {
 
     // 2. Publication proceeds into the blocked create; status shows active.
     let active = wait_for_delivery(&app, run_id, |report| {
-        report["operationActive"] == serde_json::Value::Bool(true)
-            && (report["persistedState"] == "pushing" || report["persistedState"] == "creating_pr")
+        // Wait for the blocked create itself, not merely an active push: the
+        // create log line is written before the gate wait begins.
+        report["persistedState"] == "creating_pr" || report["pullRequest"].is_object()
     })
     .await;
     assert!(active["retrySafe"] == serde_json::Value::Bool(false));
