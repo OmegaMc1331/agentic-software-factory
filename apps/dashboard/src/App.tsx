@@ -1,11 +1,11 @@
-import { useCallback, useEffect, useState } from "react";
-import { fetchRun, fetchRuns } from "./api";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { fetchRun, fetchRunsPage, RUN_PAGE_SIZE } from "./api";
 import { NetworkView } from "./components/NetworkView";
 import { PerformanceView } from "./components/PerformanceView";
 import { RunDetailView } from "./components/RunDetailView";
 import { RunList } from "./components/RunList";
 import { SettingsView } from "./components/Settings";
-import type { RunDetail, RunSummary } from "./types";
+import type { RunDetail, RunPage } from "./types";
 
 type View =
   | { name: "runs" }
@@ -69,12 +69,16 @@ const NAV: { view: View["name"]; label: string }[] = [
 ];
 
 export default function App() {
-  const [runs, setRuns] = useState<RunSummary[] | null>(null);
+  const [runsPage, setRunsPage] = useState<RunPage | null>(null);
   const [runsState, setRunsState] = useState<LoadState>("loading");
   const [runsError, setRunsError] = useState("");
+  const [pageCursors, setPageCursors] = useState<(number | null)[]>([null]);
+  const [pageIndex, setPageIndex] = useState(0);
   const [detail, setDetail] = useState<RunDetail | null>(null);
   const [view, setView] = useState<View>(viewFromHash);
   const [detailError, setDetailError] = useState<string | null>(null);
+  const runsRequestRef = useRef(0);
+  const runsAbortRef = useRef<AbortController | null>(null);
 
   const loadRun = useCallback((id: number) => {
     setDetail(null);
@@ -84,23 +88,49 @@ export default function App() {
       .catch((err: Error) => setDetailError(err.message));
   }, []);
 
-  const loadRuns = useCallback(() => {
+  const loadRuns = useCallback((cursor: number | null) => {
+    runsAbortRef.current?.abort();
+    const controller = new AbortController();
+    runsAbortRef.current = controller;
+    const requestId = ++runsRequestRef.current;
     setRunsState("loading");
     setRunsError("");
-    fetchRuns()
-      .then((nextRuns) => {
-        setRuns(nextRuns);
+    fetchRunsPage({ limit: RUN_PAGE_SIZE, before: cursor }, { signal: controller.signal })
+      .then((page) => {
+        if (requestId !== runsRequestRef.current) return;
+        setRunsPage(page);
         setRunsState("ready");
       })
       .catch((err: Error) => {
+        if (requestId !== runsRequestRef.current) return;
         setRunsError(err.message);
         setRunsState("error");
       });
   }, []);
 
   useEffect(() => {
-    loadRuns();
+    loadRuns(null);
+    return () => runsAbortRef.current?.abort();
   }, [loadRuns]);
+
+  const currentCursor = pageCursors[pageIndex] ?? null;
+
+  const goNext = () => {
+    const nextCursor = runsPage?.nextCursor;
+    if (!runsPage?.hasMore || nextCursor == null) return;
+    const nextCursors = pageCursors.slice(0, pageIndex + 1);
+    nextCursors.push(nextCursor);
+    setPageCursors(nextCursors);
+    setPageIndex(nextCursors.length - 1);
+    loadRuns(nextCursor);
+  };
+
+  const goPrevious = () => {
+    if (pageIndex === 0) return;
+    const previousIndex = pageIndex - 1;
+    setPageIndex(previousIndex);
+    loadRuns(pageCursors[previousIndex] ?? null);
+  };
 
   useEffect(() => {
     const applyHash = () => setView(viewFromHash());
@@ -166,12 +196,20 @@ export default function App() {
               <RunDetailView detail={detail} onBack={() => navigate({ name: "runs" })} />
             )}
             {view.name === "run" && !detailError && detail === null && <Loading />}
-            {view.name === "runs" && runsState === "loading" && <Loading />}
+            {view.name === "runs" && runsState === "loading" && runsPage === null && <Loading />}
             {view.name === "runs" && runsState === "error" && (
-              <RunsError message={runsError} onRetry={loadRuns} />
+              <RunsError message={runsError} onRetry={() => loadRuns(currentCursor)} />
             )}
-            {view.name === "runs" && runsState === "ready" && runs !== null && (
-              <RunList runs={runs} onSelect={(id) => navigate({ name: "run", id })} />
+            {view.name === "runs" && runsState !== "error" && runsPage !== null && (
+              <RunList
+                runs={runsPage.items}
+                onSelect={(id) => navigate({ name: "run", id })}
+                pageIndex={pageIndex}
+                hasMore={runsPage.hasMore}
+                loading={runsState === "loading"}
+                onNext={goNext}
+                onPrevious={goPrevious}
+              />
             )}
           </>
         )}

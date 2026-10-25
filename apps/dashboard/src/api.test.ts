@@ -80,6 +80,34 @@ describe("Factory API client", () => {
     );
   });
 
+  it("fetches a paginated run page with an explicit cursor", async () => {
+    const fetchMock = stubFetch(async () =>
+      jsonResponse({ items: [], nextCursor: null, hasMore: false })
+    );
+
+    await expect(api.fetchRunsPage({ limit: 10, before: 42 })).resolves.toEqual({
+      items: [],
+      nextCursor: null,
+      hasMore: false,
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/runs?limit=10&before=42",
+      expect.objectContaining({ method: "GET", credentials: "same-origin" })
+    );
+  });
+
+  it("uses the default run page size and omits the first-page cursor", async () => {
+    const fetchMock = stubFetch(async () =>
+      jsonResponse({ items: [], nextCursor: null, hasMore: false })
+    );
+
+    await api.fetchRunsPage();
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/runs?limit=25",
+      expect.objectContaining({ method: "GET" })
+    );
+  });
+
   it("reports HTTP errors with their status and detail", async () => {
     stubFetch(async () => jsonResponse({ error: "service unavailable" }, 503));
 

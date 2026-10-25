@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use factory_core::{AgentEntry, Config, RoleAssignment};
-use factory_types::{AgentSession, AgentSessionMode, RunStatus};
+use factory_types::{AgentSession, AgentSessionMode, RunStatus, TaskState};
 use http_body_util::BodyExt;
 use serde_json::json;
 use tempfile::TempDir;
@@ -961,6 +961,221 @@ async fn configured_idle_agent_has_an_empty_session_history() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn run_list_keeps_the_legacy_array_and_adds_a_paginated_envelope() {
+    let dir = TempDir::new().unwrap();
+    init_root(dir.path());
+    let state = make_state(dir.path());
+    {
+        let db = state.db.lock().unwrap();
+        let empty = db.create_run("empty run", Some("planner")).unwrap();
+        assert_eq!(empty.id, 1);
+        let mixed = db.create_run("mixed run", Some("planner")).unwrap();
+        for (position, task_state) in [
+            TaskState::Completed,
+            TaskState::Superseded,
+            TaskState::Ready,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            db.create_task(
+                mixed.id,
+                &format!("task {position}"),
+                "objective",
+                &[],
+                task_state,
+                position as i32,
+                None,
+                None,
+            )
+            .unwrap();
+        }
+    }
+    let app = common::authenticated_app(state).await;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/runs")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let legacy: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+    assert!(legacy.is_array());
+    assert_eq!(legacy.as_array().unwrap().len(), 2);
+    assert_eq!(legacy[0]["id"], 2);
+    assert_eq!(legacy[0]["counts"]["total"], 3);
+    assert_eq!(legacy[0]["counts"]["completed"], 1);
+    assert_eq!(legacy[0]["counts"]["superseded"], 1);
+    assert_eq!(legacy[0]["counts"]["ready"], 1);
+    assert_eq!(legacy[1]["id"], 1);
+    assert_eq!(legacy[1]["counts"]["total"], 0);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/runs?limit=1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let page: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+    assert_eq!(page["items"].as_array().unwrap().len(), 1);
+    assert_eq!(page["items"][0]["id"], 2);
+    assert_eq!(page["items"][0]["counts"]["total"], 3);
+    assert_eq!(page["nextCursor"], 2);
+    assert_eq!(page["hasMore"], true);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/runs?limit=1&before=2")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let page: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+    assert_eq!(page["items"].as_array().unwrap().len(), 1);
+    assert_eq!(page["items"][0]["id"], 1);
+    assert_eq!(page["items"][0]["counts"]["total"], 0);
+    assert_eq!(page["nextCursor"], serde_json::Value::Null);
+    assert_eq!(page["hasMore"], false);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/runs/2")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let detail: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+    assert_eq!(detail["run"]["id"], 2);
+    assert_eq!(detail["tasks"].as_array().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn run_list_rejects_invalid_pagination_parameters() {
+    let dir = TempDir::new().unwrap();
+    init_root(dir.path());
+    let state = make_state(dir.path());
+    let app = common::authenticated_app(state).await;
+
+    for uri in [
+        "/api/runs?limit=0",
+        "/api/runs?limit=101",
+        "/api/runs?limit=nope",
+        "/api/runs?limit=",
+        "/api/runs?before=0",
+        "/api/runs?before=-1",
+        "/api/runs?before=nope",
+        "/api/runs?before=",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+        let body: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+        assert!(body["error"].is_string(), "{uri}: {body}");
+    }
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/runs?before=10")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let page: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+    assert_eq!(page["items"].as_array().unwrap().len(), 0);
+    assert_eq!(page["nextCursor"], serde_json::Value::Null);
+    assert_eq!(page["hasMore"], false);
+}
+
+#[tokio::test]
+async fn run_list_paginates_a_large_history_without_gaps_or_duplicates() {
+    let dir = TempDir::new().unwrap();
+    init_root(dir.path());
+    let state = make_state(dir.path());
+    {
+        let db = state.db.lock().unwrap();
+        for index in 0..1_000 {
+            let run = db
+                .create_run(&format!("run {index}"), Some("planner"))
+                .unwrap();
+            db.create_task(
+                run.id,
+                "task",
+                "objective",
+                &[],
+                if index % 2 == 0 {
+                    TaskState::Completed
+                } else {
+                    TaskState::Pending
+                },
+                0,
+                None,
+                None,
+            )
+            .unwrap();
+        }
+    }
+    let app = common::authenticated_app(state).await;
+
+    let mut seen = Vec::new();
+    let mut before = None;
+    loop {
+        let uri = match before {
+            Some(cursor) => format!("/api/runs?limit=25&before={cursor}"),
+            None => "/api/runs?limit=25".to_string(),
+        };
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let page: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+        let items = page["items"].as_array().unwrap();
+        assert!(items.len() <= 25);
+        for item in items {
+            seen.push(item["id"].as_i64().unwrap());
+        }
+        if !page["hasMore"].as_bool().unwrap() {
+            assert_eq!(page["nextCursor"], serde_json::Value::Null);
+            break;
+        }
+        before = Some(page["nextCursor"].as_i64().unwrap());
+    }
+
+    assert_eq!(seen.len(), 1_000);
+    let mut unique = seen.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(unique.len(), 1_000);
+    assert_eq!(seen.first(), Some(&1_000));
+    assert_eq!(seen.last(), Some(&1));
+    assert!(seen.windows(2).all(|pair| pair[0] > pair[1]));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

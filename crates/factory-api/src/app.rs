@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::extract::ws::{CloseCode, CloseFrame, Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path as UrlPath, State};
+use axum::extract::{Path as UrlPath, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware;
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -32,6 +32,8 @@ use crate::types::{
     RunSummary, StageStatus, TaskCounts,
 };
 
+const DEFAULT_RUN_PAGE_SIZE: usize = 25;
+const MAX_RUN_PAGE_SIZE: usize = 100;
 const TERMINAL_SOCKET_SEND_TIMEOUT: Duration = Duration::from_secs(15);
 const TERMINAL_BACKPRESSURE_CLOSE_CODE: CloseCode = 1013;
 const TERMINAL_BACKPRESSURE_CLOSE_REASON: &str =
@@ -298,22 +300,104 @@ async fn health() -> Json<serde_json::Value> {
     Json(json!({ "status": "ok" }))
 }
 
-async fn list_runs(State(state): State<SharedState>) -> Result<Json<Vec<RunSummary>>, ApiError> {
-    let db = state.db.lock().expect("db mutex poisoned");
-    let runs = db.list_runs()?;
-    let mut summaries = Vec::with_capacity(runs.len());
-    for run in runs {
-        let tasks = db.list_tasks(run.id)?;
-        summaries.push(RunSummary {
-            id: run.id,
-            objective: run.objective.clone(),
-            status: run.status.as_str().to_string(),
-            planner_agent: run.planner_agent.clone(),
-            created_at: run.created_at.clone(),
-            counts: TaskCounts::from_tasks(&tasks),
-        });
+#[derive(Debug, Default, Deserialize)]
+struct RunListQuery {
+    limit: Option<String>,
+    before: Option<String>,
+}
+
+struct RunPagination {
+    limit: usize,
+    before: Option<i64>,
+}
+
+impl RunListQuery {
+    fn pagination(self) -> Result<Option<RunPagination>, ApiError> {
+        if self.limit.is_none() && self.before.is_none() {
+            return Ok(None);
+        }
+        let limit = match self.limit {
+            Some(raw) => raw.parse::<usize>().map_err(|_| {
+                ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    format!("limit must be an integer between 1 and {MAX_RUN_PAGE_SIZE}"),
+                )
+            })?,
+            None => DEFAULT_RUN_PAGE_SIZE,
+        };
+        if limit == 0 || limit > MAX_RUN_PAGE_SIZE {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                format!("limit must be an integer between 1 and {MAX_RUN_PAGE_SIZE}"),
+            ));
+        }
+        let before = match self.before {
+            Some(raw) => {
+                let cursor = raw.parse::<i64>().map_err(|_| {
+                    ApiError::new(StatusCode::BAD_REQUEST, "before must be a positive run id")
+                })?;
+                if cursor <= 0 {
+                    return Err(ApiError::new(
+                        StatusCode::BAD_REQUEST,
+                        "before must be a positive run id",
+                    ));
+                }
+                Some(cursor)
+            }
+            None => None,
+        };
+        Ok(Some(RunPagination { limit, before }))
     }
-    Ok(Json(summaries))
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RunSummaryPage {
+    items: Vec<RunSummary>,
+    next_cursor: Option<i64>,
+    has_more: bool,
+}
+
+fn run_summary(record: factory_db::RunSummaryRecord) -> RunSummary {
+    RunSummary {
+        id: record.run.id,
+        objective: record.run.objective,
+        status: record.run.status.as_str().to_string(),
+        planner_agent: record.run.planner_agent,
+        created_at: record.run.created_at,
+        counts: record.counts.into(),
+    }
+}
+
+async fn list_runs(
+    State(state): State<SharedState>,
+    Query(query): Query<RunListQuery>,
+) -> Result<Response, ApiError> {
+    let pagination = query.pagination()?;
+    let db = state.db.lock().expect("db mutex poisoned");
+    let Some(page) = pagination else {
+        let summaries: Vec<RunSummary> = db
+            .list_run_summaries()?
+            .into_iter()
+            .map(run_summary)
+            .collect();
+        return Ok(Json(summaries).into_response());
+    };
+
+    let mut records = db.list_run_summaries_page(page.limit + 1, page.before)?;
+    let has_more = records.len() > page.limit;
+    records.truncate(page.limit);
+    let next_cursor = if has_more {
+        records.last().map(|record| record.run.id)
+    } else {
+        None
+    };
+    Ok(Json(RunSummaryPage {
+        items: records.into_iter().map(run_summary).collect(),
+        next_cursor,
+        has_more,
+    })
+    .into_response())
 }
 
 #[derive(Debug, Deserialize)]

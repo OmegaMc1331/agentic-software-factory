@@ -82,6 +82,12 @@ export interface RunSummary {
   counts: TaskCounts;
 }
 
+export interface RunPage {
+  items: RunSummary[];
+  nextCursor: number | null;
+  hasMore: boolean;
+}
+
 export interface WorkflowTeam {
   planner: string;
   workers: string[];

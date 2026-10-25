@@ -79,6 +79,77 @@ impl FactoryDb {
         Ok(rows)
     }
 
+    /// All run summaries, newest first, with task counts aggregated in one
+    /// query. Used by the legacy unparameterized run list.
+    pub fn list_run_summaries(&self) -> Result<Vec<RunSummaryRecord>> {
+        self.list_run_summaries_query(None, None)
+    }
+
+    /// One newest-first page of run summaries. `before` is an exclusive
+    /// run-id cursor; task counts are aggregated by SQLite for the selected
+    /// page only.
+    pub fn list_run_summaries_page(
+        &self,
+        limit: usize,
+        before: Option<i64>,
+    ) -> Result<Vec<RunSummaryRecord>> {
+        self.list_run_summaries_query(Some(limit), before)
+    }
+
+    fn list_run_summaries_query(
+        &self,
+        limit: Option<usize>,
+        before: Option<i64>,
+    ) -> Result<Vec<RunSummaryRecord>> {
+        // SQLite treats a negative LIMIT as unbounded.
+        let limit = limit
+            .map(|value| value.min(i64::MAX as usize) as i64)
+            .unwrap_or(-1);
+        let mut stmt = self.conn.prepare(
+            "SELECT r.id, r.objective, r.status, r.planner_agent, r.created_at, r.updated_at,
+                    r.team, r.plan_revision, r.recipe, t.state, COUNT(t.id)
+             FROM (
+                 SELECT id, objective, status, planner_agent, created_at, updated_at,
+                        team, plan_revision, recipe
+                 FROM runs
+                 WHERE (?1 IS NULL OR id < ?1)
+                 ORDER BY id DESC
+                 LIMIT ?2
+             ) r
+             LEFT JOIN tasks t ON t.run_id = r.id
+             GROUP BY r.id, r.objective, r.status, r.planner_agent, r.created_at,
+                      r.updated_at, r.team, r.plan_revision, r.recipe, t.state
+             ORDER BY r.id DESC, t.state",
+        )?;
+        let rows = stmt.query_map(params![before, limit], |row| {
+            Ok((
+                build_run(row)?,
+                row.get::<_, Option<String>>(9)?,
+                row.get::<_, i64>(10)?,
+            ))
+        })?;
+
+        let mut summaries: Vec<RunSummaryRecord> = Vec::new();
+        for row in rows {
+            let (run, state, count) = row?;
+            let count = count.max(0) as usize;
+            if let Some(last) = summaries.last_mut() {
+                if last.run.id == run.id {
+                    if let Some(state) = state {
+                        last.counts.record(task_state(state), count);
+                    }
+                    continue;
+                }
+            }
+            let mut counts = TaskStateCounts::default();
+            if let Some(state) = state {
+                counts.record(task_state(state), count);
+            }
+            summaries.push(RunSummaryRecord { run, counts });
+        }
+        Ok(summaries)
+    }
+
     pub fn set_run_status(&self, id: i64, status: RunStatus) -> Result<()> {
         let changed = self.conn.execute(
             "UPDATE runs SET status = ?1, updated_at = ?2 WHERE id = ?3",
@@ -1647,6 +1718,45 @@ impl FactoryDb {
     }
 }
 
+/// A run plus its task-state counts, produced by one bounded summary query.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunSummaryRecord {
+    pub run: Run,
+    pub counts: TaskStateCounts,
+}
+
+/// Per-state task counts for one run. Mirrors the API summary contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TaskStateCounts {
+    pub pending: usize,
+    pub ready: usize,
+    pub running: usize,
+    pub awaiting_integration: usize,
+    pub integrating: usize,
+    pub blocked: usize,
+    pub failed: usize,
+    pub completed: usize,
+    pub superseded: usize,
+    pub total: usize,
+}
+
+impl TaskStateCounts {
+    fn record(&mut self, state: TaskState, count: usize) {
+        match state {
+            TaskState::Pending => self.pending += count,
+            TaskState::Ready => self.ready += count,
+            TaskState::Running => self.running += count,
+            TaskState::AwaitingIntegration => self.awaiting_integration += count,
+            TaskState::Integrating => self.integrating += count,
+            TaskState::Blocked => self.blocked += count,
+            TaskState::Failed => self.failed += count,
+            TaskState::Completed => self.completed += count,
+            TaskState::Superseded => self.superseded += count,
+        }
+        self.total += count;
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Reconciliation {
     pub sessions: usize,
@@ -2492,7 +2602,7 @@ mod tests {
     use rusqlite::Connection;
     use tempfile::TempDir;
 
-    use crate::{DbError, FactoryDb, V1_SCHEMA};
+    use crate::{DbError, FactoryDb, TaskStateCounts, V1_SCHEMA};
 
     #[test]
     fn applies_all_migrations_exactly_once() {
@@ -2754,6 +2864,191 @@ mod tests {
 
         let a_loaded = db.get_task(a).unwrap().unwrap();
         assert_eq!(a_loaded.acceptance_criteria, vec!["a works".to_string()]);
+    }
+
+    #[test]
+    fn run_summary_page_aggregates_counts_and_handles_empty_runs() {
+        let dir = TempDir::new().unwrap();
+        let db = FactoryDb::open(&dir.path().join("test.db")).unwrap();
+        let empty = db.create_run("empty", Some("codex")).unwrap();
+        let mixed = db.create_run("mixed", Some("codex")).unwrap();
+        let states = [
+            TaskState::Pending,
+            TaskState::Ready,
+            TaskState::Running,
+            TaskState::AwaitingIntegration,
+            TaskState::Integrating,
+            TaskState::Blocked,
+            TaskState::Failed,
+            TaskState::Completed,
+            TaskState::Superseded,
+            TaskState::Completed,
+        ];
+        for (position, state) in states.into_iter().enumerate() {
+            db.create_task(
+                mixed.id,
+                &format!("task {position}"),
+                "objective",
+                &[],
+                state,
+                position as i32,
+                None,
+                None,
+            )
+            .unwrap();
+        }
+
+        let records = db.list_run_summaries_page(10, None).unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].run.id, mixed.id);
+        assert_eq!(
+            records[0].counts,
+            TaskStateCounts {
+                pending: 1,
+                ready: 1,
+                running: 1,
+                awaiting_integration: 1,
+                integrating: 1,
+                blocked: 1,
+                failed: 1,
+                completed: 2,
+                superseded: 1,
+                total: 10,
+            }
+        );
+        assert_eq!(records[1].run.id, empty.id);
+        assert_eq!(records[1].counts, TaskStateCounts::default());
+    }
+
+    #[test]
+    fn run_summary_page_uses_an_exclusive_newest_first_cursor() {
+        let dir = TempDir::new().unwrap();
+        let db = FactoryDb::open(&dir.path().join("test.db")).unwrap();
+        for index in 0..6 {
+            let run = db.create_run(&format!("run {index}"), None).unwrap();
+            db.create_task(
+                run.id,
+                "task",
+                "objective",
+                &[],
+                TaskState::Ready,
+                0,
+                None,
+                None,
+            )
+            .unwrap();
+        }
+
+        let first = db.list_run_summaries_page(2, None).unwrap();
+        assert_eq!(
+            first.iter().map(|record| record.run.id).collect::<Vec<_>>(),
+            vec![6, 5]
+        );
+
+        let second = db
+            .list_run_summaries_page(2, Some(first[1].run.id))
+            .unwrap();
+        assert_eq!(
+            second
+                .iter()
+                .map(|record| record.run.id)
+                .collect::<Vec<_>>(),
+            vec![4, 3]
+        );
+
+        let third = db
+            .list_run_summaries_page(2, Some(second[1].run.id))
+            .unwrap();
+        assert_eq!(
+            third.iter().map(|record| record.run.id).collect::<Vec<_>>(),
+            vec![2, 1]
+        );
+        assert!(db
+            .list_run_summaries_page(2, Some(third[1].run.id))
+            .unwrap()
+            .is_empty());
+
+        let all = db.list_run_summaries().unwrap();
+        assert_eq!(
+            all.iter().map(|record| record.run.id).collect::<Vec<_>>(),
+            vec![6, 5, 4, 3, 2, 1]
+        );
+    }
+
+    #[test]
+    fn run_summary_pages_do_not_duplicate_or_skip_when_runs_change() {
+        let dir = TempDir::new().unwrap();
+        let db = FactoryDb::open(&dir.path().join("test.db")).unwrap();
+        for index in 0..5 {
+            db.create_run(&format!("run {index}"), None).unwrap();
+        }
+
+        let first = db.list_run_summaries_page(2, None).unwrap();
+        assert_eq!(
+            first.iter().map(|record| record.run.id).collect::<Vec<_>>(),
+            vec![5, 4]
+        );
+
+        let inserted = db.create_run("new run", None).unwrap();
+        assert!(inserted.id > first[0].run.id);
+        let second = db
+            .list_run_summaries_page(2, Some(first[1].run.id))
+            .unwrap();
+        assert_eq!(
+            second
+                .iter()
+                .map(|record| record.run.id)
+                .collect::<Vec<_>>(),
+            vec![3, 2]
+        );
+        assert!(second.iter().all(|record| record.run.id < first[1].run.id));
+
+        let deleted = second[0].run.id;
+        db.conn
+            .execute("DELETE FROM runs WHERE id = ?1", rusqlite::params![deleted])
+            .unwrap();
+        let third = db
+            .list_run_summaries_page(2, Some(second[1].run.id))
+            .unwrap();
+        assert_eq!(
+            third.iter().map(|record| record.run.id).collect::<Vec<_>>(),
+            vec![1]
+        );
+        assert!(third.iter().all(|record| record.run.id < second[1].run.id));
+    }
+
+    #[test]
+    fn run_summary_page_stays_bounded_for_large_histories() {
+        let dir = TempDir::new().unwrap();
+        let db = FactoryDb::open(&dir.path().join("test.db")).unwrap();
+        for index in 0..1_000 {
+            let run = db
+                .create_run(&format!("run {index}"), Some("codex"))
+                .unwrap();
+            db.create_task(
+                run.id,
+                "task",
+                "objective",
+                &[],
+                if index % 2 == 0 {
+                    TaskState::Completed
+                } else {
+                    TaskState::Pending
+                },
+                0,
+                None,
+                None,
+            )
+            .unwrap();
+        }
+
+        let page = db.list_run_summaries_page(25, None).unwrap();
+        assert_eq!(page.len(), 25);
+        assert_eq!(page[0].run.id, 1_000);
+        assert_eq!(page[24].run.id, 976);
+        assert!(page
+            .iter()
+            .all(|record| record.counts.total == 1 && record.counts.completed <= 1));
     }
 
     #[test]

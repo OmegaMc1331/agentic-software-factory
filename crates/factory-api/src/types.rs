@@ -57,6 +57,23 @@ impl TaskCounts {
     }
 }
 
+impl From<factory_db::TaskStateCounts> for TaskCounts {
+    fn from(counts: factory_db::TaskStateCounts) -> Self {
+        TaskCounts {
+            pending: counts.pending,
+            ready: counts.ready,
+            running: counts.running,
+            awaiting_integration: counts.awaiting_integration,
+            integrating: counts.integrating,
+            blocked: counts.blocked,
+            failed: counts.failed,
+            completed: counts.completed,
+            superseded: counts.superseded,
+            total: counts.total,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunSummary {

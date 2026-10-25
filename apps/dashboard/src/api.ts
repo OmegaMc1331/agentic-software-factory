@@ -25,6 +25,7 @@ import type {
   RolePolicyPreset,
   Run,
   RunDetail,
+  RunPage,
   RunSummary,
   WorkflowTeam,
 } from "./types";
@@ -432,8 +433,24 @@ async function remove<T = void>(path: string, options?: ApiRequestOptions): Prom
   return request<T>(path, { method: "DELETE" }, options);
 }
 
+export const RUN_PAGE_SIZE = 25;
+
 export function fetchRuns(options?: ApiRequestOptions): Promise<RunSummary[]> {
   return get<RunSummary[]>("/runs", options);
+}
+
+export interface RunPageRequest {
+  limit?: number;
+  before?: number | null;
+}
+
+export function fetchRunsPage(
+  page: RunPageRequest = {},
+  options?: ApiRequestOptions
+): Promise<RunPage> {
+  const params = new URLSearchParams({ limit: String(page.limit ?? RUN_PAGE_SIZE) });
+  if (page.before != null) params.set("before", String(page.before));
+  return get<RunPage>(`/runs?${params.toString()}`, options);
 }
 
 export function fetchRun(id: number, options?: ApiRequestOptions): Promise<RunDetail> {
