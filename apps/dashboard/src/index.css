@@ -913,6 +913,10 @@ code {
   overflow-wrap: anywhere;
 }
 
+.agent-diagnostic-action {
+  color: var(--text-secondary);
+}
+
 .settings-field {
   display: flex;
   flex-direction: column;

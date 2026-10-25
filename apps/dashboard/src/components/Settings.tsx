@@ -24,6 +24,7 @@ import {
 } from "../api";
 import {
   agentResolutionStatusLabel,
+  promptTransportLabel,
   type AgentStatusInfo,
   type ConfigData,
   type McpServerConfig,
@@ -41,7 +42,7 @@ import {
   confirmDiscardChanges,
 } from "../unsavedChanges";
 import { AgentForm } from "./AgentForm";
-import { agentArgs, agentDraftFrom, emptyAgentDraft, type AgentDraft } from "./agentFormState";
+import { agentDraftFrom, emptyAgentDraft, type AgentDraft } from "./agentFormState";
 import { RecipeForm } from "./RecipeForm";
 import { RoleForm, type RoleFormInitial } from "./RoleForm";
 
@@ -1121,7 +1122,9 @@ export function SettingsView() {
         </div>
         <p className="settings-note">
           Coding CLIs that you install and authenticate yourself. The factory only runs their
-          commands; it never manages model providers or API keys.
+          commands; it never manages model providers or API keys. Availability checks resolve
+          executables and invocation configuration only; they do not run agents or verify
+          authentication.
         </p>
         {agentNames.length === 0 && !draft ? (
           <div className="empty">
@@ -1148,7 +1151,7 @@ export function SettingsView() {
                       <code>{name}</code>
                     </td>
                     <td className="run-objective">
-                      <code>{[entry.command, ...agentArgs(entry)].join(" ")}</code>
+                      <code>{status?.invocationSummary ?? entry.command}</code>
                     </td>
                     <td>
                       {status === undefined ? (
@@ -1165,20 +1168,63 @@ export function SettingsView() {
                             }
                           >
                             {status.available
-                              ? "Installed"
+                              ? "Executable found"
                               : status.status === "broken"
-                                ? "Broken installation"
-                                : "Missing"}
+                                ? "Broken executable"
+                                : "Not found"}
                           </span>
                           <small>
-                            Workflow {status.workflowAvailable ? "available" : "unavailable"}
+                            Workflow{" "}
+                            {status.workflowAvailable
+                              ? "available"
+                              : `unavailable: ${status.workflowDiagnostic?.message ?? "reason unavailable"}`}
                           </small>
                           <small>
-                            Interactive {status.interactiveAvailable ? "available" : "unavailable"}
+                            Interactive{" "}
+                            {status.interactiveAvailable
+                              ? "available"
+                              : `unavailable: ${status.interactiveDiagnostic?.message ?? "reason unavailable"}`}
+                          </small>
+                          <small>
+                            Prompt transport: {promptTransportLabel(status.promptTransport)}
+                            {status.promptTransportConfigured ? " (configured)" : " (default)"}
                           </small>
                           <details className="agent-resolution-details">
-                            <summary>Resolution details</summary>
+                            <summary>Availability details</summary>
                             <small>Status: {agentResolutionStatusLabel(status.status)}</small>
+                            <small>
+                              Invocation: <code>{status.invocationSummary ?? entry.command}</code>
+                            </small>
+                            <small>
+                              Arguments: {status.argumentCount ?? status.args.length} (values
+                              withheld)
+                            </small>
+                            {status.workflowDiagnostic && (
+                              <>
+                                <small>
+                                  Workflow: <code>{status.workflowDiagnostic.code}</code> —{" "}
+                                  {status.workflowDiagnostic.message}
+                                </small>
+                                {status.workflowDiagnostic.action && (
+                                  <small className="agent-diagnostic-action">
+                                    Next: {status.workflowDiagnostic.action}
+                                  </small>
+                                )}
+                              </>
+                            )}
+                            {status.interactiveDiagnostic && (
+                              <>
+                                <small>
+                                  Interactive: <code>{status.interactiveDiagnostic.code}</code> —{" "}
+                                  {status.interactiveDiagnostic.message}
+                                </small>
+                                {status.interactiveDiagnostic.action && (
+                                  <small className="agent-diagnostic-action">
+                                    Next: {status.interactiveDiagnostic.action}
+                                  </small>
+                                )}
+                              </>
+                            )}
                             {status.resolvedExecutable && (
                               <>
                                 <span>Executable resolved</span>
@@ -1213,6 +1259,10 @@ export function SettingsView() {
                               Factory process PATH ({status.pathEntriesChecked ?? 0} entries
                               checked)
                             </small>
+                            <small>
+                              Executable presence does not verify provider authentication or a
+                              successful workflow run.
+                            </small>
                           </details>
                         </span>
                       )}
@@ -1241,8 +1291,12 @@ export function SettingsView() {
         )}
         {agentNames.length > 0 && (
           <div className="settings-actions">
-            <button className="button" onClick={refreshAvailability}>
-              Test agent configuration
+            <button
+              className="button"
+              onClick={refreshAvailability}
+              title="Re-resolve configured executables without running any agent"
+            >
+              Refresh agent availability
             </button>
           </div>
         )}

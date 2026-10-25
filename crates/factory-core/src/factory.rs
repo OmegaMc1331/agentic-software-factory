@@ -592,14 +592,17 @@ impl Factory {
                 return Err(FactoryError::Cancelled);
             }
             if invocation.result.exit_code != Some(0) {
-                return Err(PlanError::Agent(AgentError::Spawn(
-                    invocation.result.exit_code.map_or_else(
-                        || "planner".to_string(),
-                        |code| format!("planner exited with code {code}"),
+                let error = match invocation.result.exit_code {
+                    Some(exit_code) => AgentError::ExecutionFailed {
+                        command: planner.command().to_string(),
+                        exit_code,
+                    },
+                    None => AgentError::Spawn(
+                        planner.command().to_string(),
+                        "the planner process ended without an exit code".to_string(),
                     ),
-                    invocation.result.stderr,
-                ))
-                .into());
+                };
+                return Err(PlanError::Agent(error).into());
             }
             if let Some(error) = agent_output_limit_error("planner", &invocation.result) {
                 self.db
@@ -2740,7 +2743,7 @@ impl Factory {
             operation: scope.operation,
             agent: agent.name().to_string(),
             mode: AgentSessionMode::Automated,
-            command: agent.command_line(),
+            command: agent.invocation_summary(),
             status: "running".to_string(),
             started_at: started,
             finished_at: None,

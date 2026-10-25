@@ -3,8 +3,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use factory_agent::{
-    runtime_path_entries, AgentCapabilities, AgentConfig, AgentError, AgentKind, AgentRequest,
-    AgentStatus, CommandAgent, PromptTransport, MISSION_PLACEHOLDER,
+    invocation_summary, redacted_arguments, runtime_path_entries, AgentCapabilities, AgentConfig,
+    AgentDiagnostic, AgentError, AgentKind, AgentRequest, AgentStatus, CommandAgent,
+    PromptTransport, MISSION_PLACEHOLDER,
 };
 use factory_policy::{EffectivePolicy, PoliciesConfig};
 use factory_types::{RoutingMode, WorkflowTeam};
@@ -1027,18 +1028,26 @@ impl Agents {
                     roles: entry.capabilities.clone(),
                 },
             });
-            let resolution = agent.resolve_executable();
+            let diagnostics = agent.diagnose();
+            let resolution = diagnostics.resolution;
             let resolution_error = resolution.as_ref().err().map(|error| error.to_string());
             let permissions = self.config.effective_agent_policy(name).view();
+            let prompt_transport = agent.prompt_transport();
             let mut info = AgentInfo {
                 name: name.clone(),
-                command: format_command(&entry.command, &args),
-                args,
+                command: entry.command.clone(),
+                args: redacted_arguments(&args),
+                argument_count: args.len(),
+                invocation_summary: invocation_summary(&entry.command, &args),
                 available: resolution.is_ok(),
-                status: AgentStatus::Missing,
+                status: diagnostics.status,
                 kind,
-                workflow_available: agent.workflow_available(),
-                interactive_available: agent.interactive_available(),
+                prompt_transport,
+                prompt_transport_configured: entry.prompt_transport.is_some(),
+                workflow_available: diagnostics.workflow.is_available(),
+                interactive_available: diagnostics.interactive.is_available(),
+                workflow_diagnostic: diagnostics.workflow,
+                interactive_diagnostic: diagnostics.interactive,
                 resolved_executable: None,
                 resolution_error,
                 resolution_shim: None,
@@ -1049,7 +1058,6 @@ impl Agents {
             };
             match resolution {
                 Ok(resolved) => {
-                    info.status = AgentStatus::Available;
                     info.resolved_executable = Some(resolved.path().to_string_lossy().into_owned());
                     if resolved.kind() == factory_agent::ResolvedExecutableKind::NpmShim {
                         info.resolution_shim = info.resolved_executable.clone();
@@ -1060,11 +1068,13 @@ impl Agents {
                     info.path_entries_checked = resolved.path_entries_checked();
                 }
                 Err(AgentError::InvalidExecutable { path, shim, .. }) => {
-                    info.status = AgentStatus::Broken;
                     info.resolution_shim = shim
                         .as_ref()
                         .map(|path| path.to_string_lossy().into_owned());
                     info.resolution_target = Some(path.to_string_lossy().into_owned());
+                }
+                Err(AgentError::ExecutableNotFound { path_entries, .. }) => {
+                    info.path_entries_checked = path_entries;
                 }
                 Err(_) => {}
             }
@@ -1228,11 +1238,17 @@ pub struct AgentInfo {
     pub name: String,
     pub command: String,
     pub args: Vec<String>,
+    pub argument_count: usize,
+    pub invocation_summary: String,
     pub available: bool,
     pub status: AgentStatus,
     pub kind: AgentKind,
+    pub prompt_transport: PromptTransport,
+    pub prompt_transport_configured: bool,
     pub workflow_available: bool,
     pub interactive_available: bool,
+    pub workflow_diagnostic: AgentDiagnostic,
+    pub interactive_diagnostic: AgentDiagnostic,
     pub resolved_executable: Option<String>,
     pub resolution_error: Option<String>,
     pub resolution_shim: Option<String>,
@@ -1268,12 +1284,6 @@ pub struct RoleInfo {
     /// means no preset (permissive legacy default or fully explicit policy).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub policy_preset: Option<String>,
-}
-
-fn format_command(command: &str, args: &[String]) -> String {
-    let mut parts = vec![command.to_string()];
-    parts.extend(args.iter().cloned());
-    parts.join(" ")
 }
 
 #[cfg(test)]

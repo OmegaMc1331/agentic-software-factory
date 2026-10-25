@@ -339,6 +339,141 @@ command = "definitely-not-a-real-factory-test-binary"
 }
 
 #[test]
+fn lists_actionable_diagnostics_without_exposing_arguments_or_environment() {
+    let dir = TempDir::new().unwrap();
+    let known_good = if cfg!(windows) { "powershell" } else { "sh" };
+    write_config(
+        dir.path(),
+        &format!(
+            r#"
+[agents.ready]
+command = "{known_good}"
+interactive_args = []
+
+[agents.ghost]
+command = "definitely-not-a-real-factory-test-binary"
+interactive_args = []
+
+[agents.nointeractive]
+command = "{known_good}"
+
+[agents.disabled]
+command = "{known_good}"
+prompt_transport = "disabled"
+interactive_args = []
+
+[agents.claude]
+kind = "claude_code"
+command = "{known_good}"
+interactive_args = []
+
+[agents.secret]
+command = "{known_good}"
+args = ["--api-key", "super-secret-token"]
+prompt_transport = "argument"
+interactive_args = []
+env = {{ API_TOKEN = "env-secret-value" }}
+
+[agents.invalid]
+command = "{known_good}"
+args = ["{{mission}}", "{{mission}}"]
+prompt_transport = "argument"
+interactive_args = []
+"#
+        ),
+    );
+    let infos = Agents::load(dir.path()).unwrap().list();
+
+    let ready = infos.iter().find(|info| info.name == "ready").unwrap();
+    assert!(ready.available);
+    assert_eq!(ready.status, factory_agent::AgentStatus::Available);
+    assert_eq!(ready.prompt_transport, PromptTransport::Stdin);
+    assert!(!ready.prompt_transport_configured);
+    assert!(ready.workflow_available);
+    assert!(ready.interactive_available);
+    assert!(ready.workflow_diagnostic.is_available());
+    assert!(ready.interactive_diagnostic.is_available());
+    assert_eq!(ready.command, known_good);
+    assert_eq!(ready.invocation_summary, known_good);
+
+    let ghost = infos.iter().find(|info| info.name == "ghost").unwrap();
+    assert!(!ghost.available);
+    assert_eq!(
+        ghost.workflow_diagnostic.code,
+        factory_agent::AgentDiagnosticCode::ExecutableNotFound
+    );
+    assert_eq!(
+        ghost.interactive_diagnostic.code,
+        factory_agent::AgentDiagnosticCode::ExecutableNotFound
+    );
+    assert!(ghost
+        .workflow_diagnostic
+        .action
+        .as_deref()
+        .unwrap()
+        .contains("Install"));
+    assert!(ghost.path_entries_checked > 0);
+
+    let nointeractive = infos
+        .iter()
+        .find(|info| info.name == "nointeractive")
+        .unwrap();
+    assert!(nointeractive.available);
+    assert!(nointeractive.workflow_available);
+    assert!(!nointeractive.interactive_available);
+    assert_eq!(
+        nointeractive.interactive_diagnostic.code,
+        factory_agent::AgentDiagnosticCode::InteractiveInvocationMissing
+    );
+
+    let disabled = infos.iter().find(|info| info.name == "disabled").unwrap();
+    assert!(disabled.available);
+    assert_eq!(disabled.prompt_transport, PromptTransport::Disabled);
+    assert!(disabled.prompt_transport_configured);
+    assert!(!disabled.workflow_available);
+    assert_eq!(
+        disabled.workflow_diagnostic.code,
+        factory_agent::AgentDiagnosticCode::WorkflowTransportDisabled
+    );
+    assert!(disabled.interactive_available);
+
+    let claude = infos.iter().find(|info| info.name == "claude").unwrap();
+    assert_eq!(claude.prompt_transport, PromptTransport::Argument);
+    assert!(!claude.prompt_transport_configured);
+    assert_eq!(claude.argument_count, 1);
+    assert_eq!(
+        claude.invocation_summary,
+        format!("{known_good} (1 argument, values withheld)")
+    );
+
+    let secret = infos.iter().find(|info| info.name == "secret").unwrap();
+    assert_eq!(secret.argument_count, 2);
+    assert_eq!(
+        secret.args,
+        vec![
+            factory_agent::WITHHELD_ARGUMENT.to_string(),
+            factory_agent::WITHHELD_ARGUMENT.to_string()
+        ]
+    );
+    assert!(secret
+        .invocation_summary
+        .contains("2 arguments, values withheld"));
+    let serialized = serde_json::to_string(secret).unwrap();
+    assert!(!serialized.contains("super-secret-token"));
+    assert!(!serialized.contains("env-secret-value"));
+
+    let invalid = infos.iter().find(|info| info.name == "invalid").unwrap();
+    assert!(invalid.available);
+    assert!(!invalid.workflow_available);
+    assert_eq!(
+        invalid.workflow_diagnostic.code,
+        factory_agent::AgentDiagnosticCode::InvalidInvocation
+    );
+    assert!(invalid.workflow_diagnostic.message.contains("placeholder"));
+    assert!(invalid.interactive_available);
+}
+
+#[test]
 fn default_config_is_valid_toml_with_all_roles() {
     let dir = TempDir::new().unwrap();
     let factory = dir.path().join(".factory");

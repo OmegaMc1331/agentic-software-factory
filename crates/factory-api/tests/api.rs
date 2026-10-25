@@ -583,6 +583,120 @@ async fn lists_agents_with_availability() {
         .as_object()
         .unwrap()
         .contains_key("resolvedExecutable"));
+    assert!(value.as_array().unwrap()[0]["promptTransport"].is_string());
+    assert!(value.as_array().unwrap()[0]["invocationSummary"].is_string());
+    assert!(value.as_array().unwrap()[0]["workflowDiagnostic"].is_object());
+    assert!(value.as_array().unwrap()[0]["interactiveDiagnostic"].is_object());
+}
+
+#[tokio::test]
+async fn agent_diagnostics_are_actionable_and_redacted() {
+    let dir = TempDir::new().unwrap();
+    init_root(dir.path());
+    let app = common::authenticated_app(make_state(dir.path())).await;
+
+    let marker = dir.path().join("agent-launched.txt");
+    let known_good = if cfg!(windows) { "cmd" } else { "sh" };
+    let launcher_args = if cfg!(windows) {
+        json!(["/d", "/c", format!("echo launched> {}", marker.display())])
+    } else {
+        json!(["-c", format!("touch '{}'", marker.display())])
+    };
+    let config = json!({
+        "agents": {
+            "missing": {
+                "command": "definitely-not-a-real-factory-test-binary",
+                "interactive_args": []
+            },
+            "disabled": {
+                "command": known_good,
+                "prompt_transport": "disabled",
+                "interactive_args": []
+            },
+            "secret": {
+                "command": known_good,
+                "args": ["--api-key", "super-secret-token"],
+                "env": { "API_TOKEN": "env-secret-value" },
+                "prompt_transport": "argument",
+                "interactive_args": []
+            },
+            "launcher": {
+                "command": known_good,
+                "args": launcher_args,
+                "interactive_args": []
+            }
+        },
+        "roles": {},
+        "role_assignments": []
+    });
+    let response = put_config(app.clone(), config).await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/agents")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let agents = value.as_array().unwrap();
+    let find = |name: &str| agents.iter().find(|agent| agent["name"] == name).unwrap();
+
+    let missing = find("missing");
+    assert_eq!(missing["available"], false);
+    assert_eq!(missing["status"], "missing");
+    assert_eq!(
+        missing["workflowDiagnostic"]["code"],
+        "executable_not_found"
+    );
+    assert_eq!(
+        missing["interactiveDiagnostic"]["code"],
+        "executable_not_found"
+    );
+    assert!(missing["workflowDiagnostic"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("PATH visible to Factory"));
+    assert!(missing["workflowDiagnostic"]["action"]
+        .as_str()
+        .unwrap()
+        .contains("Install"));
+
+    let disabled = find("disabled");
+    assert_eq!(disabled["available"], true);
+    assert_eq!(disabled["promptTransport"], "disabled");
+    assert_eq!(disabled["promptTransportConfigured"], true);
+    assert_eq!(disabled["workflowAvailable"], false);
+    assert_eq!(
+        disabled["workflowDiagnostic"]["code"],
+        "workflow_transport_disabled"
+    );
+    assert_eq!(disabled["interactiveAvailable"], true);
+    assert_eq!(disabled["interactiveDiagnostic"]["code"], "available");
+
+    let secret = find("secret");
+    assert_eq!(secret["promptTransport"], "argument");
+    assert_eq!(secret["argumentCount"], 2);
+    assert_eq!(
+        secret["args"],
+        json!(["<value withheld>", "<value withheld>"])
+    );
+    assert!(secret["invocationSummary"]
+        .as_str()
+        .unwrap()
+        .contains("2 arguments, values withheld"));
+    assert!(!body.contains("super-secret-token"));
+    assert!(!body.contains("env-secret-value"));
+
+    assert!(
+        !marker.exists(),
+        "availability checks must not launch agents"
+    );
 }
 
 #[cfg(feature = "embedded-dashboard")]

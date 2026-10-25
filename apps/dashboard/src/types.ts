@@ -228,6 +228,38 @@ export type PromptTransport = "stdin" | "argument" | "disabled";
 
 export type AgentResolutionStatus = "available" | "missing" | "broken";
 
+export type AgentDiagnosticCode =
+  | "available"
+  | "executable_not_found"
+  | "broken_executable"
+  | "invalid_invocation"
+  | "workflow_transport_disabled"
+  | "interactive_invocation_missing"
+  | "process_spawn_failed"
+  | "execution_failed"
+  | "interactive_required"
+  | "cancelled"
+  | "unknown";
+
+export interface AgentDiagnostic {
+  code: AgentDiagnosticCode;
+  message: string;
+  action?: string | null;
+}
+
+export function promptTransportLabel(transport: PromptTransport | undefined): string {
+  switch (transport) {
+    case "stdin":
+      return "stdin (mission via standard input)";
+    case "argument":
+      return "argument (mission in the process arguments)";
+    case "disabled":
+      return "disabled (workflow execution unavailable)";
+    default:
+      return "unknown";
+  }
+}
+
 export interface AgentEntry {
   kind?: AgentKind;
   command: string;
@@ -448,11 +480,17 @@ export interface AgentStatusInfo {
   name: string;
   command: string;
   args: string[];
+  argumentCount?: number;
+  invocationSummary?: string;
   available: boolean;
   status?: AgentResolutionStatus;
   kind?: AgentKind;
+  promptTransport?: PromptTransport;
+  promptTransportConfigured?: boolean;
   workflowAvailable?: boolean;
   interactiveAvailable?: boolean;
+  workflowDiagnostic?: AgentDiagnostic;
+  interactiveDiagnostic?: AgentDiagnostic;
   resolvedExecutable?: string | null;
   resolutionError?: string | null;
   resolutionShim?: string | null;
@@ -478,11 +516,17 @@ export type GraphEdgeKind =
 
 export interface AgentMeta {
   command: string;
+  argumentCount?: number;
+  invocationSummary?: string;
   available: boolean;
   status?: AgentResolutionStatus;
   kind?: AgentKind;
+  promptTransport?: PromptTransport;
+  promptTransportConfigured?: boolean;
   workflowAvailable?: boolean;
   interactiveAvailable?: boolean;
+  workflowDiagnostic?: AgentDiagnostic;
+  interactiveDiagnostic?: AgentDiagnostic;
   resolvedExecutable?: string | null;
   resolutionError?: string | null;
   resolutionShim?: string | null;

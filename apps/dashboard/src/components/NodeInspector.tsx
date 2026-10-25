@@ -22,6 +22,7 @@ import {
   agentMeta,
   agentResolutionStatusLabel,
   githubIssueMeta,
+  promptTransportLabel,
   githubPrMeta,
   isImplementationOperation,
   isTaskIntegratedIds,
@@ -251,23 +252,88 @@ export function NodeInspector({
     details = (
       <>
         <Row label="Command">
-          <code>{meta.command}</code>
+          <code>{meta.invocationSummary ?? meta.command}</code>
         </Row>
         <Row label="Status">
           {meta.available
-            ? "Available"
+            ? "Executable found"
             : meta.status === "broken"
-              ? "Broken installation"
-              : "Missing"}
+              ? "Broken executable"
+              : "Not found"}
         </Row>
-        <Row label="Workflow">{meta.workflowAvailable ? "available" : "unavailable"}</Row>
-        <Row label="Interactive">{meta.interactiveAvailable ? "available" : "unavailable"}</Row>
+        <Row label="Prompt transport">
+          {promptTransportLabel(meta.promptTransport)}
+          {meta.promptTransportConfigured ? " (configured)" : " (default)"}
+        </Row>
+        <Row label="Workflow">
+          {meta.workflowAvailable ? (
+            "available"
+          ) : (
+            <>
+              unavailable
+              {meta.workflowDiagnostic && (
+                <small className="agent-resolution-source">{meta.workflowDiagnostic.message}</small>
+              )}
+              {meta.workflowDiagnostic?.action && (
+                <small className="agent-resolution-source agent-diagnostic-action">
+                  Next: {meta.workflowDiagnostic.action}
+                </small>
+              )}
+            </>
+          )}
+        </Row>
+        <Row label="Interactive">
+          {meta.interactiveAvailable ? (
+            "available"
+          ) : (
+            <>
+              unavailable
+              {meta.interactiveDiagnostic && (
+                <small className="agent-resolution-source">
+                  {meta.interactiveDiagnostic.message}
+                </small>
+              )}
+              {meta.interactiveDiagnostic?.action && (
+                <small className="agent-resolution-source agent-diagnostic-action">
+                  Next: {meta.interactiveDiagnostic.action}
+                </small>
+              )}
+            </>
+          )}
+        </Row>
         <details className="agent-resolution-details">
-          <summary>Resolution details</summary>
+          <summary>Availability details</summary>
           <div className="inspector-row">
             <span className="inspector-label">Status</span>
             <span className="inspector-value">{agentResolutionStatusLabel(meta.status)}</span>
           </div>
+          <div className="inspector-row">
+            <span className="inspector-label">Invocation</span>
+            <span className="inspector-value">
+              <code>{meta.invocationSummary ?? meta.command}</code>
+            </span>
+          </div>
+          <div className="inspector-row">
+            <span className="inspector-label">Arguments</span>
+            <span className="inspector-value">{meta.argumentCount ?? 0} (values withheld)</span>
+          </div>
+          {meta.workflowDiagnostic && (
+            <div className="inspector-row">
+              <span className="inspector-label">Workflow diagnostic</span>
+              <span className="inspector-value">
+                <code>{meta.workflowDiagnostic.code}</code> — {meta.workflowDiagnostic.message}
+              </span>
+            </div>
+          )}
+          {meta.interactiveDiagnostic && (
+            <div className="inspector-row">
+              <span className="inspector-label">Interactive diagnostic</span>
+              <span className="inspector-value">
+                <code>{meta.interactiveDiagnostic.code}</code> —{" "}
+                {meta.interactiveDiagnostic.message}
+              </span>
+            </div>
+          )}
           <div className="inspector-row">
             <span className="inspector-label">Shim</span>
             <span className="inspector-value">
@@ -296,6 +362,9 @@ export function NodeInspector({
             <span className="inspector-label">PATH entries</span>
             <span className="inspector-value">{meta.pathEntriesChecked ?? 0} checked</span>
           </div>
+          <p className="inspector-hint">
+            Executable presence does not verify authentication or a successful workflow run.
+          </p>
         </details>
         <PolicySummary permissions={meta.permissions} />
         <section className="policy-section" aria-label="Agent external tools">

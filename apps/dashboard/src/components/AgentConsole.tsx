@@ -9,12 +9,13 @@ import {
 } from "../api";
 import { connectionKind } from "../graphWorkspace";
 import { formatAttempts, formatDurationMs, formatRate } from "../performanceFormat";
-import type {
-  AgentActivity,
-  AgentMeta,
-  AgentPerformanceDetail,
-  AgentSession,
-  GraphNode,
+import {
+  promptTransportLabel,
+  type AgentActivity,
+  type AgentMeta,
+  type AgentPerformanceDetail,
+  type AgentSession,
+  type GraphNode,
 } from "../types";
 import { InteractiveTerminal } from "./InteractiveTerminal";
 
@@ -96,7 +97,7 @@ function formatBytes(bytes: number): string {
 }
 
 function sessionState(session: AgentSession | null): string {
-  if (!session) return "Available";
+  if (!session) return "Idle";
   if (["running", "active"].includes(session.status)) return "Running";
   return session.exitCode === 0 || session.status === "success" ? "Completed" : "Failed";
 }
@@ -298,12 +299,28 @@ export function AgentConsole({
             <div>
               <dt>Command</dt>
               <dd>
-                <code>{meta.command}</code>
+                <code>{meta.invocationSummary ?? meta.command}</code>
               </dd>
             </div>
             <div>
               <dt>Availability</dt>
-              <dd>{meta.available ? "Available" : "Missing"}</dd>
+              <dd>
+                {meta.available
+                  ? "Executable found"
+                  : meta.status === "broken"
+                    ? "Broken executable"
+                    : "Not found"}
+                <small className="agent-resolution-source">
+                  Executable presence does not verify authentication.
+                </small>
+              </dd>
+            </div>
+            <div>
+              <dt>Prompt transport</dt>
+              <dd>
+                {promptTransportLabel(meta.promptTransport)}
+                {meta.promptTransportConfigured ? " (configured)" : " (default)"}
+              </dd>
             </div>
             <div>
               <dt>Executable resolution</dt>
@@ -320,11 +337,35 @@ export function AgentConsole({
             </div>
             <div>
               <dt>Workflow mode</dt>
-              <dd>{meta.workflowAvailable ? "Available" : "Unavailable"}</dd>
+              <dd>
+                {meta.workflowAvailable ? "Available" : "Unavailable"}
+                {!meta.workflowAvailable && meta.workflowDiagnostic && (
+                  <small className="agent-resolution-source">
+                    {meta.workflowDiagnostic.message}
+                  </small>
+                )}
+                {!meta.workflowAvailable && meta.workflowDiagnostic?.action && (
+                  <small className="agent-resolution-source agent-diagnostic-action">
+                    Next: {meta.workflowDiagnostic.action}
+                  </small>
+                )}
+              </dd>
             </div>
             <div>
               <dt>Interactive mode</dt>
-              <dd>{meta.interactiveAvailable ? "Available" : "Unavailable"}</dd>
+              <dd>
+                {meta.interactiveAvailable ? "Available" : "Unavailable"}
+                {!meta.interactiveAvailable && meta.interactiveDiagnostic && (
+                  <small className="agent-resolution-source">
+                    {meta.interactiveDiagnostic.message}
+                  </small>
+                )}
+                {!meta.interactiveAvailable && meta.interactiveDiagnostic?.action && (
+                  <small className="agent-resolution-source agent-diagnostic-action">
+                    Next: {meta.interactiveDiagnostic.action}
+                  </small>
+                )}
+              </dd>
             </div>
             <div>
               <dt>Assigned roles</dt>
@@ -417,7 +458,10 @@ export function AgentConsole({
                 {startingInteractive ? "Startingâ€¦" : "Start session"}
               </button>
               {!meta.interactiveAvailable && (
-                <small>This agent has no interactive invocation configured.</small>
+                <small>
+                  {meta.interactiveDiagnostic?.message ??
+                    "This agent has no interactive invocation configured."}
+                </small>
               )}
             </div>
           ) : (

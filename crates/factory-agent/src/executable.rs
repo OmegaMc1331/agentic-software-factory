@@ -515,9 +515,9 @@ fn validate_batch_argument(value: &str) -> Result<(), String> {
             '\0' | '\r' | '\n' | '"' | '%' | '!' | '^' | '&' | '|' | '<' | '>'
         )
     }) {
-        return Err(format!(
-            "the batch-backed invocation argument `{value}` contains unsafe cmd.exe characters"
-        ));
+        return Err(
+            "a batch-backed invocation argument contains unsafe cmd.exe characters".to_string(),
+        );
     }
     Ok(())
 }
@@ -872,6 +872,7 @@ mod tests {
             .process_launch(&["safe".into(), "bad&command".into()])
             .unwrap_err();
         assert!(error.contains("unsafe cmd.exe characters"));
+        assert!(!error.contains("bad&command"));
         assert!(resolved.pty_launch(&["bad&command".into()]).is_err());
     }
 

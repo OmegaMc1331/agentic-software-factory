@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc;
@@ -14,6 +14,7 @@ use crate::capture::{
     BoundedOutputCapture, Utf8StreamDecoder, DEFAULT_AGENT_OUTPUT_LIMIT_BYTES,
     OUTPUT_CHANNEL_CAPACITY, OUTPUT_READ_BUFFER_BYTES,
 };
+use crate::diagnostics::{invocation_summary, AgentDiagnostic};
 use crate::executable::{
     resolve_executable, runtime_path_entries, ExecutableResolution, LaunchCommand,
     ResolvedExecutable,
@@ -139,10 +140,8 @@ pub struct ProcessInvocation {
 }
 
 impl ProcessInvocation {
-    pub fn command_line(&self) -> String {
-        let mut parts = vec![self.command.clone()];
-        parts.extend(self.args.iter().cloned());
-        parts.join(" ")
+    pub fn invocation_summary(&self) -> String {
+        invocation_summary(&self.command, &self.args)
     }
 
     pub fn process_launch(&self) -> Result<LaunchCommand, AgentError> {
@@ -164,6 +163,14 @@ pub enum AgentStatus {
     Available,
     Missing,
     Broken,
+}
+
+#[derive(Debug)]
+pub struct AgentDiagnostics {
+    pub status: AgentStatus,
+    pub resolution: Result<ResolvedExecutable, AgentError>,
+    pub workflow: AgentDiagnostic,
+    pub interactive: AgentDiagnostic,
 }
 
 #[derive(Debug, Clone)]
@@ -225,6 +232,8 @@ pub enum AgentError {
     },
     #[error("failed to run `{0}`: {1}")]
     Spawn(String, String),
+    #[error("`{command}` started but exited with code {exit_code}")]
+    ExecutionFailed { command: String, exit_code: i32 },
     #[error("Agent `{0}` has no non-interactive workflow invocation configured.")]
     AutomatedUnavailable(String),
     #[error("Agent `{0}` has no interactive invocation configured.")]
@@ -283,10 +292,8 @@ impl CommandAgent {
         &self.config.command
     }
 
-    pub fn command_line(&self) -> String {
-        let mut parts = vec![self.config.command.clone()];
-        parts.extend(self.config.args.iter().cloned());
-        parts.join(" ")
+    pub fn invocation_summary(&self) -> String {
+        invocation_summary(&self.config.command, &self.config.args)
     }
 
     pub fn kind(&self) -> AgentKind {
@@ -297,10 +304,10 @@ impl CommandAgent {
         self.config.prompt_transport
     }
 
-    pub fn automated_invocation(
+    fn automated_invocation_parts(
         &self,
         request: &AgentRequest,
-    ) -> Result<ProcessInvocation, AgentError> {
+    ) -> Result<(Vec<String>, Option<Vec<u8>>), AgentError> {
         if self.config.prompt_transport == PromptTransport::Disabled {
             return Err(AgentError::AutomatedUnavailable(self.config.name.clone()));
         }
@@ -331,46 +338,122 @@ impl CommandAgent {
             }
             PromptTransport::Disabled => unreachable!(),
         };
-        let executable = self.resolve_executable()?;
-        Ok(ProcessInvocation {
+        Ok((args, stdin_payload))
+    }
+
+    fn build_invocation(
+        &self,
+        executable: ResolvedExecutable,
+        args: Vec<String>,
+        stdin_payload: Option<Vec<u8>>,
+        working_dir: PathBuf,
+        env: BTreeMap<String, String>,
+    ) -> ProcessInvocation {
+        ProcessInvocation {
             command: self.config.command.clone(),
             executable,
             args,
-            env: merged_env(&self.config.env, &request.env, &request.env_deny),
-            working_dir: request.working_dir.clone(),
+            env,
+            working_dir,
             stdin_payload,
-        })
+        }
+    }
+
+    pub fn automated_invocation(
+        &self,
+        request: &AgentRequest,
+    ) -> Result<ProcessInvocation, AgentError> {
+        let (args, stdin_payload) = self.automated_invocation_parts(request)?;
+        let executable = self.resolve_executable()?;
+        Ok(self.build_invocation(
+            executable,
+            args,
+            stdin_payload,
+            request.working_dir.clone(),
+            merged_env(&self.config.env, &request.env, &request.env_deny),
+        ))
+    }
+
+    fn interactive_args(&self) -> Result<Vec<String>, AgentError> {
+        self.config
+            .interactive_args
+            .clone()
+            .ok_or_else(|| AgentError::InteractiveUnavailable(self.config.name.clone()))
     }
 
     pub fn interactive_invocation(
         &self,
         working_dir: impl Into<PathBuf>,
     ) -> Result<ProcessInvocation, AgentError> {
-        let args = self
-            .config
-            .interactive_args
-            .clone()
-            .ok_or_else(|| AgentError::InteractiveUnavailable(self.config.name.clone()))?;
+        let args = self.interactive_args()?;
         let executable = self.resolve_executable()?;
-        Ok(ProcessInvocation {
-            command: self.config.command.clone(),
+        Ok(self.build_invocation(
             executable,
             args,
-            env: self.config.env.clone(),
-            working_dir: working_dir.into(),
-            stdin_payload: None,
-        })
+            None,
+            working_dir.into(),
+            self.config.env.clone(),
+        ))
+    }
+
+    pub fn diagnose(&self) -> AgentDiagnostics {
+        let resolution = self.resolve_executable();
+        let workflow = match self.automated_invocation_parts(&AgentRequest::new("probe", ".")) {
+            Err(error) => error.diagnostic(),
+            Ok((args, stdin_payload)) => match &resolution {
+                Ok(executable) => {
+                    let invocation = self.build_invocation(
+                        executable.clone(),
+                        args,
+                        stdin_payload,
+                        PathBuf::from("."),
+                        self.config.env.clone(),
+                    );
+                    match invocation.process_launch() {
+                        Ok(_) => AgentDiagnostic::available(
+                            "Workflow can be launched with the current configuration.",
+                        ),
+                        Err(error) => error.diagnostic(),
+                    }
+                }
+                Err(error) => error.diagnostic(),
+            },
+        };
+        let interactive = match self.interactive_args() {
+            Err(error) => error.diagnostic(),
+            Ok(args) => match &resolution {
+                Ok(executable) => {
+                    let invocation = self.build_invocation(
+                        executable.clone(),
+                        args,
+                        None,
+                        PathBuf::from("."),
+                        self.config.env.clone(),
+                    );
+                    match invocation.pty_launch() {
+                        Ok(_) => AgentDiagnostic::available(
+                            "Interactive sessions can be launched with the current configuration.",
+                        ),
+                        Err(error) => error.diagnostic(),
+                    }
+                }
+                Err(error) => error.diagnostic(),
+            },
+        };
+        AgentDiagnostics {
+            status: status_for(&resolution),
+            resolution,
+            workflow,
+            interactive,
+        }
     }
 
     pub fn workflow_available(&self) -> bool {
-        self.automated_invocation(&AgentRequest::new("probe", "."))
-            .is_ok()
+        self.diagnose().workflow.is_available()
     }
 
     pub fn interactive_available(&self) -> bool {
-        self.interactive_invocation(".")
-            .and_then(|invocation| invocation.pty_launch().map(|_| invocation))
-            .is_ok()
+        self.diagnose().interactive.is_available()
     }
 
     pub fn config(&self) -> &AgentConfig {
@@ -378,11 +461,7 @@ impl CommandAgent {
     }
 
     pub fn status(&self) -> AgentStatus {
-        match self.resolve_executable() {
-            Ok(_) => AgentStatus::Available,
-            Err(AgentError::InvalidExecutable { .. }) => AgentStatus::Broken,
-            Err(_) => AgentStatus::Missing,
-        }
+        status_for(&self.resolve_executable())
     }
 
     pub fn available(&self) -> bool {
@@ -447,7 +526,7 @@ impl CommandAgent {
         let started = Instant::now();
         let mut child = cmd
             .spawn()
-            .map_err(|e| spawn_error(&self.config.command, &e))?;
+            .map_err(|e| spawn_error(&self.config.command, &invocation.working_dir, &e))?;
         let stdin = child.stdin.take();
         let stdout = match child.stdout.take() {
             Some(stdout) => stdout,
@@ -604,6 +683,14 @@ impl CommandAgent {
     }
 }
 
+fn status_for(resolution: &Result<ResolvedExecutable, AgentError>) -> AgentStatus {
+    match resolution {
+        Ok(_) => AgentStatus::Available,
+        Err(AgentError::InvalidExecutable { .. }) => AgentStatus::Broken,
+        Err(_) => AgentStatus::Missing,
+    }
+}
+
 fn merged_env(
     configured: &BTreeMap<String, String>,
     request: &BTreeMap<String, String>,
@@ -629,7 +716,7 @@ fn merged_env(
 /// while preserving the original OS error. Windows error 193
 /// (ERROR_BAD_EXE_FORMAT) and 216 (ERROR_EXE_MACHINE_TYPE_MISMATCH) mean the
 /// resolved file is not a runnable executable for this environment.
-fn spawn_error(command: &str, error: &std::io::Error) -> AgentError {
+fn spawn_error(command: &str, working_dir: &Path, error: &std::io::Error) -> AgentError {
     let incompatible = matches!(error.raw_os_error(), Some(193) | Some(216));
     if incompatible {
         return AgentError::Spawn(
@@ -642,7 +729,21 @@ fn spawn_error(command: &str, error: &std::io::Error) -> AgentError {
             ),
         );
     }
-    AgentError::Spawn(command.to_string(), error.to_string())
+    let directory = working_dir.display();
+    let invalid_directory = matches!(error.raw_os_error(), Some(267));
+    let reason = match error.kind() {
+        std::io::ErrorKind::PermissionDenied => {
+            format!("permission denied while starting the process in `{directory}` ({error})")
+        }
+        std::io::ErrorKind::NotFound => {
+            format!("the executable or working directory `{directory}` was not found ({error})")
+        }
+        _ if invalid_directory => {
+            format!("the working directory `{directory}` is invalid ({error})")
+        }
+        _ => error.to_string(),
+    };
+    AgentError::Spawn(command.to_string(), reason)
 }
 
 fn terminal_required(stdout: &str, stderr: &str) -> bool {
@@ -720,6 +821,7 @@ fn output_reader<R: Read + Send + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::diagnostics::AgentDiagnosticCode;
     use tempfile::TempDir;
 
     fn shell_args(kind: &str) -> (String, Vec<String>) {
@@ -806,9 +908,102 @@ mod tests {
             "definitely-not-a-real-factory-test-binary",
         ));
         assert!(!agent.available());
+        let diagnostics = agent.diagnose();
+        assert_eq!(diagnostics.status, AgentStatus::Missing);
+        assert_eq!(
+            diagnostics.workflow.code,
+            AgentDiagnosticCode::ExecutableNotFound
+        );
+        assert_eq!(
+            diagnostics.interactive.code,
+            AgentDiagnosticCode::InteractiveInvocationMissing
+        );
         let request = AgentRequest::new("mission", TempDir::new().unwrap().path());
         let err = agent.run(&request).unwrap_err();
         assert!(matches!(err, AgentError::ExecutableNotFound { .. }));
+        assert_eq!(
+            err.diagnostic().code,
+            AgentDiagnosticCode::ExecutableNotFound
+        );
+    }
+
+    #[test]
+    fn missing_working_directory_is_reported_as_a_spawn_failure() {
+        let command = if cfg!(windows) { "cmd" } else { "sh" };
+        let agent = CommandAgent::new(AgentConfig::new("test", command));
+        let directory = TempDir::new().unwrap();
+        let missing = directory.path().join("does-not-exist");
+        let error = agent
+            .run(&AgentRequest::new("", &missing))
+            .expect_err("spawn must fail");
+        assert!(matches!(error, AgentError::Spawn(_, _)));
+        assert_eq!(
+            error.diagnostic().code,
+            AgentDiagnosticCode::ProcessSpawnFailed
+        );
+        assert!(error.to_string().contains("working directory"));
+    }
+
+    #[test]
+    fn diagnoses_disabled_workflow_and_missing_interactive_invocation() {
+        let command = if cfg!(windows) { "cmd" } else { "sh" };
+        let mut workflow_only = AgentConfig::new("workflow-only", command);
+        workflow_only.prompt_transport = PromptTransport::Disabled;
+        workflow_only.interactive_args = Some(Vec::new());
+        let disabled = CommandAgent::new(workflow_only).diagnose();
+        assert_eq!(disabled.status, AgentStatus::Available);
+        assert_eq!(
+            disabled.workflow.code,
+            AgentDiagnosticCode::WorkflowTransportDisabled
+        );
+        assert!(disabled.workflow.action.is_some());
+        assert_eq!(disabled.interactive.code, AgentDiagnosticCode::Available);
+
+        let interactive_only = CommandAgent::new(AgentConfig::new("interactive-only", command));
+        let missing = interactive_only.diagnose();
+        assert_eq!(missing.workflow.code, AgentDiagnosticCode::Available);
+        assert_eq!(
+            missing.interactive.code,
+            AgentDiagnosticCode::InteractiveInvocationMissing
+        );
+        assert!(missing.interactive.action.is_some());
+    }
+
+    #[test]
+    fn diagnoses_invalid_mission_placeholders_before_execution() {
+        let command = if cfg!(windows) { "cmd" } else { "sh" };
+        let mut config = AgentConfig::new("invalid", command);
+        config.args = vec![
+            MISSION_PLACEHOLDER.to_string(),
+            MISSION_PLACEHOLDER.to_string(),
+        ];
+        config.prompt_transport = PromptTransport::Argument;
+        config.interactive_args = Some(Vec::new());
+        let agent = CommandAgent::new(config);
+        let diagnostics = agent.diagnose();
+        assert_eq!(diagnostics.status, AgentStatus::Available);
+        assert_eq!(
+            diagnostics.workflow.code,
+            AgentDiagnosticCode::InvalidInvocation
+        );
+        assert!(diagnostics.workflow.message.contains("placeholder"));
+        assert_eq!(diagnostics.interactive.code, AgentDiagnosticCode::Available);
+    }
+
+    #[test]
+    fn invocation_summaries_withhold_configured_argument_values() {
+        let command = if cfg!(windows) { "cmd" } else { "sh" };
+        let mut config = AgentConfig::new("secret", command);
+        config.args = vec!["--api-key".into(), "super-secret-token".into()];
+        let agent = CommandAgent::new(config);
+        assert!(!agent.invocation_summary().contains("super-secret-token"));
+        let invocation = agent
+            .automated_invocation(&AgentRequest::new("", "."))
+            .unwrap();
+        assert!(!invocation
+            .invocation_summary()
+            .contains("super-secret-token"));
+        assert!(invocation.invocation_summary().contains("values withheld"));
     }
 
     #[cfg(windows)]
@@ -828,12 +1023,45 @@ mod tests {
         assert_eq!(agent.status(), AgentStatus::Broken);
         assert!(!agent.available());
         assert!(!agent.workflow_available());
+        let diagnostics = agent.diagnose();
+        assert_eq!(
+            diagnostics.workflow.code,
+            AgentDiagnosticCode::BrokenExecutable
+        );
+        assert!(diagnostics
+            .workflow
+            .action
+            .as_deref()
+            .unwrap()
+            .contains("Reinstall"));
         let error = agent
             .run(&AgentRequest::new("mission", directory.path()))
             .unwrap_err();
         assert!(matches!(error, AgentError::InvalidExecutable { .. }));
         assert!(error.to_string().contains("invalid"));
         assert!(!error.to_string().contains("216"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unsafe_batch_arguments_make_workflow_availability_false_without_spawning() {
+        let directory = TempDir::new().unwrap();
+        let shim = directory.path().join("fake-agent.cmd");
+        std::fs::write(&shim, "@echo off\r\nexit /b 0\r\n").unwrap();
+        let mut config = AgentConfig::new("fake", shim.to_string_lossy().into_owned());
+        config.args = vec!["100%super-secret-token".into()];
+        config.interactive_args = Some(Vec::new());
+        let agent = CommandAgent::new(config);
+        assert!(agent.available());
+        let diagnostics = agent.diagnose();
+        assert_eq!(diagnostics.status, AgentStatus::Available);
+        assert_eq!(
+            diagnostics.workflow.code,
+            AgentDiagnosticCode::InvalidInvocation
+        );
+        assert!(diagnostics.workflow.message.contains("unsafe"));
+        assert!(!diagnostics.workflow.message.contains("super-secret-token"));
+        assert!(!agent.workflow_available());
     }
 
     #[cfg(windows)]
@@ -856,6 +1084,10 @@ mod tests {
         ));
         assert_eq!(agent.status(), AgentStatus::Broken);
         assert!(!agent.available());
+        assert_eq!(
+            agent.diagnose().workflow.code,
+            AgentDiagnosticCode::BrokenExecutable
+        );
         let error = agent
             .run(&AgentRequest::new("mission", directory.path()))
             .unwrap_err();
@@ -904,6 +1136,9 @@ mod tests {
             .run(&AgentRequest::new("mission", dir.path()))
             .unwrap();
         assert_eq!(result.exit_code, Some(3));
+        let diagnostic = result.diagnostic();
+        assert_eq!(diagnostic.code, AgentDiagnosticCode::ExecutionFailed);
+        assert!(diagnostic.message.contains("code 3"));
     }
 
     #[test]
@@ -1206,6 +1441,10 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, AgentError::RequiresTerminal(_)));
         assert!(error.is_configuration());
+        assert_eq!(
+            error.diagnostic().code,
+            AgentDiagnosticCode::InteractiveRequired
+        );
     }
 
     #[test]
@@ -1256,6 +1495,7 @@ mod tests {
             .unwrap();
         setter.join().unwrap();
         assert!(result.cancelled);
+        assert_eq!(result.diagnostic().code, AgentDiagnosticCode::Cancelled);
         // The uncancelled agent would run for ~20s (ping -n 20 / sleep 20);
         // a generous budget keeps this stable on loaded CI runners while
         // still proving the process tree was terminated early.

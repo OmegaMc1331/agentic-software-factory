@@ -49,10 +49,10 @@ export function GraphNode({ data, selected }: NodeProps<FactoryFlowNode>) {
         ? `Run #${activity.runId}`
         : `Task #${activity.taskId}`
       : meta.available
-        ? "Available"
+        ? "Executable found"
         : meta.status === "broken"
-          ? "Broken installation"
-          : "Missing";
+          ? "Broken executable"
+          : "Not found";
     return (
       <div className={classes} aria-label={`${node.label} agent, ${status}`}>
         <Handles kind={node.kind} />

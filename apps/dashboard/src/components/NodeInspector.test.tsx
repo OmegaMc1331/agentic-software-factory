@@ -8,7 +8,7 @@ import {
   fetchRun,
   fetchRunArtifacts,
 } from "../api";
-import type { GraphEdge, GraphNode } from "../types";
+import type { AgentMeta, GraphEdge, GraphNode } from "../types";
 import { NodeInspector } from "./NodeInspector";
 
 vi.mock("../api", () => ({
@@ -296,6 +296,54 @@ describe("Node Inspector (agent permissions)", () => {
     expect(screen.getByText("Denied")).toBeTruthy();
     expect(screen.getByText(/advisory — not process-enforced/)).toBeTruthy();
     expect(screen.getByText("Policy source: agent:claude")).toBeTruthy();
+  });
+
+  it("shows actionable diagnostics and safe invocation details", () => {
+    const diagnosed: GraphNode = {
+      ...agentNode,
+      meta: {
+        ...(agentNode.meta as AgentMeta),
+        invocationSummary: "claude (2 arguments, values withheld)",
+        argumentCount: 2,
+        promptTransport: "stdin",
+        promptTransportConfigured: true,
+        workflowAvailable: false,
+        interactiveAvailable: false,
+        workflowDiagnostic: {
+          code: "workflow_transport_disabled",
+          message: "Workflow transport is disabled for `claude`.",
+          action: "Enable a prompt transport for workflow use.",
+        },
+        interactiveDiagnostic: {
+          code: "interactive_invocation_missing",
+          message: "No interactive invocation is configured for `claude`.",
+          action: "Add interactive arguments in Settings.",
+        },
+      },
+    };
+    render(
+      <NodeInspector
+        node={diagnosed}
+        edge={null as GraphEdge | null}
+        nodesById={new Map([[diagnosed.id, diagnosed]])}
+        onClose={vi.fn()}
+        onDelete={vi.fn()}
+        onConnect={vi.fn()}
+      />
+    );
+
+    expect(screen.getAllByText("claude (2 arguments, values withheld)").length).toBeGreaterThan(0);
+    expect(
+      screen.getAllByText("Workflow transport is disabled for `claude`.").length
+    ).toBeGreaterThan(0);
+    expect(screen.getByText(/Enable a prompt transport/)).toBeTruthy();
+    expect(
+      screen.getAllByText("No interactive invocation is configured for `claude`.").length
+    ).toBeGreaterThan(0);
+    expect(screen.getByText(/Add interactive arguments/)).toBeTruthy();
+    expect(screen.getByText("Availability details")).toBeTruthy();
+    expect(screen.getByText(/2 \(values withheld\)/)).toBeTruthy();
+    expect(screen.getByText(/does not verify authentication/)).toBeTruthy();
   });
 
   it("omits nothing when the agent carries no policy information", () => {

@@ -411,7 +411,7 @@ impl Runtime {
             operation: None,
             agent: agent_name.to_string(),
             mode: AgentSessionMode::Interactive,
-            command: invocation.command_line(),
+            command: invocation.invocation_summary(),
             status: "running".into(),
             started_at: chrono::Utc::now().to_rfc3339(),
             finished_at: None,

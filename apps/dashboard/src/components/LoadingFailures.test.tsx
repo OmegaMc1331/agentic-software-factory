@@ -70,11 +70,24 @@ describe("secondary view loading failures", () => {
       {
         name: "codex",
         command: "codex",
-        args: ["exec"],
+        args: ["<value withheld>"],
+        argumentCount: 1,
+        invocationSummary: "codex (1 argument, values withheld)",
         available: true,
+        status: "available",
         kind: "codex",
+        promptTransport: "stdin",
+        promptTransportConfigured: false,
         workflowAvailable: true,
         interactiveAvailable: true,
+        workflowDiagnostic: {
+          code: "available",
+          message: "Workflow can be launched with the current configuration.",
+        },
+        interactiveDiagnostic: {
+          code: "available",
+          message: "Interactive sessions can be launched with the current configuration.",
+        },
         resolvedExecutable: "C:\\tools\\codex.cmd",
         resolutionError: null,
         pathEntriesChecked: 14,
@@ -83,7 +96,8 @@ describe("secondary view loading failures", () => {
     render(<SettingsView />);
 
     expect(await screen.findByRole("heading", { name: "Settings" })).toBeTruthy();
-    expect(screen.getByText("Installed")).toBeTruthy();
+    expect(screen.getByText("Executable found")).toBeTruthy();
+    expect(screen.getAllByText("codex (1 argument, values withheld)").length).toBeGreaterThan(0);
     expect(screen.getByText("C:\\tools\\codex.cmd")).toBeTruthy();
     expect(screen.getByText("Factory process PATH (14 entries checked)")).toBeTruthy();
   });

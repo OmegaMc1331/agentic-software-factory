@@ -40,10 +40,21 @@ class FakeEventSource {
 
 const meta = {
   command: "codex exec",
+  invocationSummary: "codex (1 argument, values withheld)",
+  promptTransport: "stdin" as const,
+  promptTransportConfigured: false,
   available: true,
   kind: "codex" as const,
   workflowAvailable: true,
   interactiveAvailable: true,
+  workflowDiagnostic: {
+    code: "available" as const,
+    message: "Workflow can be launched with the current configuration.",
+  },
+  interactiveDiagnostic: {
+    code: "available" as const,
+    message: "Interactive sessions can be launched with the current configuration.",
+  },
   resolvedExecutable: "C:\\tools\\codex.cmd",
   resolutionError: null,
   pathEntriesChecked: 14,
@@ -102,9 +113,68 @@ describe("Agent Console", () => {
 
     expect(await screen.findByText("No active interactive session.")).toBeTruthy();
     expect(screen.getByText("This configured agent is currently idle.")).toBeTruthy();
-    expect(screen.getByText("Available")).toBeTruthy();
+    expect(screen.getByText("Idle")).toBeTruthy();
     expect(screen.getByRole<HTMLButtonElement>("button", { name: "Start session" }).disabled).toBe(
       false
+    );
+  });
+
+  it("shows the safe invocation summary and effective prompt transport", async () => {
+    vi.mocked(fetchAgentSessions).mockResolvedValue([]);
+    render(
+      <AgentConsole
+        agentName="codex"
+        meta={meta}
+        activity={null}
+        onClose={vi.fn()}
+        onDelete={vi.fn()}
+      />
+    );
+
+    fireEvent.click(await screen.findByRole("tab", { name: "Overview" }));
+
+    expect(screen.getByText("codex (1 argument, values withheld)")).toBeTruthy();
+    expect(screen.getByText(/stdin \(mission via standard input\)/)).toBeTruthy();
+    expect(screen.getByText(/\(default\)/)).toBeTruthy();
+    expect(screen.getByText(/does not verify authentication/)).toBeTruthy();
+  });
+
+  it("explains unavailable workflow and interactive diagnostics", async () => {
+    vi.mocked(fetchAgentSessions).mockResolvedValue([]);
+    render(
+      <AgentConsole
+        agentName="codex"
+        meta={{
+          ...meta,
+          workflowAvailable: false,
+          interactiveAvailable: false,
+          workflowDiagnostic: {
+            code: "workflow_transport_disabled",
+            message: "Workflow transport is disabled for `codex`.",
+            action: "Enable a prompt transport for workflow use.",
+          },
+          interactiveDiagnostic: {
+            code: "interactive_invocation_missing",
+            message: "No interactive invocation is configured for `codex`.",
+            action: "Add interactive arguments in Settings.",
+          },
+        }}
+        activity={null}
+        onClose={vi.fn()}
+        onDelete={vi.fn()}
+      />
+    );
+
+    fireEvent.click(await screen.findByRole("tab", { name: "Overview" }));
+
+    expect(screen.getByText(/Workflow transport is disabled/)).toBeTruthy();
+    expect(screen.getByText(/Enable a prompt transport/)).toBeTruthy();
+    expect(screen.getByText(/No interactive invocation is configured/)).toBeTruthy();
+    expect(screen.getByText(/Add interactive arguments/)).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("tab", { name: "Console" }));
+    expect(screen.getByRole<HTMLButtonElement>("button", { name: "Start session" }).disabled).toBe(
+      true
     );
   });
 

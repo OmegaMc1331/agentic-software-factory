@@ -75,7 +75,7 @@ impl Planner {
                     return Ok(PlanOutcome {
                         plan,
                         agent: self.agent.name().to_string(),
-                        command: self.agent.command_line(),
+                        command: self.agent.invocation_summary(),
                         result,
                     });
                 }

@@ -22,7 +22,14 @@ import {
   updateRecipe,
   updateRole,
 } from "../api";
-import type { ConfigData, McpServerView, McpTool, Recipe, RoleInfo } from "../types";
+import type {
+  AgentStatusInfo,
+  ConfigData,
+  McpServerView,
+  McpTool,
+  Recipe,
+  RoleInfo,
+} from "../types";
 import { SettingsView } from "./Settings";
 
 vi.mock("../api", () => ({
@@ -58,6 +65,37 @@ const config: ConfigData = {
   roles: {},
   role_assignments: [],
 };
+
+function agentStatus(overrides: Partial<AgentStatusInfo> = {}): AgentStatusInfo {
+  return {
+    name: "codex",
+    command: "codex",
+    args: [],
+    argumentCount: 0,
+    invocationSummary: "codex",
+    available: true,
+    status: "available",
+    promptTransport: "stdin",
+    promptTransportConfigured: false,
+    workflowAvailable: true,
+    interactiveAvailable: true,
+    workflowDiagnostic: {
+      code: "available",
+      message: "Workflow can be launched with the current configuration.",
+    },
+    interactiveDiagnostic: {
+      code: "available",
+      message: "Interactive sessions can be launched with the current configuration.",
+    },
+    resolvedExecutable: "C:\\tools\\codex.cmd",
+    resolutionError: null,
+    resolutionShim: null,
+    resolutionTarget: "C:\\tools\\codex.cmd",
+    resolutionKind: "native",
+    pathEntriesChecked: 12,
+    ...overrides,
+  };
+}
 
 function role(id: string, name: string, assignments: RoleInfo["assignments"]): RoleInfo {
   return {
@@ -471,6 +509,203 @@ describe("Settings agents", () => {
         })
       )
     );
+  });
+});
+
+describe("Settings agent diagnostics", () => {
+  it("shows the safe invocation summary and never renders raw argument values", async () => {
+    vi.mocked(fetchConfig).mockResolvedValue({
+      ...config,
+      agents: {
+        codex: {
+          command: "codex",
+          args: ["--api-key", "super-secret-token"],
+          env: {},
+        },
+      },
+    });
+    vi.mocked(fetchAgents).mockResolvedValue([
+      agentStatus({
+        args: ["<value withheld>", "<value withheld>"],
+        argumentCount: 2,
+        invocationSummary: "codex (2 arguments, values withheld)",
+      }),
+    ]);
+    render(<SettingsView />);
+
+    expect(await screen.findByText("Executable found")).toBeTruthy();
+    expect(screen.getAllByText("codex (2 arguments, values withheld)").length).toBeGreaterThan(0);
+    expect(screen.getByText(/Prompt transport: stdin/)).toBeTruthy();
+    expect(screen.queryByText(/super-secret-token/)).toBeNull();
+    expect(screen.queryByText(/--api-key/)).toBeNull();
+  });
+
+  it("explains a missing executable and offers an installation action", async () => {
+    vi.mocked(fetchAgents).mockResolvedValue([
+      agentStatus({
+        available: false,
+        status: "missing",
+        workflowAvailable: false,
+        interactiveAvailable: false,
+        resolvedExecutable: null,
+        resolutionTarget: null,
+        resolutionKind: null,
+        resolutionError: "executable `codex` was not found in the PATH visible to Factory",
+        workflowDiagnostic: {
+          code: "executable_not_found",
+          message: "`codex` was not found in the PATH visible to Factory (12 entries checked).",
+          action: "Install `codex` or add its directory to PATH, then refresh agent availability.",
+        },
+        interactiveDiagnostic: {
+          code: "executable_not_found",
+          message: "`codex` was not found in the PATH visible to Factory (12 entries checked).",
+          action: "Install `codex` or add its directory to PATH, then refresh agent availability.",
+        },
+      }),
+    ]);
+    render(<SettingsView />);
+
+    expect(await screen.findByText("Not found")).toBeTruthy();
+    expect(screen.getAllByText(/PATH visible to Factory/).length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/Install `codex`/).length).toBeGreaterThan(0);
+  });
+
+  it("explains a broken executable without calling it missing", async () => {
+    vi.mocked(fetchAgents).mockResolvedValue([
+      agentStatus({
+        available: false,
+        status: "broken",
+        workflowAvailable: false,
+        resolvedExecutable: null,
+        resolutionTarget: "C:\\tools\\codex.exe",
+        resolutionKind: null,
+        resolutionError: "resolved Windows executable is invalid",
+        workflowDiagnostic: {
+          code: "broken_executable",
+          message: "`codex` resolves to `C:\\tools\\codex.exe`, which cannot be launched.",
+          action: "Reinstall the CLI that provides `codex` and verify it runs outside Factory.",
+        },
+      }),
+    ]);
+    render(<SettingsView />);
+
+    expect(await screen.findByText("Broken executable")).toBeTruthy();
+    expect(screen.getAllByText(/cannot be launched/).length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/Reinstall the CLI/).length).toBeGreaterThan(0);
+    expect(screen.queryByText("Not found")).toBeNull();
+  });
+
+  it("explains disabled workflow transport while keeping interactive mode available", async () => {
+    vi.mocked(fetchAgents).mockResolvedValue([
+      agentStatus({
+        workflowAvailable: false,
+        workflowDiagnostic: {
+          code: "workflow_transport_disabled",
+          message: "Workflow transport is disabled for `codex`.",
+          action: "Enable a prompt transport for workflow use or select another agent.",
+        },
+      }),
+    ]);
+    render(<SettingsView />);
+
+    expect((await screen.findAllByText(/Workflow transport is disabled/)).length).toBeGreaterThan(
+      0
+    );
+    expect(screen.getAllByText(/Enable a prompt transport/).length).toBeGreaterThan(0);
+    expect(screen.getByText(/Interactive available/)).toBeTruthy();
+  });
+
+  it("explains a missing interactive invocation while keeping workflow mode available", async () => {
+    vi.mocked(fetchAgents).mockResolvedValue([
+      agentStatus({
+        interactiveAvailable: false,
+        interactiveDiagnostic: {
+          code: "interactive_invocation_missing",
+          message: "No interactive invocation is configured for `codex`.",
+          action: "Add interactive arguments in Settings if this agent supports sessions.",
+        },
+      }),
+    ]);
+    render(<SettingsView />);
+
+    expect(
+      (await screen.findAllByText(/No interactive invocation is configured/)).length
+    ).toBeGreaterThan(0);
+    expect(screen.getAllByText(/Add interactive arguments/).length).toBeGreaterThan(0);
+    expect(screen.getByText(/Workflow available/)).toBeTruthy();
+  });
+
+  it("shows whether prompt transport is configured or inherited", async () => {
+    vi.mocked(fetchAgents).mockResolvedValue([
+      agentStatus({
+        promptTransport: "argument",
+        promptTransportConfigured: true,
+      }),
+    ]);
+    render(<SettingsView />);
+
+    expect(await screen.findByText(/Prompt transport: argument/)).toBeTruthy();
+    expect(screen.getByText(/\(configured\)/)).toBeTruthy();
+  });
+
+  it("shows resolved executable, shim, target, resolver, and PATH evidence", async () => {
+    vi.mocked(fetchAgents).mockResolvedValue([
+      agentStatus({
+        resolvedExecutable: "C:\\tools\\codex.cmd",
+        resolutionShim: "C:\\tools\\codex.cmd",
+        resolutionTarget: "C:\\tools\\node.exe",
+        resolutionKind: "npm_shim",
+        pathEntriesChecked: 14,
+      }),
+    ]);
+    render(<SettingsView />);
+
+    fireEvent.click(await screen.findByText("Availability details"));
+    expect(screen.getAllByText("C:\\tools\\codex.cmd").length).toBeGreaterThan(0);
+    expect(screen.getByText("C:\\tools\\node.exe")).toBeTruthy();
+    expect(screen.getByText("npm_shim")).toBeTruthy();
+    expect(screen.getByText(/14 entries/)).toBeTruthy();
+    expect(screen.getByText(/does not verify provider authentication/)).toBeTruthy();
+  });
+
+  it("renders safely when older API responses omit diagnostic fields", async () => {
+    vi.mocked(fetchAgents).mockResolvedValue([
+      { name: "codex", command: "codex", args: [], available: true },
+    ]);
+    render(<SettingsView />);
+
+    expect(await screen.findByText("Executable found")).toBeTruthy();
+    expect(screen.getByText(/Prompt transport: unknown/)).toBeTruthy();
+    expect(screen.getByText(/Status: Unknown/)).toBeTruthy();
+  });
+
+  it("refreshes availability without claiming to execute the agent", async () => {
+    vi.mocked(fetchAgents).mockResolvedValue([agentStatus()]);
+    render(<SettingsView />);
+
+    await screen.findByText("Executable found");
+    fireEvent.click(screen.getByRole("button", { name: "Refresh agent availability" }));
+    await waitFor(() => expect(fetchAgents).toHaveBeenCalledTimes(2));
+    expect(screen.queryByRole("button", { name: "Test agent configuration" })).toBeNull();
+  });
+
+  it("surfaces an agents API failure", async () => {
+    vi.mocked(fetchAgents).mockRejectedValue(new Error("agents unavailable"));
+    render(<SettingsView />);
+
+    expect((await screen.findByRole("alert")).textContent).toContain("agents unavailable");
+  });
+
+  it("keeps availability details accessible through a native disclosure", async () => {
+    vi.mocked(fetchAgents).mockResolvedValue([agentStatus()]);
+    render(<SettingsView />);
+
+    const summary = await screen.findByText("Availability details");
+    const details = summary.closest("details");
+    expect(details).toBeTruthy();
+    expect(details?.open).toBe(false);
+    fireEvent.click(summary);
+    expect(details?.open).toBe(true);
   });
 });
 

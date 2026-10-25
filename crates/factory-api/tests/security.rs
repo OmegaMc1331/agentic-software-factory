@@ -396,6 +396,13 @@ async fn authorized_loopback_requests_succeed_but_unauthenticated_requests_do_no
         Some("nosniff")
     );
 
+    let unauthorized_agents = raw_request(
+        server.address,
+        get_request(server.address, "/api/agents", ""),
+    )
+    .await;
+    assert_eq!(unauthorized_agents.status, 401);
+
     let invalid = raw_request(
         server.address,
         get_request(
