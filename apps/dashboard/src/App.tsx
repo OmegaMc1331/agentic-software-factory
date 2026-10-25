@@ -6,6 +6,7 @@ import { RunDetailView } from "./components/RunDetailView";
 import { RunList } from "./components/RunList";
 import { SettingsView } from "./components/Settings";
 import type { RunDetail, RunPage } from "./types";
+import { useUnsavedChangesGuard } from "./unsavedChanges";
 
 type View =
   | { name: "runs" }
@@ -79,6 +80,10 @@ export default function App() {
   const [detailError, setDetailError] = useState<string | null>(null);
   const runsRequestRef = useRef(0);
   const runsAbortRef = useRef<AbortController | null>(null);
+  const viewRef = useRef(view);
+  viewRef.current = view;
+  const bypassNavigationGuardRef = useRef(false);
+  const { confirmDiscard } = useUnsavedChangesGuard();
 
   const loadRun = useCallback((id: number) => {
     setDetail(null);
@@ -133,11 +138,23 @@ export default function App() {
   };
 
   useEffect(() => {
-    const applyHash = () => setView(viewFromHash());
+    const applyHash = () => {
+      const next = viewFromHash();
+      if (bypassNavigationGuardRef.current) {
+        bypassNavigationGuardRef.current = false;
+        setView(next);
+        return;
+      }
+      if (hashFor(next) !== hashFor(viewRef.current) && !confirmDiscard()) {
+        window.history.replaceState(null, "", hashFor(viewRef.current));
+        return;
+      }
+      setView(next);
+    };
     applyHash();
     window.addEventListener("hashchange", applyHash);
     return () => window.removeEventListener("hashchange", applyHash);
-  }, []);
+  }, [confirmDiscard]);
 
   useEffect(() => {
     if (view.name === "run") {
@@ -148,8 +165,12 @@ export default function App() {
   }, [view, loadRun]);
 
   const navigate = (next: View) => {
+    const target = hashFor(next);
+    if (target === hashFor(viewRef.current)) return;
+    if (!confirmDiscard()) return;
     setDetailError(null);
-    window.location.hash = hashFor(next);
+    bypassNavigationGuardRef.current = true;
+    window.location.hash = target;
   };
 
   return (

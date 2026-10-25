@@ -1,7 +1,9 @@
 import { useEffect, useId, useRef, useState } from "react";
 import type { AgentEntry, AgentKind, PromptTransport } from "../types";
+import { UNSAVED_AGENT_MESSAGE, useUnsavedChanges } from "../unsavedChanges";
 import { parseAgentEnv, type EnvValidationError } from "./agentEnv";
 import { type AgentDraft } from "./agentFormState";
+import { isAgentDraftDirty } from "./formDirty";
 
 const PRESETS: Record<
   Exclude<AgentKind, "custom">,
@@ -30,18 +32,35 @@ interface AgentFormProps {
     originalName: string | null
   ) => Promise<boolean> | boolean;
   onCancel: () => void;
+  onDirtyChange?: (dirty: boolean) => void;
 }
 
-export function AgentForm({ initial, error, onSave, onCancel }: AgentFormProps) {
+export function AgentForm({ initial, error, onSave, onCancel, onDirtyChange }: AgentFormProps) {
   const [draft, setDraft] = useState<AgentDraft>(initial);
+  const [baseline, setBaseline] = useState<AgentDraft>(initial);
   const [localError, setLocalError] = useState<string | null>(null);
   const [envErrors, setEnvErrors] = useState<EnvValidationError[] | null>(null);
   const [saving, setSaving] = useState(false);
+  const savingRef = useRef(false);
   const envErrorId = useId();
   const envFieldRef = useRef<HTMLTextAreaElement>(null);
+  const lastInitialRef = useRef(initial);
+  const draftRef = useRef(draft);
+  const baselineRef = useRef(baseline);
+  draftRef.current = draft;
+  baselineRef.current = baseline;
+  const dirty = isAgentDraftDirty(draft, baseline);
+  const { requestClose } = useUnsavedChanges(dirty, {
+    message: UNSAVED_AGENT_MESSAGE,
+    onDirtyChange,
+  });
 
   useEffect(() => {
+    if (lastInitialRef.current === initial) return;
+    lastInitialRef.current = initial;
+    if (isAgentDraftDirty(draftRef.current, baselineRef.current)) return;
     setDraft(initial);
+    setBaseline(initial);
     setLocalError(null);
     setEnvErrors(null);
   }, [initial]);
@@ -72,6 +91,8 @@ export function AgentForm({ initial, error, onSave, onCancel }: AgentFormProps) 
 
   const submit = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
+    if (savingRef.current) return;
+    const submittedDraft = draft;
     const name = draft.name.trim();
     if (!name) {
       setLocalError("Agent name is required.");
@@ -100,6 +121,7 @@ export function AgentForm({ initial, error, onSave, onCancel }: AgentFormProps) 
     }
     setLocalError(null);
     setEnvErrors(null);
+    savingRef.current = true;
     setSaving(true);
     const entry: AgentEntry = {
       kind: draft.kind,
@@ -118,10 +140,12 @@ export function AgentForm({ initial, error, onSave, onCancel }: AgentFormProps) 
       ...(maxConcurrency === undefined ? {} : { max_concurrency: maxConcurrency }),
     };
     try {
-      await onSave(name, entry, draft.originalName);
+      const saved = await onSave(name, entry, draft.originalName);
+      if (saved !== false) setBaseline(submittedDraft);
     } catch (reason) {
       setLocalError((reason as Error).message);
     } finally {
+      savingRef.current = false;
       setSaving(false);
     }
   };
@@ -136,7 +160,15 @@ export function AgentForm({ initial, error, onSave, onCancel }: AgentFormProps) 
           {localError ?? error}
         </p>
       )}
-      <form onSubmit={submit}>
+      <form
+        onSubmit={submit}
+        onKeyDown={(event) => {
+          if (event.key !== "Escape" || savingRef.current) return;
+          event.preventDefault();
+          event.stopPropagation();
+          requestClose(onCancel);
+        }}
+      >
         <div className="settings-grid">
           <label className="settings-field">
             <span className="meta-label">Name</span>
@@ -359,7 +391,12 @@ export function AgentForm({ initial, error, onSave, onCancel }: AgentFormProps) 
           <button className="button" type="submit" disabled={saving}>
             {saving ? "Saving…" : draft.originalName ? "Save changes" : "Add agent"}
           </button>
-          <button className="button" type="button" onClick={onCancel} disabled={saving}>
+          <button
+            className="button"
+            type="button"
+            onClick={() => requestClose(onCancel)}
+            disabled={saving}
+          >
             Cancel
           </button>
         </div>

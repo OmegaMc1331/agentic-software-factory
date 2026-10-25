@@ -1,6 +1,17 @@
-import { useState } from "react";
-import type { RecipeRoutingValue, RoleInfo, RolePolicyPreset } from "../types";
+import { useRef, useState } from "react";
+import type { RoleInfo, RolePolicyPreset } from "../types";
 import { RECIPE_ROUTING_LABELS } from "../types";
+import { UNSAVED_RECIPE_MESSAGE, useUnsavedChanges } from "../unsavedChanges";
+import {
+  isRecipeDraftDirty,
+  recipeDraftFromInitial,
+  recipeValueFromDraft,
+  type RecipeFormDraft,
+  type RecipeFormInitial,
+  type RecipeFormValue,
+} from "./formDirty";
+
+export type { RecipeFormInitial, RecipeFormValue } from "./formDirty";
 
 const POLICY_PRESETS: { value: RolePolicyPreset; label: string }[] = [
   { value: "read_only", label: "Read-only" },
@@ -9,17 +20,6 @@ const POLICY_PRESETS: { value: RolePolicyPreset; label: string }[] = [
   { value: "review", label: "Review" },
   { value: "custom", label: "Custom" },
 ];
-
-export interface RecipeFormValue {
-  name: string;
-  description: string;
-  roles: string[];
-  routing: RecipeRoutingValue;
-  maxParallelTasks: number | null;
-  policyPresets: Record<string, string>;
-  plannerGuidance: string;
-  tools: string[];
-}
 
 /**
  * The compact recipe editor: configuration fields only. There is deliberately
@@ -33,53 +33,56 @@ export function RecipeForm({
   submitLabel,
   onSubmit,
   onCancel,
+  onDirtyChange,
 }: {
   mode: "create" | "edit";
   roles: RoleInfo[];
-  initial?: Partial<RecipeFormValue>;
+  initial?: RecipeFormInitial;
   error: string | null;
   submitLabel: string;
-  onSubmit: (value: RecipeFormValue) => void;
+  onSubmit: (value: RecipeFormValue) => Promise<boolean> | boolean;
   onCancel: () => void;
+  onDirtyChange?: (dirty: boolean) => void;
 }) {
-  const [name, setName] = useState(initial?.name ?? "");
-  const [description, setDescription] = useState(initial?.description ?? "");
-  const [selectedRoles, setSelectedRoles] = useState<string[]>(initial?.roles ?? ["planner"]);
-  const [routing, setRouting] = useState<RecipeRoutingValue>(initial?.routing ?? "project_default");
-  const [parallelismText, setParallelismText] = useState(
-    initial?.maxParallelTasks != null ? String(initial.maxParallelTasks) : ""
-  );
-  const [policyPresets, setPolicyPresets] = useState<Record<string, string>>(
-    initial?.policyPresets ?? {}
-  );
-  const [guidance, setGuidance] = useState(initial?.plannerGuidance ?? "");
-  const [toolsText, setToolsText] = useState((initial?.tools ?? []).join("\n"));
+  const [draft, setDraft] = useState<RecipeFormDraft>(() => recipeDraftFromInitial(initial));
+  const [baseline, setBaseline] = useState<RecipeFormDraft>(() => recipeDraftFromInitial(initial));
   const [validationError, setValidationError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const savingRef = useRef(false);
+  const dirty = isRecipeDraftDirty(draft, baseline);
+  const { requestClose } = useUnsavedChanges(dirty, {
+    message: UNSAVED_RECIPE_MESSAGE,
+    onDirtyChange,
+  });
 
-  const plannerRequired = mode === "create" || selectedRoles.length > 0;
+  const plannerRequired = mode === "create" || draft.roles.length > 0;
 
   const toggleRole = (roleId: string, checked: boolean) => {
-    setSelectedRoles((current) =>
-      checked ? [...current, roleId] : current.filter((candidate) => candidate !== roleId)
-    );
+    setDraft((current) => ({
+      ...current,
+      roles: checked
+        ? [...current.roles, roleId]
+        : current.roles.filter((candidate) => candidate !== roleId),
+    }));
   };
 
-  const submit = (event: React.FormEvent) => {
+  const submit = async (event: React.FormEvent) => {
     event.preventDefault();
-    const trimmedName = name.trim();
+    if (savingRef.current) return;
+    const trimmedName = draft.name.trim();
     if (!trimmedName) {
       setValidationError("The recipe needs a name.");
       return;
     }
-    if (selectedRoles.length === 0) {
+    if (draft.roles.length === 0) {
       setValidationError("Select at least the planner role.");
       return;
     }
-    if (!selectedRoles.includes("planner")) {
+    if (!draft.roles.includes("planner")) {
       setValidationError("The recipe must include the planner role.");
       return;
     }
-    const parallelism = parallelismText.trim();
+    const parallelism = draft.parallelismText.trim();
     let maxParallelTasks: number | null = null;
     if (parallelism !== "") {
       const parsed = Number.parseInt(parallelism, 10);
@@ -91,31 +94,39 @@ export function RecipeForm({
       }
       maxParallelTasks = parsed;
     }
+    const submittedDraft = draft;
     setValidationError(null);
-    onSubmit({
-      name: trimmedName,
-      description: description.trim(),
-      roles: selectedRoles,
-      routing,
-      maxParallelTasks,
-      policyPresets,
-      plannerGuidance: guidance,
-      tools: toolsText
-        .split("\n")
-        .map((value) => value.trim())
-        .filter(Boolean),
-    });
+    savingRef.current = true;
+    setSaving(true);
+    try {
+      const saved = await onSubmit(recipeValueFromDraft(draft, maxParallelTasks));
+      if (saved !== false) setBaseline(submittedDraft);
+    } catch (reason) {
+      setValidationError((reason as Error).message);
+    } finally {
+      savingRef.current = false;
+      setSaving(false);
+    }
   };
 
-  const presetFor = (roleId: string) => policyPresets[roleId] ?? "";
+  const presetFor = (roleId: string) => draft.policyPresets[roleId] ?? "";
 
   return (
-    <form className="recipe-form" onSubmit={submit}>
+    <form
+      className="recipe-form"
+      onSubmit={submit}
+      onKeyDown={(event) => {
+        if (event.key !== "Escape" || savingRef.current) return;
+        event.preventDefault();
+        event.stopPropagation();
+        requestClose(onCancel);
+      }}
+    >
       <label>
         <span>Name</span>
         <input
-          value={name}
-          onChange={(event) => setName(event.target.value)}
+          value={draft.name}
+          onChange={(event) => setDraft((current) => ({ ...current, name: event.target.value }))}
           autoFocus={mode === "create"}
           required
         />
@@ -123,8 +134,10 @@ export function RecipeForm({
       <label>
         <span>Description</span>
         <input
-          value={description}
-          onChange={(event) => setDescription(event.target.value)}
+          value={draft.description}
+          onChange={(event) =>
+            setDraft((current) => ({ ...current, description: event.target.value }))
+          }
           placeholder="What kind of work is this recipe for?"
         />
       </label>
@@ -134,7 +147,7 @@ export function RecipeForm({
           <label key={role.id} className="workflow-team-check">
             <input
               type="checkbox"
-              checked={selectedRoles.includes(role.id)}
+              checked={draft.roles.includes(role.id)}
               disabled={role.id === "planner" && plannerRequired}
               onChange={(event) => toggleRole(role.id, event.target.checked)}
             />
@@ -149,10 +162,15 @@ export function RecipeForm({
         <label>
           <span>Routing</span>
           <select
-            value={routing}
-            onChange={(event) => setRouting(event.target.value as RecipeRoutingValue)}
+            value={draft.routing}
+            onChange={(event) =>
+              setDraft((current) => ({
+                ...current,
+                routing: event.target.value as RecipeFormDraft["routing"],
+              }))
+            }
           >
-            {(Object.keys(RECIPE_ROUTING_LABELS) as RecipeRoutingValue[]).map((value) => (
+            {(Object.keys(RECIPE_ROUTING_LABELS) as RecipeFormDraft["routing"][]).map((value) => (
               <option key={value} value={value}>
                 {RECIPE_ROUTING_LABELS[value]}
               </option>
@@ -165,8 +183,10 @@ export function RecipeForm({
             type="number"
             min={1}
             max={32}
-            value={parallelismText}
-            onChange={(event) => setParallelismText(event.target.value)}
+            value={draft.parallelismText}
+            onChange={(event) =>
+              setDraft((current) => ({ ...current, parallelismText: event.target.value }))
+            }
             placeholder="Project default"
           />
         </label>
@@ -177,7 +197,7 @@ export function RecipeForm({
           Optional per-role presets. They can only narrow what the Policy Engine already permits —
           never widen it.
         </p>
-        {selectedRoles
+        {draft.roles
           .filter((roleId) => roleId !== "planner")
           .map((roleId) => {
             const role = roles.find((candidate) => candidate.id === roleId);
@@ -187,11 +207,11 @@ export function RecipeForm({
                 <select
                   value={presetFor(roleId)}
                   onChange={(event) =>
-                    setPolicyPresets((current) => {
-                      const next = { ...current };
-                      if (event.target.value === "") delete next[roleId];
-                      else next[roleId] = event.target.value;
-                      return next;
+                    setDraft((current) => {
+                      const policyPresets = { ...current.policyPresets };
+                      if (event.target.value === "") delete policyPresets[roleId];
+                      else policyPresets[roleId] = event.target.value;
+                      return { ...current, policyPresets };
                     })
                   }
                 >
@@ -210,8 +230,10 @@ export function RecipeForm({
         <span>Planner guidance</span>
         <textarea
           rows={4}
-          value={guidance}
-          onChange={(event) => setGuidance(event.target.value)}
+          value={draft.plannerGuidance}
+          onChange={(event) =>
+            setDraft((current) => ({ ...current, plannerGuidance: event.target.value }))
+          }
           placeholder="Bounded planning context, e.g. prefer a compact diagnosis/fix/regression-test workflow."
         />
       </label>
@@ -219,8 +241,10 @@ export function RecipeForm({
         <span>External tool selection</span>
         <textarea
           rows={3}
-          value={toolsText}
-          onChange={(event) => setToolsText(event.target.value)}
+          value={draft.toolsText}
+          onChange={(event) =>
+            setDraft((current) => ({ ...current, toolsText: event.target.value }))
+          }
           placeholder={"docs.*\ngithub.read_*"}
         />
         <small className="inline-note">
@@ -230,10 +254,15 @@ export function RecipeForm({
       </label>
       {(validationError ?? error) && <p className="inline-error">{validationError ?? error}</p>}
       <div className="settings-actions">
-        <button className="button" type="submit">
-          {submitLabel}
+        <button className="button" type="submit" disabled={saving}>
+          {saving ? "Saving…" : submitLabel}
         </button>
-        <button className="button" type="button" onClick={onCancel}>
+        <button
+          className="button"
+          type="button"
+          onClick={() => requestClose(onCancel)}
+          disabled={saving}
+        >
           Cancel
         </button>
       </div>

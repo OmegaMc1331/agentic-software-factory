@@ -324,6 +324,53 @@ describe("Agent Graph interactions", () => {
     expect(await screen.findByLabelText("codex Agent Console")).toBeTruthy();
   });
 
+  it("keeps the agent editor open when discard is declined", async () => {
+    vi.mocked(window.confirm).mockReturnValue(false);
+    render(<NetworkView />);
+    fireEvent.click(await screen.findByRole("button", { name: "select agent:codex" }));
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "discarded-name" } });
+
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+    expect(window.confirm).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("region", { name: "Agent configuration form" })).toBeTruthy();
+    expect((screen.getByLabelText("Name") as HTMLInputElement).value).toBe("discarded-name");
+  });
+
+  it("guards Escape from inside the agent editor", async () => {
+    vi.mocked(window.confirm).mockReturnValue(false);
+    render(<NetworkView />);
+    fireEvent.click(await screen.findByRole("button", { name: "select agent:codex" }));
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    const name = screen.getByLabelText("Name");
+    fireEvent.change(name, { target: { value: "discarded-name" } });
+
+    fireEvent.keyDown(name, { key: "Escape" });
+    expect(window.confirm).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("region", { name: "Agent configuration form" })).toBeTruthy();
+
+    vi.mocked(window.confirm).mockReturnValue(true);
+    fireEvent.keyDown(name, { key: "Escape" });
+    expect(screen.queryByRole("region", { name: "Agent configuration form" })).toBeNull();
+    expect(await screen.findByLabelText("codex Agent Console")).toBeTruthy();
+  });
+
+  it("guards closing the role inspector while editing", async () => {
+    vi.mocked(window.confirm).mockReturnValue(false);
+    vi.mocked(fetchGraph).mockResolvedValue(graphWithCustomRole);
+    vi.mocked(fetchRoles).mockResolvedValue([...roles, customRole]);
+    render(<NetworkView />);
+    fireEvent.click(await screen.findByRole("button", { name: "select role:database_engineer" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Edit" }));
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Changed worker" } });
+
+    fireEvent.click(screen.getByRole("button", { name: "Close role inspector" }));
+
+    expect(window.confirm).toHaveBeenCalledTimes(1);
+    expect((screen.getByLabelText("Name") as HTMLInputElement).value).toBe("Changed worker");
+  });
+
   it("rejects a duplicate rename and leaves the editor open", async () => {
     render(<NetworkView />);
     fireEvent.click(await screen.findByRole("button", { name: "select agent:codex" }));

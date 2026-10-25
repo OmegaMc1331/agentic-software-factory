@@ -41,6 +41,11 @@ import type {
 import { agentActivity, agentMeta, taskMeta, type AgentActivity } from "../types";
 import { computeNetworkLayout, neighborsOf, type NetworkLayout } from "../networkLayout";
 import { STATE_META } from "../state";
+import {
+  UNSAVED_AGENT_MESSAGE,
+  UNSAVED_ROLE_MESSAGE,
+  confirmDiscardChanges,
+} from "../unsavedChanges";
 import { AddNodeMenu } from "./AddNodeMenu";
 import { AgentForm } from "./AgentForm";
 import { agentDraftFrom, type AgentDraft } from "./agentFormState";
@@ -99,6 +104,9 @@ export function NetworkView() {
   const [addOpen, setAddOpen] = useState(false);
   const [initialAddKind, setInitialAddKind] = useState<"workflow" | null>(null);
   const [editingAgent, setEditingAgent] = useState<AgentDraft | null>(null);
+  const [editingAgentDirty, setEditingAgentDirty] = useState(false);
+  const [roleEditorDirty, setRoleEditorDirty] = useState(false);
+  const [addDirty, setAddDirty] = useState(false);
   const [zoom, setZoom] = useState(1);
   const [positionRevision, setPositionRevision] = useState(0);
   const graphRef = useRef<AgentGraphHandle>(null);
@@ -219,6 +227,10 @@ export function NetworkView() {
   const selectedEdge = selectedEdgeId
     ? (merged?.edges.find((edge) => edge.id === selectedEdgeId) ?? null)
     : null;
+  const selectedRole = useMemo(() => {
+    if (selectedNode?.kind !== "role" || !roles) return null;
+    return roles.find((role) => role.id === selectedNode.id.slice("role:".length)) ?? null;
+  }, [roles, selectedNode]);
 
   const persistWorkspace = useCallback(async (next: GraphWorkspace): Promise<boolean> => {
     setWorkspace(next);
@@ -271,6 +283,7 @@ export function NetworkView() {
       return;
     }
     setOperationError(null);
+    setEditingAgentDirty(false);
     setEditingAgent(agentDraftFrom(name, entry));
   }, [config, selectedNode]);
 
@@ -295,6 +308,7 @@ export function NetworkView() {
       const saved = await saveConfiguration({ ...config, agents, role_assignments }, nextWorkspace);
       if (!saved) return false;
       setEditingAgent(null);
+      setEditingAgentDirty(false);
       setSelectedNodeId(`agent:${name}`);
       setSelectedEdgeId(null);
       setPositionRevision((value) => value + 1);
@@ -322,6 +336,7 @@ export function NetworkView() {
       void saveConfiguration(nextConfig, nextWorkspace).then((saved) => {
         if (!saved) return;
         setAddOpen(false);
+        setAddDirty(false);
         setSelectedNodeId(`agent:${name}`);
         setPositionRevision((value) => value + 1);
       });
@@ -344,6 +359,7 @@ export function NetworkView() {
         };
         await persistWorkspace(nextWorkspace);
         setAddOpen(false);
+        setAddDirty(false);
         setInitialAddKind(null);
         setSelectedNodeId(nodeId);
         setPositionRevision((value) => value + 1);
@@ -370,6 +386,7 @@ export function NetworkView() {
         };
         await persistWorkspace(nextWorkspace);
         setAddOpen(false);
+        setAddDirty(false);
         setInitialAddKind(null);
         setSelectedNodeId(nodeId);
         setPositionRevision((value) => value + 1);
@@ -406,8 +423,8 @@ export function NetworkView() {
   );
 
   const createRoleNode = useCallback(
-    async (value: RoleFormValue) => {
-      if (!workspace) return;
+    async (value: RoleFormValue): Promise<boolean> => {
+      if (!workspace) return false;
       setOperationError(null);
       try {
         const role = await createRole({
@@ -426,13 +443,16 @@ export function NetworkView() {
         };
         await persistWorkspace(nextWorkspace);
         setAddOpen(false);
+        setAddDirty(false);
         setInitialAddKind(null);
         setSelectedNodeId(nodeId);
         setPositionRevision((revision) => revision + 1);
         reloadGraph();
         reloadRoles();
+        return true;
       } catch (reason) {
         setOperationError((reason as Error).message);
+        return false;
       }
     },
     [freePosition, persistWorkspace, reloadGraph, reloadRoles, workspace]
@@ -448,6 +468,7 @@ export function NetworkView() {
       try {
         await addRoleAssignment(roleId, agent);
         setAddOpen(false);
+        setAddDirty(false);
         setInitialAddKind(null);
         reloadGraph();
         reloadRoles();
@@ -473,6 +494,7 @@ export function NetworkView() {
       void persistWorkspace(next).then((saved) => {
         if (!saved) return;
         setAddOpen(false);
+        setAddDirty(false);
         setSelectedNodeId(id);
         setPositionRevision((value) => value + 1);
       });
@@ -619,6 +641,40 @@ export function NetworkView() {
     workspace,
   ]);
 
+  const closeAddMenu = useCallback(() => {
+    setAddOpen(false);
+    setAddDirty(false);
+    setInitialAddKind(null);
+  }, []);
+
+  const requestAddClose = useCallback(() => {
+    if (!confirmDiscardChanges(addDirty, UNSAVED_ROLE_MESSAGE)) return;
+    closeAddMenu();
+  }, [addDirty, closeAddMenu]);
+
+  const closeAgentEditor = useCallback(() => {
+    setEditingAgent(null);
+    setEditingAgentDirty(false);
+    setOperationError(null);
+  }, []);
+
+  const requestAgentClose = useCallback(() => {
+    if (!confirmDiscardChanges(editingAgentDirty, UNSAVED_AGENT_MESSAGE)) return;
+    closeAgentEditor();
+  }, [closeAgentEditor, editingAgentDirty]);
+
+  const closeRoleInspector = useCallback(() => {
+    setSelectedNodeId(null);
+    setRoleEditorDirty(false);
+  }, []);
+
+  const canChangeSelection = useCallback(() => {
+    if (selectedRole && !confirmDiscardChanges(roleEditorDirty, UNSAVED_ROLE_MESSAGE)) {
+      return false;
+    }
+    return true;
+  }, [roleEditorDirty, selectedRole]);
+
   const resetLayout = useCallback(() => {
     if (!workspace) return;
     if (
@@ -643,11 +699,20 @@ export function NetworkView() {
         return;
       }
       if (event.key === "Escape") {
-        setAddOpen(false);
-        setEditingAgent(null);
+        if (addOpen) return;
+        if (editingAgent) {
+          requestAgentClose();
+          return;
+        }
+        if (selectedRole) {
+          if (!confirmDiscardChanges(roleEditorDirty, UNSAVED_ROLE_MESSAGE)) return;
+          closeRoleInspector();
+          return;
+        }
         setSelectedNodeId(null);
         setSelectedEdgeId(null);
       } else if (event.key === "Delete" || event.key === "Backspace") {
+        if (addOpen || editingAgent || (selectedRole && roleEditorDirty)) return;
         deleteSelection();
       } else if (event.key.toLowerCase() === "f" || event.key === "0") {
         event.preventDefault();
@@ -656,17 +721,21 @@ export function NetworkView() {
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [deleteSelection]);
+  }, [
+    addOpen,
+    closeRoleInspector,
+    deleteSelection,
+    editingAgent,
+    requestAgentClose,
+    roleEditorDirty,
+    selectedRole,
+  ]);
 
   if (error) return <LoadError message={error} onRetry={reload} />;
   if (!data || !workspace || !config || !roles || !merged) return <Loading />;
 
   const empty = data.metadata.agents === 0;
   const visibleError = operationError ?? pollError;
-  const selectedRole =
-    selectedNode?.kind === "role"
-      ? (roles.find((role) => role.id === selectedNode.id.slice("role:".length)) ?? null)
-      : null;
 
   return (
     <div className="network-view">
@@ -686,8 +755,12 @@ export function NetworkView() {
           if (!value) setPollError(null);
         }}
         onAdd={() => {
+          if (addOpen) {
+            requestAddClose();
+            return;
+          }
           setInitialAddKind(null);
-          setAddOpen((value) => !value);
+          setAddOpen(true);
         }}
         onFit={() => graphRef.current?.fit()}
         onCenter={() => graphRef.current?.center()}
@@ -704,10 +777,7 @@ export function NetworkView() {
           recipes={recipes}
           error={operationError}
           initialKind={initialAddKind}
-          onClose={() => {
-            setAddOpen(false);
-            setInitialAddKind(null);
-          }}
+          onClose={closeAddMenu}
           onCreateWorkflow={(objective, team, recipe) =>
             void createWorkflowNode(objective, team, recipe)
           }
@@ -715,9 +785,10 @@ export function NetworkView() {
             void createWorkflowFromIssueNode(issue, team, recipe)
           }
           onCreateAgent={createAgent}
-          onCreateRole={(value) => void createRoleNode(value)}
+          onCreateRole={createRoleNode}
           onAssignCoreRole={(roleId, agent) => void assignCoreRole(roleId, agent)}
           onCreateVisual={createVisual}
+          onDirtyChange={setAddDirty}
         />
         {visibleError && !addOpen && (
           <p className="net-inline-error" role="alert">
@@ -759,14 +830,17 @@ export function NetworkView() {
                 neighborIds={neighbors}
                 activities={activities}
                 onNodeSelect={(id) => {
+                  if (!canChangeSelection()) return;
                   setSelectedNodeId(id);
                   setSelectedEdgeId(null);
                 }}
                 onEdgeSelect={(id) => {
+                  if (!canChangeSelection()) return;
                   setSelectedEdgeId(id);
                   setSelectedNodeId(null);
                 }}
                 onBackgroundClick={() => {
+                  if (!canChangeSelection()) return;
                   setSelectedNodeId(null);
                   setSelectedEdgeId(null);
                 }}
@@ -790,13 +864,12 @@ export function NetworkView() {
             </div>
             {editingAgent ? (
               <AgentForm
+                key={editingAgent.originalName ?? "new"}
                 initial={editingAgent}
                 error={operationError}
                 onSave={saveEditedAgent}
-                onCancel={() => {
-                  setEditingAgent(null);
-                  setOperationError(null);
-                }}
+                onCancel={requestAgentClose}
+                onDirtyChange={setEditingAgentDirty}
               />
             ) : selectedNode?.kind === "agent" ? (
               <AgentConsole
@@ -827,14 +900,16 @@ export function NetworkView() {
               />
             ) : selectedRole ? (
               <RoleInspector
+                key={selectedRole.id}
                 role={selectedRole}
                 agents={Object.keys(config.agents).sort()}
-                onClose={() => setSelectedNodeId(null)}
+                onClose={closeRoleInspector}
                 onChanged={() => {
                   reloadGraph();
                   reloadRoles();
                 }}
                 onDelete={deleteSelection}
+                onDirtyChange={setRoleEditorDirty}
               />
             ) : (
               <NodeInspector

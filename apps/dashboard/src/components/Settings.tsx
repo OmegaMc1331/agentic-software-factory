@@ -34,6 +34,12 @@ import {
   type RoutingModeValue,
 } from "../types";
 import { RECIPE_ROUTING_LABELS } from "../types";
+import {
+  UNSAVED_AGENT_MESSAGE,
+  UNSAVED_RECIPE_MESSAGE,
+  UNSAVED_ROLE_MESSAGE,
+  confirmDiscardChanges,
+} from "../unsavedChanges";
 import { AgentForm } from "./AgentForm";
 import { agentArgs, agentDraftFrom, emptyAgentDraft, type AgentDraft } from "./agentFormState";
 import { RecipeForm } from "./RecipeForm";
@@ -153,13 +159,19 @@ export function SettingsView() {
   } | null>(null);
   const mcpActionPending = useRef(false);
   const [draft, setDraft] = useState<AgentDraft | null>(null);
+  const [agentDirty, setAgentDirty] = useState(false);
+  const [agentEditorKey, setAgentEditorKey] = useState(0);
   const [editingRole, setEditingRole] = useState<RoleInfo | null>(null);
+  const [roleDirty, setRoleDirty] = useState(false);
+  const [roleEditorKey, setRoleEditorKey] = useState(0);
   const [roleSelection, setRoleSelection] = useState<Record<string, string>>({});
   const [recipeEditor, setRecipeEditor] = useState<{
     mode: "create" | "edit";
     id: string | null;
     duplicateOf: Recipe | null;
   } | null>(null);
+  const [recipeDirty, setRecipeDirty] = useState(false);
+  const [recipeEditorKey, setRecipeEditorKey] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState<string | null>(null);
   const [conflict, setConflict] = useState<string | null>(null);
@@ -228,6 +240,50 @@ export function SettingsView() {
     [reload]
   );
 
+  const openAgentEditor = (next: AgentDraft): boolean => {
+    if (!confirmDiscardChanges(agentDirty, UNSAVED_AGENT_MESSAGE)) return false;
+    setAgentEditorKey((value) => value + 1);
+    setAgentDirty(false);
+    setDraft(next);
+    return true;
+  };
+
+  const closeAgentEditor = () => {
+    setDraft(null);
+    setAgentDirty(false);
+  };
+
+  const openRoleEditor = (role: RoleInfo): boolean => {
+    if (editingRole?.id === role.id) return false;
+    if (!confirmDiscardChanges(roleDirty, UNSAVED_ROLE_MESSAGE)) return false;
+    setRoleEditorKey((value) => value + 1);
+    setRoleDirty(false);
+    setEditingRole(role);
+    return true;
+  };
+
+  const closeRoleEditor = () => {
+    setEditingRole(null);
+    setRoleDirty(false);
+  };
+
+  const openRecipeEditor = (next: {
+    mode: "create" | "edit";
+    id: string | null;
+    duplicateOf: Recipe | null;
+  }): boolean => {
+    if (!confirmDiscardChanges(recipeDirty, UNSAVED_RECIPE_MESSAGE)) return false;
+    setRecipeEditorKey((value) => value + 1);
+    setRecipeDirty(false);
+    setRecipeEditor(next);
+    return true;
+  };
+
+  const closeRecipeEditor = () => {
+    setRecipeEditor(null);
+    setRecipeDirty(false);
+  };
+
   const saveAgentDraft = useCallback(
     async (name: string, entry: ConfigData["agents"][string], originalName: string | null) => {
       if (!config) return false;
@@ -254,7 +310,10 @@ export function SettingsView() {
         { ...config, agents, role_assignments },
         originalName ? `Saved agent ${name}.` : `Added agent ${name}.`
       );
-      if (saved) setDraft(null);
+      if (saved) {
+        setDraft(null);
+        setAgentDirty(false);
+      }
       return saved;
     },
     [apply, config]
@@ -262,10 +321,12 @@ export function SettingsView() {
 
   const removeAgent = (name: string) => {
     if (!config) return;
+    const editingRemovedAgent = draft?.originalName === name;
+    if (editingRemovedAgent && !confirmDiscardChanges(agentDirty, UNSAVED_AGENT_MESSAGE)) return;
+    if (editingRemovedAgent) closeAgentEditor();
     const agents = { ...config.agents };
     delete agents[name];
     const role_assignments = config.role_assignments.filter((entry) => entry.agent !== name);
-    setDraft(null);
     void apply({ ...config, agents, role_assignments }, `Removed agent ${name}.`);
   };
 
@@ -831,14 +892,22 @@ export function SettingsView() {
                       <button
                         className="button"
                         aria-label={`Edit ${role.name} role`}
-                        onClick={() => setEditingRole(role)}
+                        onClick={() => openRoleEditor(role)}
                       >
                         Edit
                       </button>
                       <button
                         className="button"
                         onClick={() => {
+                          const editingDeletedRole = editingRole?.id === role.id;
+                          if (
+                            editingDeletedRole &&
+                            !confirmDiscardChanges(roleDirty, UNSAVED_ROLE_MESSAGE)
+                          ) {
+                            return;
+                          }
                           if (!window.confirm(`Delete the ${role.name} custom role?`)) return;
+                          if (editingDeletedRole) closeRoleEditor();
                           runRoleOperation(
                             () => deleteRole(role.id),
                             `Deleted the ${role.name} role.`
@@ -860,6 +929,7 @@ export function SettingsView() {
         <section className="section settings-form">
           <h3 className="section-title">Edit {editingRole.name}</h3>
           <RoleForm
+            key={`${editingRole.id}-${roleEditorKey}`}
             mode="edit"
             agents={agentNames}
             initial={{
@@ -868,23 +938,27 @@ export function SettingsView() {
             }}
             error={error}
             submitLabel="Save role"
-            onSubmit={(value) => {
+            onDirtyChange={setRoleDirty}
+            onSubmit={async (value) => {
               setError(null);
-              updateRole(editingRole.id, {
-                name: value.name,
-                description: value.description,
-                executionClass: value.executionClass,
-                instructions: value.instructions,
-                policyPreset: value.policyPreset ?? undefined,
-              })
-                .then(() => {
-                  setEditingRole(null);
-                  setSaved(`Saved the ${editingRole.name} role.`);
-                  reload();
-                })
-                .catch((err: Error) => setError(err.message));
+              try {
+                await updateRole(editingRole.id, {
+                  name: value.name,
+                  description: value.description,
+                  executionClass: value.executionClass,
+                  instructions: value.instructions,
+                  policyPreset: value.policyPreset ?? undefined,
+                });
+                closeRoleEditor();
+                setSaved(`Saved the ${editingRole.name} role.`);
+                reload();
+                return true;
+              } catch (err) {
+                setError((err as Error).message);
+                return false;
+              }
             }}
-            onCancel={() => setEditingRole(null)}
+            onCancel={closeRoleEditor}
           />
         </section>
       )}
@@ -895,7 +969,7 @@ export function SettingsView() {
           {!recipeEditor && (
             <button
               className="button"
-              onClick={() => setRecipeEditor({ mode: "create", id: null, duplicateOf: null })}
+              onClick={() => openRecipeEditor({ mode: "create", id: null, duplicateOf: null })}
             >
               New recipe
             </button>
@@ -909,6 +983,9 @@ export function SettingsView() {
         </p>
         {recipeEditor ? (
           <RecipeForm
+            key={`${recipeEditor.mode}-${recipeEditor.id ?? "new"}-${
+              recipeEditor.duplicateOf?.id ?? "none"
+            }-${recipeEditorKey}`}
             mode={recipeEditor.mode}
             roles={roles}
             initial={
@@ -943,21 +1020,25 @@ export function SettingsView() {
             }
             error={error}
             submitLabel={recipeEditor.mode === "edit" ? "Save recipe" : "Create recipe"}
-            onSubmit={(value) => {
+            onDirtyChange={setRecipeDirty}
+            onSubmit={async (value) => {
               setError(null);
-              const done = () => {
-                setRecipeEditor(null);
+              try {
+                if (recipeEditor.mode === "edit" && recipeEditor.id) {
+                  await updateRecipe(recipeEditor.id, value);
+                } else {
+                  await createRecipe(value);
+                }
+                closeRecipeEditor();
                 setSaved(`Saved the ${value.name} recipe.`);
                 reload();
-              };
-              const failed = (err: Error) => setError(err.message);
-              if (recipeEditor.mode === "edit" && recipeEditor.id) {
-                updateRecipe(recipeEditor.id, value).then(done).catch(failed);
-              } else {
-                createRecipe(value).then(done).catch(failed);
+                return true;
+              } catch (err) {
+                setError((err as Error).message);
+                return false;
               }
             }}
-            onCancel={() => setRecipeEditor(null)}
+            onCancel={closeRecipeEditor}
           />
         ) : (
           <div className="settings-roles">
@@ -989,7 +1070,7 @@ export function SettingsView() {
                       className="button"
                       aria-label={`Duplicate ${recipe.name}`}
                       onClick={() =>
-                        setRecipeEditor({
+                        openRecipeEditor({
                           mode: "create",
                           id: null,
                           duplicateOf: recipe,
@@ -1004,7 +1085,7 @@ export function SettingsView() {
                           className="button"
                           aria-label={`Edit ${recipe.name} recipe`}
                           onClick={() =>
-                            setRecipeEditor({ mode: "edit", id: recipe.id, duplicateOf: null })
+                            openRecipeEditor({ mode: "edit", id: recipe.id, duplicateOf: null })
                           }
                         >
                           Edit
@@ -1034,7 +1115,7 @@ export function SettingsView() {
       <section className="section">
         <div className="settings-section-head">
           <h3 className="section-title">Agents</h3>
-          <button className="button" onClick={() => setDraft(emptyAgentDraft())}>
+          <button className="button" onClick={() => openAgentEditor(emptyAgentDraft())}>
             Add agent
           </button>
         </div>
@@ -1140,7 +1221,10 @@ export function SettingsView() {
                       <span className="settings-actions">
                         <button
                           className="button"
-                          onClick={() => setDraft(agentDraftFrom(name, entry))}
+                          onClick={() => {
+                            if (draft?.originalName === name) return;
+                            openAgentEditor(agentDraftFrom(name, entry));
+                          }}
                         >
                           Edit
                         </button>
@@ -1166,10 +1250,12 @@ export function SettingsView() {
 
       {draft && (
         <AgentForm
+          key={`agent-${draft.originalName ?? "new"}-${agentEditorKey}`}
           initial={draft}
           error={error}
           onSave={saveAgentDraft}
-          onCancel={() => setDraft(null)}
+          onCancel={closeAgentEditor}
+          onDirtyChange={setAgentDirty}
         />
       )}
     </div>

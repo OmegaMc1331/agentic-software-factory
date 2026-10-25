@@ -11,6 +11,7 @@ import type {
   WorkflowTeam,
 } from "../types";
 import { PIPELINE_ROLE_IDS, preferredRoleAgents, roleAgents } from "../types";
+import { UNSAVED_ROLE_MESSAGE, confirmDiscardChanges } from "../unsavedChanges";
 import { RoleForm, type RoleFormValue } from "./RoleForm";
 
 type AddKind = "workflow" | "agent" | "role" | "group" | "note";
@@ -69,6 +70,7 @@ export function AddNodeMenu({
   onCreateRole,
   onAssignCoreRole,
   onCreateVisual,
+  onDirtyChange,
 }: {
   open: boolean;
   config: ConfigData;
@@ -80,9 +82,10 @@ export function AddNodeMenu({
   onCreateWorkflow: (objective: string, team: WorkflowTeam, recipe?: string) => void;
   onCreateWorkflowFromIssue: (issue: string, team: WorkflowTeam, recipe?: string) => void;
   onCreateAgent: (name: string, entry: AgentEntry) => void;
-  onCreateRole: (value: RoleFormValue) => void;
+  onCreateRole: (value: RoleFormValue) => Promise<boolean> | boolean;
   onAssignCoreRole: (roleId: string, agent: string) => void;
   onCreateVisual: (kind: "group" | "note", label: string, text: string) => void;
+  onDirtyChange?: (dirty: boolean) => void;
 }) {
   const [kind, setKind] = useState<AddKind | null>(null);
   const [name, setName] = useState("");
@@ -107,7 +110,13 @@ export function AddNodeMenu({
   const [teamReviewers, setTeamReviewers] = useState<string[]>([]);
   const [teamAdditional, setTeamAdditional] = useState<Record<string, string[]>>({});
   const [validationError, setValidationError] = useState<string | null>(null);
+  const [roleDirty, setRoleDirty] = useState(false);
   const firstButton = useRef<HTMLButtonElement>(null);
+
+  const requestClose = () => {
+    if (!confirmDiscardChanges(roleDirty, UNSAVED_ROLE_MESSAGE)) return;
+    onClose();
+  };
 
   useEffect(() => {
     if (open) {
@@ -119,17 +128,20 @@ export function AddNodeMenu({
       setCoreRoleDraft(null);
       setValidationError(null);
       setRecipeId("");
+      setRoleDirty(false);
     }
   }, [initialKind, open]);
 
   useEffect(() => {
     if (!open) return;
     const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onClose();
+      if (event.key !== "Escape") return;
+      if (!confirmDiscardChanges(roleDirty, UNSAVED_ROLE_MESSAGE)) return;
+      onClose();
     };
     window.addEventListener("keydown", closeOnEscape);
     return () => window.removeEventListener("keydown", closeOnEscape);
-  }, [onClose, open]);
+  }, [onClose, open, roleDirty]);
 
   useEffect(() => {
     if (!open || kind !== "workflow") return;
@@ -298,7 +310,7 @@ export function AddNodeMenu({
           {kind ? `New ${kind}` : "Add node"}
           {kind === "role" && roleMode ? ` — ${roleMode}` : ""}
         </strong>
-        <button className="inspector-close" onClick={onClose} aria-label="Close add node menu">
+        <button className="inspector-close" onClick={requestClose} aria-label="Close add node menu">
           x
         </button>
       </div>
@@ -334,6 +346,10 @@ export function AddNodeMenu({
           submitLabel="Create role"
           onSubmit={onCreateRole}
           onCancel={() => setRoleMode(null)}
+          onDirtyChange={(dirty) => {
+            setRoleDirty(dirty);
+            onDirtyChange?.(dirty);
+          }}
         />
       ) : (
         <form className="add-node-form" onSubmit={submit}>

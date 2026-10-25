@@ -1,5 +1,16 @@
-import { useId, useState } from "react";
+import { useId, useRef, useState } from "react";
 import type { ExecutionClass, RolePolicyPreset } from "../types";
+import { UNSAVED_ROLE_MESSAGE, useUnsavedChanges } from "../unsavedChanges";
+import {
+  isRoleDraftDirty,
+  roleDraftFromInitial,
+  roleValueFromDraft,
+  type RoleFormDraft,
+  type RoleFormInitial,
+  type RoleFormValue,
+} from "./formDirty";
+
+export type { RoleFormInitial, RoleFormValue } from "./formDirty";
 
 const POLICY_PRESETS: { value: RolePolicyPreset | ""; label: string }[] = [
   { value: "implementation", label: "Implementation — task-worktree write" },
@@ -18,26 +29,6 @@ function roleSlug(name: string): string {
       .replace(/^_+|_+$/g, "")
       .slice(0, 64) || ""
   );
-}
-
-export interface RoleFormValue {
-  id?: string;
-  name: string;
-  description: string;
-  executionClass: ExecutionClass;
-  instructions: string;
-  agents: string[];
-  preferredAgent: string | null;
-  policyPreset: RolePolicyPreset | null;
-}
-
-export interface RoleFormInitial {
-  id?: string;
-  name?: string;
-  description?: string;
-  executionClass?: ExecutionClass;
-  instructions?: string;
-  policyPreset?: RolePolicyPreset | null;
 }
 
 const EXECUTION_CLASSES: { value: ExecutionClass; label: string }[] = [
@@ -114,75 +105,94 @@ export function RoleForm({
   submitLabel,
   onSubmit,
   onCancel,
+  onDirtyChange,
 }: {
   mode: "create" | "edit";
   agents: string[];
   initial?: RoleFormInitial;
   error?: string | null;
   submitLabel: string;
-  onSubmit: (value: RoleFormValue) => void;
+  onSubmit: (value: RoleFormValue) => Promise<boolean> | boolean;
   onCancel: () => void;
+  onDirtyChange?: (dirty: boolean) => void;
 }) {
   const preferredRadioName = useId();
   const [templateId, setTemplateId] = useState("");
-  const [name, setName] = useState(initial?.name ?? "");
-  const [roleId, setRoleId] = useState(initial?.id ?? "");
+  const [draft, setDraft] = useState<RoleFormDraft>(() => roleDraftFromInitial(initial));
+  const [baseline, setBaseline] = useState<RoleFormDraft>(() => roleDraftFromInitial(initial));
   const [roleIdEdited, setRoleIdEdited] = useState(initial?.id !== undefined);
-  const [description, setDescription] = useState(initial?.description ?? "");
-  const [executionClass, setExecutionClass] = useState<ExecutionClass>(
-    initial?.executionClass ?? "execution"
-  );
-  const [instructions, setInstructions] = useState(initial?.instructions ?? "");
-  const [selectedAgents, setSelectedAgents] = useState<string[]>([]);
-  const [preferredAgent, setPreferredAgent] = useState<string | null>(null);
-  const [policyPreset, setPolicyPreset] = useState<RolePolicyPreset | null>(
-    initial?.policyPreset ?? null
-  );
   const [validationError, setValidationError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const savingRef = useRef(false);
+  const dirty = isRoleDraftDirty(draft, baseline);
+  const { requestClose } = useUnsavedChanges(dirty, {
+    message: UNSAVED_ROLE_MESSAGE,
+    onDirtyChange,
+  });
 
   const applyTemplate = (nextTemplateId: string) => {
     setTemplateId(nextTemplateId);
     const template = ROLE_TEMPLATES.find((candidate) => candidate.id === nextTemplateId);
     if (!template) return;
-    setDescription(template.description);
-    setExecutionClass(template.executionClass);
-    setInstructions(template.instructions);
+    setDraft((current) => ({
+      ...current,
+      description: template.description,
+      executionClass: template.executionClass,
+      instructions: template.instructions,
+    }));
+    setValidationError(null);
   };
 
   const toggleAgent = (agent: string, checked: boolean) => {
-    setSelectedAgents((current) =>
-      checked ? [...current, agent] : current.filter((candidate) => candidate !== agent)
-    );
-    if (!checked && preferredAgent === agent) setPreferredAgent(null);
-    if (checked && preferredAgent === null) setPreferredAgent(agent);
+    setDraft((current) => {
+      const selectedAgents = checked
+        ? [...current.selectedAgents, agent]
+        : current.selectedAgents.filter((candidate) => candidate !== agent);
+      let preferredAgent = current.preferredAgent;
+      if (!checked && preferredAgent === agent) preferredAgent = null;
+      if (checked && preferredAgent === null) preferredAgent = agent;
+      return { ...current, selectedAgents, preferredAgent };
+    });
   };
 
-  const submit = (event: React.FormEvent) => {
+  const submit = async (event: React.FormEvent) => {
     event.preventDefault();
-    const trimmedName = name.trim();
+    if (savingRef.current) return;
+    const trimmedName = draft.name.trim();
     if (!trimmedName) {
       setValidationError("A role name is required.");
       return;
     }
-    if (!description.trim()) {
+    if (!draft.description.trim()) {
       setValidationError("Describe what this role does.");
       return;
     }
+    const submittedDraft = draft;
     setValidationError(null);
-    onSubmit({
-      id: mode === "create" ? roleId.trim() || roleSlug(trimmedName) || undefined : undefined,
-      name: trimmedName,
-      description: description.trim(),
-      executionClass,
-      instructions: instructions.trim(),
-      agents: mode === "create" ? selectedAgents : [],
-      preferredAgent: mode === "create" ? preferredAgent : null,
-      policyPreset,
-    });
+    savingRef.current = true;
+    setSaving(true);
+    try {
+      const saved = await onSubmit(roleValueFromDraft(draft, mode, roleSlug(trimmedName)));
+      if (saved !== false) setBaseline(submittedDraft);
+    } catch (reason) {
+      setValidationError((reason as Error).message);
+    } finally {
+      savingRef.current = false;
+      setSaving(false);
+    }
   };
 
   return (
-    <form className="add-node-form role-form" onSubmit={submit}>
+    <form
+      className="add-node-form role-form"
+      onSubmit={submit}
+      onKeyDown={(event) => {
+        if (event.key !== "Escape" || savingRef.current) return;
+        event.preventDefault();
+        event.stopPropagation();
+        requestClose(onCancel);
+      }}
+    >
       {mode === "create" && (
         <label>
           <span>Template</span>
@@ -199,10 +209,14 @@ export function RoleForm({
       <label>
         <span>Name</span>
         <input
-          value={name}
+          value={draft.name}
           onChange={(event) => {
-            setName(event.target.value);
-            if (!roleIdEdited) setRoleId(roleSlug(event.target.value));
+            const name = event.target.value;
+            setDraft((current) => ({
+              ...current,
+              name,
+              ...(roleIdEdited ? {} : { id: roleSlug(name) }),
+            }));
             setValidationError(null);
           }}
           required
@@ -214,17 +228,18 @@ export function RoleForm({
           <label>
             <span>Role id</span>
             <input
-              value={roleId}
+              value={draft.id}
               onChange={(event) => {
-                setRoleId(event.target.value);
+                const id = event.target.value;
+                setDraft((current) => ({ ...current, id }));
                 setRoleIdEdited(true);
               }}
-              placeholder={roleSlug(name) || "derived-from-name"}
+              placeholder={roleSlug(draft.name) || "derived-from-name"}
               aria-describedby="role-id-preview"
             />
           </label>
           <small className="role-form-hint" id="role-id-preview">
-            {roleSlug(name) || "derived from the name"}
+            {roleSlug(draft.name) || "derived from the name"}
           </small>
         </div>
       )}
@@ -232,16 +247,23 @@ export function RoleForm({
         <span>Description</span>
         <textarea
           rows={2}
-          value={description}
-          onChange={(event) => setDescription(event.target.value)}
+          value={draft.description}
+          onChange={(event) =>
+            setDraft((current) => ({ ...current, description: event.target.value }))
+          }
           required
         />
       </label>
       <label>
         <span>Execution class</span>
         <select
-          value={executionClass}
-          onChange={(event) => setExecutionClass(event.target.value as ExecutionClass)}
+          value={draft.executionClass}
+          onChange={(event) =>
+            setDraft((current) => ({
+              ...current,
+              executionClass: event.target.value as ExecutionClass,
+            }))
+          }
         >
           {EXECUTION_CLASSES.map((option) => (
             <option key={option.value} value={option.value}>
@@ -254,19 +276,23 @@ export function RoleForm({
         <span>Instructions</span>
         <textarea
           rows={8}
-          value={instructions}
-          onChange={(event) => setInstructions(event.target.value)}
+          value={draft.instructions}
+          onChange={(event) =>
+            setDraft((current) => ({ ...current, instructions: event.target.value }))
+          }
           placeholder="Purpose, responsibilities, boundaries and expected output"
         />
       </label>
       <label>
         <span>Policy preset</span>
         <select
-          value={policyPreset ?? ""}
+          value={draft.policyPreset ?? ""}
           onChange={(event) =>
-            setPolicyPreset(
-              event.target.value === "" ? null : (event.target.value as RolePolicyPreset)
-            )
+            setDraft((current) => ({
+              ...current,
+              policyPreset:
+                event.target.value === "" ? null : (event.target.value as RolePolicyPreset),
+            }))
           }
           aria-describedby="role-policy-hint"
         >
@@ -292,18 +318,20 @@ export function RoleForm({
                 <label className="role-form-agent-check">
                   <input
                     type="checkbox"
-                    checked={selectedAgents.includes(agent)}
+                    checked={draft.selectedAgents.includes(agent)}
                     onChange={(event) => toggleAgent(agent, event.target.checked)}
                   />
                   <span>{agent}</span>
                 </label>
-                {selectedAgents.includes(agent) && (
+                {draft.selectedAgents.includes(agent) && (
                   <label className="role-form-agent-preferred">
                     <input
                       type="radio"
                       name={preferredRadioName}
-                      checked={preferredAgent === agent}
-                      onChange={() => setPreferredAgent(agent)}
+                      checked={draft.preferredAgent === agent}
+                      onChange={() =>
+                        setDraft((current) => ({ ...current, preferredAgent: agent }))
+                      }
                     />
                     <span>Preferred</span>
                   </label>
@@ -315,10 +343,15 @@ export function RoleForm({
       )}
       {(validationError ?? error) && <p className="inline-error">{validationError ?? error}</p>}
       <div className="add-node-actions">
-        <button className="button" type="submit">
-          {submitLabel}
+        <button className="button" type="submit" disabled={saving}>
+          {saving ? "Saving…" : submitLabel}
         </button>
-        <button className="button" type="button" onClick={onCancel}>
+        <button
+          className="button"
+          type="button"
+          onClick={() => requestClose(onCancel)}
+          disabled={saving}
+        >
           {mode === "create" ? "Back" : "Cancel"}
         </button>
       </div>

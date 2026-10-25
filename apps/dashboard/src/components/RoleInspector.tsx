@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   addRoleAssignment,
   createRole,
@@ -9,6 +9,7 @@ import {
   updateRole,
 } from "../api";
 import type { EffectiveToolPermission, RoleInfo, RolePolicyPreset } from "../types";
+import { UNSAVED_ROLE_MESSAGE, confirmDiscardChanges } from "../unsavedChanges";
 import { PolicySummary } from "./PolicySummary";
 import { RoleForm } from "./RoleForm";
 
@@ -36,18 +37,40 @@ export function RoleInspector({
   onClose,
   onChanged,
   onDelete,
+  onDirtyChange,
 }: {
   role: RoleInfo;
   agents: string[];
   onClose: () => void;
   onChanged: () => void;
   onDelete: () => void;
+  onDirtyChange?: (dirty: boolean) => void;
 }) {
   const [addAgent, setAddAgent] = useState("");
   const [editing, setEditing] = useState(false);
+  const [editingDirty, setEditingDirty] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [externalTools, setExternalTools] = useState<EffectiveToolPermission[]>([]);
+
+  const onDirtyChangeRef = useRef(onDirtyChange);
+  onDirtyChangeRef.current = onDirtyChange;
+
+  useEffect(() => {
+    onDirtyChangeRef.current?.(editingDirty);
+  }, [editingDirty]);
+
+  useEffect(
+    () => () => {
+      onDirtyChangeRef.current?.(false);
+    },
+    []
+  );
+
+  const closeInspector = () => {
+    if (editing && !confirmDiscardChanges(editingDirty, UNSAVED_ROLE_MESSAGE)) return;
+    onClose();
+  };
 
   useEffect(() => {
     let active = true;
@@ -87,7 +110,7 @@ export function RoleInspector({
     executionClass: RoleInfo["executionClass"];
     instructions: string;
     policyPreset: RolePolicyPreset | null;
-  }) => {
+  }): Promise<boolean> => {
     setBusy(true);
     setError(null);
     try {
@@ -100,8 +123,10 @@ export function RoleInspector({
       });
       setEditing(false);
       await onChanged();
+      return true;
     } catch (reason) {
       setError((reason as Error).message);
+      return false;
     } finally {
       setBusy(false);
     }
@@ -112,7 +137,11 @@ export function RoleInspector({
       <aside className="net-inspector role-inspector" aria-label={`Edit ${role.name} role`}>
         <div className="inspector-header">
           <span className="inspector-kind">Custom role</span>
-          <button className="inspector-close" onClick={onClose} aria-label="Close role inspector">
+          <button
+            className="inspector-close"
+            onClick={closeInspector}
+            aria-label="Close role inspector"
+          >
             x
           </button>
         </div>
@@ -131,8 +160,9 @@ export function RoleInspector({
             }}
             error={error}
             submitLabel="Save role"
-            onSubmit={(value) => void saveDefinition(value)}
+            onSubmit={saveDefinition}
             onCancel={() => setEditing(false)}
+            onDirtyChange={setEditingDirty}
           />
         </div>
       </aside>
@@ -143,7 +173,11 @@ export function RoleInspector({
     <aside className="net-inspector role-inspector" aria-label={`${role.name} role`}>
       <div className="inspector-header">
         <span className="inspector-kind">{role.kind === "core" ? "Core role" : "Custom role"}</span>
-        <button className="inspector-close" onClick={onClose} aria-label="Close role inspector">
+        <button
+          className="inspector-close"
+          onClick={closeInspector}
+          aria-label="Close role inspector"
+        >
           x
         </button>
       </div>
