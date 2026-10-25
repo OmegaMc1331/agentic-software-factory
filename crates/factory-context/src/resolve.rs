@@ -441,6 +441,76 @@ mod tests {
         assert_eq!(resolved.budget_files, 1);
     }
 
+    /// ASF-R01 downstream: a same-size, restored-mtime replacement must not
+    /// leave stale symbols in the index fast path, the resolved selection, or
+    /// the rendered mission section. Content search reads live bytes and is
+    /// fresh either way — the Symbol-kind hits are what the stale cache
+    /// corrupts.
+    #[test]
+    fn same_mtime_replacement_refreshes_search_resolution_and_rendering() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src").join("auth.rs"), "pub fn alpha_gate() {}\n").unwrap();
+        let mut engine = engine(&root);
+        engine.ensure_index().unwrap();
+
+        let file = root.join("src").join("auth.rs");
+        let metadata = std::fs::metadata(&file).unwrap();
+        let original_mtime = filetime::FileTime::from_last_modification_time(&metadata);
+        std::fs::write(&file, "pub fn bravo_lock() {}\n").unwrap();
+        filetime::set_file_mtime(&file, original_mtime).unwrap();
+        engine.refresh().unwrap();
+
+        let fresh = engine.search("bravo_lock", 10).unwrap();
+        assert!(
+            fresh
+                .iter()
+                .any(|hit| hit.match_kind == crate::search::MatchKind::Symbol
+                    && hit.path == "src/auth.rs"),
+            "the new symbol must be an indexed-symbol hit: {fresh:?}"
+        );
+        let stale = engine.search("alpha_gate", 10).unwrap();
+        assert!(
+            stale
+                .iter()
+                .all(|hit| hit.match_kind != crate::search::MatchKind::Symbol),
+            "the removed symbol must not survive in the index: {stale:?}"
+        );
+
+        let resolved = engine
+            .resolve(&ContextRequest {
+                scope_dir: root.clone(),
+                root_dir: root.clone(),
+                title: "harden the auth guard".into(),
+                ..Default::default()
+            })
+            .expect("resolution succeeds");
+        let selected = resolved
+            .selected
+            .iter()
+            .find(|file| file.path == "src/auth.rs")
+            .expect("auth.rs still selected");
+        assert!(selected
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "bravo_lock"));
+        assert!(!selected
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "alpha_gate"));
+
+        let rendered = crate::render::render_repository_context(&resolved);
+        assert!(
+            rendered.contains("bravo_lock@"),
+            "rendered mission context must carry the current symbol: {rendered}"
+        );
+        assert!(
+            !rendered.contains("alpha_gate@"),
+            "rendered mission context must not present the removed symbol: {rendered}"
+        );
+    }
+
     #[test]
     fn search_combines_index_and_content() {
         let dir = TempDir::new().unwrap();

@@ -447,6 +447,7 @@ mod tests {
             language: Some("rust".into()),
             size: 10,
             mtime_ms: 0,
+            content_hash: None,
             symbols: match path {
                 "src/auth.rs" => vec![Symbol {
                     name: "authenticate".into(),
@@ -524,6 +525,7 @@ mod tests {
                 language: Some("rust".into()),
                 size: 10,
                 mtime_ms: 0,
+                content_hash: None,
                 symbols: Vec::new(),
             },
         );
@@ -560,6 +562,7 @@ mod tests {
                     language: Some("rust".into()),
                     size: 10,
                     mtime_ms: 0,
+                    content_hash: None,
                     symbols: Vec::new(),
                 },
                 score: 25,

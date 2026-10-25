@@ -291,6 +291,7 @@ mod tests {
                         language: language.map(|l| l.to_string()),
                         size: text.len() as u64,
                         mtime_ms: 0,
+                        content_hash: None,
                         symbols,
                     },
                 )
