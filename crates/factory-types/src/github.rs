@@ -58,6 +58,11 @@ pub enum DeliveryState {
     Published,
     /// The last delivery attempt failed; see `error`.
     Failed,
+    /// The last delivery attempt was interrupted or its remote outcome is
+    /// unknown (push accepted but connection lost, `gh pr create` timed out,
+    /// Factory stopped mid-operation). Reconciliation is required before any
+    /// retry; this is deliberately distinct from [`DeliveryState::Failed`].
+    Interrupted,
 }
 
 impl DeliveryState {
@@ -69,7 +74,13 @@ impl DeliveryState {
             DeliveryState::CreatingPr => "creating_pr",
             DeliveryState::Published => "published",
             DeliveryState::Failed => "failed",
+            DeliveryState::Interrupted => "interrupted",
         }
+    }
+
+    /// Whether an operation is currently executing for this delivery.
+    pub fn is_active(self) -> bool {
+        matches!(self, DeliveryState::Pushing | DeliveryState::CreatingPr)
     }
 }
 
@@ -84,6 +95,7 @@ impl std::str::FromStr for DeliveryState {
             "creating_pr" => Ok(DeliveryState::CreatingPr),
             "published" => Ok(DeliveryState::Published),
             "failed" => Ok(DeliveryState::Failed),
+            "interrupted" => Ok(DeliveryState::Interrupted),
             other => Err(format!("unknown delivery state '{other}'")),
         }
     }
@@ -119,6 +131,13 @@ pub struct GitHubDelivery {
     pub pull_request: Option<PullRequestInfo>,
     /// Human-readable reason for the last failure, if any.
     pub error: Option<String>,
+    /// Durable identity of the current (or last) delivery operation attempt.
+    /// Assigned when the operation is atomically claimed; survives browser
+    /// reloads and Factory restarts.
+    pub operation_id: Option<String>,
+    /// Whether the last attempt's remote outcome is unknown and must be
+    /// reconciled before any retry. `1` for an unconfirmed attempt.
+    pub recovery_required: bool,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -136,6 +155,8 @@ impl GitHubDelivery {
             pushed_head: None,
             pull_request: None,
             error: None,
+            operation_id: None,
+            recovery_required: false,
             created_at: now.to_string(),
             updated_at: now.to_string(),
         }

@@ -1,9 +1,10 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   createPullRequest,
   fetchDelivery,
   fetchPrPreview,
+  reconcileDelivery,
   fetchRoles,
   fetchRun,
   isUncertainApiError,
@@ -28,6 +29,7 @@ vi.mock("../api", () => ({
   fetchDelivery: vi.fn(),
   fetchPrPreview: vi.fn(),
   createPullRequest: vi.fn(),
+  reconcileDelivery: vi.fn(),
   isUncertainApiError: vi.fn(),
 }));
 
@@ -160,6 +162,11 @@ const deliveryNotReady: DeliveryReport = {
   error: null,
   eligible: false,
   blockers: ["the workflow is planned (delivery requires completed)"],
+  operationId: null,
+  operationActive: false,
+  recoveryRequired: false,
+  retrySafe: false,
+  updatedAt: "2026-08-20T10:00:00Z",
 };
 
 const deliveryReady: DeliveryReport = {
@@ -224,8 +231,27 @@ const publishedRecord: GitHubDeliveryRecord = {
     isDraft: false,
   },
   error: null,
+  operationId: "delivery-12-1-1",
+  recoveryRequired: false,
   createdAt: "2026-08-21T10:00:00Z",
   updatedAt: "2026-08-21T10:00:00Z",
+};
+
+const activeDelivery: DeliveryReport = {
+  ...deliveryReady,
+  state: "pushing",
+  persistedState: "pushing",
+  operationId: "delivery-12-2-1",
+  operationActive: true,
+};
+
+const interruptedDelivery: DeliveryReport = {
+  ...deliveryReady,
+  state: "interrupted",
+  persistedState: "interrupted",
+  error: "Factory stopped before the delivery outcome was confirmed",
+  operationId: "delivery-12-3-1",
+  recoveryRequired: true,
 };
 
 beforeEach(() => {
@@ -248,6 +274,7 @@ beforeEach(() => {
   vi.mocked(fetchDelivery).mockReset().mockResolvedValue(deliveryNotReady);
   vi.mocked(fetchPrPreview).mockReset();
   vi.mocked(createPullRequest).mockReset();
+  vi.mocked(reconcileDelivery).mockReset();
   vi.mocked(isUncertainApiError).mockReset().mockReturnValue(false);
   vi.spyOn(window, "confirm").mockReturnValue(true);
 });
@@ -477,24 +504,7 @@ describe("Workflow inspector", () => {
       eligible: true,
       blockers: [],
     });
-    vi.mocked(createPullRequest).mockResolvedValue({
-      runId: 12,
-      state: "published",
-      repository: "OmegaMc1331/example",
-      remote: "origin",
-      baseBranch: "main",
-      headBranch: "factory/run-12",
-      pushedHead: "abc123",
-      pullRequest: {
-        number: 58,
-        url: "https://github.com/OmegaMc1331/example/pull/58",
-        state: "OPEN",
-        isDraft: false,
-      },
-      error: null,
-      createdAt: "2026-08-21T10:00:00Z",
-      updatedAt: "2026-08-21T10:00:00Z",
-    });
+    vi.mocked(createPullRequest).mockResolvedValue(publishedRecord);
     const completedMeta: RunMeta = { ...meta, status: "completed" };
     const completedNode: GraphNode = { ...node, meta: completedMeta };
     const onTeamUpdated = vi.fn();
@@ -777,5 +787,138 @@ describe("Workflow inspector", () => {
     expect(await screen.findByText(/Saved "Saved Recipe" as a custom recipe/)).toBeTruthy();
     // The save captured configuration only — no DAG or history involved.
     expect(saveRunAsRecipe).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows an active Factory-owned operation and blocks duplicate submission", async () => {
+    vi.mocked(fetchDelivery).mockReset().mockResolvedValue(activeDelivery);
+    render(
+      <WorkflowInspector
+        node={node}
+        onClose={vi.fn()}
+        onStart={vi.fn()}
+        onCancel={vi.fn()}
+        onRetry={vi.fn()}
+      />
+    );
+    await screen.findByText(/Publishing pull request… the operation is owned by Factory/);
+    expect(screen.queryByText("Create Pull Request")).toBeNull();
+    expect(fetchDelivery).toHaveBeenCalledWith(12);
+    expect(createPullRequest).not.toHaveBeenCalled();
+  });
+
+  it("recovers an interrupted delivery through explicit reconciliation", async () => {
+    vi.mocked(fetchDelivery)
+      .mockReset()
+      .mockResolvedValueOnce(interruptedDelivery)
+      .mockResolvedValueOnce(interruptedDelivery)
+      .mockResolvedValue(publishedDelivery);
+    vi.mocked(reconcileDelivery).mockReset().mockResolvedValue({ linkedExisting: publishedRecord });
+    render(
+      <WorkflowInspector
+        node={node}
+        onClose={vi.fn()}
+        onStart={vi.fn()}
+        onCancel={vi.fn()}
+        onRetry={vi.fn()}
+      />
+    );
+    const reconcile = await screen.findByText("Check GitHub for the previous attempt");
+    expect(screen.queryByText("Create Pull Request")).toBeNull();
+    fireEvent.click(reconcile);
+    expect(
+      await screen.findByText("Reconciliation linked the existing pull request #58.")
+    ).toBeTruthy();
+    expect(await screen.findByRole("link", { name: "Open on GitHub" })).toBeTruthy();
+    expect(reconcileDelivery).toHaveBeenCalledWith(12);
+  });
+
+  it("keeps retry blocked when reconciliation cannot reach GitHub", async () => {
+    vi.mocked(fetchDelivery).mockReset().mockResolvedValue(interruptedDelivery);
+    vi.mocked(reconcileDelivery)
+      .mockReset()
+      .mockResolvedValue({
+        unconfirmed: { reason: "network unreachable", pushConfirmed: null },
+      });
+    render(
+      <WorkflowInspector
+        node={node}
+        onClose={vi.fn()}
+        onStart={vi.fn()}
+        onCancel={vi.fn()}
+        onRetry={vi.fn()}
+      />
+    );
+    fireEvent.click(await screen.findByText("Check GitHub for the previous attempt"));
+    await screen.findByText(
+      /GitHub could not be reached, so the outcome stays unconfirmed: network unreachable/
+    );
+    expect(screen.queryByText("Create Pull Request")).toBeNull();
+  });
+
+  it("polls a running delivery to publication and then stops", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.mocked(fetchDelivery)
+        .mockReset()
+        .mockResolvedValueOnce(activeDelivery)
+        .mockResolvedValueOnce(activeDelivery)
+        .mockResolvedValue(publishedDelivery);
+      render(
+        <WorkflowInspector
+          node={node}
+          onClose={vi.fn()}
+          onStart={vi.fn()}
+          onCancel={vi.fn()}
+          onRetry={vi.fn()}
+        />
+      );
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      const pollsBefore = vi.mocked(fetchDelivery).mock.calls.length;
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(2000);
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(2000);
+      });
+      const pollsAfter = vi.mocked(fetchDelivery).mock.calls.length;
+      expect(pollsAfter).toBeGreaterThan(pollsBefore);
+      expect(screen.getAllByRole("link", { name: "Open on GitHub" }).length).toBeGreaterThan(0);
+      const settled = vi.mocked(fetchDelivery).mock.calls.length;
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(6000);
+      });
+      expect(vi.mocked(fetchDelivery).mock.calls.length).toBe(settled);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("unmounting stops delivery polling", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.mocked(fetchDelivery).mockReset().mockResolvedValue(activeDelivery);
+      const view = render(
+        <WorkflowInspector
+          node={node}
+          onClose={vi.fn()}
+          onStart={vi.fn()}
+          onCancel={vi.fn()}
+          onRetry={vi.fn()}
+        />
+      );
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      view.unmount();
+      const afterUnmount = vi.mocked(fetchDelivery).mock.calls.length;
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(6000);
+      });
+      expect(vi.mocked(fetchDelivery).mock.calls.length).toBe(afterUnmount);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

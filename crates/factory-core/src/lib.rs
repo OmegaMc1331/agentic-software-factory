@@ -15,7 +15,8 @@ pub use config::{
     RoutingConfig, UpdateError, UpdateOutcome,
 };
 pub use factory::{
-    Factory, FactoryError, MarkOutcome, RunOutcome, WorkflowResult, FACTORY_DIR, MAX_TASK_ATTEMPTS,
+    DeliveryClaim, DeliveryRequest, Factory, FactoryError, MarkOutcome, RunOutcome, WorkflowResult,
+    FACTORY_DIR, MAX_TASK_ATTEMPTS,
 };
 pub use factory_agent::AgentStatus;
 pub use factory_context::ContextConfig;

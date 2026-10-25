@@ -161,7 +161,8 @@ impl From<RuntimeError> for ApiError {
                 | factory_core::FactoryError::Git(_)
                 | factory_core::FactoryError::GitHub(_),
             ) => StatusCode::BAD_REQUEST,
-            RuntimeError::Factory(factory_core::FactoryError::NotDeliverable(_)) => {
+            RuntimeError::Factory(factory_core::FactoryError::NotDeliverable(_))
+            | RuntimeError::Factory(factory_core::FactoryError::DeliveryConflict(_)) => {
                 StatusCode::CONFLICT
             }
             _ => StatusCode::INTERNAL_SERVER_ERROR,
@@ -198,6 +199,7 @@ pub fn router(state: SharedState) -> Router {
         .route("/api/runs/:id/delivery", get(run_delivery))
         .route("/api/runs/:id/pr-preview", get(run_pr_preview))
         .route("/api/runs/:id/pull-request", post(create_pull_request))
+        .route("/api/runs/:id/delivery/reconcile", post(reconcile_delivery))
         .route("/api/tasks/:id/retry", post(retry_task))
         .route(
             "/api/tasks/:id/routing-preview",
@@ -591,6 +593,14 @@ struct CreatePullRequestRequest {
 /// The single Factory-owned delivery action: push `factory/run-<id>` and
 /// create (or link) its pull request. This endpoint is semantic — there is no
 /// generic GitHub command passthrough.
+///
+/// The operation is claimed atomically and executed by the Factory-owned
+/// runtime worker, decoupled from this request: a browser timeout or
+/// navigation never cancels it. Responds `202 Accepted` with the claimed
+/// record (including `operationId`) when started, `200 OK` with the existing
+/// record when the run already has a pull request, and `409 Conflict` when
+/// another operation is active, an earlier attempt's outcome is unknown, or
+/// the run is not deliverable. Clients poll `GET /api/runs/:id/delivery`.
 async fn create_pull_request(
     State(state): State<SharedState>,
     UrlPath(id): UrlPath<i64>,
@@ -599,16 +609,49 @@ async fn create_pull_request(
     let request = body
         .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "invalid JSON body"))?
         .0;
-    let delivery = run_delivery_operation(state, move |factory| {
-        factory.create_pull_request(
-            id,
-            request.title.as_deref(),
-            request.body.as_deref(),
-            request.draft,
-        )
+    let root = state.root.clone();
+    let claim = tokio::task::spawn_blocking(move || {
+        let factory = factory_core::Factory::open(&root).map_err(RuntimeError::from)?;
+        factory
+            .begin_delivery(
+                id,
+                request.title.as_deref(),
+                request.body.as_deref(),
+                request.draft,
+            )
+            .map_err(RuntimeError::from)
     })
-    .await?;
-    Ok((StatusCode::CREATED, Json(delivery)))
+    .await
+    .map_err(|error| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+    .map_err(ApiError::from)?;
+    match claim {
+        factory_core::DeliveryClaim::AlreadyPublished(delivery) => {
+            Ok((StatusCode::OK, Json(delivery)))
+        }
+        factory_core::DeliveryClaim::Claimed(delivery, operation_request) => {
+            let operation_id = delivery
+                .operation_id
+                .clone()
+                .expect("a claimed delivery always carries an operation id");
+            state
+                .runtime
+                .start_delivery(id, &operation_id, operation_request)
+                .map_err(ApiError::from)?;
+            Ok((StatusCode::ACCEPTED, Json(delivery)))
+        }
+    }
+}
+
+/// Reconciles a run whose delivery attempt was interrupted: read-only GitHub
+/// checks that link an already-created pull request or authoritatively
+/// confirm none exists. Never pushes, never creates; `409 Conflict` when
+/// there is nothing to reconcile or an operation is active.
+async fn reconcile_delivery(
+    State(state): State<SharedState>,
+    UrlPath(id): UrlPath<i64>,
+) -> Result<Json<factory_core::github::DeliveryReconciliation>, ApiError> {
+    let outcome = state.runtime.reconcile_delivery(id).await?;
+    Ok(Json(outcome))
 }
 
 /// Runs a blocking delivery operation against a freshly opened Factory.

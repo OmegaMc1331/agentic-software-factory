@@ -71,6 +71,12 @@ pub struct Runtime {
     root: Arc<PathBuf>,
     active: Arc<Mutex<HashMap<i64, Active>>>,
     terminals: Arc<Mutex<HashMap<i64, Arc<InteractiveTerminal>>>>,
+    /// In-flight GitHub delivery operations: run id -> operation id. The
+    /// durable database claim is authoritative; this map only reflects the
+    /// operations this Factory process is currently executing.
+    delivery_operations: Arc<Mutex<HashMap<i64, String>>>,
+    /// Runs currently being reconciled (single-flight, read-only).
+    delivery_reconciles: Arc<Mutex<HashMap<i64, ()>>>,
     _project_lock: Arc<ProjectLock>,
 }
 
@@ -354,13 +360,128 @@ impl Runtime {
             return Err(FactoryError::NotInitialized.into());
         }
         let project_lock = ProjectLock::acquire(&canonical_root, root)?;
-        Factory::open(root)?.reconcile_interrupted()?;
+        let factory = Factory::open(root)?;
+        factory.reconcile_interrupted()?;
+        // Deliveries left mid-operation by a previous process have unknown
+        // outcomes; they become `interrupted` and require reconciliation
+        // before any retry. Nothing is pushed or created at startup.
+        factory.demote_interrupted_deliveries()?;
         Ok(Self {
             root: Arc::new(root.to_path_buf()),
             active: Arc::new(Mutex::new(HashMap::new())),
             terminals: Arc::new(Mutex::new(HashMap::new())),
+            delivery_operations: Arc::new(Mutex::new(HashMap::new())),
+            delivery_reconciles: Arc::new(Mutex::new(HashMap::new())),
             _project_lock: Arc::new(project_lock),
         })
+    }
+
+    /// The operation id of the delivery currently executing for `run_id` in
+    /// this Factory process, if any.
+    pub fn delivery_operation(&self, run_id: i64) -> Option<String> {
+        self.delivery_operations
+            .lock()
+            .expect("runtime mutex poisoned")
+            .get(&run_id)
+            .cloned()
+    }
+
+    /// Starts Factory-owned background execution of a claimed delivery
+    /// operation. The claim (and all state) lives in SQLite; this only spawns
+    /// the worker, so the operation continues independently of the HTTP
+    /// request that claimed it. A worker panic marks the attempt interrupted
+    /// instead of leaving `pushing` forever.
+    pub fn start_delivery(
+        &self,
+        run_id: i64,
+        operation_id: &str,
+        request: factory_core::DeliveryRequest,
+    ) -> Result<(), RuntimeError> {
+        {
+            let mut operations = self
+                .delivery_operations
+                .lock()
+                .expect("runtime mutex poisoned");
+            if let Some(existing) = operations.get(&run_id) {
+                return Err(RuntimeError::Factory(FactoryError::DeliveryConflict(
+                    format!(
+                        "workflow {run_id} already has an active delivery operation ({existing})"
+                    ),
+                )));
+            }
+            operations.insert(run_id, operation_id.to_string());
+        }
+        let root = self.root.clone();
+        let operations = Arc::clone(&self.delivery_operations);
+        let operation_id = operation_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                match Factory::open(&root) {
+                    Ok(factory) => factory
+                        .execute_delivery(run_id, &operation_id, &request)
+                        .map(|_| ()),
+                    Err(error) => Err(error),
+                }
+            }));
+            if outcome.is_err() {
+                if let Ok(factory) = Factory::open(&root) {
+                    let _ = factory.mark_delivery_interrupted(
+                        run_id,
+                        &operation_id,
+                        "the delivery worker stopped unexpectedly; the outcome is unknown",
+                    );
+                }
+            }
+            operations
+                .lock()
+                .expect("runtime mutex poisoned")
+                .remove(&run_id);
+        });
+        Ok(())
+    }
+
+    /// Reconciles an interrupted delivery against the remote. Single-flight
+    /// per run and read-only against GitHub; awaited because it is bounded
+    /// (`ls-remote` + one `gh pr list`).
+    pub async fn reconcile_delivery(
+        &self,
+        run_id: i64,
+    ) -> Result<factory_core::github::DeliveryReconciliation, RuntimeError> {
+        {
+            let operations = self
+                .delivery_operations
+                .lock()
+                .expect("runtime mutex poisoned");
+            if operations.contains_key(&run_id) {
+                return Err(RuntimeError::Factory(FactoryError::DeliveryConflict(
+                    format!("workflow {run_id} has an active delivery operation"),
+                )));
+            }
+        }
+        if self
+            .delivery_reconciles
+            .lock()
+            .expect("runtime mutex poisoned")
+            .insert(run_id, ())
+            .is_some()
+        {
+            return Err(RuntimeError::Factory(FactoryError::DeliveryConflict(
+                format!("workflow {run_id} is already being reconciled"),
+            )));
+        }
+        let root = self.root.clone();
+        let reconciles = Arc::clone(&self.delivery_reconciles);
+        let result = tokio::task::spawn_blocking(move || {
+            Factory::open(&root).and_then(|factory| factory.reconcile_delivery(run_id))
+        })
+        .await
+        .map_err(|error| RuntimeError::Terminal(error.to_string()))
+        .and_then(|outcome| outcome.map_err(RuntimeError::from));
+        reconciles
+            .lock()
+            .expect("runtime mutex poisoned")
+            .remove(&run_id);
+        result
     }
 
     pub fn start_interactive_session(

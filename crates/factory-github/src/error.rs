@@ -17,6 +17,8 @@ pub enum GitHubError {
     GhAuthRequired,
     #[error("GitHub CLI failed: {0}")]
     Gh(String),
+    #[error("the GitHub operation outcome could not be confirmed: {0}")]
+    Uncertain(String),
     #[error("the repository has no GitHub remote; add one (git remote add origin <url>) or run Factory inside a GitHub clone")]
     NotAGithubRemote,
     #[error("cannot determine the GitHub repository: {0}")]

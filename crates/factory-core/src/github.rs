@@ -142,19 +142,125 @@ pub fn pr_evidence(
     }
 }
 
-/// The effective delivery state shown to users: persisted terminal states
-/// win; otherwise eligibility decides between `ready` and `not_ready`.
+/// The effective delivery state shown to users. Operational states always
+/// win over eligibility: a recorded pull request means publication is
+/// established, an active operation must be visible as active, a confirmed
+/// failure stays visible, and an interrupted attempt stays visibly
+/// uncertain. Readiness is derived from eligibility only when no
+/// higher-priority operational state applies — a persisted `creating_pr`
+/// must never be masked as `ready`.
 pub fn effective_delivery_state(
     delivery: &GitHubDelivery,
     eligible: bool,
 ) -> factory_types::DeliveryState {
-    if delivery.pull_request.is_some() {
+    if delivery.pull_request.is_some() || delivery.state == DeliveryState::Published {
         return DeliveryState::Published;
+    }
+    match delivery.state {
+        DeliveryState::Pushing | DeliveryState::CreatingPr => return delivery.state,
+        DeliveryState::Failed => return DeliveryState::Failed,
+        DeliveryState::Interrupted => return DeliveryState::Interrupted,
+        DeliveryState::NotReady | DeliveryState::Ready | DeliveryState::Published => {}
     }
     if eligible {
         DeliveryState::Ready
     } else {
         DeliveryState::NotReady
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn delivery(state: DeliveryState) -> GitHubDelivery {
+        GitHubDelivery {
+            state,
+            ..GitHubDelivery::initial(7, "2026-10-25T00:00:00Z")
+        }
+    }
+
+    fn published_pr() -> factory_types::PullRequestInfo {
+        factory_types::PullRequestInfo {
+            number: 58,
+            url: "https://github.com/octocat/example/pull/58".into(),
+            state: "OPEN".into(),
+            is_draft: false,
+        }
+    }
+
+    #[test]
+    fn a_recorded_pull_request_is_always_published() {
+        let mut record = delivery(DeliveryState::Pushing);
+        record.pull_request = Some(published_pr());
+        assert_eq!(
+            effective_delivery_state(&record, false),
+            DeliveryState::Published
+        );
+    }
+
+    #[test]
+    fn a_persisted_published_state_stays_published_without_pr_metadata() {
+        assert_eq!(
+            effective_delivery_state(&delivery(DeliveryState::Published), false),
+            DeliveryState::Published
+        );
+    }
+
+    #[test]
+    fn pushing_is_never_masked_by_eligibility() {
+        assert_eq!(
+            effective_delivery_state(&delivery(DeliveryState::Pushing), true),
+            DeliveryState::Pushing
+        );
+        assert_eq!(
+            effective_delivery_state(&delivery(DeliveryState::Pushing), false),
+            DeliveryState::Pushing
+        );
+    }
+
+    #[test]
+    fn creating_pr_is_never_displayed_as_ready() {
+        assert_eq!(
+            effective_delivery_state(&delivery(DeliveryState::CreatingPr), true),
+            DeliveryState::CreatingPr
+        );
+    }
+
+    #[test]
+    fn a_confirmed_failure_remains_visible_even_when_eligible_again() {
+        assert_eq!(
+            effective_delivery_state(&delivery(DeliveryState::Failed), true),
+            DeliveryState::Failed
+        );
+    }
+
+    #[test]
+    fn an_interrupted_attempt_stays_uncertain() {
+        assert_eq!(
+            effective_delivery_state(&delivery(DeliveryState::Interrupted), true),
+            DeliveryState::Interrupted
+        );
+    }
+
+    #[test]
+    fn readiness_comes_from_eligibility_only_for_idle_records() {
+        assert_eq!(
+            effective_delivery_state(&delivery(DeliveryState::NotReady), true),
+            DeliveryState::Ready
+        );
+        assert_eq!(
+            effective_delivery_state(&delivery(DeliveryState::NotReady), false),
+            DeliveryState::NotReady
+        );
+        assert_eq!(
+            effective_delivery_state(&delivery(DeliveryState::Ready), true),
+            DeliveryState::Ready
+        );
+        assert_eq!(
+            effective_delivery_state(&delivery(DeliveryState::Ready), false),
+            DeliveryState::NotReady
+        );
     }
 }
 
@@ -193,8 +299,9 @@ pub struct GitHubStatus {
 #[serde(rename_all = "camelCase")]
 pub struct DeliveryReport {
     pub run_id: i64,
-    /// Effective state (`published`/`ready`/`not_ready`), derived from the
-    /// persisted record plus eligibility.
+    /// Effective state, derived from the persisted record plus eligibility
+    /// with operational precedence (published → active → failed/interrupted
+    /// → ready/not_ready).
     pub state: DeliveryState,
     /// The last persisted transient/terminal state (e.g. `failed`).
     pub persisted_state: DeliveryState,
@@ -209,6 +316,37 @@ pub struct DeliveryReport {
     pub error: Option<String>,
     pub eligible: bool,
     pub blockers: Vec<String>,
+    /// Durable identity of the current (or last) delivery operation attempt.
+    pub operation_id: Option<String>,
+    /// Whether an operation is executing for this delivery right now.
+    pub operation_active: bool,
+    /// Whether the last attempt's remote outcome is unknown and must be
+    /// reconciled before any retry.
+    pub recovery_required: bool,
+    /// Server-enforced retry safety: no PR yet, nothing active, nothing to
+    /// reconcile, and the run is eligible.
+    pub retry_safe: bool,
+    pub updated_at: String,
+}
+
+/// Outcome of reconciling an interrupted delivery attempt. Read-only against
+/// GitHub; nothing is pushed or created.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DeliveryReconciliation {
+    /// The expected pull request exists; it is linked and persisted.
+    LinkedExisting(GitHubDelivery),
+    /// GitHub authoritatively reported no pull request for the head branch;
+    /// the record is now an ordinary failed attempt and retry is safe.
+    ConfirmedMissing(GitHubDelivery),
+    /// The remote state could not be determined; the attempt stays
+    /// `interrupted` and must not be retried yet.
+    Unconfirmed {
+        reason: String,
+        /// Whether the remote branch could be confirmed present (`true`),
+        /// confirmed absent (`false`), or not checked (`null`).
+        push_confirmed: Option<bool>,
+    },
 }
 
 /// The editable pull request preview shown before creation.

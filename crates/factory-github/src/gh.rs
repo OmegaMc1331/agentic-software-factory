@@ -116,6 +116,26 @@ impl GhCli {
         repository: &str,
         head_branch: &str,
     ) -> Result<Vec<factory_types::PullRequestInfo>> {
+        self.list_pull_requests_with_state(repository, head_branch, "open")
+    }
+
+    /// Pull requests for `head_branch` in any lifecycle state (open, closed,
+    /// merged). Reconciliation uses this: an attempt whose PR was created and
+    /// then closed before recovery must still be discoverable.
+    pub fn list_all_pull_requests(
+        &self,
+        repository: &str,
+        head_branch: &str,
+    ) -> Result<Vec<factory_types::PullRequestInfo>> {
+        self.list_pull_requests_with_state(repository, head_branch, "all")
+    }
+
+    fn list_pull_requests_with_state(
+        &self,
+        repository: &str,
+        head_branch: &str,
+        state: &str,
+    ) -> Result<Vec<factory_types::PullRequestInfo>> {
         let output = self.run(&[
             "pr",
             "list",
@@ -124,7 +144,7 @@ impl GhCli {
             "--head",
             head_branch,
             "--state",
-            "open",
+            state,
             "--json",
             "number,url,state,isDraft",
         ])?;

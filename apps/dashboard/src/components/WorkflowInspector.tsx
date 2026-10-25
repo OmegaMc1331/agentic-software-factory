@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   createPullRequest,
   fetchDelivery,
+  reconcileDelivery,
   fetchPrPreview,
   fetchRoles,
   fetchRun,
@@ -36,10 +37,11 @@ const SAVE_RECIPE_STATUSES = ["planning", "planned", "blocked"];
 const DELIVERY_STATE_LABELS: Record<string, string> = {
   not_ready: "Not published",
   ready: "Ready to publish",
-  pushing: "Pushing…",
-  creating_pr: "Creating pull request…",
+  pushing: "Publishing pull request…",
+  creating_pr: "Publishing pull request…",
   published: "Published",
   failed: "Failed",
+  interrupted: "Interrupted — outcome unconfirmed",
 };
 
 function progressLabel(detail: RunDetail | null, fallback: ReturnType<typeof runMeta>): string {
@@ -109,6 +111,8 @@ export function WorkflowInspector({
     checking: boolean;
     canRetry: boolean;
   } | null>(null);
+  const [reconciling, setReconciling] = useState(false);
+  const [reconcileNote, setReconcileNote] = useState<string | null>(null);
   const [prPending, setPrPending] = useState(false);
   const prSubmitPending = useRef(false);
   const [saveRecipeForm, setSaveRecipeForm] = useState<{
@@ -175,13 +179,22 @@ export function WorkflowInspector({
       return;
     }
 
-    if (report.persistedState === "failed") {
+    if (report.persistedState === "failed" || report.persistedState === "interrupted") {
+      if (report.persistedState === "interrupted" || report.recoveryRequired) {
+        setDeliveryRecovery({
+          message:
+            "Factory stopped before the previous delivery outcome was confirmed. No new pull request will be created until the previous attempt is checked with GitHub.",
+          checking: false,
+          canRetry: false,
+        });
+        return;
+      }
       setDeliveryRecovery({
         message: report.error
           ? `Delivery failed: ${report.error}`
           : "Delivery failed. Review the error and retry when ready.",
         checking: false,
-        canRetry: true,
+        canRetry: report.retrySafe,
       });
       return;
     }
@@ -208,6 +221,38 @@ export function WorkflowInspector({
       canRetry: false,
     });
   }, [meta.runId, onTeamUpdated]);
+
+  // Reconciliation is deliberate and read-only: it resolves an interrupted
+  // attempt against the real GitHub state. Never a hidden retry.
+  const reconcileDeliveryRemote = useCallback(async () => {
+    if (reconciling) return;
+    setReconciling(true);
+    setReconcileNote(null);
+    setError(null);
+    try {
+      const outcome = await reconcileDelivery(meta.runId);
+      if ("linkedExisting" in outcome) {
+        const number = outcome.linkedExisting.pullRequest?.number ?? null;
+        setReconcileNote(
+          number === null
+            ? "Reconciliation linked the existing pull request."
+            : `Reconciliation linked the existing pull request #${number}.`
+        );
+      } else if ("confirmedMissing" in outcome) {
+        setReconcileNote("GitHub confirmed no pull request exists; creating one is safe again.");
+      } else {
+        setReconcileNote(
+          `GitHub could not be reached, so the outcome stays unconfirmed: ${outcome.unconfirmed.reason}`
+        );
+      }
+    } catch (reason) {
+      setError((reason as Error).message);
+    } finally {
+      setReconciling(false);
+      void loadDelivery();
+      onTeamUpdated?.();
+    }
+  }, [meta.runId, onTeamUpdated, loadDelivery, reconciling]);
 
   useEffect(() => {
     let active = true;
@@ -246,6 +291,40 @@ export function WorkflowInspector({
   useEffect(() => {
     void loadDelivery();
   }, [loadDelivery, status]);
+
+  // While a Factory-owned delivery operation runs, poll the durable local
+  // status (never GitHub) until it settles. Stale responses cannot overwrite
+  // newer state, requests never overlap, and polling stops on completion or
+  // unmount.
+  const deliveryPollSeq = useRef(0);
+  const deliveryPollInFlight = useRef(false);
+  const operationActive =
+    delivery?.operationActive === true ||
+    delivery?.persistedState === "pushing" ||
+    delivery?.persistedState === "creating_pr";
+  useEffect(() => {
+    if (!operationActive) return;
+    const seq = ++deliveryPollSeq.current;
+    const timer = window.setInterval(() => {
+      if (deliveryPollSeq.current !== seq || deliveryPollInFlight.current) return;
+      deliveryPollInFlight.current = true;
+      fetchDelivery(meta.runId)
+        .then((report) => {
+          if (deliveryPollSeq.current === seq) setDelivery(report);
+        })
+        .catch(() => {
+          // Transient status failures keep polling; the durable record is
+          // the source of truth, not the browser's last success.
+        })
+        .finally(() => {
+          deliveryPollInFlight.current = false;
+        });
+    }, 2000);
+    return () => {
+      deliveryPollSeq.current += 1;
+      window.clearInterval(timer);
+    };
+  }, [meta.runId, operationActive]);
 
   useEffect(() => {
     if (!editingTeam) return;
@@ -611,6 +690,30 @@ export function WorkflowInspector({
                   {delivery.repository.repository} · base {delivery.baseBranch ?? "main"}
                 </p>
               )}
+              {operationActive && !delivery.pullRequest && (
+                <p className="inline-note" role="status">
+                  Publishing pull request… the operation is owned by Factory and survives closing
+                  this view; the status refreshes automatically.
+                </p>
+              )}
+              {!delivery.pullRequest && !operationActive && delivery.recoveryRequired && (
+                <div className="workflow-delivery-uncertain" role="status">
+                  <p className="inline-note">
+                    Factory stopped before the previous delivery outcome was confirmed. No new pull
+                    request will be created until the previous attempt is checked.
+                  </p>
+                  <div className="workflow-actions">
+                    <button
+                      className="button"
+                      onClick={() => void reconcileDeliveryRemote()}
+                      disabled={busy || reconciling}
+                    >
+                      {reconciling ? "Checking GitHub…" : "Check GitHub for the previous attempt"}
+                    </button>
+                  </div>
+                  {reconcileNote && <p className="inline-note">{reconcileNote}</p>}
+                </div>
+              )}
               {delivery.error && <p className="inline-error">{delivery.error}</p>}
               {!delivery.pullRequest && delivery.blockers.length > 0 && status === "completed" && (
                 <ul className="workflow-delivery-blockers">
@@ -747,15 +850,19 @@ export function WorkflowInspector({
                       Open on GitHub
                     </a>
                   )}
-                  {!delivery.pullRequest && delivery.eligible && (
-                    <button
-                      className="button button-primary"
-                      onClick={openPrPreview}
-                      disabled={busy}
-                    >
-                      Create Pull Request
-                    </button>
-                  )}
+                  {!delivery.pullRequest &&
+                    delivery.eligible &&
+                    !operationActive &&
+                    !delivery.recoveryRequired &&
+                    delivery.state !== "interrupted" && (
+                      <button
+                        className="button button-primary"
+                        onClick={openPrPreview}
+                        disabled={busy}
+                      >
+                        Create Pull Request
+                      </button>
+                    )}
                 </div>
               )}
             </section>

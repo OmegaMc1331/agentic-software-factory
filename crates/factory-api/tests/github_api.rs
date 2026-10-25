@@ -14,7 +14,8 @@ use std::sync::Arc;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use axum::body::Body;
-use axum::http::{Request, StatusCode};
+use axum::http::{Method, Request, StatusCode};
+use axum::Router;
 use factory_core::{AgentEntry, Config, RoleAssignment};
 use http_body_util::BodyExt;
 use serde_json::json;
@@ -420,4 +421,289 @@ async fn graph_exposes_compact_github_issue_and_pr_nodes() {
 
 fn link_issue_url() -> &'static str {
     "https://github.com/octocat/example/issues/42"
+}
+
+// --- ASF-18: durable asynchronous delivery operations -----------------------
+
+/// Drives the fixture workflow to completion through the core Factory (the
+/// API's runtime holds the project lock; `Factory::open` stays lock-free).
+async fn completed_delivery_run(dir: &Path) -> i64 {
+    let plan_path = dir.join("plan.json");
+    let worker_path = dir.join("worker.json");
+    let reviewer_path = dir.join("reviewer.json");
+    std::fs::write(&worker_path, r#"{"commands":["cargo test"]}"#).unwrap();
+    std::fs::write(
+        &reviewer_path,
+        r#"{"decision":"approve","reason":"lgtm","feedback":[]}"#,
+    )
+    .unwrap();
+    let cat = |path: &Path| -> String {
+        if cfg!(windows) {
+            format!("type {}", path.display())
+        } else {
+            format!("cat '{}'", path.display())
+        }
+    };
+    let worker = if cfg!(windows) {
+        format!(
+            "echo done>worker-output.txt & type {}",
+            worker_path.display()
+        )
+    } else {
+        format!(
+            "printf 'done\n' > worker-output.txt; cat '{}'",
+            worker_path.display()
+        )
+    };
+    let mut config = Config::default();
+    config
+        .agents
+        .insert("planner-test".into(), command_entry(&cat(&plan_path)));
+    config
+        .agents
+        .insert("worker-test".into(), command_entry(&worker));
+    config
+        .agents
+        .insert("reviewer-test".into(), command_entry(&cat(&reviewer_path)));
+    for (role, agent) in [
+        ("planner", "planner-test"),
+        ("worker", "worker-test"),
+        ("reviewer", "reviewer-test"),
+    ] {
+        config.role_assignments.push(RoleAssignment {
+            role: role.into(),
+            agent: agent.into(),
+            preferred: true,
+        });
+    }
+    config.write_atomic(dir).unwrap();
+
+    // Open only after the config exists: the Factory snapshots it at open.
+    let factory = factory_core::Factory::open(dir).unwrap();
+    let run = factory.import_github_issue("#42", None, None).unwrap();
+    factory
+        .plan_run(run.id, &std::sync::atomic::AtomicBool::new(false))
+        .unwrap();
+    factory.prepare_start(run.id).unwrap();
+    let result = factory
+        .execute_active_run(run.id, &std::sync::atomic::AtomicBool::new(false))
+        .unwrap();
+    assert!(matches!(result, factory_core::WorkflowResult::Completed));
+    run.id
+}
+
+async fn delivery_report(app: &Router, run_id: i64) -> serde_json::Value {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/runs/{run_id}/delivery"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    common::response_json(response).await
+}
+
+async fn post_delivery(app: &Router, run_id: i64) -> (StatusCode, serde_json::Value) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/runs/{run_id}/pull-request"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"title": "ASF-18 api title", "body": "api body"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    (status, common::response_json(response).await)
+}
+
+#[tokio::test]
+async fn pull_request_runs_asynchronously_and_publishes() {
+    let _guard = gh_env_lock();
+    let (dir, state) = fixture();
+    let run_id = completed_delivery_run(dir.path()).await;
+    let app = common::authenticated_app(state).await;
+
+    let (status, body) = post_delivery(&app, run_id).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "body: {body}");
+    assert_eq!(body["state"], "pushing");
+    assert!(
+        body["operationId"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty()),
+        "the accepted response carries the durable operation id: {body}"
+    );
+
+    // The operation is Factory-owned: poll the durable status to completion.
+    let mut published = None;
+    for _ in 0..100 {
+        let report = delivery_report(&app, run_id).await;
+        if report["pullRequest"].is_object() {
+            published = Some(report);
+            break;
+        }
+        assert_eq!(report["operationActive"], true, "while running: {report}");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let report = published.unwrap_or_else(|| panic!("delivery never published"));
+    assert_eq!(report["state"], "published");
+    assert_eq!(report["persistedState"], "published");
+    assert_eq!(report["pullRequest"]["number"], 58);
+    assert_eq!(report["retrySafe"], false);
+    assert_eq!(report["recoveryRequired"], false);
+}
+
+#[tokio::test]
+async fn repeat_request_after_publication_returns_the_existing_pr() {
+    let _guard = gh_env_lock();
+    let (dir, state) = fixture();
+    let run_id = completed_delivery_run(dir.path()).await;
+    let app = common::authenticated_app(state).await;
+
+    let (first_status, _) = post_delivery(&app, run_id).await;
+    assert_eq!(first_status, StatusCode::ACCEPTED);
+    let mut done = false;
+    for _ in 0..100 {
+        if delivery_report(&app, run_id).await["pullRequest"].is_object() {
+            done = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(done, "delivery never published");
+
+    let (status, body) = post_delivery(&app, run_id).await;
+    assert_eq!(status, StatusCode::OK, "idempotent repeat: {body}");
+    assert_eq!(body["pullRequest"]["number"], 58);
+}
+
+#[tokio::test]
+async fn concurrent_requests_launch_exactly_one_operation() {
+    let _guard = gh_env_lock();
+    let (dir, state) = fixture();
+    let run_id = completed_delivery_run(dir.path()).await;
+    let app = common::authenticated_app(state).await;
+    let second = app.clone();
+
+    let (left, right) = tokio::join!(post_delivery(&app, run_id), post_delivery(&second, run_id));
+    let mut accepted = 0;
+    let mut conflicts = 0;
+    for (status, body) in [left, right] {
+        match status {
+            StatusCode::ACCEPTED => accepted += 1,
+            StatusCode::CONFLICT => {
+                conflicts += 1;
+                assert!(
+                    body["error"].to_string().contains("delivery operation"),
+                    "conflict explains itself: {body}"
+                );
+            }
+            other => panic!("unexpected status {other}: {body}"),
+        }
+    }
+    assert_eq!(accepted, 1, "exactly one request may start the operation");
+    assert_eq!(conflicts, 1);
+
+    let mut published = false;
+    for _ in 0..100 {
+        if delivery_report(&app, run_id).await["pullRequest"].is_object() {
+            published = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(published, "delivery never published");
+}
+
+#[tokio::test]
+async fn delivery_endpoints_require_authentication() {
+    let _guard = gh_env_lock();
+    let (dir, state) = fixture();
+    let run_id = completed_delivery_run(dir.path()).await;
+    let app = factory_api::router(state);
+
+    for uri in [
+        format!("/api/runs/{run_id}/pull-request"),
+        format!("/api/runs/{run_id}/delivery/reconcile"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(uri)
+                    .header("host", "127.0.0.1:4321")
+                    .header("origin", "http://127.0.0.1:4321")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+}
+
+#[tokio::test]
+async fn interrupted_delivery_is_inspectable_blocked_then_reconciled() {
+    let _guard = gh_env_lock();
+    let (dir, state) = fixture();
+    let run_id = completed_delivery_run(dir.path()).await;
+
+    // Simulate a crash: the operation is claimed, then startup demotion marks
+    // it interrupted with an unknown outcome.
+    let factory = factory_core::Factory::open(dir.path()).unwrap();
+    factory
+        .begin_delivery(run_id, Some("title"), Some("body"), false)
+        .unwrap();
+    factory.demote_interrupted_deliveries().unwrap();
+    drop(factory);
+
+    let app = common::authenticated_app(state).await;
+    let report = delivery_report(&app, run_id).await;
+    assert_eq!(report["state"], "interrupted");
+    assert_eq!(report["persistedState"], "interrupted");
+    assert_eq!(report["recoveryRequired"], true);
+    assert_eq!(report["retrySafe"], false, "unknown outcome blocks retry");
+
+    let (status, body) = post_delivery(&app, run_id).await;
+    assert_eq!(status, StatusCode::CONFLICT, "no blind retry: {body}");
+
+    // GitHub reveals the PR the crashed attempt created.
+    std::fs::write(
+        dir.path().join("pr-list.json"),
+        r#"[{"number":91,"url":"https://github.com/octocat/example/pull/91","state":"OPEN","isDraft":false}]"#,
+    )
+    .unwrap();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/runs/{run_id}/delivery/reconcile"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let outcome = common::response_json(response).await;
+    assert!(
+        outcome.to_string().contains("linkedExisting"),
+        "outcome: {outcome}"
+    );
+
+    let report = delivery_report(&app, run_id).await;
+    assert_eq!(report["state"], "published");
+    assert_eq!(report["pullRequest"]["number"], 91);
+    assert_eq!(report["recoveryRequired"], false);
 }

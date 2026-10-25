@@ -26,6 +26,8 @@ struct FakeGh {
     dir: PathBuf,
     authenticated: bool,
     existing_prs: Vec<u32>,
+    failing_pr_create: bool,
+    failing_pr_list: bool,
 }
 
 impl FakeGh {
@@ -34,6 +36,8 @@ impl FakeGh {
             dir: dir.to_path_buf(),
             authenticated: true,
             existing_prs: Vec::new(),
+            failing_pr_create: false,
+            failing_pr_list: false,
         }
     }
 
@@ -44,6 +48,20 @@ impl FakeGh {
 
     fn with_existing_pr(mut self, number: u32) -> FakeGh {
         self.existing_prs.push(number);
+        self
+    }
+
+    /// `gh pr create` fails with output no classifier recognizes: the
+    /// delivery outcome must become uncertain, never a definitive failure.
+    fn with_failing_pr_create(mut self) -> FakeGh {
+        self.failing_pr_create = true;
+        self
+    }
+
+    /// `gh pr list` fails as a network error: reconciliation stays
+    /// unconfirmed instead of guessing.
+    fn with_failing_pr_list(mut self) -> FakeGh {
+        self.failing_pr_list = true;
         self
     }
 
@@ -66,6 +84,14 @@ impl FakeGh {
             .collect();
         std::fs::write(&pr_list_file, format!("[{}]", list.join(","))).unwrap();
         let create_log = self.dir.join("gh-create.log");
+        let list_fail = self.dir.join("gh-list-fail");
+        let create_fail = self.dir.join("gh-create-fail");
+        if self.failing_pr_list {
+            std::fs::write(&list_fail, "").unwrap();
+        }
+        if self.failing_pr_create {
+            std::fs::write(&create_fail, "").unwrap();
+        }
         let path = if cfg!(windows) {
             let script = format!(
                 "@echo off\r\n\
@@ -82,9 +108,11 @@ impl FakeGh {
                  type \"{issue}\"\r\n\
                  exit /b 0\r\n\
                  :prlist\r\n\
+                 if exist \"{list_fail}\" (echo could not resolve host api.github.com network 1>&2 & exit /b 1)\r\n\
                  type \"{pr_list}\"\r\n\
                  exit /b 0\r\n\
                  :prcreate\r\n\
+                 if exist \"{create_fail}\" (echo gh: something exploded 1>&2 & exit /b 1)\r\n\
                  echo create>>\"{create_log}\"\r\n\
                  echo https://github.com/octocat/example/pull/58\r\n\
                  exit /b 0\r\n",
@@ -97,6 +125,8 @@ impl FakeGh {
                 auth_code = if self.authenticated { 0 } else { 1 },
                 issue = issue_file.display(),
                 pr_list = pr_list_file.display(),
+                list_fail = list_fail.display(),
+                create_fail = create_fail.display(),
                 create_log = create_log.display(),
             );
             let path = self.dir.join("fake-gh.cmd");
@@ -113,12 +143,14 @@ impl FakeGh {
                  auth)\n{auth_body};;\n\
                  issue) cat '{issue}' ;;\n\
                  pr)\n  case \"$2\" in\n\
-                 list) cat '{pr_list}' ;;\n\
-                 create) echo create >> '{create_log}'; echo https://github.com/octocat/example/pull/58 ;;\n\
+                 list) if [ -f '{list_fail}' ]; then echo 'could not resolve host api.github.com network' >&2; exit 1; fi; cat '{pr_list}' ;;\n\
+                 create) if [ -f '{create_fail}' ]; then echo 'gh: something exploded' >&2; exit 1; fi; echo create >> '{create_log}'; echo https://github.com/octocat/example/pull/58 ;;\n\
                  *) echo unknown >&2; exit 1 ;;\n  esac ;;\n\
                  *) echo unknown gh subcommand >&2; exit 1 ;;\nesac\n",
                 issue = issue_file.display(),
                 pr_list = pr_list_file.display(),
+                list_fail = list_fail.display(),
+                create_fail = create_fail.display(),
                 create_log = create_log.display(),
             );
             let path = self.dir.join("fake-gh.sh");
@@ -249,6 +281,24 @@ fn github_fixture() -> (TempDir, Factory, FakeGh, PathBuf) {
 }
 
 fn github_fixture_with_existing_pr(existing: Vec<u32>) -> (TempDir, Factory, FakeGh, PathBuf) {
+    github_fixture_custom(move |dir| {
+        let mut fake = FakeGh::new(dir);
+        for number in existing {
+            fake = fake.with_existing_pr(number);
+        }
+        fake
+    })
+}
+
+/// A fixture whose fake `gh` fails `pr create` unrecognized: the delivery
+/// must end interrupted (uncertain), never definitively failed.
+fn interrupted_fixture() -> (TempDir, Factory, FakeGh, PathBuf) {
+    github_fixture_custom(|dir| FakeGh::new(dir).with_failing_pr_create())
+}
+
+fn github_fixture_custom(
+    build_fake: impl FnOnce(&Path) -> FakeGh,
+) -> (TempDir, Factory, FakeGh, PathBuf) {
     let dir = TempDir::new().unwrap();
     let bare = init_github_clone(dir.path());
     Factory::init(dir.path()).unwrap();
@@ -304,10 +354,7 @@ fn github_fixture_with_existing_pr(existing: Vec<u32>) -> (TempDir, Factory, Fak
     }
     config.write_atomic(dir.path()).unwrap();
 
-    let mut fake_gh = FakeGh::new(dir.path());
-    for number in existing {
-        fake_gh = fake_gh.with_existing_pr(number);
-    }
+    let fake_gh = build_fake(dir.path());
     fake_gh.install();
     let factory = Factory::open(dir.path()).unwrap();
     (dir, factory, fake_gh, bare)
@@ -715,4 +762,278 @@ fn policy_engine_stays_authoritative_over_imported_issues() {
     assert!(view.git_denied.contains(&"push".to_string()));
     assert!(view.git_denied.contains(&"force_push".to_string()));
     assert!(view.git_allowed.iter().all(|op| op != "push"));
+}
+
+// --- ASF-18: durable, recoverable, idempotent delivery ----------------------
+
+use factory_core::DeliveryClaim;
+use factory_types::DeliveryState;
+use std::sync::{Arc, Barrier};
+
+#[test]
+fn uncertain_pr_create_interrupts_the_delivery_and_blocks_blind_retry() {
+    let _guard = gh_env_lock();
+    let (dir, factory, _gh, _bare) = interrupted_fixture();
+    let run_id = completed_issue_workflow(&factory);
+
+    let error = factory
+        .create_pull_request(run_id, None, Some("body"), false)
+        .unwrap_err();
+    assert!(!error.to_string().is_empty());
+
+    let report = factory.delivery_report(run_id).unwrap();
+    assert_eq!(report.persisted_state, DeliveryState::Interrupted);
+    assert!(report.recovery_required, "uncertainty must be flagged");
+    assert!(
+        !report.retry_safe,
+        "unknown outcomes are not safely retryable"
+    );
+    assert_eq!(report.pull_request, None);
+    // The push itself succeeded before the PR step failed: the remote branch
+    // exists, which reconciliation uses as independent evidence.
+    assert!(factory_github::remote_branch_sha(
+        dir.path(),
+        "origin",
+        &format!("factory/run-{run_id}")
+    )
+    .unwrap()
+    .is_some());
+
+    // A blind retry is rejected by the server-side claim, not by the UI.
+    let retry = factory
+        .begin_delivery(run_id, None, None, false)
+        .unwrap_err();
+    assert!(matches!(retry, FactoryError::DeliveryConflict(_)));
+}
+
+#[test]
+fn reconciliation_links_an_existing_pr_without_creating_one() {
+    let _guard = gh_env_lock();
+    let (dir, factory, gh, _bare) = interrupted_fixture();
+    let run_id = completed_issue_workflow(&factory);
+    let _ = factory
+        .create_pull_request(run_id, None, Some("body"), false)
+        .unwrap_err();
+    // GitHub actually created the PR before the local failure; only a later
+    // pr list reveals it.
+    std::fs::write(
+        dir.path().join("pr-list.json"),
+        r#"[{"number":77,"url":"https://github.com/octocat/example/pull/77","state":"OPEN","isDraft":false}]"#,
+    )
+    .unwrap();
+    let creates_before = gh.created_pull_requests();
+
+    let outcome = factory.reconcile_delivery(run_id).unwrap();
+    match &outcome {
+        github::DeliveryReconciliation::LinkedExisting(delivery) => {
+            assert_eq!(delivery.state, DeliveryState::Published);
+            assert_eq!(delivery.pull_request.as_ref().unwrap().number, 77);
+        }
+        other => panic!("expected a linked PR, got {other:?}"),
+    }
+    assert_eq!(
+        gh.created_pull_requests(),
+        creates_before,
+        "reconciliation must never create a pull request"
+    );
+    let report = factory.delivery_report(run_id).unwrap();
+    assert_eq!(report.state, DeliveryState::Published);
+    assert!(!report.recovery_required);
+}
+
+#[test]
+fn reconciliation_confirms_no_pr_and_unblocks_a_safe_retry() {
+    let _guard = gh_env_lock();
+    let (_dir, factory, gh, _bare) = interrupted_fixture();
+    let run_id = completed_issue_workflow(&factory);
+    let _ = factory
+        .create_pull_request(run_id, None, Some("body"), false)
+        .unwrap_err();
+
+    let outcome = factory.reconcile_delivery(run_id).unwrap();
+    assert!(matches!(
+        outcome,
+        github::DeliveryReconciliation::ConfirmedMissing(_)
+    ));
+    let report = factory.delivery_report(run_id).unwrap();
+    assert_eq!(report.persisted_state, DeliveryState::Failed);
+    assert!(!report.recovery_required);
+    assert!(
+        report.retry_safe,
+        "authoritative no-PR evidence unblocks retry"
+    );
+
+    // The retry path works end to end and creates exactly one PR; the
+    // transient GitHub failure is gone by then.
+    std::fs::remove_file(_dir.path().join("gh-create-fail")).unwrap();
+    let delivery = factory
+        .create_pull_request(run_id, None, Some("body"), false)
+        .unwrap();
+    assert_eq!(delivery.state, DeliveryState::Published);
+    assert_eq!(gh.created_pull_requests(), 1);
+}
+
+#[test]
+fn unreachable_github_leaves_reconciliation_unconfirmed() {
+    let _guard = gh_env_lock();
+    let (dir, factory, _gh, _bare) = github_fixture_custom(|dir_path| {
+        FakeGh::new(dir_path)
+            .with_failing_pr_create()
+            .with_failing_pr_list()
+    });
+    let run_id = completed_issue_workflow(&factory);
+    let _ = factory
+        .create_pull_request(run_id, None, Some("body"), false)
+        .unwrap_err();
+    std::fs::write(dir.path().join("gh-list-fail"), "").unwrap();
+
+    let outcome = factory.reconcile_delivery(run_id).unwrap();
+    match outcome {
+        github::DeliveryReconciliation::Unconfirmed { reason, .. } => {
+            assert!(reason.contains("network"), "reason: {reason}");
+        }
+        other => panic!("expected unconfirmed, got {other:?}"),
+    }
+    let report = factory.delivery_report(run_id).unwrap();
+    assert_eq!(report.persisted_state, DeliveryState::Interrupted);
+    assert!(report.recovery_required);
+    assert!(!report.retry_safe);
+}
+
+#[test]
+fn restart_demotes_stale_active_deliveries_to_interrupted() {
+    let _guard = gh_env_lock();
+    let (_dir, factory, _gh, _bare) = github_fixture();
+    let run_id = completed_issue_workflow(&factory);
+
+    // Claim without executing: this is exactly the state a crashed Factory
+    // process leaves behind (`pushing`, and after a push `creating_pr`).
+    let claim = factory.begin_delivery(run_id, None, None, false).unwrap();
+    let DeliveryClaim::Claimed(claimed, _request) = claim else {
+        panic!("expected a claim");
+    };
+    assert_eq!(claimed.state, DeliveryState::Pushing);
+    assert!(claimed.operation_id.is_some());
+
+    let demoted = factory.demote_interrupted_deliveries().unwrap();
+    assert_eq!(demoted, vec![run_id]);
+    let report = factory.delivery_report(run_id).unwrap();
+    assert_eq!(report.state, DeliveryState::Interrupted);
+    assert!(report.recovery_required);
+    assert!(!report.retry_safe);
+    assert!(report.error.as_deref().unwrap().contains("stopped"));
+
+    // No automatic duplicate PR creation happens at restart: only explicit
+    // user action can continue.
+    let retry = factory
+        .begin_delivery(run_id, None, None, false)
+        .unwrap_err();
+    assert!(matches!(retry, FactoryError::DeliveryConflict(_)));
+}
+
+#[test]
+fn a_stale_operation_cannot_overwrite_a_newer_outcome() {
+    let _guard = gh_env_lock();
+    let (_dir, factory, _gh, _bare) = github_fixture();
+    let run_id = completed_issue_workflow(&factory);
+
+    // First attempt crashes mid-flight and is demoted + reconciled.
+    let first = match factory.begin_delivery(run_id, None, None, false).unwrap() {
+        DeliveryClaim::Claimed(delivery, request) => {
+            (delivery.operation_id.clone().unwrap(), request)
+        }
+        DeliveryClaim::AlreadyPublished(_) => panic!("expected a claim"),
+    };
+    factory.demote_interrupted_deliveries().unwrap();
+    let outcome = factory.reconcile_delivery(run_id).unwrap();
+    assert!(matches!(
+        outcome,
+        github::DeliveryReconciliation::ConfirmedMissing(_)
+    ));
+
+    // A second attempt claims a new operation identity and finishes.
+    let second = factory
+        .create_pull_request(run_id, None, Some("body"), false)
+        .unwrap();
+    assert_eq!(second.state, DeliveryState::Published);
+
+    // The first (stale) worker resurfaces and tries to write its result.
+    let stale_error = factory
+        .execute_delivery(run_id, &first.0, &first.1)
+        .unwrap_err();
+    assert!(matches!(stale_error, FactoryError::DeliveryConflict(_)));
+    let after = factory.delivery_report(run_id).unwrap();
+    assert_eq!(after.state, DeliveryState::Published);
+    assert!(
+        after.pull_request.is_some(),
+        "published state survives the stale writer"
+    );
+}
+
+#[test]
+fn concurrent_claims_start_exactly_one_operation() {
+    let _guard = gh_env_lock();
+    let (dir, factory, gh, _bare) = github_fixture();
+    let run_id = completed_issue_workflow(&factory);
+
+    let barrier = Arc::new(Barrier::new(2));
+    let root = dir.path().to_path_buf();
+    let handles: Vec<_> = (0..2)
+        .map(|_| {
+            let barrier = Arc::clone(&barrier);
+            let root = root.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                let opener = Factory::open(&root).unwrap();
+                opener.begin_delivery(run_id, None, None, false)
+            })
+        })
+        .collect();
+    let mut claims = 0;
+    let mut conflicts = 0;
+    for handle in handles {
+        match handle.join().unwrap() {
+            Ok(DeliveryClaim::Claimed(..)) => claims += 1,
+            Ok(DeliveryClaim::AlreadyPublished(_)) => panic!("nothing published yet"),
+            Err(FactoryError::DeliveryConflict(_)) => conflicts += 1,
+            Err(other) => panic!("unexpected claim error: {other}"),
+        }
+    }
+    assert_eq!(claims, 1, "exactly one request may win the durable claim");
+    assert_eq!(conflicts, 1);
+
+    // The claimed-but-unexecuted operation still owns the run.
+    let blocked = factory
+        .create_pull_request(run_id, None, None, false)
+        .unwrap_err();
+    assert!(matches!(blocked, FactoryError::DeliveryConflict(_)));
+    assert_eq!(gh.created_pull_requests(), 0);
+}
+
+#[test]
+fn published_deliveries_survive_restart_and_never_recreate() {
+    let _guard = gh_env_lock();
+    let (_dir, factory, gh, _bare) = github_fixture();
+    let run_id = completed_issue_workflow(&factory);
+    let published = factory
+        .create_pull_request(run_id, None, Some("body"), false)
+        .unwrap();
+    let pr_number = published.pull_request.as_ref().unwrap().number;
+    let creates_after_publish = gh.created_pull_requests();
+
+    // A restart runs startup demotion: a published record must be untouched.
+    factory.demote_interrupted_deliveries().unwrap();
+    let again = factory
+        .create_pull_request(run_id, Some("different title"), Some("body"), true)
+        .unwrap();
+    assert_eq!(
+        again.pull_request.as_ref().unwrap().number,
+        pr_number,
+        "repeated requests return the existing PR"
+    );
+    assert_eq!(
+        gh.created_pull_requests(),
+        creates_after_publish,
+        "no duplicate PR creation after publication"
+    );
 }

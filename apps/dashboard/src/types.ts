@@ -590,7 +590,7 @@ export interface RunMeta {
 // --- GitHub -----------------------------------------------------------------
 
 export type DeliveryState =
-  "not_ready" | "ready" | "pushing" | "creating_pr" | "published" | "failed";
+  "not_ready" | "ready" | "pushing" | "creating_pr" | "published" | "failed" | "interrupted";
 
 export interface GitHubIssueLink {
   provider: string;
@@ -643,6 +643,15 @@ export interface DeliveryReport {
   error: string | null;
   eligible: boolean;
   blockers: string[];
+  /** Durable identity of the current (or last) delivery operation attempt. */
+  operationId: string | null;
+  /** Whether a Factory-owned operation is executing right now. */
+  operationActive: boolean;
+  /** Whether the last attempt's outcome is unknown and must be reconciled. */
+  recoveryRequired: boolean;
+  /** Server-enforced retry safety: no PR yet, nothing active or unresolved. */
+  retrySafe: boolean;
+  updatedAt: string;
 }
 
 /** The persisted delivery record returned after `Create Pull Request`. */
@@ -656,9 +665,17 @@ export interface GitHubDeliveryRecord {
   pushedHead: string | null;
   pullRequest: PullRequestInfo | null;
   error: string | null;
+  operationId: string | null;
+  recoveryRequired: boolean;
   createdAt: string;
   updatedAt: string;
 }
+
+/** Outcome of reconciling an interrupted delivery against GitHub. */
+export type DeliveryReconciliation =
+  | { linkedExisting: GitHubDeliveryRecord }
+  | { confirmedMissing: GitHubDeliveryRecord }
+  | { unconfirmed: { reason: string; pushConfirmed: boolean | null } };
 
 export interface PrPreview {
   runId: number;

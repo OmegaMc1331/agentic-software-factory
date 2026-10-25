@@ -121,6 +121,49 @@ timestamps) is persisted on the workflow, so state survives browser reloads
 and restarts. Before creating a PR, Factory checks for an open PR on the head
 branch and links it instead of duplicating.
 
+### Durable operation ownership (ASF-18)
+
+Creating a pull request is an asynchronous, Factory-owned operation:
+
+1. The API request validates the workflow, then **atomically claims** the
+   run's delivery operation in SQLite (a compare-and-set from an idle or
+   failed state). Exactly one concurrent request can win the claim; the
+   others receive a `409 Conflict`. The claim — including a durable
+   `operationId` — is committed before any external side effect runs.
+2. The worker executes under Factory ownership, decoupled from the browser:
+   closing the tab, a request timeout, or a reload never cancels it. The
+   endpoint answers `202 Accepted` with the claimed record; a repeated
+   request after publication answers `200` with the existing PR and creates
+   nothing.
+3. Every state transition is guarded by the operation id, so a stale attempt
+   (left behind by a crash and superseded after recovery) can never
+   overwrite a newer outcome — including `published`.
+4. The dashboard polls the durable local status (`GET /api/runs/:id/delivery`)
+   while an operation runs; polling never contacts GitHub.
+
+### Uncertain outcomes and reconciliation
+
+A failed local command does not prove the remote side effect did not happen
+(the push may have been accepted before the connection dropped; GitHub may
+have created the PR before `gh` timed out). Such attempts are recorded as
+`interrupted` with recovery required — never as `failed` — and Factory
+refuses to start another operation until reconciliation resolves them:
+
+- On restart, deliveries left `pushing`/`creating_pr` by a previous process
+  are demoted to `interrupted`. Nothing is pushed or created at startup.
+- `POST /api/runs/:id/delivery/reconcile` performs a read-only check
+  (`gh pr list --state all` for the head branch, plus `git ls-remote` for
+  the pushed head). An existing PR is linked and persisted; an
+  authoritative "no PR exists" turns the attempt into an ordinary,
+  retryable failure; an unreachable GitHub leaves the outcome explicitly
+  *unconfirmed* — never a guessed failure.
+
+A local database alone cannot guarantee exactly-once execution when GitHub
+may succeed before Factory persists the result. What Factory guarantees
+instead is practical idempotency: one operation per run at a time, existing
+PRs linked instead of duplicated, unknown outcomes never retried blindly,
+and stale attempts unable to corrupt newer state.
+
 ## Security model summary
 
 - **Agent permissions vs Factory delivery permissions** are distinct
@@ -139,11 +182,15 @@ branch and links it instead of duplicating.
 ```text
 not_ready → ready → pushing → creating_pr → published
                        ↘ failed (actionable error, retryable)
+                       ↘ interrupted (outcome unknown → reconcile first)
 ```
 
 Delivery state is deliberately separate from RunStatus: a workflow can be
 `Completed` while its delivery is `not_ready`, and a `failed` delivery can
-be retried once its blocker is resolved.
+be retried once its blocker is resolved. An `interrupted` delivery blocks
+retry until reconciliation confirms the remote outcome; `effective` state
+reporting always shows active, failed, and interrupted operations instead of
+masking them as `ready`.
 
 ## Troubleshooting
 

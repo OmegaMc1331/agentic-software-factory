@@ -6,6 +6,7 @@ import type {
   AgentStatusInfo,
   ConfigData,
   DeliveryReport,
+  DeliveryReconciliation,
   ExecutionClass,
   GitHubDeliveryRecord,
   GitHubStatus,
@@ -573,6 +574,22 @@ export function createPullRequest(
   return post<GitHubDeliveryRecord>(
     `/runs/${runId}/pull-request`,
     request,
+    operationOptions(options, "externalOperation", "write")
+  );
+}
+
+/**
+ * Reconciles an interrupted delivery: read-only GitHub checks that link an
+ * already-created pull request or authoritatively confirm none exists. Never
+ * pushes or creates.
+ */
+export function reconcileDelivery(
+  runId: number,
+  options?: ApiRequestOptions
+): Promise<DeliveryReconciliation> {
+  return post<DeliveryReconciliation>(
+    `/runs/${runId}/delivery/reconcile`,
+    undefined,
     operationOptions(options, "externalOperation", "write")
   );
 }

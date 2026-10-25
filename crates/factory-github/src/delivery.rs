@@ -58,7 +58,36 @@ fn classify_push_failure(text: &str) -> GitHubError {
     {
         return GitHubError::Network(text.to_string());
     }
-    GitHubError::PushRejected(text.to_string())
+    // The remote may have accepted the push before the failure; the outcome
+    // is unknown until reconciliation checks the remote branch.
+    GitHubError::Uncertain(text.to_string())
+}
+
+/// The commit the remote currently holds for `branch`, if the branch exists.
+/// Read-only (`git ls-remote`); used to confirm or refute an uncertain push
+/// without ever pushing.
+pub fn remote_branch_sha(root: &Path, remote: &str, branch: &str) -> Result<Option<String>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["ls-remote", remote])
+        .arg(format!("refs/heads/{branch}"))
+        .output()
+        .map_err(GitHubError::Io)?;
+    if !output.status.success() {
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return Err(classify_push_failure(&text));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    Ok(text
+        .lines()
+        .find_map(|line| line.split_once('\t'))
+        .filter(|(sha, reference)| !sha.is_empty() && *reference == format!("refs/heads/{branch}"))
+        .map(|(sha, _)| sha.to_string()))
 }
 
 /// Outcome of a delivery attempt: either a freshly created PR or an existing
@@ -84,12 +113,12 @@ pub fn create_or_link_pull_request(
     if let Some(pr) = existing.into_iter().max_by_key(|pr| pr.number) {
         return Ok(DeliveryOutcome::LinkedExisting(pr));
     }
-    Ok(DeliveryOutcome::Created(gh.create_pull_request(
-        repository,
-        base,
-        head_branch,
-        title,
-        body,
-        draft,
-    )?))
+    match gh.create_pull_request(repository, base, head_branch, title, body, draft) {
+        Ok(pr) => Ok(DeliveryOutcome::Created(pr)),
+        // An unrecognized `gh pr create` failure cannot prove the PR was not
+        // created (GitHub may have accepted it before the CLI failed); the
+        // delivery outcome stays unknown until reconciliation.
+        Err(GitHubError::Gh(detail)) => Err(GitHubError::Uncertain(detail)),
+        Err(error) => Err(error),
+    }
 }

@@ -204,6 +204,31 @@ describe("Factory API client", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
+  it("posts delivery reconciliation to the semantic reconcile endpoint", async () => {
+    vi.useFakeTimers();
+    let reconcileBody: unknown;
+    stubFetch((url, init) => {
+      if (url === "/api/auth/session") return Promise.resolve(sessionResponse());
+      if (url === "/api/runs/12/delivery/reconcile") {
+        reconcileBody = init?.body;
+        return Promise.resolve(
+          jsonResponse(
+            { linkedExisting: { runId: 12, state: "published", pullRequest: { number: 58 } } },
+            200
+          )
+        );
+      }
+      return Promise.resolve(jsonResponse({ error: "unexpected request" }, 500));
+    });
+
+    const request = api.reconcileDelivery(12);
+    await vi.advanceTimersByTimeAsync(1);
+    await expect(request).resolves.toMatchObject({
+      linkedExisting: { runId: 12, state: "published" },
+    });
+    expect(reconcileBody).toBeUndefined();
+  });
+
   it("times out an external write as uncertain without retrying it", async () => {
     vi.useFakeTimers();
     let pullRequestCalls = 0;

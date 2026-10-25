@@ -94,6 +94,12 @@ pub enum FactoryError {
     Mcp(#[from] factory_mcp::McpError),
     #[error("delivery not allowed: {0}")]
     NotDeliverable(String),
+    /// A delivery operation cannot start or continue: another operation owns
+    /// the run, an interrupted attempt must be reconciled first, or the
+    /// record is otherwise not claimable right now. Distinct from
+    /// [`FactoryError::NotDeliverable`]: eligibility is fine, the state is.
+    #[error("delivery operation conflict: {0}")]
+    DeliveryConflict(String),
     #[error("task {0} is not ready to run")]
     NotReady(i64),
     #[error("routing override: {0}")]
@@ -3365,6 +3371,13 @@ impl Factory {
                 url: remote.web_url(),
                 default_branch: remote.default_branch.clone(),
             });
+        let operation_active = delivery.state.is_active();
+        let retry_safe = delivery.pull_request.is_none()
+            && delivery.state != DeliveryState::Published
+            && !operation_active
+            && !delivery.recovery_required
+            && delivery.state != DeliveryState::Interrupted
+            && eligibility.ready;
         Ok(crate::github::DeliveryReport {
             run_id,
             state: crate::github::effective_delivery_state(&delivery, eligibility.ready),
@@ -3383,7 +3396,42 @@ impl Factory {
             error: delivery.error,
             eligible: eligibility.ready,
             blockers: eligibility.blockers,
+            operation_id: delivery.operation_id,
+            operation_active,
+            recovery_required: delivery.recovery_required,
+            retry_safe,
+            updated_at: delivery.updated_at,
         })
+    }
+
+    /// Marks an operation's delivery interrupted when its worker died
+    /// without a clean failure path (for example a panic). Best effort and
+    /// scoped to the operation id: a superseded attempt is left untouched.
+    pub fn mark_delivery_interrupted(
+        &self,
+        run_id: i64,
+        operation_id: &str,
+        reason: &str,
+    ) -> Result<(), FactoryError> {
+        if let Some(mut delivery) = self.db.get_delivery(run_id)? {
+            if delivery.operation_id.as_deref() == Some(operation_id) && delivery.state.is_active()
+            {
+                delivery.state = DeliveryState::Interrupted;
+                delivery.recovery_required = true;
+                delivery.error = Some(reason.to_string());
+                let _ = self.db.set_delivery_if_operation(&delivery, operation_id);
+            }
+        }
+        Ok(())
+    }
+
+    /// Startup recovery: deliveries a previous process left `pushing` or
+    /// `creating_pr` become `interrupted` with recovery required. Exclusively
+    /// owned by project-lock startup — never while another Factory process
+    /// could still be executing. Never pushes or creates anything; returns
+    /// the affected run ids.
+    pub fn demote_interrupted_deliveries(&self) -> Result<Vec<i64>, FactoryError> {
+        Ok(self.db.demote_interrupted_deliveries()?)
     }
 
     /// The editable pull request preview for a completed run.
@@ -3449,6 +3497,9 @@ impl Factory {
 
     /// Delivers a completed workflow: pushes its `factory/run-<id>` branch to
     /// the project remote and creates (or links an existing) pull request.
+    /// Synchronous composition of [`Factory::begin_delivery`] and
+    /// [`Factory::execute_delivery`]; the API layer runs the two steps
+    /// separately so the operation survives its HTTP request.
     ///
     /// This is the only Factory-owned push path. Agents never reach it: the
     /// Policy Engine independently denies push-class git operations for task
@@ -3460,14 +3511,38 @@ impl Factory {
         body: Option<&str>,
         draft: bool,
     ) -> Result<GitHubDelivery, FactoryError> {
+        match self.begin_delivery(run_id, title, body, draft)? {
+            DeliveryClaim::AlreadyPublished(delivery) => Ok(delivery),
+            DeliveryClaim::Claimed(delivery, request) => {
+                let operation_id = delivery
+                    .operation_id
+                    .clone()
+                    .expect("a claimed delivery always carries an operation id");
+                self.execute_delivery(run_id, &operation_id, &request)
+            }
+        }
+    }
+
+    /// Validates the delivery request and atomically claims the run's
+    /// delivery operation. On success the durable record carries a fresh
+    /// `operation_id` and the `pushing` state — the claim is committed before
+    /// any external side effect runs, and exactly one concurrent caller can
+    /// win it. An already-published run returns its existing PR instead.
+    pub fn begin_delivery(
+        &self,
+        run_id: i64,
+        title: Option<&str>,
+        body: Option<&str>,
+        draft: bool,
+    ) -> Result<DeliveryClaim, FactoryError> {
         let run = self
             .db
             .get_run(run_id)?
             .ok_or(FactoryError::RunNotFound(run_id))?;
-        let mut delivery = self.db.get_or_create_delivery(run_id)?;
+        let delivery = self.db.get_or_create_delivery(run_id)?;
         // An existing PR is shown and linked, never duplicated.
-        if delivery.pull_request.is_some() {
-            return Ok(delivery);
+        if delivery.pull_request.is_some() || delivery.state == DeliveryState::Published {
+            return Ok(DeliveryClaim::AlreadyPublished(delivery));
         }
         let integration_head = self.db.get_run_integration(run_id)?;
         let repo = Repo::detect_bounded(&self.root, &self.root)?;
@@ -3476,7 +3551,8 @@ impl Factory {
             .ok()
             .filter(|sha| !sha.is_empty());
         // Eligibility covers completion, integration head, and branch drift;
-        // each failure names its blocker.
+        // each failure names its blocker. Pre-claim validation failures are
+        // returned without touching the record: no operation was started.
         let eligibility = crate::github::delivery_eligibility(
             &run,
             integration_head.as_deref(),
@@ -3487,23 +3563,24 @@ impl Factory {
                 eligibility.blockers.join("; "),
             ));
         }
-        let integration_head =
-            integration_head.expect("eligibility guarantees an integration head");
         let remote = self.github_remote()?;
         let base = remote
             .default_branch
             .clone()
             .unwrap_or_else(|| "main".to_string());
-        // From here on, every failure is recorded on the delivery record.
         match factory_github::remote_branch_exists(&self.root, &remote.remote, &base) {
             Ok(true) => {}
             Ok(false) => {
-                return self.fail_delivery(
-                    delivery,
-                    factory_github::GitHubError::BaseBranchUnavailable(base),
-                )
+                let error = factory_github::GitHubError::BaseBranchUnavailable(base);
+                self.db
+                    .mark_delivery_failed_if_idle(run_id, &error.to_string())?;
+                return Err(FactoryError::GitHub(error));
             }
-            Err(error) => return self.fail_delivery(delivery, error),
+            Err(error) => {
+                self.db
+                    .mark_delivery_failed_if_idle(run_id, &error.to_string())?;
+                return Err(FactoryError::GitHub(error));
+            }
         }
         let tasks = self.db.list_tasks(run_id)?;
         let attempts = self.db.list_task_attempts(run_id)?;
@@ -3519,33 +3596,86 @@ impl Factory {
         let final_body = body
             .map(str::to_string)
             .unwrap_or_else(|| factory_github::build_pr_body(&evidence));
+        let request = DeliveryRequest {
+            title: final_title,
+            body: final_body,
+            draft,
+        };
+        let operation_id = new_delivery_operation_id(run_id);
+        let Some(delivery) = self.db.claim_delivery(
+            run_id,
+            &operation_id,
+            &remote.repository,
+            &remote.remote,
+            &base,
+        )?
+        else {
+            // Lost the claim or the state forbids starting; name the reason
+            // from the authoritative current record.
+            let current = self.db.get_delivery(run_id)?.ok_or(FactoryError::Db(
+                factory_db::DbError::Corrupt(format!("delivery row for run {run_id} vanished")),
+            ))?;
+            if current.pull_request.is_some() || current.state == DeliveryState::Published {
+                return Ok(DeliveryClaim::AlreadyPublished(current));
+            }
+            return Err(FactoryError::DeliveryConflict(format!(
+                "workflow {run_id} cannot start a delivery operation now (state: {})",
+                current.state.as_str()
+            )));
+        };
+        Ok(DeliveryClaim::Claimed(delivery, request))
+    }
 
-        delivery.state = DeliveryState::Pushing;
-        delivery.repository = Some(remote.repository.clone());
-        delivery.remote = Some(remote.remote.clone());
-        delivery.base_branch = Some(base.clone());
-        delivery.error = None;
-        self.db.set_delivery(&delivery)?;
-        if let Err(error) =
-            factory_github::push_branch(&self.root, &remote.remote, &delivery.head_branch)
-        {
-            return self.fail_delivery(delivery, error);
+    /// Executes a claimed delivery operation to completion. Every state
+    /// transition is guarded by the operation id, so a stale attempt (left
+    /// behind by a restart and superseded by a newer claim) can never
+    /// overwrite a newer outcome. Failures split into definitive failures
+    /// (`failed`, retryable after correction) and outcomes whose remote
+    /// effect could not be confirmed (`interrupted`, reconciliation
+    /// required before any retry).
+    pub fn execute_delivery(
+        &self,
+        run_id: i64,
+        operation_id: &str,
+        request: &DeliveryRequest,
+    ) -> Result<GitHubDelivery, FactoryError> {
+        let Some(mut delivery) = self.db.get_delivery(run_id)? else {
+            return Err(FactoryError::RunNotFound(run_id));
+        };
+        if delivery.operation_id.as_deref() != Some(operation_id) {
+            return Err(FactoryError::DeliveryConflict(format!(
+                "operation {operation_id} no longer owns the delivery for workflow {run_id}"
+            )));
         }
-
+        let remote = delivery.remote.clone().expect("claim persists the remote");
+        let repository = delivery
+            .repository
+            .clone()
+            .expect("claim persists the repository");
+        let base = delivery
+            .base_branch
+            .clone()
+            .expect("claim persists the base branch");
+        if let Err(error) = factory_github::push_branch(&self.root, &remote, &delivery.head_branch)
+        {
+            return self.finish_failed_delivery(operation_id, &mut delivery, error);
+        }
         delivery.state = DeliveryState::CreatingPr;
-        self.db.set_delivery(&delivery)?;
+        if !self.db.set_delivery_if_operation(&delivery, operation_id)? {
+            return self.current_delivery(run_id);
+        }
         let gh = factory_github::GhCli::discovered();
         let outcome = match factory_github::create_or_link_pull_request(
             &gh,
-            &remote.repository,
+            &repository,
             &base,
             &delivery.head_branch,
-            &final_title,
-            &final_body,
-            draft,
+            &request.title,
+            &request.body,
+            request.draft,
         ) {
             Ok(outcome) => outcome,
-            Err(error) => return self.fail_delivery(delivery, error),
+            Err(error) => return self.finish_failed_delivery(operation_id, &mut delivery, error),
         };
         let mut pull_request = match &outcome {
             factory_github::DeliveryOutcome::Created(pr) => pr.clone(),
@@ -3555,27 +3685,160 @@ impl Factory {
         // what Factory records for freshly created PRs; linked existing PRs
         // keep the state GitHub reported.
         if matches!(outcome, factory_github::DeliveryOutcome::Created(_)) {
-            pull_request.is_draft = draft;
+            pull_request.is_draft = request.draft;
         }
+        let integration_head = self.db.get_run_integration(run_id)?;
         delivery.pull_request = Some(pull_request);
-        delivery.pushed_head = Some(integration_head);
+        delivery.pushed_head = integration_head;
         delivery.state = DeliveryState::Published;
         delivery.error = None;
-        self.db.set_delivery(&delivery)?;
+        delivery.recovery_required = false;
+        if !self.db.set_delivery_if_operation(&delivery, operation_id)? {
+            return self.current_delivery(run_id);
+        }
         Ok(delivery)
     }
 
-    /// Records a failed delivery attempt and converts the error.
-    fn fail_delivery(
+    /// Inspects the remote state of a run whose delivery attempt was
+    /// interrupted, then persists what could be confirmed. Read-only against
+    /// GitHub: reconciliation never pushes and never creates a pull request.
+    /// An unreachable GitHub leaves the outcome explicitly unconfirmed.
+    pub fn reconcile_delivery(
         &self,
-        mut delivery: GitHubDelivery,
+        run_id: i64,
+    ) -> Result<crate::github::DeliveryReconciliation, FactoryError> {
+        let Some(delivery) = self.db.get_delivery(run_id)? else {
+            return Err(FactoryError::RunNotFound(run_id));
+        };
+        if delivery.state != DeliveryState::Interrupted {
+            return Err(FactoryError::DeliveryConflict(format!(
+                "workflow {run_id} has nothing to reconcile (state: {})",
+                delivery.state.as_str()
+            )));
+        }
+        let repository = delivery
+            .repository
+            .clone()
+            .or_else(|| self.github_remote().ok().map(|remote| remote.repository))
+            .ok_or_else(|| FactoryError::GitHub(factory_github::GitHubError::NotAGithubRemote))?;
+        let remote = delivery
+            .remote
+            .clone()
+            .unwrap_or_else(|| "origin".to_string());
+        let gh = factory_github::GhCli::discovered();
+        let candidates = match gh.list_all_pull_requests(&repository, &delivery.head_branch) {
+            Ok(candidates) => candidates,
+            Err(error) => {
+                return Ok(crate::github::DeliveryReconciliation::Unconfirmed {
+                    reason: error.to_string(),
+                    push_confirmed: None,
+                })
+            }
+        };
+        // The query is constrained to the Factory-owned head branch; multiple
+        // matches are still reported as ambiguity instead of guessing.
+        if candidates.len() > 1 {
+            return Ok(crate::github::DeliveryReconciliation::Unconfirmed {
+                reason: format!(
+                    "GitHub reported {} pull requests for {} — resolve manually",
+                    candidates.len(),
+                    delivery.head_branch
+                ),
+                push_confirmed: None,
+            });
+        }
+        // Independent evidence about the push, reported with every outcome.
+        let push_confirmed =
+            match factory_github::remote_branch_sha(&self.root, &remote, &delivery.head_branch) {
+                Ok(Some(_)) => Some(true),
+                Ok(None) => Some(false),
+                Err(_) => None,
+            };
+        let mut reconciled = delivery.clone();
+        if let Some(pr) = candidates.into_iter().next() {
+            reconciled.pull_request = Some(pr);
+            reconciled.state = DeliveryState::Published;
+            reconciled.error = None;
+            reconciled.recovery_required = false;
+            if push_confirmed == Some(true) {
+                reconciled.pushed_head = self.db.get_run_integration(run_id)?;
+            }
+            self.db.set_delivery(&reconciled)?;
+            return Ok(crate::github::DeliveryReconciliation::LinkedExisting(
+                reconciled,
+            ));
+        }
+        // Authoritative "no pull request exists": the retry path is safe, so
+        // the record becomes an ordinary failed attempt with a clear reason.
+        reconciled.state = DeliveryState::Failed;
+        reconciled.error = Some(
+            "the previous attempt's outcome was unknown; reconciliation confirmed no pull \
+             request exists — retrying is safe"
+                .to_string(),
+        );
+        reconciled.recovery_required = false;
+        self.db.set_delivery(&reconciled)?;
+        Ok(crate::github::DeliveryReconciliation::ConfirmedMissing(
+            reconciled,
+        ))
+    }
+
+    fn current_delivery(&self, run_id: i64) -> Result<GitHubDelivery, FactoryError> {
+        self.db
+            .get_delivery(run_id)?
+            .ok_or(FactoryError::RunNotFound(run_id))
+    }
+
+    /// Records a finished-but-unsuccessful attempt. Definitive failures
+    /// (validation, authentication, rejection) become `failed`; errors whose
+    /// remote effect could not be ruled out become `interrupted` with
+    /// recovery required. Both keep the original diagnostic.
+    fn finish_failed_delivery(
+        &self,
+        operation_id: &str,
+        delivery: &mut GitHubDelivery,
         error: factory_github::GitHubError,
     ) -> Result<GitHubDelivery, FactoryError> {
-        delivery.state = DeliveryState::Failed;
+        let uncertain = matches!(
+            &error,
+            factory_github::GitHubError::Uncertain(_)
+                | factory_github::GitHubError::Network(_)
+                | factory_github::GitHubError::Io(_)
+        );
+        delivery.state = if uncertain {
+            DeliveryState::Interrupted
+        } else {
+            DeliveryState::Failed
+        };
         delivery.error = Some(error.to_string());
-        let _ = self.db.set_delivery(&delivery);
+        delivery.recovery_required = uncertain;
+        let _ = self.db.set_delivery_if_operation(delivery, operation_id);
         Err(FactoryError::GitHub(error))
     }
+}
+
+/// The resolved, immutable request a claimed operation executes with.
+#[derive(Debug, Clone)]
+pub struct DeliveryRequest {
+    pub title: String,
+    pub body: String,
+    pub draft: bool,
+}
+
+/// Result of [`Factory::begin_delivery`].
+#[derive(Debug)]
+pub enum DeliveryClaim {
+    /// The run already has a pull request; nothing was started.
+    AlreadyPublished(GitHubDelivery),
+    /// The operation was claimed; execute it with the given request.
+    Claimed(GitHubDelivery, DeliveryRequest),
+}
+
+/// A durable operation identity: unique across processes and restarts
+/// without relying on a global counter or client state.
+fn new_delivery_operation_id(run_id: i64) -> String {
+    let nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
+    format!("delivery-{run_id}-{nanos}-{}", std::process::id())
 }
 
 // --- Workflow stage --------------------------------------------------------

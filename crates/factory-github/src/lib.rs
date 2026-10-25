@@ -14,7 +14,7 @@ pub mod issue;
 pub mod pr;
 pub mod remote;
 
-pub use delivery::{create_or_link_pull_request, push_branch, DeliveryOutcome};
+pub use delivery::{create_or_link_pull_request, push_branch, remote_branch_sha, DeliveryOutcome};
 pub use error::{GitHubError, Result};
 pub use gh::{GhAuth, GhCli};
 pub use issue::{

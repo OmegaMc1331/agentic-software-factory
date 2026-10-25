@@ -1435,7 +1435,8 @@ impl FactoryDb {
     }
 
     /// The delivery record for a run, creating a fresh `not_ready` row when
-    /// none exists yet.
+    /// none exists yet. The insert is conflict-safe: two connections racing
+    /// to initialize the same run's row cannot fail.
     pub fn get_or_create_delivery(&self, run_id: i64) -> Result<GitHubDelivery> {
         if let Some(existing) = self.get_delivery(run_id)? {
             return Ok(existing);
@@ -1445,7 +1446,8 @@ impl FactoryDb {
             "INSERT INTO github_deliveries
                  (run_id, state, repository, remote, base_branch, head_branch,
                   pushed_head, pr_number, pr_url, pr_state, pr_is_draft, error, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+             ON CONFLICT(run_id) DO NOTHING",
             params![
                 delivery.run_id,
                 delivery.state.as_str(),
@@ -1463,7 +1465,8 @@ impl FactoryDb {
                 delivery.updated_at
             ],
         )?;
-        Ok(delivery)
+        self.get_delivery(run_id)?
+            .ok_or_else(|| DbError::Corrupt(format!("delivery row for run {run_id} vanished")))
     }
 
     /// The persisted delivery state of a run, when a record exists.
@@ -1472,7 +1475,8 @@ impl FactoryDb {
             .conn
             .query_row(
                 "SELECT run_id, state, repository, remote, base_branch, head_branch, pushed_head,
-                        pr_number, pr_url, pr_state, pr_is_draft, error, created_at, updated_at
+                        pr_number, pr_url, pr_state, pr_is_draft, error, created_at, updated_at,
+                        operation_id, recovery_required
                  FROM github_deliveries WHERE run_id = ?1",
                 params![run_id],
                 |row| {
@@ -1491,6 +1495,8 @@ impl FactoryDb {
                         row.get::<_, Option<String>>(11)?,
                         row.get::<_, String>(12)?,
                         row.get::<_, String>(13)?,
+                        row.get::<_, Option<String>>(14)?,
+                        row.get::<_, i64>(15)?,
                     ))
                 },
             )
@@ -1510,6 +1516,8 @@ impl FactoryDb {
             error,
             created_at,
             updated_at,
+            operation_id,
+            recovery_required,
         )) = row
         else {
             return Ok(None);
@@ -1535,6 +1543,8 @@ impl FactoryDb {
             pushed_head,
             pull_request,
             error,
+            operation_id,
+            recovery_required: recovery_required != 0,
             created_at,
             updated_at,
         }))
@@ -1546,8 +1556,9 @@ impl FactoryDb {
             "UPDATE github_deliveries
              SET state = ?1, repository = ?2, remote = ?3, base_branch = ?4,
                  pushed_head = ?5, pr_number = ?6, pr_url = ?7, pr_state = ?8,
-                 pr_is_draft = ?9, error = ?10, updated_at = ?11
-             WHERE run_id = ?12",
+                 pr_is_draft = ?9, error = ?10, updated_at = ?11,
+                 operation_id = ?12, recovery_required = ?13
+             WHERE run_id = ?14",
             params![
                 delivery.state.as_str(),
                 delivery.repository,
@@ -1560,6 +1571,8 @@ impl FactoryDb {
                 delivery.pull_request.as_ref().map(|pr| pr.is_draft as i64),
                 delivery.error,
                 now(),
+                delivery.operation_id,
+                delivery.recovery_required as i64,
                 delivery.run_id
             ],
         )?;
@@ -1567,6 +1580,107 @@ impl FactoryDb {
             return Err(DbError::NotFound("github delivery"));
         }
         Ok(())
+    }
+
+    /// Persists a delivery transition only while `operation_id` still owns the
+    /// row. A stale worker (an attempt superseded after a restart or retry)
+    /// cannot overwrite a newer outcome — including `published`.
+    pub fn set_delivery_if_operation(
+        &self,
+        delivery: &GitHubDelivery,
+        operation_id: &str,
+    ) -> Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE github_deliveries
+             SET state = ?1, pushed_head = ?2, pr_number = ?3, pr_url = ?4, pr_state = ?5,
+                 pr_is_draft = ?6, error = ?7, updated_at = ?8, recovery_required = ?9
+             WHERE run_id = ?10 AND operation_id = ?11 AND state IN ('pushing','creating_pr')",
+            params![
+                delivery.state.as_str(),
+                delivery.pushed_head,
+                delivery.pull_request.as_ref().map(|pr| pr.number),
+                delivery.pull_request.as_ref().map(|pr| pr.url.clone()),
+                delivery.pull_request.as_ref().map(|pr| pr.state.clone()),
+                delivery.pull_request.as_ref().map(|pr| pr.is_draft as i64),
+                delivery.error,
+                now(),
+                delivery.recovery_required as i64,
+                delivery.run_id,
+                operation_id
+            ],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Atomically claims the run's delivery operation: exactly one caller can
+    /// move an idle/failed record into `pushing` with the given operation
+    /// identity. SQLite serializes the compare-and-set, so concurrent
+    /// connections cannot both win. Returns the claimed record, or `None`
+    /// when another state (active, interrupted, or published) owns the row.
+    pub fn claim_delivery(
+        &self,
+        run_id: i64,
+        operation_id: &str,
+        repository: &str,
+        remote: &str,
+        base_branch: &str,
+    ) -> Result<Option<GitHubDelivery>> {
+        let changed = self.conn.execute(
+            "UPDATE github_deliveries
+             SET state = 'pushing', operation_id = ?2, repository = ?3, remote = ?4,
+                 base_branch = ?5, error = NULL, recovery_required = 0, pushed_head = NULL,
+                 updated_at = ?6
+             WHERE run_id = ?1
+               AND state IN ('not_ready','ready','failed')
+               AND pr_number IS NULL",
+            params![run_id, operation_id, repository, remote, base_branch, now()],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        self.get_delivery(run_id)?
+            .ok_or_else(|| DbError::Corrupt(format!("delivery row for run {run_id} vanished")))
+            .map(Some)
+    }
+
+    /// Records a definitive pre-operation failure on an idle delivery record
+    /// (no push or PR creation was attempted). Conditional on the record
+    /// still being idle so it can never overwrite an active operation or a
+    /// newer outcome.
+    pub fn mark_delivery_failed_if_idle(&self, run_id: i64, error: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE github_deliveries
+             SET state = 'failed', error = ?2, recovery_required = 0, updated_at = ?3
+             WHERE run_id = ?1 AND state IN ('not_ready','ready','failed') AND pr_number IS NULL",
+            params![run_id, error, now()],
+        )?;
+        Ok(())
+    }
+
+    /// Demotes deliveries left in an active state by a previous process:
+    /// single-writer project ownership means no live worker can hold them at
+    /// startup, so their outcome is unknown until reconciled. Returns the
+    /// affected run ids. Never pushes or creates anything.
+    pub fn demote_interrupted_deliveries(&self) -> Result<Vec<i64>> {
+        let timestamp = now();
+        let mut statement = self.conn.prepare(
+            "SELECT run_id FROM github_deliveries WHERE state IN ('pushing','creating_pr')",
+        )?;
+        let run_ids = statement
+            .query_map([], |row| row.get::<_, i64>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(statement);
+        for run_id in &run_ids {
+            self.conn.execute(
+                "UPDATE github_deliveries
+                 SET state = 'interrupted', recovery_required = 1,
+                     error = 'Factory stopped before the delivery outcome was confirmed',
+                     updated_at = ?1
+                 WHERE run_id = ?2 AND state IN ('pushing','creating_pr')",
+                params![timestamp, run_id],
+            )?;
+        }
+        Ok(run_ids)
     }
 
     // --- Evaluation reads ------------------------------------------------------
@@ -2554,10 +2668,19 @@ CREATE TABLE mcp_server_leases (
 /// legacy rows and interactive sessions remain valid.
 const V17_SCHEMA: &str = "ALTER TABLE agent_sessions ADD COLUMN output_meta TEXT;";
 
+/// ASF-18: durable identity and recovery flags for GitHub delivery
+/// operations. `operation_id` scopes every state transition to the attempt
+/// that wrote it, so a stale worker cannot overwrite a newer outcome;
+/// `recovery_required` marks attempts whose remote outcome is unknown.
+const V18_SCHEMA: &str = "
+ALTER TABLE github_deliveries ADD COLUMN operation_id TEXT;
+ALTER TABLE github_deliveries ADD COLUMN recovery_required INTEGER NOT NULL DEFAULT 0;
+";
+
 const MIGRATIONS: &[&str] = &[
     V1_SCHEMA, V2_SCHEMA, V3_SCHEMA, V4_SCHEMA, V5_SCHEMA, V6_SCHEMA, V7_SCHEMA, V8_SCHEMA,
     V9_SCHEMA, V10_SCHEMA, V11_SCHEMA, V12_SCHEMA, V13_SCHEMA, V14_SCHEMA, V15_SCHEMA, V16_SCHEMA,
-    V17_SCHEMA,
+    V17_SCHEMA, V18_SCHEMA,
 ];
 
 fn migrate(conn: &mut Connection) -> Result<()> {
@@ -2612,7 +2735,7 @@ mod tests {
         let versions = schema_versions(&path);
         assert_eq!(
             versions,
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]
         );
         db.create_run("objective", Some("codex")).unwrap();
         drop(db);
@@ -2620,7 +2743,7 @@ mod tests {
         let db = FactoryDb::open(&path).unwrap();
         assert_eq!(
             schema_versions(&path),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]
         );
         db.list_runs().unwrap();
     }
@@ -2648,7 +2771,7 @@ mod tests {
         let db = FactoryDb::open(&path).unwrap();
         assert_eq!(
             schema_versions(&path),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]
         );
         let run = db.get_run(1).unwrap().unwrap();
         assert_eq!(run.objective, "legacy");
@@ -2706,7 +2829,7 @@ mod tests {
         // opening records versions 6 and 7 exactly once
         assert_eq!(
             schema_versions(&path),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]
         );
         let tasks = db.list_tasks(1).unwrap();
         let operation_of = |title: &str| {
@@ -4116,5 +4239,213 @@ mod tests {
         assert!(db.get_delivery(999999).unwrap().is_none());
         // get_or_create returns the persisted record, never a reset one.
         assert_eq!(db.get_or_create_delivery(run.id).unwrap(), persisted);
+    }
+    #[test]
+    fn delivery_claim_is_atomic_across_connections() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("claim.db");
+        let db = FactoryDb::open(&db_path).unwrap();
+        let run = db.create_run("durable delivery", None).unwrap();
+        drop(db);
+
+        let a = FactoryDb::open(&db_path).unwrap();
+        let b = FactoryDb::open(&db_path).unwrap();
+        a.get_or_create_delivery(run.id).unwrap();
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = [a, b]
+            .into_iter()
+            .map(|db| {
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    db.claim_delivery(run.id, "op-id", "octocat/example", "origin", "main")
+                })
+            })
+            .collect();
+        let mut winners = 0;
+        for handle in handles {
+            let outcome = handle.join().unwrap().unwrap();
+            if outcome.is_some() {
+                winners += 1;
+            }
+        }
+        assert_eq!(winners, 1, "exactly one connection may claim the operation");
+        let delivery = FactoryDb::open(&db_path)
+            .unwrap()
+            .get_delivery(run.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(delivery.state.as_str(), "pushing");
+        assert_eq!(delivery.operation_id.as_deref(), Some("op-id"));
+    }
+
+    #[test]
+    fn delivery_claim_rejects_active_interrupted_and_published_records() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("guards.db");
+        let db = FactoryDb::open(&db_path).unwrap();
+        let run = db.create_run("claim guards", None).unwrap();
+        db.get_or_create_delivery(run.id).unwrap();
+
+        let claim = |db: &FactoryDb| {
+            db.claim_delivery(run.id, "op", "octocat/example", "origin", "main")
+                .unwrap()
+                .is_some()
+        };
+        assert!(claim(&db), "an idle record is claimable");
+        assert!(!claim(&db), "an active record is not claimable twice");
+
+        db.demote_interrupted_deliveries().unwrap();
+        assert!(
+            !claim(&db),
+            "an interrupted outcome must be reconciled first"
+        );
+
+        let mut delivery = db.get_delivery(run.id).unwrap().unwrap();
+        delivery.state = factory_types::DeliveryState::Failed;
+        delivery.error = Some("definitive".into());
+        db.set_delivery(&delivery).unwrap();
+        assert!(claim(&db), "a failed attempt is retryable");
+
+        let mut delivery = db.get_delivery(run.id).unwrap().unwrap();
+        delivery.state = factory_types::DeliveryState::Published;
+        delivery.pull_request = Some(factory_types::PullRequestInfo {
+            number: 58,
+            url: "https://github.com/octocat/example/pull/58".into(),
+            state: "OPEN".into(),
+            is_draft: false,
+        });
+        db.set_delivery(&delivery).unwrap();
+        assert!(!claim(&db), "a published PR must never be recreated");
+    }
+
+    #[test]
+    fn stale_delivery_operations_cannot_write() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("stale.db");
+        let db = FactoryDb::open(&db_path).unwrap();
+        let run = db.create_run("stale writer", None).unwrap();
+        db.get_or_create_delivery(run.id).unwrap();
+        let claimed = db
+            .claim_delivery(run.id, "op-1", "octocat/example", "origin", "main")
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.state.as_str(), "pushing");
+
+        // A different operation id never writes.
+        let mut from_stale = claimed.clone();
+        from_stale.state = factory_types::DeliveryState::Published;
+        assert!(!db.set_delivery_if_operation(&from_stale, "op-2").unwrap());
+
+        // The owning operation can, including terminal states.
+        assert!(db.set_delivery_if_operation(&from_stale, "op-1").unwrap());
+        let persisted = db.get_delivery(run.id).unwrap().unwrap();
+        assert_eq!(persisted.state.as_str(), "published");
+
+        // Once terminal, even the same operation id cannot write again.
+        from_stale.state = factory_types::DeliveryState::Failed;
+        assert!(!db.set_delivery_if_operation(&from_stale, "op-1").unwrap());
+        let persisted = db.get_delivery(run.id).unwrap().unwrap();
+        assert_eq!(persisted.state.as_str(), "published");
+    }
+
+    #[test]
+    fn demotion_marks_only_active_deliveries_and_preserves_history() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("restart.db");
+        let db = FactoryDb::open(&db_path).unwrap();
+        let run = db.create_run("restart recovery", None).unwrap();
+        let idle = db.create_run("idle run", None).unwrap();
+
+        db.get_or_create_delivery(run.id).unwrap();
+        db.get_or_create_delivery(idle.id).unwrap();
+        db.claim_delivery(run.id, "op", "octocat/example", "origin", "main")
+            .unwrap()
+            .unwrap();
+
+        let demoted = db.demote_interrupted_deliveries().unwrap();
+        assert_eq!(demoted, vec![run.id]);
+        let interrupted = db.get_delivery(run.id).unwrap().unwrap();
+        assert_eq!(interrupted.state.as_str(), "interrupted");
+        assert!(interrupted.recovery_required);
+        assert!(interrupted.error.unwrap().contains("stopped"));
+        assert_eq!(interrupted.repository.as_deref(), Some("octocat/example"));
+        assert_eq!(interrupted.base_branch.as_deref(), Some("main"));
+        assert_eq!(
+            interrupted.head_branch,
+            format!("factory/run-{}", run.id),
+            "reconciliation metadata is preserved"
+        );
+        // Idempotent: a second startup pass changes nothing.
+        assert!(db.demote_interrupted_deliveries().unwrap().is_empty());
+    }
+
+    #[test]
+    fn legacy_delivery_rows_gain_operation_columns_on_migration() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("legacy-delivery.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(V1_SCHEMA).unwrap();
+        // The delivery table exactly as V12 created it, before V18 columns.
+        conn.execute_batch(
+            "CREATE TABLE github_deliveries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id INTEGER NOT NULL UNIQUE REFERENCES runs(id) ON DELETE CASCADE,
+                state TEXT NOT NULL DEFAULT 'not_ready',
+                repository TEXT,
+                remote TEXT,
+                base_branch TEXT,
+                head_branch TEXT NOT NULL,
+                pushed_head TEXT,
+                pr_number INTEGER,
+                pr_url TEXT,
+                pr_state TEXT,
+                pr_is_draft INTEGER,
+                error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+             INSERT INTO schema_migrations (version, applied_at) VALUES
+             (1,'2026-01-01T00:00:00Z'),(2,'2026-01-01T00:00:00Z'),(3,'2026-01-01T00:00:00Z'),
+             (4,'2026-01-01T00:00:00Z'),(5,'2026-01-01T00:00:00Z'),(6,'2026-01-01T00:00:00Z'),
+             (7,'2026-01-01T00:00:00Z'),(8,'2026-01-01T00:00:00Z'),(9,'2026-01-01T00:00:00Z'),
+             (10,'2026-01-01T00:00:00Z'),(11,'2026-01-01T00:00:00Z'),(12,'2026-01-01T00:00:00Z'),
+             (13,'2026-01-01T00:00:00Z'),(14,'2026-01-01T00:00:00Z'),(15,'2026-01-01T00:00:00Z'),
+             (16,'2026-01-01T00:00:00Z'),(17,'2026-01-01T00:00:00Z');",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO runs (objective, status, planner_agent, created_at, updated_at)
+             VALUES ('legacy delivery', 'completed', NULL, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO github_deliveries
+                 (run_id, state, head_branch, created_at, updated_at)
+             VALUES (1, 'pushing', 'factory/run-1', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let db = FactoryDb::open(&db_path).unwrap();
+        let delivery = db.get_delivery(1).unwrap().unwrap();
+        assert_eq!(delivery.state.as_str(), "pushing");
+        assert_eq!(
+            delivery.operation_id, None,
+            "legacy rows have no operation yet"
+        );
+        assert!(
+            !delivery.recovery_required,
+            "legacy rows default to no recovery flag"
+        );
+        // The legacy active row migrates cleanly into the recovery flow.
+        assert_eq!(db.demote_interrupted_deliveries().unwrap(), vec![1]);
     }
 }
