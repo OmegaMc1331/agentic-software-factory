@@ -944,6 +944,11 @@ code {
   border-color: var(--accent);
 }
 
+.settings-env-errors ul {
+  margin: 0;
+  padding-left: 18px;
+}
+
 .settings-form {
   background: var(--bg-raised);
   border: 1px solid var(--border);

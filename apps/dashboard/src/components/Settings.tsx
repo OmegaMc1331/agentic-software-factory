@@ -47,15 +47,15 @@ function parseLines(text: string): string[] {
 }
 
 function parseEnv(text: string): Record<string, string> {
-  const result: Record<string, string> = {};
+  const entries: [string, string][] = [];
   for (const line of text.split("\n")) {
     const trimmed = line.trim();
     if (!trimmed) continue;
     const eq = trimmed.indexOf("=");
     if (eq <= 0) continue;
-    result[trimmed.slice(0, eq).trim()] = trimmed.slice(eq + 1).trim();
+    entries.push([trimmed.slice(0, eq).trim(), trimmed.slice(eq + 1).trim()]);
   }
-  return result;
+  return Object.fromEntries(entries);
 }
 
 interface McpDraft {

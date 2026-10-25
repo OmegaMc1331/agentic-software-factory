@@ -1,5 +1,6 @@
-import { useEffect, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import type { AgentEntry, AgentKind, PromptTransport } from "../types";
+import { parseAgentEnv, type EnvValidationError } from "./agentEnv";
 import { type AgentDraft } from "./agentFormState";
 
 const PRESETS: Record<
@@ -20,18 +21,6 @@ function parseLines(text: string): string[] {
     .filter((line) => line.length > 0);
 }
 
-function parseEnv(text: string): Record<string, string> {
-  const result: Record<string, string> = {};
-  for (const line of text.split("\n")) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    const eq = trimmed.indexOf("=");
-    if (eq <= 0) continue;
-    result[trimmed.slice(0, eq).trim()] = trimmed.slice(eq + 1).trim();
-  }
-  return result;
-}
-
 interface AgentFormProps {
   initial: AgentDraft;
   error?: string | null;
@@ -46,11 +35,15 @@ interface AgentFormProps {
 export function AgentForm({ initial, error, onSave, onCancel }: AgentFormProps) {
   const [draft, setDraft] = useState<AgentDraft>(initial);
   const [localError, setLocalError] = useState<string | null>(null);
+  const [envErrors, setEnvErrors] = useState<EnvValidationError[] | null>(null);
   const [saving, setSaving] = useState(false);
+  const envErrorId = useId();
+  const envFieldRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
     setDraft(initial);
     setLocalError(null);
+    setEnvErrors(null);
   }, [initial]);
 
   const updateArgument = (index: number, value: string) => {
@@ -98,13 +91,21 @@ export function AgentForm({ initial, error, onSave, onCancel }: AgentFormProps) 
         return;
       }
     }
+    const parsedEnv = parseAgentEnv(draft.envText);
+    if (!parsedEnv.ok) {
+      setLocalError(null);
+      setEnvErrors(parsedEnv.errors);
+      envFieldRef.current?.focus();
+      return;
+    }
     setLocalError(null);
+    setEnvErrors(null);
     setSaving(true);
     const entry: AgentEntry = {
       kind: draft.kind,
       command,
       args: draft.args.filter((argument) => argument.trim().length > 0),
-      env: parseEnv(draft.envText),
+      env: parsedEnv.env,
       capabilities: draft.capabilities,
       ...(draft.kind === "custom"
         ? {
@@ -291,13 +292,39 @@ export function AgentForm({ initial, error, onSave, onCancel }: AgentFormProps) 
             <label className="settings-field">
               <span className="meta-label">Environment (KEY=VALUE, one per line)</span>
               <textarea
+                ref={envFieldRef}
                 className="net-select"
                 aria-label="Environment (KEY=VALUE, one per line)"
+                aria-invalid={envErrors ? true : undefined}
+                aria-describedby={envErrors ? envErrorId : undefined}
                 rows={3}
                 value={draft.envText}
-                onChange={(event) => setDraft({ ...draft, envText: event.target.value })}
+                onChange={(event) => {
+                  const envText = event.target.value;
+                  setDraft((current) => ({ ...current, envText }));
+                  setEnvErrors((current) => {
+                    if (!current) return current;
+                    const result = parseAgentEnv(envText);
+                    return result.ok ? null : result.errors;
+                  });
+                }}
                 placeholder="OPENAI_API_KEY=…"
               />
+              {envErrors && (
+                <div className="error settings-env-errors" id={envErrorId} role="alert">
+                  <ul>
+                    {envErrors.map((validationError) => (
+                      <li key={`${validationError.line}-${validationError.message}`}>
+                        Line {validationError.line}: {validationError.message}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+              <small className="muted">
+                Names use letters, digits, and underscores and cannot start with a digit. Duplicate
+                names are rejected, including case variants; surrounding whitespace is trimmed.
+              </small>
             </label>
             <label className="settings-field">
               <span className="meta-label">Max concurrency (optional)</span>

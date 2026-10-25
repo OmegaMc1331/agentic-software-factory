@@ -569,6 +569,31 @@ describe("Settings MCP servers", () => {
     );
   });
 
+  it("keeps permissive MCP header keys and prototype names safe", async () => {
+    vi.mocked(createMcpServer).mockResolvedValue({ ...server, id: "remote" });
+    render(<SettingsView />);
+    fireEvent.click(await screen.findByRole("button", { name: "Add server" }));
+    fireEvent.change(screen.getByLabelText("Server id"), { target: { value: "remote" } });
+    fireEvent.change(screen.getByLabelText("Transport"), { target: { value: "http" } });
+    fireEvent.change(screen.getByLabelText("Streamable HTTP URL"), {
+      target: { value: "http://127.0.0.1:3001/mcp" },
+    });
+    fireEvent.change(screen.getByLabelText(/Header references/), {
+      target: { value: "X-API-Key=token\n__proto__=safe" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save server" }));
+
+    await waitFor(() => expect(createMcpServer).toHaveBeenCalledTimes(1));
+    const config = vi.mocked(createMcpServer).mock.calls[0][1];
+    expect(config.headers).toEqual(
+      Object.fromEntries([
+        ["X-API-Key", "token"],
+        ["__proto__", "safe"],
+      ])
+    );
+    expect(Object.prototype.hasOwnProperty.call(config.headers, "__proto__")).toBe(true);
+  });
+
   it("shows MCP discovery pending state and ignores duplicate actions", async () => {
     vi.mocked(fetchMcpServers).mockResolvedValue([server]);
     let resolveTest!: (value: McpServerView) => void;
