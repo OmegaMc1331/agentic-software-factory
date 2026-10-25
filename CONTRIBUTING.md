@@ -39,6 +39,13 @@ first, then `cargo build --release --features embedded-dashboard -p factory-cli`
   `crates/factory-core/tests/` (e2e) and `crates/factory-git/` are intentionally slow
   because they call git.
 
+## Security issues
+
+Ordinary bugs and feature requests belong in GitHub Issues. Suspected security
+vulnerabilities do not: report them privately as described in
+[SECURITY.md](SECURITY.md), and keep exploit details out of public issues and
+pull requests.
+
 ## Commit messages
 
 Concise, imperative mood, focused on one logical change (for example:

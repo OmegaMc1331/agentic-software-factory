@@ -240,6 +240,9 @@ Planner produces the DAG
 
 Run agents you trust. See [docs/security.md](docs/security.md) for the full model.
 
+To report a security vulnerability, follow [SECURITY.md](SECURITY.md) — please do
+not post vulnerability details in public issues.
+
 ## Documentation
 
 | Guide | Purpose |
