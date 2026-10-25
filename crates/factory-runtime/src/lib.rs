@@ -1365,63 +1365,149 @@ mod tests {
         let slow = runtime.subscribe_terminal(session.id).unwrap();
         let mut healthy = runtime.subscribe_terminal(session.id).unwrap();
 
-        let deadline = Instant::now() + std::time::Duration::from_secs(60);
-        let mut output = healthy.snapshot;
-        let mut answered_cursor_query = false;
-        let mut started = false;
-        let mut resumed = false;
-        loop {
-            let mut received = 0;
-            while let Ok(chunk) = healthy.receiver.try_recv() {
-                output.extend_from_slice(&chunk);
-                received += 1;
-            }
-            if !answered_cursor_query && output.windows(4).any(|window| window == b"\x1b[6n") {
-                runtime.write_terminal(session.id, b"\x1b[1;1R").unwrap();
-                answered_cursor_query = true;
-            }
-            if !started && output.windows(12).any(|window| window == b"STREAM_READY") {
-                runtime.write_terminal(session.id, b"g\r").unwrap();
-                started = true;
-            }
-            if output.windows(12).any(|window| window == b"STREAM_ALIVE") {
-                break;
-            }
-            if !resumed && output.windows(11).any(|window| window == b"STREAM_DONE") {
-                runtime.write_terminal(session.id, b"r\r").unwrap();
-                resumed = true;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "PTY stream did not complete; received {} bytes: {:?}",
-                output.len(),
-                String::from_utf8_lossy(&output)
-            );
-            if received == 0 {
-                std::thread::sleep(std::time::Duration::from_millis(5));
+        struct DrainState {
+            output: Vec<u8>,
+            answered_cursor_query: bool,
+            started: bool,
+            resumed: bool,
+        }
+        impl DrainState {
+            fn summary(&self) -> String {
+                let text = String::from_utf8_lossy(&self.output);
+                let head: String = text.chars().take(120).collect();
+                let tail: String = text
+                    .chars()
+                    .rev()
+                    .take(120)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect();
+                format!(
+                    "bytes={} answered={} started={} resumed={} head={head:?} tail={tail:?}",
+                    self.output.len(),
+                    self.answered_cursor_query,
+                    self.started,
+                    self.resumed,
+                )
             }
         }
-
+        let state = Arc::new(Mutex::new(DrainState {
+            output: healthy.snapshot.clone(),
+            answered_cursor_query: false,
+            started: false,
+            resumed: false,
+        }));
+        let (drained_tx, drained_rx) = std_mpsc::channel::<Result<bool, String>>();
+        let drain_runtime = runtime.clone();
+        let drain_state = Arc::clone(&state);
+        let drain_session_id = session.id;
+        std::thread::spawn(move || {
+            // A healthy subscriber drains continuously; polling with sleeps
+            // lets a fast PTY burst fill the bounded queue and evict the very
+            // subscriber that is supposed to survive the stream.
+            let outcome = (move || {
+                let mut state = drain_state.lock().expect("terminal drain state poisoned");
+                loop {
+                    let mut received = 0;
+                    while let Ok(chunk) = healthy.receiver.try_recv() {
+                        state.output.extend_from_slice(&chunk);
+                        received += 1;
+                    }
+                    if !state.answered_cursor_query
+                        && state.output.windows(4).any(|window| window == b"\x1b[6n")
+                    {
+                        drain_runtime
+                            .write_terminal(drain_session_id, b"\x1b[1;1R")
+                            .unwrap();
+                        state.answered_cursor_query = true;
+                    }
+                    if !state.started
+                        && state
+                            .output
+                            .windows(12)
+                            .any(|window| window == b"STREAM_READY")
+                    {
+                        drain_runtime
+                            .write_terminal(drain_session_id, b"g\r")
+                            .unwrap();
+                        state.started = true;
+                    }
+                    if state
+                        .output
+                        .windows(12)
+                        .any(|window| window == b"STREAM_ALIVE")
+                    {
+                        break;
+                    }
+                    if !state.resumed
+                        && state
+                            .output
+                            .windows(11)
+                            .any(|window| window == b"STREAM_DONE")
+                    {
+                        drain_runtime
+                            .write_terminal(drain_session_id, b"r\r")
+                            .unwrap();
+                        state.resumed = true;
+                    }
+                    if received == 0 {
+                        drop(state);
+                        std::thread::yield_now();
+                        state = drain_state.lock().expect("terminal drain state poisoned");
+                    }
+                }
+                drop(state);
+                let close_deadline = Instant::now() + std::time::Duration::from_secs(10);
+                loop {
+                    match healthy.receiver.try_recv() {
+                        Ok(_) => {}
+                        Err(TerminalTryRecvError::Disconnected) => break,
+                        Err(TerminalTryRecvError::Empty) => {
+                            if Instant::now() >= close_deadline {
+                                return Err(
+                                    "terminal subscription did not close after process exit".into(),
+                                );
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                    }
+                }
+                Ok(healthy.receiver.overflowed())
+            })();
+            let _ = drained_tx.send(outcome);
+        });
+        let healthy_overflowed = match drained_rx.recv_timeout(std::time::Duration::from_secs(75)) {
+            Ok(Ok(healthy_overflowed)) => healthy_overflowed,
+            Ok(Err(message)) => panic!("{message}"),
+            Err(std_mpsc::RecvTimeoutError::Timeout) => panic!(
+                "PTY stream did not complete; {}",
+                state
+                    .lock()
+                    .expect("terminal drain state poisoned")
+                    .summary()
+            ),
+            Err(std_mpsc::RecvTimeoutError::Disconnected) => panic!(
+                "terminal drain thread exited unexpectedly; {}",
+                state
+                    .lock()
+                    .expect("terminal drain state poisoned")
+                    .summary()
+            ),
+        };
+        let (started, resumed, x_count) = {
+            let state = state.lock().expect("terminal drain state poisoned");
+            (
+                state.started,
+                state.resumed,
+                state.output.iter().filter(|byte| **byte == b'x').count(),
+            )
+        };
         assert!(started);
         assert!(slow.receiver.overflowed());
-        assert!(!healthy.receiver.overflowed());
-        assert!(output.iter().filter(|byte| **byte == b'x').count() >= 280 * 8192);
+        assert!(!healthy_overflowed);
+        assert!(x_count >= 280 * 8192);
         assert!(resumed);
-
-        let close_deadline = Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            match healthy.receiver.try_recv() {
-                Ok(_) => {}
-                Err(TerminalTryRecvError::Disconnected) => break,
-                Err(TerminalTryRecvError::Empty) => {
-                    assert!(
-                        Instant::now() < close_deadline,
-                        "terminal subscription did not close after process exit"
-                    );
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-            }
-        }
 
         let db = FactoryDb::open(&dir.path().join(".factory").join("db.sqlite3")).unwrap();
         let mut saved = db.get_agent_session(session.id).unwrap().unwrap();
