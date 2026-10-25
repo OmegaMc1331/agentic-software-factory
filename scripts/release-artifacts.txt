@@ -1,0 +1,4 @@
+factory-linux-x86_64.tar.gz
+factory-macos-aarch64.tar.gz
+factory-macos-x86_64.tar.gz
+factory-windows-x86_64.zip

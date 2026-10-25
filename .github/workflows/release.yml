@@ -188,19 +188,20 @@ jobs:
           rm -f "$contents"
           echo "OK: archive contents verified"
 
-      - name: Generate the SHA-256 checksum
+      - name: Generate and verify the SHA-256 checksum
         shell: bash
         run: |
           set -euo pipefail
-          ( sha256sum "release/${{ matrix.archive }}" || shasum -a 256 "release/${{ matrix.archive }}" ) > "release/${{ matrix.archive }}.sha256"
-          echo "OK: checksum written"
-          ls -la release
+          node scripts/release-checksums.mjs generate "release/${{ matrix.archive }}"
+          node scripts/release-checksums.mjs verify "release/${{ matrix.archive }}"
 
       - name: Upload the release artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.name }}
-          path: release/
+          path: |
+            release/${{ matrix.archive }}
+            release/${{ matrix.archive }}.sha256
           if-no-files-found: error
 
   release:
@@ -210,24 +211,28 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
       - name: Download all release artifacts
         uses: actions/download-artifact@v4
         with:
           path: release
           merge-multiple: true
 
-      - name: Verify all archives and checksums
+      - name: Verify the exact release artifact inventory
+        run: |
+          set -euo pipefail
+          node scripts/release-checksums.mjs verify-release release
+
+      - name: Verify all archive contents
         run: |
           set -euo pipefail
           cd release
-          for f in \
-            factory-windows-x86_64.zip \
-            factory-linux-x86_64.tar.gz \
-            factory-macos-aarch64.tar.gz \
-            factory-macos-x86_64.tar.gz; do
-            [ -f "$f" ] || { echo "missing artifact: $f"; exit 1; }
-            [ -f "$f.sha256" ] || { echo "missing checksum: $f.sha256"; exit 1; }
-          done
           windows_list="$(mktemp)"
           unzip -Z1 factory-windows-x86_64.zip > "$windows_list"
           grep -qx factory.exe "$windows_list"
@@ -252,24 +257,39 @@ jobs:
           grep -qx LICENSE "$macos_x86_64_list"
           rm -f "$macos_x86_64_list"
 
-          echo "OK: all archives, binaries, and checksums present"
+          echo "OK: all archive contents verified"
 
-      - name: Combine the checksums
+      - name: Generate and verify the consolidated manifest
         run: |
-          cat release/*.sha256 | sort > SHA256SUMS.txt
-          cat SHA256SUMS.txt
+          set -euo pipefail
+          node scripts/release-checksums.mjs finalize-release release
+
+      - name: Verify the consolidated manifest with sha256sum
+        run: |
+          set -euo pipefail
+          cd release
+          sha256sum -c SHA256SUMS.txt
+          expected="$(wc -l < ../scripts/release-artifacts.txt)"
+          actual="$(wc -l < SHA256SUMS.txt)"
+          test "$actual" -eq "$expected"
 
       - name: Create the GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
           prerelease=""
           if [[ "$GITHUB_REF_NAME" == *-* ]]; then
             prerelease="--prerelease"
           fi
+          assets=()
+          while IFS= read -r archive; do
+            assets+=("release/$archive" "release/$archive.sha256")
+          done < scripts/release-artifacts.txt
+          assets+=("release/SHA256SUMS.txt")
           gh release create "$GITHUB_REF_NAME" \
-            release/* SHA256SUMS.txt \
+            "${assets[@]}" \
             --repo "$GITHUB_REPOSITORY" \
             --title "Agentic Software Factory $GITHUB_REF_NAME" \
-            --notes "Prebuilt binaries for Windows (x86_64), Linux (x86_64), macOS Apple Silicon and macOS Intel." \
+            --notes "Prebuilt binaries for Windows (x86_64), Linux (x86_64), macOS Apple Silicon and macOS Intel. SHA-256 checksums are included." \
             $prerelease

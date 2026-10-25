@@ -6,6 +6,21 @@ on:
   pull_request:
 
 jobs:
+  checksums:
+    name: Release checksum tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Test release checksum helpers
+        run: node --test scripts/release-checksums.test.mjs
+
   rust:
     name: Rust (${{ matrix.os }})
     strategy:
@@ -133,7 +148,9 @@ jobs:
               z.write("target/release/factory", "factory.exe")
               z.write(f"{sys.argv[1]}/LICENSE", "LICENSE")
           EOF
-          ( cd assets && for f in *.tar.gz *.zip; do sha256sum "$f" > "$f.sha256"; done )
+          for f in factory-linux-x86_64.tar.gz factory-windows-x86_64.zip; do
+            node scripts/release-checksums.mjs generate "assets/$f"
+          done
           ls -la assets
       - name: Exercise install.sh and install.ps1 against the archives
         run: |
@@ -155,4 +172,62 @@ jobs:
           test -x /tmp/ps-install/factory.exe || test -f /tmp/ps-install/factory.exe
           FACTORY_INSTALL_DIR=/tmp/ps-install pwsh -NoProfile -File install.ps1
 
-          echo "OK: installers verified end-to-end"
+          linux_sha="assets/factory-linux-x86_64.tar.gz.sha256"
+          windows_sha="assets/factory-windows-x86_64.zip.sha256"
+          cp "$linux_sha" /tmp/linux.sha256.good
+          cp "$windows_sha" /tmp/windows.sha256.good
+          rm -rf /tmp/factory-bad-sh /tmp/factory-bad-ps /tmp/factory-legacy /tmp/factory-legacy-ps
+
+          printf '%064d  factory-linux-x86_64.tar.gz\n' 0 > "$linux_sha"
+          if FACTORY_INSTALL_DIR=/tmp/factory-bad-sh sh install.sh; then
+            echo "install.sh accepted a mismatched checksum" >&2
+            exit 1
+          fi
+          test ! -e /tmp/factory-bad-sh/factory
+
+          printf 'not a checksum\n' > "$linux_sha"
+          if FACTORY_INSTALL_DIR=/tmp/factory-bad-sh sh install.sh; then
+            echo "install.sh accepted a malformed checksum" >&2
+            exit 1
+          fi
+
+          rm -f "$linux_sha"
+          if FACTORY_INSTALL_DIR=/tmp/factory-bad-sh sh install.sh; then
+            echo "install.sh accepted a missing checksum" >&2
+            exit 1
+          fi
+          cp /tmp/linux.sha256.good "$linux_sha"
+
+          digest="$(awk '{print $1}' "$linux_sha")"
+          printf '%s  release/factory-linux-x86_64.tar.gz\n' "$digest" > "$linux_sha"
+          FACTORY_INSTALL_DIR=/tmp/factory-legacy sh install.sh
+          test -x /tmp/factory-legacy/factory
+          cp /tmp/linux.sha256.good "$linux_sha"
+
+          printf '%064d  factory-windows-x86_64.zip\n' 0 > "$windows_sha"
+          if FACTORY_INSTALL_DIR=/tmp/factory-bad-ps pwsh -NoProfile -File install.ps1; then
+            echo "install.ps1 accepted a mismatched checksum" >&2
+            exit 1
+          fi
+          test ! -e /tmp/factory-bad-ps/factory.exe
+
+          printf 'not a checksum\n' > "$windows_sha"
+          if FACTORY_INSTALL_DIR=/tmp/factory-bad-ps pwsh -NoProfile -File install.ps1; then
+            echo "install.ps1 accepted a malformed checksum" >&2
+            exit 1
+          fi
+
+          rm -f "$windows_sha"
+          if FACTORY_INSTALL_DIR=/tmp/factory-bad-ps pwsh -NoProfile -File install.ps1; then
+            echo "install.ps1 accepted a missing checksum" >&2
+            exit 1
+          fi
+          cp /tmp/windows.sha256.good "$windows_sha"
+
+          digest="$(awk '{print $1}' "$windows_sha")"
+          printf '%s  release/factory-windows-x86_64.zip\n' "$digest" > "$windows_sha"
+          FACTORY_INSTALL_DIR=/tmp/factory-legacy-ps pwsh -NoProfile -File install.ps1
+          test -f /tmp/factory-legacy-ps/factory.exe
+          cp /tmp/windows.sha256.good "$windows_sha"
+
+          echo "OK: installers verified and rejected bad checksums"

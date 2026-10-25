@@ -176,16 +176,76 @@ cargo test --release --features embedded-dashboard -p factory-api
 ## Releasing
 
 Pushing a version tag runs [the release workflow](../.github/workflows/release.yml),
-builds all supported platform archives, verifies installers, and creates a GitHub
-Release. Do not tag routine changes automatically.
+builds all supported platform archives, verifies archives and checksums, and creates a
+GitHub Release. Installer end-to-end tests run in CI. Do not tag routine changes
+automatically.
 
 ```bash
 git tag v1.0.5
 git push origin v1.0.5
 ```
 
+### Release checksums
+
+Each release publishes these archives:
+
+- `factory-windows-x86_64.zip`
+- `factory-linux-x86_64.tar.gz`
+- `factory-macos-aarch64.tar.gz`
+- `factory-macos-x86_64.tar.gz`
+
+The build jobs generate a `.sha256` file next to each archive after packaging and
+content verification. Each file contains one LF-terminated entry with the lowercase
+digest and the archive basename:
+
+```text
+<64-character lowercase SHA-256 digest>  factory-linux-x86_64.tar.gz
+```
+
+The publishing job downloads the artifacts, checks the exact inventory, verifies every
+archive checksum again, checks the archive contents, and writes a sorted
+`SHA256SUMS.txt` with one basename-only entry per archive. It then runs
+`sha256sum -c SHA256SUMS.txt` before creating the GitHub Release. The checksum helpers
+are `scripts/release-checksums.mjs` and the inventory is
+`scripts/release-artifacts.txt`; run their tests with:
+
+```bash
+node --test scripts/release-checksums.test.mjs
+```
+
+Download the archive, its `.sha256` file, and `SHA256SUMS.txt` into one directory.
+Linux:
+
+```bash
+sha256sum -c SHA256SUMS.txt
+```
+
+macOS:
+
+```bash
+shasum -a 256 -c SHA256SUMS.txt
+```
+
+Windows PowerShell:
+
+```powershell
+$expected = (Get-Content .\SHA256SUMS.txt |
+  Where-Object { $_ -match 'factory-windows-x86_64\.zip$' }) -split '\s+' | Select-Object -First 1
+$actual = (Get-FileHash .\factory-windows-x86_64.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+if ($actual -ne $expected) { throw 'SHA-256 checksum mismatch' }
+```
+
+The installers verify the per-archive `.sha256` file before extracting or installing
+anything. SHA-256 checksums detect a mismatch between an archive and the published
+manifest. They are integrity metadata, not a digital signature: if an attacker can
+replace both the archive and the manifest on the same distribution channel, the
+checksum cannot establish publisher authenticity. Signing or provenance attestation
+would be a separate follow-up. Checksums are reproducible for a given archive byte
+sequence; they do not make separate builds byte-for-byte reproducible.
+
 [CI](../.github/workflows/ci.yml) runs Rust checks on Ubuntu and Windows, dashboard
-checks, an embedded release-style smoke test, and installer tests.
+checks, an embedded release-style smoke test, installer tests, and cross-platform
+release checksum tests.
 
 ## Role-aware internals
 

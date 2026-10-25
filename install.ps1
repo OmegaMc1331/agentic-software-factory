@@ -96,18 +96,51 @@ $shaPath = Join-Path $tmp "$asset.sha256"
 
 Write-Host "Downloading $asset ($tag)..."
 Invoke-WebRequest -Uri "$base/$asset" -OutFile $zipPath
-Invoke-WebRequest -Uri "$base/$asset.sha256" -OutFile $shaPath
-if (-not (Test-Path $shaPath)) {
-  Remove-Item -Recurse -Force $tmp
+try {
+  Invoke-WebRequest -Uri "$base/$asset.sha256" -OutFile $shaPath
+} catch {
+  Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
   throw 'No published checksum for this release. Refusing to install an unverified binary.'
+}
+if (-not (Test-Path $shaPath)) {
+  Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+  throw 'No published checksum for this release. Refusing to install an unverified binary.'
+}
+if (-not (Test-Path $zipPath)) {
+  Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+  throw 'The archive download is missing. Aborting.'
+}
+if ((Get-Item $zipPath).Length -eq 0) {
+  Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+  throw 'The archive download is empty. Aborting.'
 }
 
 # 4. verify the SHA-256 checksum
-$expected = ((Get-Content $shaPath -Raw).Trim() -split '\s+')[0]
-$actual = (Get-FileHash -Path $zipPath -Algorithm SHA256).Hash
-if (-not $expected -or $actual -ine $expected) {
-  Remove-Item -Recurse -Force $tmp
-  throw "Checksum mismatch for $asset. Expected $expected, got $actual. Aborting."
+try {
+  $shaLines = @(Get-Content $shaPath | Where-Object { $_.Trim() })
+  if ($shaLines.Count -ne 1) {
+    throw "Malformed checksum file for $asset. Refusing to install."
+  }
+  $parts = @($shaLines[0].Trim() -split '\s+' | Where-Object { $_ -ne '' })
+  if ($parts.Count -ne 2) {
+    throw "Malformed checksum file for $asset. Refusing to install."
+  }
+  $expected = $parts[0]
+  if ($expected -notmatch '^[0-9a-fA-F]{64}$') {
+    throw "Malformed checksum file for $asset. Refusing to install."
+  }
+  $checksumName = $parts[1]
+  if ($checksumName -ne $asset -and $checksumName -ne "release/$asset") {
+    throw "Checksum file does not refer to $asset. Refusing to install."
+  }
+  $expected = $expected.ToLowerInvariant()
+  $actual = (Get-FileHash -Path $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+  if ($actual -ne $expected) {
+    throw "Checksum mismatch for $asset. Expected $expected, got $actual. Aborting."
+  }
+} catch {
+  Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+  throw
 }
 Write-Host 'Checksum OK.'
 
@@ -122,6 +155,7 @@ New-Item -ItemType Directory -Path $installDir -Force | Out-Null
 Copy-Item -Path $extracted -Destination $exePath -Force
 
 # 6. make sure the install directory is on the user PATH
+$pathChanged = $false
 if (-not $env:FACTORY_INSTALL_DIR) {
   if (-not (Test-AsfOnUserPath $installDir)) {
     $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')

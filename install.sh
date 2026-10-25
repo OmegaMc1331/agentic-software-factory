@@ -87,7 +87,14 @@ sha_file="$tmp/$ASSET.sha256"
 
 printf 'Downloading %s (%s)...\n' "$ASSET" "$tag"
 curl -fsSL -o "$archive" "$base/$ASSET"
-curl -fsSL -o "$sha_file" "$base/$ASSET.sha256"
+if ! curl -fsSL -o "$sha_file" "$base/$ASSET.sha256"; then
+  printf 'No published checksum for this release. Refusing to install an unverified binary.\n' >&2
+  exit 1
+fi
+if [ ! -s "$archive" ]; then
+  printf 'The archive download is empty. Aborting.\n' >&2
+  exit 1
+fi
 if [ ! -f "$sha_file" ]; then
   printf 'No published checksum for this release. Refusing to install an unverified binary.\n' >&2
   exit 1
@@ -104,8 +111,26 @@ else
   printf 'No SHA-256 tool found (need sha256sum, shasum or openssl).\n' >&2
   exit 1
 fi
-expected="$(awk '{print $1}' "$sha_file")"
-if [ -z "$expected" ] || [ "$actual" != "$expected" ]; then
+entry_count="$(awk 'NF { count += 1 } END { print count + 0 }' "$sha_file")"
+fields="$(awk 'NF { print NF; exit }' "$sha_file")"
+expected="$(awk 'NF { print $1; exit }' "$sha_file")"
+checksum_name="$(awk 'NF { print $2; exit }' "$sha_file")"
+case "$expected" in
+  *[!0-9a-fA-F]*|'')
+    printf 'Malformed checksum file for %s. Refusing to install.\n' "$ASSET" >&2
+    exit 1
+    ;;
+esac
+if [ "${#expected}" -ne 64 ] || [ "$entry_count" -ne 1 ] || [ "$fields" -ne 2 ]; then
+  printf 'Malformed checksum file for %s. Refusing to install.\n' "$ASSET" >&2
+  exit 1
+fi
+if [ "$checksum_name" != "$ASSET" ] && [ "$checksum_name" != "release/$ASSET" ]; then
+  printf 'Checksum file does not refer to %s. Refusing to install.\n' "$ASSET" >&2
+  exit 1
+fi
+expected="$(printf '%s' "$expected" | tr 'A-F' 'a-f')"
+if [ "$actual" != "$expected" ]; then
   printf 'Checksum mismatch for %s. Aborting.\n' "$ASSET" >&2
   exit 1
 fi
