@@ -59,7 +59,7 @@ pub async fn authenticated_app(state: Arc<factory_api::ApiState>) -> Router {
     ))
 }
 
-async fn bootstrap(state: &Arc<factory_api::ApiState>) -> (String, String) {
+pub async fn bootstrap(state: &Arc<factory_api::ApiState>) -> (String, String) {
     let response = factory_api::router(state.clone())
         .oneshot(
             Request::builder()

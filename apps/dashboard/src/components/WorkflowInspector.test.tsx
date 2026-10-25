@@ -921,4 +921,113 @@ describe("Workflow inspector", () => {
       vi.useRealTimers();
     }
   });
+
+  it("recovers from a client-side timeout without resubmitting or guessing", async () => {
+    const completedMeta: RunMeta = { ...meta, status: "completed" };
+    const completedNode: GraphNode = { ...node, meta: completedMeta };
+    // Mount sees a ready delivery (Create is offered); after the uncertain
+    // timeout the authoritative status shows the operation running.
+    vi.mocked(fetchDelivery)
+      .mockReset()
+      .mockResolvedValueOnce(deliveryReady)
+      .mockResolvedValueOnce(deliveryReady)
+      .mockResolvedValue(activeDelivery);
+    vi.mocked(createPullRequest)
+      .mockReset()
+      .mockRejectedValueOnce(
+        new Error(
+          "The request timed out. The operation may still be running or may have completed. Check its status before retrying."
+        )
+      );
+    vi.mocked(isUncertainApiError).mockReset().mockReturnValue(true);
+    vi.mocked(fetchPrPreview).mockReset().mockResolvedValue(readyPreview);
+    render(
+      <WorkflowInspector
+        node={completedNode}
+        onClose={vi.fn()}
+        onStart={vi.fn()}
+        onCancel={vi.fn()}
+        onRetry={vi.fn()}
+      />
+    );
+    fireEvent.click(await screen.findByText("Create Pull Request"));
+    // Wait for the preview form before submitting.
+    await screen.findByDisplayValue("Fix refresh token race");
+    fireEvent.click(screen.getByRole("button", { name: "Create Pull Request" }));
+
+    // The uncertain outcome drives a status check, never an automatic
+    // resubmission: exactly one POST, at least one authoritative GET.
+    await waitFor(() => expect(vi.mocked(createPullRequest).mock.calls.length).toBe(1));
+    await waitFor(() =>
+      expect(vi.mocked(fetchDelivery).mock.calls.length).toBeGreaterThanOrEqual(1)
+    );
+    await screen.findByText(/Delivery is still in progress/);
+    expect(
+      await screen.findByText(/Publishing pull request… the operation is owned by Factory/)
+    ).toBeTruthy();
+    expect(screen.queryByText("Retry delivery")).toBeNull();
+  });
+
+  it("never overlaps delivery polls, so stale responses cannot overwrite newer state", async () => {
+    const completedMeta: RunMeta = { ...meta, status: "completed" };
+    const completedNode: GraphNode = { ...node, meta: completedMeta };
+    vi.useFakeTimers();
+    try {
+      // Mount load resolves immediately with an active delivery; the first
+      // interval poll stays pending until the test releases it.
+      vi.mocked(fetchDelivery)
+        .mockReset()
+        .mockResolvedValueOnce(activeDelivery)
+        .mockResolvedValueOnce(activeDelivery)
+        .mockImplementationOnce(
+          () =>
+            new Promise((resolve) => {
+              releaseFirstPoll = () => resolve(publishedDelivery);
+            })
+        )
+        .mockResolvedValue(activeDelivery);
+      let releaseFirstPoll: (report: DeliveryReport) => void = () => {};
+      const app = render(
+        <WorkflowInspector
+          node={completedNode}
+          onClose={vi.fn()}
+          onStart={vi.fn()}
+          onCancel={vi.fn()}
+          onRetry={vi.fn()}
+        />
+      );
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      const callsAfterMount = vi.mocked(fetchDelivery).mock.calls.length;
+
+      // The first poll fires and stays pending; subsequent ticks are skipped
+      // while one request is in flight (no overlap, no out-of-order writes).
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(2000);
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(2000);
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(2000);
+      });
+      expect(vi.mocked(fetchDelivery).mock.calls.length).toBe(callsAfterMount + 1);
+
+      // The pending poll resolves to `published`; polling stops there.
+      await act(async () => {
+        releaseFirstPoll(publishedDelivery);
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(screen.getAllByRole("link", { name: "Open on GitHub" }).length).toBeGreaterThan(0);
+      const settled = vi.mocked(fetchDelivery).mock.calls.length;
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(6000);
+      });
+      expect(vi.mocked(fetchDelivery).mock.calls.length).toBe(settled);
+      app.unmount();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

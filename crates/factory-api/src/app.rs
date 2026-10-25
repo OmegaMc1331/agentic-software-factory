@@ -610,36 +610,41 @@ async fn create_pull_request(
         .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "invalid JSON body"))?
         .0;
     let root = state.root.clone();
+    // The worker starts inside the blocking task, after the durable claim
+    // commits and before this handler can be cancelled by a dropped
+    // connection: a client that loses the acknowledgement can never leave a
+    // claimed operation without its worker. The claim and the worker start
+    // are one unit from the client's perspective.
     let claim = tokio::task::spawn_blocking(move || {
         let factory = factory_core::Factory::open(&root).map_err(RuntimeError::from)?;
-        factory
+        let claim = factory
             .begin_delivery(
                 id,
                 request.title.as_deref(),
                 request.body.as_deref(),
                 request.draft,
             )
-            .map_err(RuntimeError::from)
+            .map_err(RuntimeError::from)?;
+        match claim {
+            factory_core::DeliveryClaim::AlreadyPublished(delivery) => {
+                Ok::<_, RuntimeError>((StatusCode::OK, delivery))
+            }
+            factory_core::DeliveryClaim::Claimed(delivery, operation_request) => {
+                let operation_id = delivery
+                    .operation_id
+                    .clone()
+                    .expect("a claimed delivery always carries an operation id");
+                state
+                    .runtime
+                    .start_delivery(id, &operation_id, operation_request)?;
+                Ok((StatusCode::ACCEPTED, delivery))
+            }
+        }
     })
     .await
     .map_err(|error| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
     .map_err(ApiError::from)?;
-    match claim {
-        factory_core::DeliveryClaim::AlreadyPublished(delivery) => {
-            Ok((StatusCode::OK, Json(delivery)))
-        }
-        factory_core::DeliveryClaim::Claimed(delivery, operation_request) => {
-            let operation_id = delivery
-                .operation_id
-                .clone()
-                .expect("a claimed delivery always carries an operation id");
-            state
-                .runtime
-                .start_delivery(id, &operation_id, operation_request)
-                .map_err(ApiError::from)?;
-            Ok((StatusCode::ACCEPTED, Json(delivery)))
-        }
-    }
+    Ok((claim.0, Json(claim.1)))
 }
 
 /// Reconciles a run whose delivery attempt was interrupted: read-only GitHub
