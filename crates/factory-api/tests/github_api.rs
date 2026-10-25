@@ -451,7 +451,7 @@ async fn completed_delivery_run(dir: &Path) -> i64 {
         )
     } else {
         format!(
-            "printf 'done\n' > worker-output.txt; cat '{}'",
+            "echo done > worker-output.txt; cat '{}'",
             worker_path.display()
         )
     };
