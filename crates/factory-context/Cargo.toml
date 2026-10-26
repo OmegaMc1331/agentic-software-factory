@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+factory-proc = { workspace = true }
 factory-types = { workspace = true }
 factory-git = { workspace = true }
 regex = "1"

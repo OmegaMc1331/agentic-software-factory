@@ -539,6 +539,7 @@ name = "factory-context"
 version = "1.0.5"
 dependencies = [
  "factory-git",
+ "factory-proc",
  "factory-types",
  "filetime",
  "regex",
@@ -652,6 +653,7 @@ name = "factory-proc"
 version = "1.0.5"
 dependencies = [
  "tempfile",
+ "windows-sys",
 ]
 
 [[package]]
