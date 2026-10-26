@@ -317,6 +317,30 @@ mod tests {
         Bounds::new(Duration::from_secs(10), 64 * 1024, 64 * 1024)
     }
 
+    /// Linux runners can transiently refuse to exec a freshly written script
+    /// (`ETXTBSY` — the kernel's writeback still holds the inode) when many
+    /// tests write and spawn scripts concurrently. Real binaries from PATH
+    /// never hit this; retrying the spawn briefly is deterministic-safe.
+    fn run_resilient(
+        command: ProcCommand,
+        bounds: Bounds,
+        cancel: Option<&AtomicBool>,
+    ) -> std::result::Result<ProcOutput, ProcError> {
+        let mut attempts = 0;
+        loop {
+            match command.run_with_cancel(bounds, cancel) {
+                Err(ProcError::Spawn(error))
+                    if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                        && attempts < 40 =>
+                {
+                    attempts += 1;
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                other => return other,
+            }
+        }
+    }
+
     #[test]
     fn captures_successful_output_and_exit_status() {
         let fixture = fixture();
@@ -326,7 +350,7 @@ mod tests {
             "@echo off\r\necho hello\r\necho oops 1>&2\r\nexit /b 3\r\n",
             "#!/bin/sh\necho hello\necho oops >&2\nexit 3\n",
         );
-        let output = ProcCommand::new(program).run(fast_bounds()).unwrap();
+        let output = run_resilient(ProcCommand::new(program), fast_bounds(), None).unwrap();
         assert_eq!(output.status.code(), Some(3));
         assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "hello");
         assert_eq!(String::from_utf8_lossy(&output.stderr).trim(), "oops");
@@ -335,9 +359,12 @@ mod tests {
 
     #[test]
     fn a_missing_program_is_a_spawn_error() {
-        let error = ProcCommand::new("definitely-not-a-real-program-xyz")
-            .run(fast_bounds())
-            .unwrap_err();
+        let error = run_resilient(
+            ProcCommand::new("definitely-not-a-real-program-xyz"),
+            fast_bounds(),
+            None,
+        )
+        .unwrap_err();
         assert!(matches!(error, ProcError::Spawn(_)));
     }
 
@@ -351,9 +378,12 @@ mod tests {
             "#!/bin/sh\necho started\nsleep 60\n",
         );
         let started = Instant::now();
-        let error = ProcCommand::new(program)
-            .run(Bounds::new(Duration::from_millis(400), 1024, 1024))
-            .unwrap_err();
+        let error = run_resilient(
+            ProcCommand::new(program),
+            Bounds::new(Duration::from_millis(400), 1024, 1024),
+            None,
+        )
+        .unwrap_err();
         let ProcError::TimedOut { output } = error else {
             panic!("expected a timeout, got {error:?}");
         };
@@ -375,9 +405,12 @@ mod tests {
             "@echo off\r\nfor /l %%i in (1,1,2000) do echo 0123456789012345678901234567890123456789\r\n",
             "#!/bin/sh\ni=0\nwhile [ $i -lt 2000 ]; do echo 0123456789012345678901234567890123456789; i=$((i+1)); done\n",
         );
-        let output = ProcCommand::new(program)
-            .run(Bounds::new(Duration::from_secs(20), 4096, 1024))
-            .unwrap();
+        let output = run_resilient(
+            ProcCommand::new(program),
+            Bounds::new(Duration::from_secs(20), 4096, 1024),
+            None,
+        )
+        .unwrap();
         assert!(output.stdout_truncated, "flood must be flagged");
         assert_eq!(output.stdout.len(), 4096);
         assert!(output.stdout.starts_with(b"0123456789"));
@@ -392,9 +425,12 @@ mod tests {
             "@echo off\r\nfor /l %%i in (1,1,2000) do echo noise 1>&2\r\n",
             "#!/bin/sh\ni=0\nwhile [ $i -lt 2000 ]; do echo noise >&2; i=$((i+1)); done\n",
         );
-        let output = ProcCommand::new(program)
-            .run(Bounds::new(Duration::from_secs(20), 1024, 2048))
-            .unwrap();
+        let output = run_resilient(
+            ProcCommand::new(program),
+            Bounds::new(Duration::from_secs(20), 1024, 2048),
+            None,
+        )
+        .unwrap();
         assert!(output.stderr_truncated);
         assert!(output.stderr.len() <= 2048);
         assert!(!output.stdout_truncated);
@@ -409,9 +445,12 @@ mod tests {
             "@echo off\r\nping -n 2 127.0.0.1 >nul\r\necho done\r\n",
             "#!/bin/sh\nsleep 1\necho done\n",
         );
-        let output = ProcCommand::new(program)
-            .run(Bounds::new(Duration::from_secs(10), 1024, 1024))
-            .unwrap();
+        let output = run_resilient(
+            ProcCommand::new(program),
+            Bounds::new(Duration::from_secs(10), 1024, 1024),
+            None,
+        )
+        .unwrap();
         assert!(output.success());
         assert!(String::from_utf8_lossy(&output.stdout).contains("done"));
     }
@@ -430,7 +469,8 @@ mod tests {
             let handle = {
                 let cancel_flag = &cancel;
                 scope.spawn(move || {
-                    ProcCommand::new(program).run_with_cancel(
+                    run_resilient(
+                        ProcCommand::new(program),
                         Bounds::new(Duration::from_secs(30), 1024, 1024),
                         Some(cancel_flag),
                     )
@@ -489,9 +529,12 @@ mod tests {
                 ),
             )
         };
-        let error = ProcCommand::new(program)
-            .run(Bounds::new(Duration::from_millis(700), 1024, 1024))
-            .unwrap_err();
+        let error = run_resilient(
+            ProcCommand::new(program),
+            Bounds::new(Duration::from_millis(700), 1024, 1024),
+            None,
+        )
+        .unwrap_err();
         assert!(matches!(error, ProcError::TimedOut { .. }));
         // The descendant must die with the tree: its heartbeat stops growing.
         std::thread::sleep(Duration::from_millis(500));
@@ -518,9 +561,12 @@ mod tests {
             "@echo off\r\nset /p value=\r\necho got-%value%\r\n",
             "#!/bin/sh\nread value\necho \"got-$value\"\n",
         );
-        let output = ProcCommand::new(program)
-            .run(Bounds::new(Duration::from_secs(5), 1024, 1024))
-            .unwrap();
+        let output = run_resilient(
+            ProcCommand::new(program),
+            Bounds::new(Duration::from_secs(5), 1024, 1024),
+            None,
+        )
+        .unwrap();
         assert!(
             output.success(),
             "a stdin reader must exit cleanly on EOF: {:?}",
@@ -537,11 +583,14 @@ mod tests {
             "@echo off\r\necho %FACTORY_PROC_PROBE%\r\n",
             "#!/bin/sh\necho \"$FACTORY_PROC_PROBE\"\n",
         );
-        let output = ProcCommand::new(program)
-            .env("FACTORY_PROC_PROBE", "probe-value")
-            .current_dir(&fixture.dir)
-            .run(fast_bounds())
-            .unwrap();
+        let output = run_resilient(
+            ProcCommand::new(program)
+                .env("FACTORY_PROC_PROBE", "probe-value")
+                .current_dir(&fixture.dir),
+            fast_bounds(),
+            None,
+        )
+        .unwrap();
         assert_eq!(
             String::from_utf8_lossy(&output.stdout).trim(),
             "probe-value"
