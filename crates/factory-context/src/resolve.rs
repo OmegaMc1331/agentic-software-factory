@@ -136,7 +136,15 @@ impl ContextEngine {
 
     /// Incrementally refreshes the in-memory index and persists it when the
     /// working tree changed.
+    ///
+    /// Ignore rules are re-collected here (ASF-F02): a long-lived engine
+    /// instance must not keep applying `.gitignore` state from its
+    /// construction time after the repository changed its mind. Factory Core
+    /// builds a fresh engine per operation, so this matters only for
+    /// directly-held instances — but the boundary guarantees freshness for
+    /// both without a filesystem watcher.
     pub fn refresh(&mut self) -> Result<()> {
+        self.ignore = IgnoreRules::collect(&self.root);
         let index = self.index.get_or_insert_with(|| ContextIndex {
             root: self.root.clone(),
             files: Default::default(),

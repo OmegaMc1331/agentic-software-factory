@@ -153,35 +153,68 @@ impl IgnoreRules {
             if raw.is_empty() {
                 continue;
             }
-            let anchored = raw.starts_with('/');
+            let root_anchored = raw.starts_with('/');
             let raw = raw.trim_start_matches('/');
+            // gitignore(5): a pattern with an interior slash is relative to
+            // the contributing directory; a slash-free pattern matches a
+            // basename at any depth. Leading `/` anchors to the directory.
+            let path_relative = root_anchored || raw.contains('/');
 
             let mut parts = Vec::new();
-            let mut chars = raw.char_indices().peekable();
-            while let Some((_, ch)) = chars.next() {
+            let chars: Vec<char> = raw.chars().collect();
+            let mut index = 0usize;
+            while index < chars.len() {
+                let ch = chars[index];
                 match ch {
-                    '*' => {
-                        if chars.peek().is_some_and(|(_, next)| *next == '*') {
-                            parts.push(".*".to_string());
-                            chars.next();
+                    // gitignore: a backslash escapes the next character —
+                    // `?`, `*`, `#`, `!`, space, or another backslash match
+                    // literally. A trailing lone backslash is literal.
+                    '\\' => {
+                        if let Some(escaped) = chars.get(index + 1) {
+                            parts.push(regex::escape(escaped.encode_utf8(&mut [0u8; 4])));
+                            index += 2;
                         } else {
-                            parts.push("[^/]*".to_string());
+                            parts.push(regex::escape("\\"));
+                            index += 1;
                         }
+                    }
+                    '*' if chars.get(index + 1) == Some(&'*') => {
+                        // Context-aware `**` per gitignore(5):
+                        // - leading `**/`  → zero or more leading directories
+                        // - `a/**/b`       → zero or more middle directories
+                        // - trailing `/**` → everything inside
+                        // - otherwise      → any characters, including `/`
+                        let at_start = index == 0;
+                        let after_slash = at_start || chars[index - 1] == '/';
+                        let followed_by_slash = chars.get(index + 2) == Some(&'/');
+                        if after_slash && followed_by_slash {
+                            // `**/a` (leading) and `c/**/d` (middle): zero or
+                            // more directories before the next component.
+                            parts.push("(?:.*/)?".to_string());
+                            index += 3;
+                        } else {
+                            // `b/**` (everything inside) and any standalone
+                            // `**`: any characters, including separators.
+                            parts.push(".*".to_string());
+                            index += 2;
+                        }
+                    }
+                    '*' => {
+                        parts.push("[^/]*".to_string());
+                        index += 1;
                     }
                     '?' => {
                         parts.push("[^/]".to_string());
+                        index += 1;
                     }
                     _ => {
                         parts.push(regex::escape(ch.encode_utf8(&mut [0u8; 4])));
+                        index += 1;
                     }
                 }
             }
             let pattern = parts.join("");
-            // Anchored patterns bind to the contributing directory; all other
-            // patterns match the tail of the path relative to it (git's "no
-            // slash" basename case and "has slash" cases both reduce to this
-            // for a root-level file).
-            let regex_text = if anchored {
+            let regex_text = if path_relative {
                 format!("^{pattern}$")
             } else {
                 format!("(?:^|/){pattern}$")
