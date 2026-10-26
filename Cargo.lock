@@ -600,6 +600,7 @@ dependencies = [
 name = "factory-git"
 version = "1.0.5"
 dependencies = [
+ "factory-proc",
  "tempfile",
  "thiserror 2.0.20",
 ]
@@ -609,6 +610,7 @@ name = "factory-github"
 version = "1.0.5"
 dependencies = [
  "chrono",
+ "factory-proc",
  "factory-types",
  "serde",
  "serde_json",
@@ -643,6 +645,13 @@ version = "1.0.5"
 dependencies = [
  "serde",
  "toml",
+]
+
+[[package]]
+name = "factory-proc"
+version = "1.0.5"
+dependencies = [
+ "tempfile",
 ]
 
 [[package]]

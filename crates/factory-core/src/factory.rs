@@ -2797,11 +2797,24 @@ impl Factory {
         }
         let timer = Instant::now();
         let mut output_error = None;
+        // Redaction must survive chunk boundaries: a child process can emit a
+        // secret across two writes, so each stream keeps an independent
+        // stateful redactor that holds back only the suffix a future chunk
+        // could complete. Every append below therefore stores secret-free
+        // text, not text that merely looks incomplete.
+        let mut stdout_redactor = factory_policy::StreamingRedactor::new(&secrets);
+        let mut stderr_redactor = factory_policy::StreamingRedactor::new(&secrets);
         let result = agent.run_observed(&request, cancel, |stream, chunk| {
             if output_error.is_some() {
                 return;
             }
-            let chunk = secrets.redact(chunk);
+            let chunk = match stream {
+                OutputStream::Stdout => stdout_redactor.push_chunk(chunk),
+                OutputStream::Stderr => stderr_redactor.push_chunk(chunk),
+            };
+            if chunk.is_empty() {
+                return;
+            }
             let update = match stream {
                 OutputStream::Stdout => {
                     self.db
@@ -2816,6 +2829,22 @@ impl Factory {
                 output_error = Some(error);
             }
         });
+        // Release each stream's held-back suffix (secret-free by construction)
+        // so no path — success, cancellation, or failure — loses or leaks it.
+        let stdout_tail = stdout_redactor.finish();
+        let stderr_tail = stderr_redactor.finish();
+        if !stdout_tail.is_empty() || !stderr_tail.is_empty() {
+            let update = self.db.append_agent_session_output(
+                session.id,
+                (!stdout_tail.is_empty()).then_some(stdout_tail.as_str()),
+                (!stderr_tail.is_empty()).then_some(stderr_tail.as_str()),
+            );
+            if let Err(error) = update {
+                if output_error.is_none() {
+                    output_error = Some(error);
+                }
+            }
+        }
         if let Some(grant) = &grant {
             // Revocation happens before any task state transition. If the
             // agent was cancelled, its active MCP subprocess is terminated by
@@ -3804,6 +3833,10 @@ impl Factory {
             factory_github::GitHubError::Uncertain(_)
                 | factory_github::GitHubError::Network(_)
                 | factory_github::GitHubError::Io(_)
+                // A deadline miss can never prove the remote side effect did
+                // not happen; it keeps the delivery interrupted like any
+                // other uncertain outcome.
+                | factory_github::GitHubError::TimedOut(_)
         );
         delivery.state = if uncertain {
             DeliveryState::Interrupted

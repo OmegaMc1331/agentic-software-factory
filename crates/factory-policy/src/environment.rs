@@ -74,6 +74,11 @@ impl Secrets {
         self.values.is_empty()
     }
 
+    /// Secret values in registration order (used by the streaming redactor).
+    pub(crate) fn values(&self) -> &[String] {
+        &self.values
+    }
+
     /// Replaces every occurrence of a known secret with `[REDACTED]`.
     /// Longer secrets are replaced first so overlapping values keep the
     /// largest match visible as redacted.

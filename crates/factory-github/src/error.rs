@@ -17,6 +17,10 @@ pub enum GitHubError {
     GhAuthRequired,
     #[error("GitHub CLI failed: {0}")]
     Gh(String),
+    #[error("the GitHub CLI command did not finish within its deadline and was terminated: {0}")]
+    TimedOut(String),
+    #[error("the pull request body exceeds {0} characters")]
+    BodyTooLarge(usize),
     #[error("the GitHub operation outcome could not be confirmed: {0}")]
     Uncertain(String),
     #[error("the repository has no GitHub remote; add one (git remote add origin <url>) or run Factory inside a GitHub clone")]

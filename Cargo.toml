@@ -9,6 +9,7 @@ license = "MIT"
 repository = "https://github.com/OmegaMc1331/agentic-software-factory"
 
 [workspace.dependencies]
+factory-proc = { path = "crates/factory-proc" }
 factory-types = { path = "crates/factory-types" }
 factory-agent = { path = "crates/factory-agent" }
 factory-context = { path = "crates/factory-context" }

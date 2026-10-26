@@ -8,6 +8,7 @@
 pub mod environment;
 pub mod path;
 pub mod policy;
+pub mod redact;
 
 pub use environment::{
     filter_configured_env, filter_environment, redact_secrets, secrets_from_denied, Secrets,
@@ -18,3 +19,4 @@ pub use policy::{
     EffectiveTools, EnvironmentPolicy, FilesystemPolicy, GitOperation, GitPolicy, NetworkMode,
     NetworkPolicy, PoliciesConfig, PolicyPreset, PolicyScope, PolicyView, ToolPolicy,
 };
+pub use redact::StreamingRedactor;

@@ -28,6 +28,12 @@ struct FakeGh {
     existing_prs: Vec<u32>,
     failing_pr_create: bool,
     failing_pr_list: bool,
+    /// `gh pr create` logs the attempt and then never returns, until the
+    /// bounded supervisor kills it (ASF-N02 timeout semantics).
+    hanging_pr_create: bool,
+    /// When set, the fake copies whatever file `--body-file` points at to
+    /// this path (ASF-N05 body transport verification).
+    capture_body_to: Option<PathBuf>,
 }
 
 impl FakeGh {
@@ -38,6 +44,8 @@ impl FakeGh {
             existing_prs: Vec::new(),
             failing_pr_create: false,
             failing_pr_list: false,
+            hanging_pr_create: false,
+            capture_body_to: None,
         }
     }
 
@@ -62,6 +70,16 @@ impl FakeGh {
     /// unconfirmed instead of guessing.
     fn with_failing_pr_list(mut self) -> FakeGh {
         self.failing_pr_list = true;
+        self
+    }
+
+    fn with_hanging_pr_create(mut self) -> FakeGh {
+        self.hanging_pr_create = true;
+        self
+    }
+
+    fn with_body_capture(mut self, destination: &Path) -> FakeGh {
+        self.capture_body_to = Some(destination.to_path_buf());
         self
     }
 
@@ -114,7 +132,19 @@ impl FakeGh {
                  :prcreate\r\n\
                  if exist \"{create_fail}\" (echo gh: something exploded 1>&2 & exit /b 1)\r\n\
                  echo create>>\"{create_log}\"\r\n\
+                 if \"{hang_create}\"==\"yes\" goto hangcreate\r\n\
+                 shift\r\n\
+                 shift\r\n\
+                 :bodyparse\r\n\
+                 if \"%~1\"==\"\" goto bodydone\r\n\
+                 if \"%~1\"==\"--body-file\" copy /y \"%~2\" \"{body_capture}\" >nul\r\n\
+                 shift\r\n\
+                 goto bodyparse\r\n\
+                 :bodydone\r\n\
                  echo https://github.com/octocat/example/pull/58\r\n\
+                 exit /b 0\r\n\
+                 :hangcreate\r\n\
+                 ping -n 300 127.0.0.1 >nul\r\n\
                  exit /b 0\r\n",
                 auth_body = if self.authenticated {
                     "echo   Logged in to github.com account octocat keyring\r\n".to_string()
@@ -128,6 +158,16 @@ impl FakeGh {
                 list_fail = list_fail.display(),
                 create_fail = create_fail.display(),
                 create_log = create_log.display(),
+                hang_create = if self.hanging_pr_create {
+                    "yes"
+                } else {
+                    "no"
+                },
+                body_capture = self
+                    .capture_body_to
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "NUL".to_string()),
             );
             let path = self.dir.join("fake-gh.cmd");
             std::fs::write(&path, script).unwrap();
@@ -144,7 +184,7 @@ impl FakeGh {
                  issue) cat '{issue}' ;;\n\
                  pr)\n  case \"$2\" in\n\
                  list) if [ -f '{list_fail}' ]; then echo 'could not resolve host api.github.com network' >&2; exit 1; fi; cat '{pr_list}' ;;\n\
-                 create) if [ -f '{create_fail}' ]; then echo 'gh: something exploded' >&2; exit 1; fi; echo create >> '{create_log}'; echo https://github.com/octocat/example/pull/58 ;;\n\
+                 create) if [ -f '{create_fail}' ]; then echo 'gh: something exploded' >&2; exit 1; fi; echo create >> '{create_log}'; if [ '{hang_create}' = 'yes' ]; then sleep 300; fi; prev=; for a in \"$@\"; do if [ \"$prev\" = '--body-file' ]; then cp \"$a\" '{body_capture}'; fi; prev=$a; done; echo https://github.com/octocat/example/pull/58 ;;\n\
                  *) echo unknown >&2; exit 1 ;;\n  esac ;;\n\
                  *) echo unknown gh subcommand >&2; exit 1 ;;\nesac\n",
                 issue = issue_file.display(),
@@ -152,6 +192,16 @@ impl FakeGh {
                 list_fail = list_fail.display(),
                 create_fail = create_fail.display(),
                 create_log = create_log.display(),
+                hang_create = if self.hanging_pr_create {
+                    "yes"
+                } else {
+                    "no"
+                },
+                body_capture = self
+                    .capture_body_to
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "/dev/null".to_string()),
             );
             let path = self.dir.join("fake-gh.sh");
             std::fs::write(&path, script).unwrap();
@@ -1035,5 +1085,105 @@ fn published_deliveries_survive_restart_and_never_recreate() {
         gh.created_pull_requests(),
         creates_after_publish,
         "no duplicate PR creation after publication"
+    );
+}
+
+/// Bounds every gh/git network deadline while alive (tests keep hanging
+/// fakes fast); restores the production deadline on drop.
+struct GhTimeoutGuard;
+
+impl GhTimeoutGuard {
+    fn set(secs: &str) -> Self {
+        std::env::set_var("FACTORY_GH_TIMEOUT_SECS", secs);
+        GhTimeoutGuard
+    }
+}
+
+impl Drop for GhTimeoutGuard {
+    fn drop(&mut self) {
+        std::env::remove_var("FACTORY_GH_TIMEOUT_SECS");
+    }
+}
+
+// --- ASF-N02: bounded gh execution and uncertain timeout outcomes ----------
+
+#[test]
+fn a_timed_out_pr_create_stays_interrupted_and_is_never_blindly_retried() {
+    let _guard = gh_env_lock();
+    let (dir, factory, gh, _bare) =
+        github_fixture_custom(|dir| FakeGh::new(dir).with_hanging_pr_create());
+    let _timeout = GhTimeoutGuard::set("2");
+    let run_id = completed_issue_workflow(&factory);
+
+    let error = factory
+        .create_pull_request(run_id, None, Some("body"), false)
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("timed out"),
+        "expected a timeout classification, got: {error}"
+    );
+
+    // Exactly one create attempt ran (logged before the hang); the timeout
+    // killed the CLI before GitHub answered, so the outcome is uncertain.
+    assert_eq!(
+        gh.created_pull_requests(),
+        1,
+        "a timeout must never trigger an automatic second create"
+    );
+    let report = factory.delivery_report(run_id).unwrap();
+    assert_eq!(report.persisted_state, DeliveryState::Interrupted);
+    assert!(report.recovery_required, "uncertainty must be flagged");
+    assert!(!report.retry_safe, "unknown outcomes are not retryable");
+    assert_eq!(report.pull_request, None);
+    // The push itself completed before the PR step: independent evidence
+    // reconciliation relies on.
+    assert!(factory_github::remote_branch_sha(
+        dir.path(),
+        "origin",
+        &format!("factory/run-{run_id}")
+    )
+    .unwrap()
+    .is_some());
+
+    // A blind retry is rejected by the durable claim, not by the CLI.
+    let retry = factory
+        .begin_delivery(run_id, None, None, false)
+        .unwrap_err();
+    assert!(matches!(retry, FactoryError::DeliveryConflict(_)));
+}
+
+#[test]
+fn a_large_multiline_pr_body_travels_through_the_body_file_unchanged() {
+    let _guard = gh_env_lock();
+    let (dir, factory, gh, _bare) = github_fixture_custom(|dir| {
+        FakeGh::new(dir).with_body_capture(&dir.join("body-received.md"))
+    });
+    let received = dir.path().join("body-received.md");
+    let run_id = completed_issue_workflow(&factory);
+
+    // 120 KB of markdown with unicode, quotes, backticks, and blank lines —
+    // far beyond Windows argv limits, ordinary for a rich PR description.
+    let section = "# Section \u{1f9e9}\n\nSome `code` and \"quotes\" and it's apostrophes.\n\n- \u{65e5}\u{672c}\u{8a9e} item\n- caf\u{e9} item\n\n";
+    let mut body = String::with_capacity(130_000);
+    while body.len() < 120_000 {
+        body.push_str(section);
+    }
+    let delivery = factory
+        .create_pull_request(run_id, None, Some(&body), false)
+        .unwrap();
+    assert!(delivery.pull_request.is_some(), "delivery published");
+    assert_eq!(
+        gh.created_pull_requests(),
+        1,
+        "the body capture path is the ordinary create path"
+    );
+
+    let on_disk = std::fs::read(&received).unwrap();
+    // begin_delivery trims surrounding whitespace by design; everything else
+    // — quotes, backticks, unicode, blank lines, all 120 KB — arrives intact.
+    assert_eq!(
+        on_disk,
+        body.trim().as_bytes(),
+        "the CLI must receive the exact body bytes via --body-file"
     );
 }

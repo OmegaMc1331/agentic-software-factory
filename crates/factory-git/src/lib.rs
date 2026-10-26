@@ -3,9 +3,74 @@ pub mod error;
 pub use error::GitError;
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::time::Duration;
+
+use factory_proc::{Bounds, ProcCommand, ProcError};
 
 pub type Result<T> = std::result::Result<T, GitError>;
+
+/// Default deadline for one local git operation: generous enough for large
+/// repositories on slow disks, short enough that a wedged git process cannot
+/// stall a workflow worker indefinitely. Override with
+/// `FACTORY_GIT_TIMEOUT_SECS` (also used by tests to keep timeouts fast).
+pub const DEFAULT_GIT_TIMEOUT_SECS: u64 = 120;
+
+/// stdout retained for ordinary read operations (rev-parse, status, worktree
+/// listings). Full diffs pass their own budget explicitly.
+const DEFAULT_STDOUT_LIMIT: usize = 4 * 1024 * 1024;
+const DEFAULT_STDERR_LIMIT: usize = 256 * 1024;
+/// stderr retained for status-style commands whose only use is diagnostics.
+const DIAGNOSTIC_STDERR_LIMIT: usize = 16 * 1024;
+
+/// Which git binary to run: `git` from PATH, or `FACTORY_GIT_BIN` when set
+/// (tests point this at fake git scripts).
+fn git_program() -> std::ffi::OsString {
+    std::env::var_os("FACTORY_GIT_BIN")
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "git".into())
+}
+
+fn git_timeout() -> Duration {
+    Duration::from_secs(
+        std::env::var("FACTORY_GIT_TIMEOUT_SECS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .filter(|secs| *secs > 0)
+            .unwrap_or(DEFAULT_GIT_TIMEOUT_SECS),
+    )
+}
+
+fn default_bounds() -> Bounds {
+    Bounds::new(git_timeout(), DEFAULT_STDOUT_LIMIT, DEFAULT_STDERR_LIMIT)
+}
+
+/// Runs git under the bounded supervisor with a null stdin and
+/// `GIT_TERMINAL_PROMPT=0`: Factory operations are noninteractive, so git must
+/// fail on missing credentials instead of waiting for terminal input.
+/// Credential helpers and askpass flows keep working.
+fn run_git(
+    dir: &Path,
+    args: &[&str],
+    extra_env: &[(&str, String)],
+    bounds: Bounds,
+) -> Result<factory_proc::ProcOutput> {
+    let operation = args.join(" ");
+    let seconds = bounds.timeout.as_secs();
+    let mut command = ProcCommand::new(git_program())
+        .arg("-C")
+        .arg(normalize_path(dir))
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0");
+    for (key, value) in extra_env {
+        command = command.env(key, value);
+    }
+    match command.run(bounds) {
+        Ok(output) => Ok(output),
+        Err(ProcError::TimedOut { .. }) => Err(GitError::TimedOut { operation, seconds }),
+        Err(ProcError::Cancelled { .. }) => Err(GitError::TimedOut { operation, seconds }),
+        Err(ProcError::Spawn(error)) | Err(ProcError::Io(error)) => Err(GitError::Io(error)),
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeInfo {
@@ -84,21 +149,28 @@ impl Repo {
         if self.find_worktree(worktree_path)?.is_some() {
             return Ok(());
         }
-        let mut cmd = Command::new("git");
-        cmd.arg("-C")
-            .arg(&self.root)
-            .arg("worktree")
-            .arg("add")
-            .arg("--quiet");
+        let mut args: Vec<String> = vec!["worktree".into(), "add".into(), "--quiet".into()];
         if self.branch_exists(branch)? {
-            cmd.arg(worktree_path).arg(branch);
+            args.push(worktree_path.display().to_string());
+            args.push(branch.into());
         } else if let Some(base) = base {
-            cmd.arg("-b").arg(branch).arg(worktree_path).arg(base);
+            args.push("-b".into());
+            args.push(branch.into());
+            args.push(worktree_path.display().to_string());
+            args.push(base.into());
         } else {
-            cmd.arg("-b").arg(branch).arg(worktree_path);
+            args.push("-b".into());
+            args.push(branch.into());
+            args.push(worktree_path.display().to_string());
         }
-        let status = cmd.status().map_err(GitError::Io)?;
-        if !status.success() {
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let output = run_git(
+            &self.root,
+            &arg_refs,
+            &[],
+            Bounds::new(git_timeout(), 64 * 1024, DIAGNOSTIC_STDERR_LIMIT),
+        )?;
+        if !output.success() {
             return Err(GitError::WorktreeAddFailed(worktree_path.to_path_buf()));
         }
         Ok(())
@@ -175,14 +247,19 @@ impl Repo {
     fn remove_internal(&self, worktree_path: &Path, force: bool) -> Result<()> {
         let registered = self.find_worktree(worktree_path)?.is_some();
         if registered {
-            let mut cmd = Command::new("git");
-            cmd.arg("-C").arg(&self.root).args(["worktree", "remove"]);
+            let mut args: Vec<String> = vec!["worktree".into(), "remove".into()];
             if force {
-                cmd.arg("--force");
+                args.push("--force".into());
             }
-            cmd.arg(worktree_path);
-            let status = cmd.status().map_err(GitError::Io)?;
-            if !status.success() {
+            args.push(worktree_path.display().to_string());
+            let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            let output = run_git(
+                &self.root,
+                &arg_refs,
+                &[],
+                Bounds::new(git_timeout(), 64 * 1024, DIAGNOSTIC_STDERR_LIMIT),
+            )?;
+            if !output.success() {
                 return Err(GitError::WorktreeRemoveFailed(worktree_path.to_path_buf()));
             }
         } else if worktree_path.exists() {
@@ -193,9 +270,19 @@ impl Repo {
     }
 
     pub fn prune(&self) -> Result<()> {
-        let mut cmd = Command::new("git");
-        cmd.arg("-C").arg(&self.root).args(["worktree", "prune"]);
-        cmd.status().map_err(GitError::Io)?;
+        let output = run_git(
+            &self.root,
+            &["worktree", "prune"],
+            &[],
+            Bounds::new(git_timeout(), 64 * 1024, DIAGNOSTIC_STDERR_LIMIT),
+        )?;
+        if !output.success() {
+            return Err(GitError::CommandFailed(format!(
+                "git worktree prune failed with exit status {:?}{}",
+                output.status.code(),
+                diagnostic_excerpt(&output.stderr),
+            )));
+        }
         Ok(())
     }
 
@@ -222,39 +309,27 @@ impl Repo {
     ) -> Result<Option<String>> {
         let (name, email) = identity;
         let dir = normalize_path(worktree_path);
-        let add = Command::new("git")
-            .arg("-C")
-            .arg(&dir)
-            .args(["add", "-A"])
-            .status()
-            .map_err(GitError::Io)?;
+        let diagnostic = Bounds::new(git_timeout(), 64 * 1024, DIAGNOSTIC_STDERR_LIMIT);
+        let add = run_git(&dir, &["add", "-A"], &[], diagnostic)?;
         if !add.success() {
             return Err(GitError::CommandFailed("git add -A failed".to_string()));
         }
-        let staged = Command::new("git")
-            .arg("-C")
-            .arg(&dir)
-            .args(["diff", "--cached", "--quiet"])
-            .status()
-            .map_err(GitError::Io)?;
-        if staged.code() == Some(0) {
+        let staged = run_git(&dir, &["diff", "--cached", "--quiet"], &[], diagnostic)?;
+        if staged.status.code() == Some(0) {
             return Ok(None);
         }
-        let out = Command::new("git")
-            .arg("-C")
-            .arg(&dir)
-            .args(["commit", "-m", message])
-            .env("GIT_AUTHOR_NAME", name)
-            .env("GIT_AUTHOR_EMAIL", email)
-            .env("GIT_COMMITTER_NAME", name)
-            .env("GIT_COMMITTER_EMAIL", email)
-            .output()
-            .map_err(GitError::Io)?;
-        if out.status.success() {
+        let identity_env = [
+            ("GIT_AUTHOR_NAME", name.to_string()),
+            ("GIT_AUTHOR_EMAIL", email.to_string()),
+            ("GIT_COMMITTER_NAME", name.to_string()),
+            ("GIT_COMMITTER_EMAIL", email.to_string()),
+        ];
+        let output = run_git(&dir, &["commit", "-m", message], &identity_env, diagnostic)?;
+        if output.success() {
             return Ok(Some(self.head_sha(&dir)?));
         }
         Err(GitError::CommandFailed(
-            String::from_utf8_lossy(&out.stderr).trim().to_string(),
+            String::from_utf8_lossy(&output.stderr).trim().to_string(),
         ))
     }
 
@@ -278,13 +353,13 @@ impl Repo {
     /// Whether `ancestor` is an ancestor of `descendant` (both short branch
     /// names or shas). Returns `false` when they are unrelated.
     pub fn is_ancestor(&self, ancestor: &str, descendant: &str) -> Result<bool> {
-        let status = Command::new("git")
-            .arg("-C")
-            .arg(&self.root)
-            .args(["merge-base", "--is-ancestor", ancestor, descendant])
-            .status()
-            .map_err(GitError::Io)?;
-        match status.code() {
+        let output = run_git(
+            &self.root,
+            &["merge-base", "--is-ancestor", ancestor, descendant],
+            &[],
+            Bounds::new(git_timeout(), 64 * 1024, DIAGNOSTIC_STDERR_LIMIT),
+        )?;
+        match output.status.code() {
             Some(0) => Ok(true),
             Some(1) => Ok(false),
             _ => Err(GitError::CommandFailed(format!(
@@ -309,13 +384,13 @@ impl Repo {
     /// name or sha). Fails if a conflict occurs; the worktree is left mid-rebase
     /// for inspection.
     pub fn rebase_onto_in(&self, worktree_path: &Path, onto: &str) -> Result<()> {
-        let status = Command::new("git")
-            .arg("-C")
-            .arg(normalize_path(worktree_path))
-            .args(["rebase", onto])
-            .status()
-            .map_err(GitError::Io)?;
-        if !status.success() {
+        let output = run_git(
+            &normalize_path(worktree_path),
+            &["rebase", onto],
+            &[],
+            Bounds::new(git_timeout(), 64 * 1024, DIAGNOSTIC_STDERR_LIMIT),
+        )?;
+        if !output.success() {
             return Err(GitError::CommandFailed(format!(
                 "git rebase {onto} failed in {}",
                 worktree_path.display()
@@ -371,30 +446,58 @@ impl Repo {
     /// `max_chars` characters at a character boundary. Specialized review roles
     /// receive this so they can evaluate the actual change without sharing the
     /// implementation worktree.
+    ///
+    /// The process output itself is captured under the same budget (plus a
+    /// small slack), so a 100 MB diff never materializes in memory: only the
+    /// head that fits the budget is retained, and a truncation marker is
+    /// appended whenever any content was dropped so a reader can never mistake
+    /// a partial patch for the complete change.
     pub fn diff_patch(
         &self,
         worktree_path: &Path,
         base_sha: &str,
         max_chars: usize,
     ) -> Result<String> {
-        let full = git(worktree_path, &["diff", base_sha, "--", "."], None)?;
+        // Slack lets the line-based trim finish the line that crosses the
+        // budget without the capture having cut mid-line first.
+        const SLACK_BYTES: usize = 4096;
+        let capture_limit = max_chars.saturating_add(SLACK_BYTES);
+        let output = run_git(
+            worktree_path,
+            &["diff", base_sha, "--", "."],
+            &[],
+            Bounds::new(git_timeout(), capture_limit, 64 * 1024),
+        )?;
+        if !output.success() {
+            return Err(GitError::CommandFailed(format!(
+                "git diff {base_sha} failed"
+            )));
+        }
+        let captured = output.stdout;
+        let capture_truncated = output.stdout_truncated;
         let mut bounded = String::new();
         let mut chars = 0usize;
-        for line in full.lines() {
+        let mut complete = !capture_truncated;
+        for line in String::from_utf8_lossy(&captured).lines() {
             if chars + line.len() > max_chars {
+                complete = false;
                 break;
             }
             bounded.push_str(line);
             bounded.push('\n');
             chars += line.len() + 1;
         }
+        if !complete {
+            bounded.push_str(&format!(
+                "\n[DIFF TRUNCATED: showing the first {max_chars} characters]\n"
+            ));
+        }
         Ok(bounded)
     }
 }
 
 fn git(dir: &Path, args: &[&str], ceiling: Option<&Path>) -> Result<String> {
-    let mut cmd = Command::new("git");
-    cmd.arg("-C").arg(normalize_path(dir)).args(args);
+    let mut extra_env: Vec<(&str, String)> = Vec::new();
     if let Some(ceiling) = ceiling {
         let mut value = ceiling.display().to_string();
         if let Ok(existing) = std::env::var("GIT_CEILING_DIRECTORIES") {
@@ -403,16 +506,36 @@ fn git(dir: &Path, args: &[&str], ceiling: Option<&Path>) -> Result<String> {
                 value.push_str(&existing);
             }
         }
-        cmd.env("GIT_CEILING_DIRECTORIES", value);
+        extra_env.push(("GIT_CEILING_DIRECTORIES", value));
     }
-    let out = cmd.output().map_err(GitError::Io)?;
-    if !out.status.success() {
+    let output = run_git(dir, args, &extra_env, default_bounds())?;
+    if output.stdout_truncated {
+        return Err(GitError::OutputLimitExceeded {
+            operation: args.join(" "),
+            limit: DEFAULT_STDOUT_LIMIT,
+        });
+    }
+    if !output.status.success() {
         return Err(GitError::CommandFailed(format!(
             "git {} failed",
             args.join(" ")
         )));
     }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// A short, bounded stderr excerpt for maintenance error messages.
+fn diagnostic_excerpt(stderr: &[u8]) -> String {
+    if stderr.is_empty() {
+        return String::new();
+    }
+    let text = String::from_utf8_lossy(&stderr[..stderr.len().min(DIAGNOSTIC_STDERR_LIMIT)]);
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        String::new()
+    } else {
+        format!(": {trimmed}")
+    }
 }
 
 fn normalize_path(path: &Path) -> PathBuf {

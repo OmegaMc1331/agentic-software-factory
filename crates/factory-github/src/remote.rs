@@ -4,9 +4,44 @@
 //! guessed from folder names. HTTPS and SSH GitHub remotes are supported.
 
 use std::path::Path;
-use std::process::Command;
+use std::time::Duration;
+
+use factory_proc::{Bounds, ProcCommand, ProcError};
 
 use crate::error::{GitHubError, Result};
+
+/// Deadline for the git reads used during remote detection and reconciliation.
+const GIT_READ_TIMEOUT_SECS: u64 = 60;
+
+fn git_timeout() -> Duration {
+    Duration::from_secs(
+        std::env::var("FACTORY_GH_TIMEOUT_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|secs| *secs > 0)
+            .unwrap_or(GIT_READ_TIMEOUT_SECS),
+    )
+}
+
+/// Runs one read-only git command under the bounded supervisor with
+/// `GIT_TERMINAL_PROMPT=0` (these operations are noninteractive; a credential
+/// gap must fail, not hang).
+fn run_read_git(root: &Path, args: &[&str]) -> Result<factory_proc::ProcOutput> {
+    let summary = args.join(" ");
+    match ProcCommand::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .run(Bounds::new(git_timeout(), 4 * 1024 * 1024, 256 * 1024))
+    {
+        Ok(output) => Ok(output),
+        Err(ProcError::TimedOut { .. }) | Err(ProcError::Cancelled { .. }) => {
+            Err(GitHubError::Network(format!("git {summary} timed out")))
+        }
+        Err(ProcError::Spawn(error)) | Err(ProcError::Io(error)) => Err(GitHubError::Io(error)),
+    }
+}
 
 /// The GitHub repository a Factory project is connected to.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,14 +136,9 @@ fn validate_slug(value: &str) -> Result<()> {
 /// are read (not `git remote -v`) so URL rewrite rules such as
 /// `url.<local>.insteadOf` cannot mask the real GitHub remote.
 pub fn list_remotes(root: &Path) -> Result<Vec<(String, String)>> {
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["config", "--get-regexp", r"^remote\..*\.url$"])
-        .output()
-        .map_err(GitHubError::Io)?;
+    let output = run_read_git(root, &["config", "--get-regexp", r"^remote\..*\.url$"])?;
     // `--get-regexp` exits 1 when nothing matches: a repo with no remotes.
-    if !output.status.success() && output.status.code() != Some(1) {
+    if !output.success() && output.status.code() != Some(1) {
         return Err(GitHubError::Git(format!(
             "git config --get-regexp remote urls failed: {}",
             String::from_utf8_lossy(&output.stderr).trim()
@@ -165,13 +195,8 @@ pub fn detect(root: &Path) -> Result<GitHubRemote> {
 /// symbolic ref. `None` when the clone has no remote HEAD mapping.
 fn default_branch_of(root: &Path, remote: &str) -> Option<String> {
     let reference = format!("refs/remotes/{remote}/HEAD");
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["symbolic-ref", "--short", &reference])
-        .output()
-        .ok()?;
-    if !out.status.success() {
+    let out = run_read_git(root, &["symbolic-ref", "--short", &reference]).ok()?;
+    if !out.success() {
         return None;
     }
     let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -181,13 +206,8 @@ fn default_branch_of(root: &Path, remote: &str) -> Option<String> {
 
 /// Whether `branch` exists on `remote` (any head ref matches).
 pub fn remote_branch_exists(root: &Path, remote: &str, branch: &str) -> Result<bool> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["ls-remote", "--heads", remote, branch])
-        .output()
-        .map_err(GitHubError::Io)?;
-    if !out.status.success() {
+    let out = run_read_git(root, &["ls-remote", "--heads", remote, branch])?;
+    if !out.success() {
         return Err(GitHubError::Network(format!(
             "git ls-remote {} {} failed: {}",
             remote,

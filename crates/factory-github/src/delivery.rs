@@ -7,30 +7,57 @@
 //! separately denies push-class git operations for task agents.
 
 use std::path::Path;
-use std::process::Command;
+use std::time::Duration;
+
+use factory_proc::{Bounds, ProcCommand, ProcError};
 
 use crate::error::{GitHubError, Result};
 use crate::gh::GhCli;
 use factory_types::PullRequestInfo;
 
+/// Deadline for one network git operation (push, ls-remote). Generous for slow
+/// links; a permanently wedged command is terminated and classified.
+const GIT_NETWORK_TIMEOUT_SECS: u64 = 120;
+
+fn git_timeout() -> Duration {
+    Duration::from_secs(
+        std::env::var("FACTORY_GH_TIMEOUT_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|secs| *secs > 0)
+            .unwrap_or(GIT_NETWORK_TIMEOUT_SECS),
+    )
+}
+
+/// Runs git against the network under the bounded supervisor. Output limits
+/// bound captured remote diagnostics; credentials never appear in argv.
+fn run_network_git(root: &Path, args: &[&str]) -> Result<factory_proc::ProcOutput> {
+    let summary = args.join(" ");
+    match ProcCommand::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .run(Bounds::new(git_timeout(), 4 * 1024 * 1024, 1024 * 1024))
+    {
+        Ok(output) => Ok(output),
+        // The remote may have accepted the push before the deadline killed
+        // git: the outcome stays unknown until reconciliation.
+        Err(ProcError::TimedOut { .. }) | Err(ProcError::Cancelled { .. }) => {
+            Err(GitHubError::Uncertain(format!("git {summary} timed out")))
+        }
+        Err(ProcError::Spawn(error)) | Err(ProcError::Io(error)) => Err(GitHubError::Io(error)),
+    }
+}
+
 /// Pushes `branch` to `remote` with upstream tracking. Never force-pushes and
 /// never pushes any branch it was not handed by the delivery engine.
 pub fn push_branch(root: &Path, remote: &str, branch: &str) -> Result<()> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["push", "--set-upstream", remote, branch])
-        .output()
-        .map_err(GitHubError::Io)?;
-    if output.status.success() {
+    let output = run_network_git(root, &["push", "--set-upstream", remote, branch])?;
+    if output.success() {
         return Ok(());
     }
-    let text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    Err(classify_push_failure(&text))
+    Err(classify_push_failure(&output.combined_text()))
 }
 
 fn classify_push_failure(text: &str) -> GitHubError {
@@ -67,26 +94,16 @@ fn classify_push_failure(text: &str) -> GitHubError {
 /// Read-only (`git ls-remote`); used to confirm or refute an uncertain push
 /// without ever pushing.
 pub fn remote_branch_sha(root: &Path, remote: &str, branch: &str) -> Result<Option<String>> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["ls-remote", remote])
-        .arg(format!("refs/heads/{branch}"))
-        .output()
-        .map_err(GitHubError::Io)?;
-    if !output.status.success() {
-        let text = format!(
-            "{}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        return Err(classify_push_failure(&text));
+    let want = format!("refs/heads/{branch}");
+    let output = run_network_git(root, &["ls-remote", remote, &want])?;
+    if !output.success() {
+        return Err(classify_push_failure(&output.combined_text()));
     }
     let text = String::from_utf8_lossy(&output.stdout);
     Ok(text
         .lines()
         .find_map(|line| line.split_once('\t'))
-        .filter(|(sha, reference)| !sha.is_empty() && *reference == format!("refs/heads/{branch}"))
+        .filter(|(sha, reference)| !sha.is_empty() && *reference == want)
         .map(|(sha, _)| sha.to_string()))
 }
 

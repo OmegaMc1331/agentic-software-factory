@@ -8,6 +8,10 @@ pub enum GitError {
     NotARepository,
     #[error("git command failed: {0}")]
     CommandFailed(String),
+    #[error("git {operation} timed out after {seconds}s and was terminated")]
+    TimedOut { operation: String, seconds: u64 },
+    #[error("git {operation} produced more output than the {limit} byte capture limit")]
+    OutputLimitExceeded { operation: String, limit: usize },
     #[error("failed to create worktree at {0}")]
     WorktreeAddFailed(PathBuf),
     #[error("worktree at {0} has uncommitted changes; commit or discard them first")]
