@@ -122,18 +122,38 @@ rules, and caps every indexed read and every rendered output. The `[context]`
 table in `.factory/config.toml` controls it (`enabled`, `max_files`, `max_chars`,
 `include_tests`, `include_symbols`).
 
-Ignore policy (ASF-N07): the engine honors **repository-local rules only** — the
-root `.gitignore`, nested `.gitignore` files (deeper files override shallower,
-gitignore(5) precedence, and files under an excluded directory can never be
-re-included), and `.git/info/exclude` — layered under Factory's built-in
-exclusions (`.git`, `.factory`, build/vendor directories, binary and lockfile
-patterns), which nothing can negate. User-global excludes
-(`core.excludesFile`) are deliberately not consulted, so indexing and search
-are identical on every machine; when ripgrep is available it runs with
-`--no-ignore` and Factory's compiled rules are the single exclusion policy for
-indexing, symbol search, content search, and excerpt extraction alike.
-Gitignore parsing is Unicode-safe (patterns with multi-byte characters parse
-and match per character, never per byte).
+Ignore policy (ASF-N07/ASF-F02): the engine honors **repository-local rules
+only** — the root `.gitignore`, nested `.gitignore` files (deeper files
+override shallower, gitignore(5) precedence, and files under an excluded
+directory can never be re-included), and `.git/info/exclude` — layered under
+Factory's built-in exclusions (`.git`, `.factory`, build/vendor directories,
+binary and lockfile patterns), which nothing can negate. Pattern semantics
+follow git exactly where the parser reaches: slash-free patterns match
+basenames at any depth, patterns with interior or leading slashes anchor to
+their contributing directory (so `!dir/allowed.env` re-includes exactly that
+path and never a deeper copy), backslash escapes make the next character
+literal, and `**` is translated context-aware (`**/a`, `b/**`, `c/**/d`).
+Correctness is pinned by a differential suite that compares every decision
+with real `git check-ignore` under an isolated `core.excludesFile`. A
+long-lived engine re-collects the effective rules on every `refresh()`, so
+`.gitignore` edits apply without a restart. User-global excludes are
+deliberately not consulted, so indexing and search are identical on every
+machine.
+
+Boundary and resource rules (ASF-F01/ASF-F04): symbolic links (including
+Windows junctions) are never followed and never read — traversal decides on
+`DirEntry::file_type()`, so external targets, cycles, and reparse points
+cannot pull out-of-repository content into the index or search results, and
+every path returned by the ripgrep subprocess is revalidated against the
+canonical root, the non-symlink rule, the ignore policy, and the read-size
+limit before any byte is read. Ripgrep itself runs under the `factory-proc`
+supervisor (deadline, bounded stdout/stderr capture, NUL-separated output,
+explicit no-match/error exit semantics; a hung, failed, or truncated run
+falls back to the bounded pure-Rust scanner, which caps visited entries at
+`MAX_INDEX_ENTRIES`, matched paths at 1,000, and every file read at
+`MAX_INDEX_FILE_READ_BYTES` through a `take()`d reader). Gitignore parsing
+is Unicode-safe (patterns with multi-byte characters parse and match per
+character, never per byte).
 
 ## Evaluation
 

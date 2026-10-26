@@ -211,6 +211,14 @@ charset and cross-repository issue imports are refused. The API exposes only
 semantic operations (`from-issue`, `delivery`, `pr-preview`, `pull-request`) —
 there is no generic GitHub command endpoint.
 
+**Repository-boundary safety.** The Context Engine treats symbolic links
+(including Windows junctions) as opaque names, never as files or directories:
+link targets outside the repository are neither traversed nor read, link
+cycles cannot loop the walk, and external tools' path output is revalidated
+against the canonical repository root before use. This bounds *Factory-managed
+context*; it is not an OS sandbox — a separately launched coding agent retains
+its own filesystem access.
+
 **Bounded subprocess supervision.** Every Factory-owned `git`/`gh` command runs
 under a shared supervisor with an explicit per-operation deadline, concurrent
 stdout/stderr draining, hard output-capture limits, a null stdin, and
