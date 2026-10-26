@@ -1,13 +1,19 @@
-//! Bread-and-butter ignore rules for the bounded repository walk.
+//! Repository ignore rules for the bounded repository walk.
 //!
-//! The engine is read-only and offline-friendly: it honors the Factory's own
-//! production directories plus standard build/vendor directories, and applies
-//! a pragmatic subset of the root `.gitignore` (blank lines, comments, exact
-//! names, anchored paths, `*`/`**` globs, directory `/` suffixes, and `!`
-//! negations). It deliberately does not run `git check-ignore`, so the index
-//! stays deterministic even when git does not work.
+//! The engine is read-only and offline-friendly. Its documented policy is
+//! **repository-local ignore rules only**: the root `.gitignore`, nested
+//! `.gitignore` files, and `.git/info/exclude`, layered with Factory's own
+//! built-in exclusions (which nothing can negate). User-global excludes
+//! (`core.excludesFile`) are deliberately NOT consulted so indexing stays
+//! deterministic across machines; a repository that wants a file excluded must
+//! say so in the repository itself.
+//!
+//! Parsing follows the gitignore subset Factory has always supported (blank
+//! lines, comments, exact names, anchored paths, `*`/`**` globs, `?`, `/`
+//! directory suffixes, `!` negations) and is UTF-8 safe: multi-byte
+//! characters are handled per character, never per byte.
 
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 /// Directory names always skipped at any depth — including the Factory's own
 /// state and common build/vendor sinks.
@@ -67,6 +73,10 @@ const ALWAYS_IGNORED_FILES: &[&str] = &[
     "*.lock",
 ];
 
+/// Bound for the rule-collection walk, mirroring the index walk's cap so a
+/// pathological tree cannot make rule collection unbounded.
+const COLLECT_ENTRY_LIMIT: usize = 20_000;
+
 pub fn is_builtin_ignored_dir(name: &str) -> bool {
     ALWAYS_IGNORED_DIRS.contains(&name)
 }
@@ -81,7 +91,14 @@ pub fn is_builtin_ignored_file(name: &str) -> bool {
     })
 }
 
-/// Compiled ignore rules derived from the repository root `.gitignore`.
+/// Compiled ignore rules for one repository.
+///
+/// Patterns carry the directory whose `.gitignore` contributed them
+/// (`prefix`, `""` for the repository root) and a `precedence` encoding
+/// gitignore(5) ordering: `.git/info/exclude` is weakest, and deeper
+/// `.gitignore` files override shallower ones. Within one file, later lines
+/// win. At match time patterns are evaluated lowest precedence first so the
+/// last match wins, exactly like git.
 #[derive(Debug, Default, Clone)]
 pub struct IgnoreRules {
     globs: Vec<IgnorePattern>,
@@ -92,6 +109,11 @@ struct IgnorePattern {
     /// `true` for a `!` negation pattern.
     negate: bool,
     only_directories: bool,
+    /// Forward-slash directory (relative to the walk root, no trailing
+    /// slash) this pattern applies under; `""` means the root.
+    prefix: String,
+    /// Lower applies first; the last matching pattern decides.
+    precedence: u32,
     regex: regex::Regex,
 }
 
@@ -100,20 +122,32 @@ impl IgnoreRules {
         Self::default()
     }
 
-    /// Parses `.gitignore` semantics from `text`. Patterns starting with `!`
-    /// re-include previously ignored paths; the last matching pattern wins, as
-    /// in git.
+    /// Parses the repository-root `.gitignore` (and, for compatibility with
+    /// existing callers and tests, any root-level rule text).
     pub fn from_gitignore(text: &str) -> Self {
         let mut rules = Self::default();
+        rules.add_scoped(text, "", 1);
+        rules
+    }
+
+    /// Adds rules from one ignore file, scoped to `prefix` at `precedence`.
+    pub fn add_scoped(&mut self, text: &str, prefix: &str, precedence: u32) {
         for line in text.lines() {
             let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
+            if line.is_empty() {
                 continue;
             }
-            let (negate, raw) = match line.strip_prefix('!') {
-                Some(rest) => (true, rest),
-                None => (false, line),
+            // `\#` and `\!` escape a literal first character.
+            let (negate, raw) = match line.strip_prefix('\\') {
+                Some(rest) if rest.starts_with('#') || rest.starts_with('!') => (false, rest),
+                _ => match line.strip_prefix('!') {
+                    Some(rest) => (true, rest),
+                    None => (false, line),
+                },
             };
+            if raw.starts_with('#') && !line.starts_with("\\#") {
+                continue;
+            }
             let only_directories = raw.ends_with('/');
             let raw = raw.trim_end_matches('/');
             if raw.is_empty() {
@@ -123,44 +157,92 @@ impl IgnoreRules {
             let raw = raw.trim_start_matches('/');
 
             let mut parts = Vec::new();
-            let bytes = raw.as_bytes();
-            let mut i = 0usize;
-            while i < bytes.len() {
-                match bytes[i] {
-                    b'*' => {
-                        if i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            let mut chars = raw.char_indices().peekable();
+            while let Some((_, ch)) = chars.next() {
+                match ch {
+                    '*' => {
+                        if chars.peek().is_some_and(|(_, next)| *next == '*') {
                             parts.push(".*".to_string());
-                            i += 2;
+                            chars.next();
                         } else {
                             parts.push("[^/]*".to_string());
-                            i += 1;
                         }
                     }
-                    b'?' => {
+                    '?' => {
                         parts.push("[^/]".to_string());
-                        i += 1;
                     }
                     _ => {
-                        parts.push(regex::escape(&raw[i..i + 1]));
-                        i += 1;
+                        parts.push(regex::escape(ch.encode_utf8(&mut [0u8; 4])));
                     }
                 }
             }
             let pattern = parts.join("");
-            // Anchored patterns bind to the root; all other patterns match the
-            // tail of the relative path (git's "no slash" basename case and
-            // "has slash" cases both reduce to this for a root-level file).
+            // Anchored patterns bind to the contributing directory; all other
+            // patterns match the tail of the path relative to it (git's "no
+            // slash" basename case and "has slash" cases both reduce to this
+            // for a root-level file).
             let regex_text = if anchored {
                 format!("^{pattern}$")
             } else {
                 format!("(?:^|/){pattern}$")
             };
             if let Ok(regex) = regex::Regex::new(&regex_text) {
-                rules.globs.push(IgnorePattern {
+                self.globs.push(IgnorePattern {
                     negate,
                     only_directories,
+                    prefix: prefix.to_string(),
+                    precedence,
                     regex,
                 });
+            }
+        }
+        self.globs.sort_by_key(|pattern| pattern.precedence);
+    }
+
+    /// Collects the effective repository-local ignore rules for `root`:
+    /// `.git/info/exclude` (weakest), then every `.gitignore` from the root
+    /// down through directories that are not themselves ignored. The walk is
+    /// read-only, bounded, and does not follow symlinks.
+    pub fn collect(root: &Path) -> Self {
+        let mut rules = Self::default();
+        if let Some(exclude) = read_info_exclude(root) {
+            rules.add_scoped(&exclude, "", 0);
+        }
+        if let Ok(bytes) = std::fs::read(root.join(".gitignore")) {
+            rules.add_scoped(&String::from_utf8_lossy(&bytes), "", 1);
+        }
+        let mut visited: usize = 0;
+        let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                visited += 1;
+                if visited > COLLECT_ENTRY_LIMIT {
+                    return rules;
+                }
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
+                // Symlinked directories are not followed (entry metadata for
+                // a symlink reports a file), matching the index walk.
+                if !file_type.is_dir() {
+                    continue;
+                }
+                let relative = match entry.path().strip_prefix(root) {
+                    Ok(relative) => relative.to_path_buf(),
+                    Err(_) => continue,
+                };
+                if rules.is_ignored(&relative, true) {
+                    continue;
+                }
+                if let Ok(bytes) = std::fs::read(entry.path().join(".gitignore")) {
+                    let prefix = relative.to_string_lossy().replace('\\', "/");
+                    let precedence = prefix.split('/').count() as u32 + 1;
+                    rules.add_scoped(&String::from_utf8_lossy(&bytes), &prefix, precedence);
+                }
+                stack.push(entry.path());
             }
         }
         rules
@@ -186,20 +268,80 @@ impl IgnoreRules {
         {
             return true;
         }
-        // Builtin rules cannot be undone by gitignore negation; parsed rules
-        // decide the rest with git-compatible precedence.
-        let mut ignored = false;
         let text = relative.to_string_lossy().replace('\\', "/");
+        // gitignore(5): a file cannot be re-included when a parent directory
+        // is excluded, so an ignored ancestor settles the question before any
+        // negation for the path itself is considered.
+        let mut ancestors = Vec::new();
+        let mut current = String::new();
+        for component in text.split('/') {
+            if component.is_empty() {
+                continue;
+            }
+            if !current.is_empty() {
+                current.push('/');
+            }
+            current.push_str(component);
+            ancestors.push(current.clone());
+        }
+        ancestors.pop();
+        for ancestor in ancestors {
+            if self.match_with_rules(&ancestor, true) {
+                return true;
+            }
+        }
+        self.match_with_rules(&text, is_directory)
+    }
+
+    /// Last-matching-pattern decision for one path, gitignore precedence
+    /// order (patterns are stored sorted by precedence; equal precedence
+    /// keeps file line order). Builtin rules cannot be undone by negation and
+    /// are decided before this runs.
+    fn match_with_rules(&self, text: &str, is_directory: bool) -> bool {
+        let mut ignored = false;
         for rule in &self.globs {
             if rule.only_directories && !is_directory {
                 continue;
             }
-            if rule.regex.is_match(&text) {
+            // A nested file's patterns apply only under its directory.
+            let candidate = if rule.prefix.is_empty() {
+                text
+            } else {
+                match text.strip_prefix(&rule.prefix) {
+                    Some(rest) => rest.strip_prefix('/').unwrap_or(rest),
+                    None => continue,
+                }
+            };
+            if candidate.is_empty() {
+                continue;
+            }
+            if rule.regex.is_match(candidate) {
                 ignored = !rule.negate;
             }
         }
         ignored
     }
+}
+
+/// `.git/info/exclude` of the repository at `root`. Worktrees keep their git
+/// directory elsewhere; their `.git` file is followed so both layouts share
+/// one rule source.
+fn read_info_exclude(root: &Path) -> Option<String> {
+    let dot_git = root.join(".git");
+    let git_dir = if dot_git.is_dir() {
+        dot_git
+    } else {
+        let pointer = std::fs::read_to_string(&dot_git).ok()?;
+        let path = pointer.trim().strip_prefix("gitdir:")?.trim();
+        let path = Path::new(path);
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            root.join(path)
+        }
+    };
+    let bytes = std::fs::read(git_dir.join("info").join("exclude")).ok()?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 #[cfg(test)]
@@ -264,5 +406,135 @@ mod tests {
     fn builtin_rules_are_not_overridden_by_negation() {
         let rules = IgnoreRules::from_gitignore("!target\n");
         assert!(rules.is_ignored(&rel("target"), true));
+    }
+
+    #[test]
+    fn files_inside_an_ignored_directory_cannot_be_reincluded() {
+        let rules = IgnoreRules::from_gitignore("build/\n");
+        assert!(rules.is_ignored(&rel("build/keep.rs"), false));
+        let negating = IgnoreRules::from_gitignore("build/\n!build/keep.rs\n");
+        assert!(
+            negating.is_ignored(&rel("build/keep.rs"), false),
+            "gitignore(5): no re-inclusion under an excluded directory"
+        );
+        assert!(negating.is_ignored(&rel("build/deep/keep.rs"), false));
+    }
+
+    // --- ASF-N04: Unicode-safe parsing --------------------------------------
+
+    #[test]
+    fn unicode_patterns_parse_without_panicking_and_match() {
+        for pattern in [
+            "données/",
+            "résumé.md",
+            "日本語/",
+            "naïve*.rs",
+            "文件/**",
+            "emoji-😀.txt",
+        ] {
+            let rules = IgnoreRules::from_gitignore(pattern);
+            // The pattern must compile without a byte-boundary panic; the
+            // match assertions below prove the semantics survived.
+            let _ = &rules;
+        }
+        let rules = IgnoreRules::from_gitignore("données/\n");
+        assert!(rules.is_ignored(&rel("données"), true));
+        assert!(rules.is_ignored(&rel("src/données"), true));
+        assert!(rules.is_ignored(&rel("données/file.txt"), false));
+
+        let rules = IgnoreRules::from_gitignore("résumé.md\n");
+        assert!(rules.is_ignored(&rel("docs/résumé.md"), false));
+        assert!(!rules.is_ignored(&rel("docs/résumé.md.bak"), false));
+
+        let rules = IgnoreRules::from_gitignore("日本語/\n");
+        assert!(rules.is_ignored(&rel("日本語/kanji.txt"), false));
+
+        let rules = IgnoreRules::from_gitignore("naïve*.rs\n");
+        assert!(rules.is_ignored(&rel("naïve1.rs"), false));
+        assert!(!rules.is_ignored(&rel("naïve1.ts"), false));
+
+        let rules = IgnoreRules::from_gitignore("文件/**\n");
+        assert!(rules.is_ignored(&rel("文件/a/b.txt"), false));
+
+        let rules = IgnoreRules::from_gitignore("emoji-😀.txt\n");
+        assert!(rules.is_ignored(&rel("misc/emoji-😀.txt"), false));
+    }
+
+    #[test]
+    fn every_unicode_pattern_split_stays_parseable() {
+        // Parsing a pattern with multi-byte characters at every position must
+        // never hit a byte/character boundary panic.
+        let pattern = "日本語/ファイル*.md";
+        let mut rules = IgnoreRules::empty();
+        rules.add_scoped(pattern, "", 1);
+        assert!(rules.is_ignored(&rel("日本語/ファイル一覧.md"), false));
+    }
+
+    #[test]
+    fn escaped_hash_and_bang_are_literals() {
+        let rules = IgnoreRules::from_gitignore("\\#not-a-comment\n\\!important\n");
+        assert!(rules.is_ignored(&rel("#not-a-comment"), false));
+        assert!(rules.is_ignored(&rel("!important"), false));
+    }
+
+    // --- ASF-N07: nested rules, info/exclude, precedence --------------------
+
+    #[test]
+    fn nested_gitignore_scopes_and_overrides_the_root() {
+        let mut rules = IgnoreRules::from_gitignore("*.generated.md\n");
+        rules.add_scoped("!keep.generated.md", "docs", 2);
+        assert!(rules.is_ignored(&rel("root.generated.md"), false));
+        assert!(rules.is_ignored(&rel("other/keep.generated.md"), false));
+        assert!(
+            !rules.is_ignored(&rel("docs/keep.generated.md"), false),
+            "the nested file overrides the root rule under docs/"
+        );
+    }
+
+    #[test]
+    fn nested_rules_do_not_leak_outside_their_directory() {
+        let mut rules = IgnoreRules::empty();
+        rules.add_scoped("secret.txt", "tools", 2);
+        assert!(rules.is_ignored(&rel("tools/secret.txt"), false));
+        assert!(!rules.is_ignored(&rel("secret.txt"), false));
+        assert!(!rules.is_ignored(&rel("other/secret.txt"), false));
+    }
+
+    #[test]
+    fn info_exclude_is_weaker_than_gitignore() {
+        let mut rules = IgnoreRules::empty();
+        rules.add_scoped("scratch/", "", 0);
+        rules.add_scoped("!scratch/", "", 1);
+        assert!(
+            !rules.is_ignored(&rel("scratch"), true),
+            ".gitignore beats .git/info/exclude"
+        );
+    }
+
+    #[test]
+    fn collect_reads_root_nested_and_info_exclude_rules() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "root-ignored.txt\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("nested")).unwrap();
+        std::fs::write(dir.path().join("nested/.gitignore"), "local.txt\n").unwrap();
+        std::fs::create_dir_all(dir.path().join(".git/info")).unwrap();
+        std::fs::write(dir.path().join(".git/info/exclude"), "exclude-only.txt\n").unwrap();
+
+        let rules = IgnoreRules::collect(dir.path());
+        assert!(rules.is_ignored(&rel("root-ignored.txt"), false));
+        assert!(rules.is_ignored(&rel("nested/local.txt"), false));
+        assert!(!rules.is_ignored(&rel("local.txt"), false));
+        assert!(rules.is_ignored(&rel("exclude-only.txt"), false));
+    }
+
+    #[test]
+    fn collect_does_not_read_gitignores_inside_ignored_directories() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "build/\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("build")).unwrap();
+        // A negation inside an excluded directory must never be picked up.
+        std::fs::write(dir.path().join("build/.gitignore"), "!keep.txt\n").unwrap();
+        let rules = IgnoreRules::collect(dir.path());
+        assert!(rules.is_ignored(&rel("build/keep.txt"), false));
     }
 }

@@ -157,6 +157,11 @@ pub fn search_content(
         command
             .arg("--files-with-matches")
             .arg("--hidden")
+            // Factory's IgnoreRules is the single exclusion policy: rg's own
+            // ignore handling (which would also consult this machine's
+            // global excludes) is disabled so results match the fallback
+            // scanner and the index exactly.
+            .arg("--no-ignore")
             .arg("-i")
             .arg("-m")
             .arg("1")

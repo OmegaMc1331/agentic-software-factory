@@ -99,10 +99,10 @@ pub struct ContextEngine {
 impl ContextEngine {
     pub fn new(root: &Path, factory_dir: &Path, config: ContextConfig) -> Self {
         let root = normalize(root);
-        let ignore = match std::fs::read(root.join(".gitignore")) {
-            Ok(bytes) => IgnoreRules::from_gitignore(&String::from_utf8_lossy(&bytes)),
-            Err(_) => IgnoreRules::empty(),
-        };
+        // Repository-local policy only: root + nested `.gitignore` plus
+        // `.git/info/exclude`. Global user excludes are intentionally not
+        // consulted, so the index is identical on every machine.
+        let ignore = IgnoreRules::collect(&root);
         Self {
             config,
             root,
