@@ -295,8 +295,8 @@ validation; GitHub Actions results were not yet available at authoring time.
 ## E. Compatibility
 
 - Windows validated locally (process trees via `taskkill`, `.cmd` fakes,
-  unicode paths, UTF-8 fixtures). Linux/macOS code paths compile and run in
-  CI (unix process groups, `sh` fakes); CI results pending push.
+  unicode paths, UTF-8 fixtures). Linux and macOS validated by the green CI
+  run 40287071214 (unix process groups, `sh` fakes, ETXTBSY retry).
 - Existing SQLite databases: no migrations; new read paths only.
 - Existing context manifests: unchanged format; ASF-R01 content hashes
   keep working (refresh test proves both directions of ignore-rule
@@ -329,7 +329,7 @@ codes captured directly, logs not piped through tail):
 | `cargo test --workspace -j 1 -- --test-threads=1` | PASS (585 tests, 57 suites, 0 failures) |
 | `cargo test --workspace -j 1` (CI-mode default parallel test threads) | PASS (708 test executions, 0 failures) — after serializing the bounded-execution fixtures whose process-wide `FACTORY_GIT_TIMEOUT_SECS` override leaked into parallel tests on CI |
 | dashboard `format:check` / `lint` / `typecheck` / `test` / `build` | PASS (no TS/TSX changed; 303 tests, build ok) |
-| GitHub Actions (linux/windows/macOS) | NOT RUN (push pending) |
+| GitHub Actions (linux/windows/macOS) | PASS — run 40287071214 (commit 044eb65): Rust ×3 platforms, Dashboard, Installer e2e, embedded-dashboard smoke, release checksums all green. Two intermediate flakes found and fixed on the way: (1) CI runs cargo test with default parallel threads, so the bounded-execution fixtures' process-wide FACTORY_GIT_TIMEOUT_SECS leaked into sibling tests — every test in that file now holds the env-serialization lock for its whole body; (2) Linux ETXTBSY (exec of a freshly written script racing kernel writeback) — spawn-only retry in the factory-proc tests. |
 
 The exact final outcomes of the last three rows are recorded in the
 repository history of this file if amended, and in the final chat summary.
@@ -342,6 +342,6 @@ repository history of this file if amended, and in the final chat summary.
 | >1 MiB configured secrets not streaming-matched across chunks | low | unit test documents | yes (by construction) | none realistically required | 1 MiB cap bounds memory; real credentials are far smaller |
 | Evaluation is a full lean scan per request | low | benchmark after-fix table | measured | materialize/cache if histories grow another order of magnitude | current numbers make a cache premature |
 | Best-effort tree termination (no SIGKILL escalation ladder) | low | factory-proc kill path | n/a | add escalating kill if descendants survive | `child.kill()` follows immediately; no surviving-descendant case observed |
-| macOS/Linux validation of new process-supervisor paths | pending CI | — | not locally possible | run CI matrix | push not yet performed at authoring time |
+| none open — the macOS/Linux-validation row was resolved by the green CI run | — | — | — | — |
 
 No newly discovered defects remain open from this campaign.
