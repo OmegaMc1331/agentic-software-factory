@@ -212,7 +212,11 @@ pub(crate) struct History {
 
 impl History {
     pub(crate) fn load(db: &FactoryDb) -> factory_db::Result<Self> {
-        let attempts = db.list_task_attempts_all()?;
+        // ASF-N06: the lean evaluation projection. It carries exactly the
+        // fields the metrics consume (including the evidence changed-file
+        // list, extracted SQL-side) and skips the multi-kilobyte diff patches
+        // that made whole-history reads scale with evidence size.
+        let attempts = db.list_task_attempts_for_evaluation()?;
         let sessions = db.list_session_durations()?;
         let integrations = db.list_integration_outcomes()?;
 

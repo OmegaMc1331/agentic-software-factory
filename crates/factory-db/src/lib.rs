@@ -1702,6 +1702,58 @@ impl FactoryDb {
         Ok(attempts)
     }
 
+    /// Lean attempt projection for the evaluation engine (ASF-N06). The
+    /// evaluator consumes identity, classification, timing, error text, and
+    /// only `evidence.changed_files` — loading the full evidence JSON (which
+    /// carries multi-kilobyte diff patches per attempt) made history reads
+    /// grow hundreds of megabytes at tens of thousands of attempts. This
+    /// query extracts the changed-file list SQL-side and leaves the other
+    /// evidence fields and the review blob at their defaults; it is not a
+    /// general-purpose read.
+    pub fn list_task_attempts_for_evaluation(&self) -> Result<Vec<TaskAttempt>> {
+        let mut statement = self.conn.prepare(
+            "SELECT id, task_id, attempt_number, agent, status, started_at,
+                    finished_at, exit_code, error, role, operation,
+                    json_extract(evidence, '$.changedFiles')
+             FROM task_attempts
+             ORDER BY task_id, attempt_number",
+        )?;
+        let attempts = statement
+            .query_map([], |row| {
+                let changed_files_json: Option<String> = row.get(11)?;
+                let changed_files = changed_files_json
+                    .and_then(|json| serde_json::from_str::<Vec<String>>(&json).ok());
+                Ok(TaskAttempt {
+                    id: row.get(0)?,
+                    task_id: row.get(1)?,
+                    attempt_number: row.get(2)?,
+                    agent: row.get(3)?,
+                    status: row
+                        .get::<_, String>(4)?
+                        .parse()
+                        .unwrap_or(AttemptStatus::Failed),
+                    started_at: row.get(5)?,
+                    finished_at: row.get(6)?,
+                    worktree_path: String::new(),
+                    commit_sha: None,
+                    exit_code: row.get(7)?,
+                    error: row.get(8)?,
+                    evidence: changed_files.map(|files| TaskEvidence {
+                        changed_files: files,
+                        ..TaskEvidence::default()
+                    }),
+                    review: None,
+                    role: row.get(9)?,
+                    operation: row
+                        .get::<_, Option<String>>(10)?
+                        .and_then(|value| value.parse().ok()),
+                    source_base: None,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(attempts)
+    }
+
     /// Lean `agent_sessions` projection for the evaluation engine: timing and
     /// identity only, never session output. Only rows attached to a task
     /// attempt are returned (durations are attributed per attempt).
@@ -3847,6 +3899,96 @@ mod tests {
         assert_eq!(outcomes[0].agent, "opencode");
         assert_eq!(outcomes[0].outcome, IntegrationOutcomeKind::Rebased);
         assert_eq!(outcomes[0].task_id, task);
+    }
+
+    #[test]
+    fn evaluation_projection_matches_the_full_rows_on_evaluator_fields() {
+        // ASF-N06: the lean evaluation projection must agree with the full
+        // rows on every field the evaluation engine consumes, while skipping
+        // the payloads (diff patches, reviews) the metrics never read.
+        let dir = TempDir::new().unwrap();
+        let db = FactoryDb::open(&dir.path().join("test.db")).unwrap();
+        let run = db.create_run("objective", Some("codex")).unwrap();
+        let task = db
+            .create_task(
+                run.id,
+                "Task",
+                "objective",
+                &[],
+                TaskState::Completed,
+                0,
+                Some("worker"),
+                Some(TaskOperation::Implement),
+            )
+            .unwrap();
+        let attempt = db
+            .create_task_attempt(
+                task,
+                "worker",
+                Some(TaskOperation::Implement),
+                "opencode",
+                "worktree",
+                None,
+            )
+            .unwrap();
+        db.finish_task_attempt(
+            attempt.id,
+            AttemptStatus::Approved,
+            Some(0),
+            Some("abc"),
+            Some("boom"),
+            Some(&TaskEvidence {
+                changed_files: vec!["src/日本語.rs".to_string(), "lib/core.rs".to_string()],
+                diff_summary: "summary".to_string(),
+                commit_sha: Some("abc".to_string()),
+                commands: vec!["cargo test".to_string()],
+                acceptance_criteria: vec![],
+                worker_exit_code: Some(0),
+                artifacts: vec![],
+                diff_patch: Some("@@ patch @@".repeat(4_000)),
+            }),
+            Some(&ReviewResult {
+                decision: ReviewDecision::Approve,
+                reason: "ok".to_string(),
+                feedback: vec![],
+            }),
+        )
+        .unwrap();
+        // A second attempt without any evidence at all.
+        db.create_task_attempt(task, "worker", None, "qwen", "worktree", None)
+            .unwrap();
+
+        let full = db.list_task_attempts_all().unwrap();
+        let lean = db.list_task_attempts_for_evaluation().unwrap();
+        assert_eq!(full.len(), lean.len());
+        for (full, lean) in full.iter().zip(lean.iter()) {
+            assert_eq!(lean.id, full.id);
+            assert_eq!(lean.task_id, full.task_id);
+            assert_eq!(lean.attempt_number, full.attempt_number);
+            assert_eq!(lean.agent, full.agent);
+            assert_eq!(lean.status, full.status);
+            assert_eq!(lean.started_at, full.started_at);
+            assert_eq!(lean.finished_at, full.finished_at);
+            assert_eq!(lean.exit_code, full.exit_code);
+            assert_eq!(lean.error, full.error);
+            assert_eq!(lean.role, full.role);
+            assert_eq!(lean.operation, full.operation);
+            assert_eq!(
+                lean.evidence.as_ref().map(|e| e.changed_files.clone()),
+                full.evidence.as_ref().map(|e| e.changed_files.clone()),
+                "changed-file lists drive language attribution and must match"
+            );
+            if full.evidence.is_some() {
+                let lean_evidence = lean
+                    .evidence
+                    .as_ref()
+                    .expect("lean keeps evidence when the full row has it");
+                assert!(
+                    lean_evidence.diff_patch.is_none(),
+                    "diff patches must not be transferred"
+                );
+            }
+        }
     }
 
     #[test]
