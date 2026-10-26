@@ -330,8 +330,7 @@ mod tests {
         loop {
             match command.run_with_cancel(bounds, cancel) {
                 Err(ProcError::Spawn(error))
-                    if error.kind() == std::io::ErrorKind::ExecutableFileBusy
-                        && attempts < 40 =>
+                    if error.kind() == std::io::ErrorKind::ExecutableFileBusy && attempts < 40 =>
                 {
                     attempts += 1;
                     std::thread::sleep(Duration::from_millis(25));
