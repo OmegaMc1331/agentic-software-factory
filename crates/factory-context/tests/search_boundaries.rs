@@ -23,12 +23,12 @@ fn rg_env_lock() -> MutexGuard<'static, ()> {
 /// assertion failure).
 struct FakeRg {
     _dir: TempDir,
-    _guard: MutexGuard<'static, ()>,
 }
 
 impl FakeRg {
+    /// Callers must hold [`rg_env_lock`] for the whole test: the override
+    /// is process-wide and the suite runs with parallel test threads on CI.
     fn install(windows: &str, unix: &str) -> FakeRg {
-        let guard = rg_env_lock();
         let dir = TempDir::new().unwrap();
         let path = if cfg!(windows) {
             let script = dir.path().join("fake-rg.cmd");
@@ -47,10 +47,7 @@ impl FakeRg {
             script
         };
         std::env::set_var("FACTORY_RG_BIN", &path);
-        FakeRg {
-            _dir: dir,
-            _guard: guard,
-        }
+        FakeRg { _dir: dir }
     }
 }
 
@@ -108,6 +105,7 @@ fn hits(dir: &TempDir, query: &str) -> Vec<String> {
 
 #[test]
 fn a_symlink_to_an_external_file_exposes_nothing() {
+    let _guard = rg_env_lock();
     let dir = TempDir::new().unwrap();
     let private = dir.path().parent().unwrap().join("f01-private-file");
     std::fs::create_dir_all(&private).unwrap();
@@ -135,6 +133,7 @@ fn a_symlink_to_an_external_file_exposes_nothing() {
 
 #[test]
 fn b_symlink_to_an_external_directory_is_not_traversed() {
+    let _guard = rg_env_lock();
     let dir = TempDir::new().unwrap();
     let private = dir.path().parent().unwrap().join("f01-private-dir");
     std::fs::create_dir_all(&private).unwrap();
@@ -157,6 +156,7 @@ fn b_symlink_to_an_external_directory_is_not_traversed() {
 
 #[test]
 fn c_symlink_cycles_terminate_within_a_bounded_time() {
+    let _guard = rg_env_lock();
     let dir = TempDir::new().unwrap();
     write(&dir.path().join("nested").join("real.txt"), "cycle probe\n");
     let nested = dir.path().join("nested");
@@ -186,6 +186,7 @@ fn c_symlink_cycles_terminate_within_a_bounded_time() {
 
 #[test]
 fn d_ordinary_files_with_spaces_and_unicode_stay_searchable() {
+    let _guard = rg_env_lock();
     let dir = TempDir::new().unwrap();
     write(
         &dir.path().join("src").join("日本語 notes.md"),
@@ -203,6 +204,7 @@ fn d_ordinary_files_with_spaces_and_unicode_stay_searchable() {
 
 #[test]
 fn e_internal_symlinks_are_not_followed_either() {
+    let _guard = rg_env_lock();
     // Policy (matching the index): symlinks are never followed or read,
     // including targets that live inside the repository.
     let dir = TempDir::new().unwrap();
@@ -223,6 +225,7 @@ fn e_internal_symlinks_are_not_followed_either() {
 
 #[test]
 fn f_broken_symlinks_are_ignored_without_error() {
+    let _guard = rg_env_lock();
     let dir = TempDir::new().unwrap();
     write(&dir.path().join("ok.txt"), "still works\n");
     let broken = dir.path().join("dangling.txt");
@@ -241,6 +244,7 @@ fn f_broken_symlinks_are_ignored_without_error() {
 
 #[test]
 fn oversized_files_are_rejected_before_any_read_allocates() {
+    let _guard = rg_env_lock();
     let dir = TempDir::new().unwrap();
     let limit = factory_context::index::MAX_INDEX_FILE_READ_BYTES as usize;
     // A file one byte past the read limit containing the needle: it must be
@@ -264,6 +268,7 @@ fn oversized_files_are_rejected_before_any_read_allocates() {
 
 #[test]
 fn invalid_utf8_and_binary_files_do_not_break_the_scan() {
+    let _guard = rg_env_lock();
     let dir = TempDir::new().unwrap();
     std::fs::write(dir.path().join("bin.dat"), vec![0xff, 0xfe, 0x00, 0x01]).unwrap();
     // Invalid UTF-8 that would decode to the needle under lossy conversion.
@@ -282,6 +287,7 @@ fn invalid_utf8_and_binary_files_do_not_break_the_scan() {
 
 #[test]
 fn a_hanging_ripgrep_falls_back_to_a_bounded_scan() {
+    let _guard = rg_env_lock();
     // Real rg answers `--version` instantly; only the search itself hangs.
     let _fake = FakeRg::install(
         "@echo off\r\nif \"%1\"==\"--version\" (echo 14.1.0 & exit /b 0)\r\nping -n 120 127.0.0.1 >nul\r\n",
@@ -302,6 +308,7 @@ fn a_hanging_ripgrep_falls_back_to_a_bounded_scan() {
 
 #[test]
 fn a_failing_ripgrep_falls_back_but_a_no_match_does_not() {
+    let _guard = rg_env_lock();
     // Exit 2 is a real tool failure → fallback runs and finds the file.
     // (Each fake lives in its own block: two serialization guards held at
     // once would self-deadlock the process-wide lock.)
@@ -340,6 +347,7 @@ fn a_failing_ripgrep_falls_back_but_a_no_match_does_not() {
 
 #[test]
 fn truncated_ripgrep_output_is_rejected_not_parsed() {
+    let _guard = rg_env_lock();
     // The fake floods stdout past the capture limit with plausible-looking
     // paths; the truncated output must be discarded and the bounded
     // fallback decide.
@@ -355,6 +363,7 @@ fn truncated_ripgrep_output_is_rejected_not_parsed() {
 
 #[test]
 fn ripgrep_paths_outside_the_root_or_through_links_are_rejected() {
+    let _guard = rg_env_lock();
     // The fake rg "finds" the query in paths that must never be accepted:
     // one outside the repository, one behind a symlink, and one legit path.
     // The NUL-separated payload is prebuilt as a binary file; both fake
