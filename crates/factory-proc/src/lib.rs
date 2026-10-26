@@ -921,7 +921,7 @@ while true; do echo x >> '{heartbeat_arg}'; sleep 0.1; done
             std::fs::write(
                 dir.join("parent.sh"),
                 "#!/bin/sh
-'$(dirname \"$0\")/child.sh' &
+\"$(dirname \"$0\")/child.sh\" &
 exit 0
 ",
             )
