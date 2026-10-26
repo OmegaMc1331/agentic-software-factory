@@ -190,8 +190,16 @@ the agent entry still apply, minus anything denied. Deny wins over allow, and ke
 compare case-insensitively.
 
 Denied values are treated as secrets: their values are registered for redaction and
-replaced with `[REDACTED]` if they ever appear in captured session output. Secret
-values are never written to the database, the audit record, or logs.
+replaced with `[REDACTED]` if they ever appear in captured session output. Redaction
+is streaming and stateful per output stream (stdout and stderr independently): a
+secret split across process write boundaries is caught by holding back the bounded
+suffix a future chunk could complete, so neither the incremental session rows, the
+session event stream, nor the final stored output ever contains a reconstructable
+secret. When a stream ends mid-secret the unterminated prefix is released verbatim —
+it is not the secret value and can no longer be completed. Secret values are never
+written to the database, the audit record, or logs. Redaction covers the secrets
+Factory knows (denied and agent-configured environment values, MCP grant tokens);
+it is not detection of arbitrary secrets, and it does not decode encoded values.
 
 ## Resolution in practice
 

@@ -86,7 +86,18 @@ Permissions come from the **policy engine**, not from instructions. See
   but cannot restrict a launched process's network on current platforms;
 - environment policies filter the child process environment before launch (allow
   lists, deny lists, deny-wins), and denied values are redacted from captured
-  session output; secret values are never logged or persisted;
+  session output; secret values are never logged or persisted. Redaction is
+  **streaming**: each output stream keeps an independent stateful redactor that
+  holds back the bounded suffix a future chunk could complete, so a secret split
+  across process write boundaries never reaches the incremental database rows,
+  the session event stream, or the final stored output. When a stream ends
+  mid-secret, the unterminated prefix is flushed verbatim — it is not the secret
+  value and can no longer be completed. Secret values longer than 1 MiB (far
+  beyond real credential sizes) are matched within single chunks and in final
+  whole-text redaction, but their cross-chunk streaming match is not guaranteed.
+  Factory only redacts secrets it knows: policy-denied environment values,
+  agent-configured environment values, and MCP grant tokens. It does not detect
+  arbitrary secrets, or secrets that arrive encoded or transformed;
 - tasks that cannot legally execute are blocked before an agent process starts, and
   policy violations fail an attempt without consuming the normal retry budget.
 
@@ -190,12 +201,30 @@ content, and no role instruction can trigger `git push` or `gh pr create` throug
 Factory. See [Policies — agent vs delivery permissions](policies.md#git).
 
 **Injection resistance.** All `git`/`gh` invocations use structured process
-arguments — no `sh -c`, no `cmd /c`, no string-interpolated commands. PR titles and
-bodies travel as single argv values and as JSON in the API; branch names are always
-Factory-generated (`factory/run-<id>`); repository slugs are parsed with a strict
-`owner/name` charset and cross-repository issue imports are refused. The API exposes
-only semantic operations (`from-issue`, `delivery`, `pr-preview`, `pull-request`) —
+arguments — no `sh -c`, no `cmd /c`, no string-interpolated commands. PR titles
+travel as single argv values; PR bodies travel through an exclusive-create
+temporary file consumed by `gh pr create --body-file` (removed on success,
+failure, and timeout), never through argv, and bodies larger than 262,144
+characters are rejected up front. Branch names are always Factory-generated
+(`factory/run-<id>`); repository slugs are parsed with a strict `owner/name`
+charset and cross-repository issue imports are refused. The API exposes only
+semantic operations (`from-issue`, `delivery`, `pr-preview`, `pull-request`) —
 there is no generic GitHub command endpoint.
+
+**Bounded subprocess supervision.** Every Factory-owned `git`/`gh` command runs
+under a shared supervisor with an explicit per-operation deadline, concurrent
+stdout/stderr draining, hard output-capture limits, a null stdin, and
+process-tree termination when the deadline fires (`taskkill /T` on Windows, the
+child's own process group on Unix). Git and gh invocations set
+`GIT_TERMINAL_PROMPT=0` so missing credentials fail instead of waiting for
+terminal input; credential helpers and keyring flows keep working. Deadlines
+default per operation class (30–180 s, 120 s for local git) and can be scaled
+with `FACTORY_GIT_TIMEOUT_SECS` / `FACTORY_GH_TIMEOUT_SECS`. A timeout after an
+external side effect — `git push` or `gh pr create` — is classified as an
+**uncertain** outcome: the delivery is marked `interrupted` and requires
+reconciliation before any retry; a timeout never triggers an automatic second
+push or pull-request creation. JSON responses are never parsed from truncated
+output; a capture that exceeds its limit is an explicit error.
 
 ### Custom and specialized role boundaries
 
@@ -220,7 +249,8 @@ are parameterized and schema changes use versioned migrations. Automated stdout 
 stderr are drained concurrently, captured with a 1 MB per-stream head/tail bound, and
 stored with truncation metadata; oversized structured output is rejected before parsing.
 Session logs may still contain agent-produced sensitive content. Secret values are
-redacted before persistence.
+redacted before persistence, including across streaming chunk boundaries; see
+[Agent Console and redaction](#process-permissions) above.
 
 `PUT /api/config` and `PUT /api/graph/workspace` validate their bodies before atomic
 temp-file-and-rename writes. The graph workspace contains visual metadata only.

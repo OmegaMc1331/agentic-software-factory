@@ -27,6 +27,20 @@ MCP transport/server failures never enter agent-quality denominators. See
   `integration_outcomes` table because integration quality (clean vs
   rebased vs conflicted landings) was not derivable from existing rows.
   Attempt history itself is *not* duplicated into any event store.
+- **Scalability (ASF-N06).** The attempt read is a dedicated lean projection
+  (`list_task_attempts_for_evaluation`): identity, classification, timing,
+  error text, and the evidence changed-file list extracted SQL-side. The full
+  evidence JSON — dominated by multi-kilobyte diff patches per attempt — is
+  *not* transferred, which makes evaluation cost independent of evidence size
+  and keeps the old path's unbounded memory growth (measured at ~4.6 GB of
+  materialized evidence strings per request at 100,000 attempts) from ever
+  occurring. Measured: 10,000 attempts fell from ~10.6 s to ~1.9 s per
+  `evaluate()` call; 100,000 attempts complete in ~62 s (debug build; full
+  numbers in `docs/audits/asf-stabilization-n01-n08.md`). The projection
+  agrees with the full rows on every field the metrics consume; metric
+  definitions are unchanged. Evaluations still load the whole (now lean)
+  history per request — linear in attempts; a materialization cache can be
+  added later if histories grow another order of magnitude.
 - **`factory-api`** exposes two read-only semantic endpoints (below).
 - **Dashboard** adds a Performance view and a compact Agent Inspector block.
 - **Routing consumers**: `factory_eval::performance(db, agent, role,

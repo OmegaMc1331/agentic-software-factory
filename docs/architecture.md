@@ -122,6 +122,19 @@ rules, and caps every indexed read and every rendered output. The `[context]`
 table in `.factory/config.toml` controls it (`enabled`, `max_files`, `max_chars`,
 `include_tests`, `include_symbols`).
 
+Ignore policy (ASF-N07): the engine honors **repository-local rules only** — the
+root `.gitignore`, nested `.gitignore` files (deeper files override shallower,
+gitignore(5) precedence, and files under an excluded directory can never be
+re-included), and `.git/info/exclude` — layered under Factory's built-in
+exclusions (`.git`, `.factory`, build/vendor directories, binary and lockfile
+patterns), which nothing can negate. User-global excludes
+(`core.excludesFile`) are deliberately not consulted, so indexing and search
+are identical on every machine; when ripgrep is available it runs with
+`--no-ignore` and Factory's compiled rules are the single exclusion policy for
+indexing, symbol search, content search, and excerpt extraction alike.
+Gitignore parsing is Unicode-safe (patterns with multi-byte characters parse
+and match per character, never per byte).
+
 ## Evaluation
 
 `factory-eval` measures agent performance (first-pass approval, retries,

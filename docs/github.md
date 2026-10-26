@@ -99,6 +99,12 @@ force-push, never arbitrary user branches.
 
 All `git`/`gh` commands use structured process arguments; there is no
 `sh -c`, no `cmd /c`, and no string-interpolated shell anywhere in the path.
+Every command runs under a bounded supervisor: a per-operation deadline
+(30–180 s depending on the operation), concurrent output draining with hard
+capture limits, a null stdin, and process-tree termination on timeout. Deadlines
+can be scaled with `FACTORY_GH_TIMEOUT_SECS` / `FACTORY_GIT_TIMEOUT_SECS`.
+Output that exceeds its capture limit is an explicit error — truncated JSON is
+never parsed as a real response.
 
 ### Pull request preview
 
@@ -113,6 +119,13 @@ approved attempts actually reported as Verification, and the recorded review
 decisions as Reviews. If the workflow was imported from an issue, the body
 ends with `Closes #<number>`; otherwise that line is omitted. Factory never
 fabricates tests or reviews — absent evidence is stated as absent.
+
+The body is transported to the GitHub CLI through an exclusive-create temporary
+file consumed by `gh pr create --body-file` (removed on success, failure, and
+timeout), so arbitrarily long multi-line bodies — including Unicode and
+markdown — arrive byte-exact and never hit Windows command-line length limits.
+Bodies larger than 262,144 characters (GitHub's own cap) are rejected with an
+actionable error before anything is published.
 
 ### Persistence and duplicates
 
@@ -145,7 +158,10 @@ Creating a pull request is an asynchronous, Factory-owned operation:
 
 A failed local command does not prove the remote side effect did not happen
 (the push may have been accepted before the connection dropped; GitHub may
-have created the PR before `gh` timed out). Such attempts are recorded as
+have created the PR before `gh` timed out). The same is true when the bounded
+supervisor kills a command at its deadline: the side effect may already be
+complete remotely. All such attempts — unrecognized CLI failures, network
+drops, and timeouts on `git push` or `gh pr create` alike — are recorded as
 `interrupted` with recovery required — never as `failed` — and Factory
 refuses to start another operation until reconciliation resolves them:
 
@@ -172,7 +188,9 @@ and stale attempts unable to corrupt newer state.
 - Shell injection from issue titles, malicious PR titles/bodies, and
   branch-name injection are all structurally prevented: issue text travels
   as data (never through a shell), branch names are always Factory-generated
-  `factory/run-<id>`, and PR titles/bodies are passed as single argv values.
+  `factory/run-<id>`, PR titles are passed as single argv values, and PR
+  bodies travel via a securely created temporary `--body-file` that is
+  removed after the command finishes.
 - Repository URL manipulation is blocked: remotes are parsed with a strict
   `owner/name` charset and cross-repository issue imports are refused.
 - Authentication tokens are never read, logged, or persisted by Factory.
