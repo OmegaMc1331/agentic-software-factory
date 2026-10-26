@@ -327,6 +327,7 @@ codes captured directly, logs not piped through tail):
 | `cargo fmt --all -- --check` | PASS |
 | `cargo clippy --workspace --all-targets -j 1 -- -D warnings` | PASS (after 4 mechanical lint fixes in new code) |
 | `cargo test --workspace -j 1 -- --test-threads=1` | PASS (585 tests, 57 suites, 0 failures) |
+| `cargo test --workspace -j 1` (CI-mode default parallel test threads) | PASS (708 test executions, 0 failures) — after serializing the bounded-execution fixtures whose process-wide `FACTORY_GIT_TIMEOUT_SECS` override leaked into parallel tests on CI |
 | dashboard `format:check` / `lint` / `typecheck` / `test` / `build` | PASS (no TS/TSX changed; 303 tests, build ok) |
 | GitHub Actions (linux/windows/macOS) | NOT RUN (push pending) |
 

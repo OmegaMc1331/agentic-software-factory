@@ -22,10 +22,11 @@ fn git_env_lock() -> MutexGuard<'static, ()> {
 }
 
 /// Installs a fake git (and optionally a short timeout) and restores the real
-/// configuration when dropped, even on assertion failure.
+/// configuration when dropped, even on assertion failure. Callers must hold
+/// [`git_env_lock`] for the whole test: the overrides are process-wide and
+/// the suite may run with parallel test threads.
 struct FakeGit {
     _dir: TempDir,
-    _guard: MutexGuard<'static, ()>,
 }
 
 impl FakeGit {
@@ -34,7 +35,6 @@ impl FakeGit {
     }
 
     fn install_with_timeout(windows: &str, unix: &str, timeout_secs: Option<&str>) -> FakeGit {
-        let guard = git_env_lock();
         let dir = TempDir::new().unwrap();
         let path: PathBuf = if cfg!(windows) {
             let script = dir.path().join("fake-git.cmd");
@@ -56,10 +56,7 @@ impl FakeGit {
         if let Some(seconds) = timeout_secs {
             std::env::set_var("FACTORY_GIT_TIMEOUT_SECS", seconds);
         }
-        FakeGit {
-            _dir: dir,
-            _guard: guard,
-        }
+        FakeGit { _dir: dir }
     }
 }
 
@@ -111,6 +108,7 @@ fn real_repo() -> (TempDir, Repo) {
 
 #[test]
 fn a_nonzero_worktree_prune_exit_is_reported_as_failure() {
+    let _guard = git_env_lock();
     let (_dir, repo) = real_repo();
     let _fake = FakeGit::install(
         "@echo off\r\necho simulated prune failure 1>&2\r\nexit /b 1\r\n",
@@ -128,6 +126,7 @@ fn a_nonzero_worktree_prune_exit_is_reported_as_failure() {
 
 #[test]
 fn a_hanging_git_command_is_terminated_at_the_deadline() {
+    let _guard = git_env_lock();
     let (_dir, repo) = real_repo();
     std::env::set_var("FACTORY_GIT_TIMEOUT_SECS", "1");
     let _fake = FakeGit::install(
@@ -154,6 +153,7 @@ fn a_hanging_git_command_is_terminated_at_the_deadline() {
 
 #[test]
 fn runaway_git_output_is_rejected_instead_of_parsed() {
+    let _guard = git_env_lock();
     let (_dir, repo) = real_repo();
     let _fake = FakeGit::install(
         "@echo off\r\nfor /l %%i in (1,1,60000) do echo 01234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789ABCDE\r\n",
@@ -172,6 +172,7 @@ fn runaway_git_output_is_rejected_instead_of_parsed() {
 
 #[test]
 fn diff_capture_is_bounded_with_an_explicit_truncation_marker() {
+    let _guard = git_env_lock();
     let (dir, repo) = real_repo();
     let worktree = dir.path().join("wt");
     repo.add_worktree(&worktree, "factory/t1", None).unwrap();
@@ -197,6 +198,7 @@ fn diff_capture_is_bounded_with_an_explicit_truncation_marker() {
 
 #[test]
 fn a_small_diff_is_returned_complete_without_a_marker() {
+    let _guard = git_env_lock();
     let (dir, repo) = real_repo();
     let worktree = dir.path().join("wt");
     repo.add_worktree(&worktree, "factory/t1", None).unwrap();
@@ -215,6 +217,7 @@ fn a_small_diff_is_returned_complete_without_a_marker() {
 
 #[test]
 fn a_diff_exactly_at_the_budget_is_returned_complete() {
+    let _guard = git_env_lock();
     let (dir, repo) = real_repo();
     let worktree = dir.path().join("wt");
     repo.add_worktree(&worktree, "factory/t1", None).unwrap();
@@ -236,6 +239,7 @@ fn a_diff_exactly_at_the_budget_is_returned_complete() {
 
 #[test]
 fn unicode_and_binary_content_never_panic_or_leak_the_budget() {
+    let _guard = git_env_lock();
     let (dir, repo) = real_repo();
     let worktree = dir.path().join("wt");
     repo.add_worktree(&worktree, "factory/t1", None).unwrap();
@@ -260,6 +264,7 @@ fn unicode_and_binary_content_never_panic_or_leak_the_budget() {
 
 #[test]
 fn a_git_error_before_producing_a_diff_surfaces_as_a_failure() {
+    let _guard = git_env_lock();
     let (dir, repo) = real_repo();
     let worktree = dir.path().join("wt");
     repo.add_worktree(&worktree, "factory/t1", None).unwrap();
