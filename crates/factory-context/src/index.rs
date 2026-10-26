@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::MAX_INDEX_ENTRIES;
 use crate::error::{ContextError, Result};
+use crate::files::{file_key, open_repository_file, read_bounded, repository_metadata};
 use crate::ignore::IgnoreRules;
 use crate::symbols::{extract_symbols, language_for, Symbol};
 
@@ -133,6 +134,9 @@ impl ContextIndex {
         let mut stack: Vec<PathBuf> = Vec::new();
         stack.push(root.clone());
         while let Some(dir) = stack.pop() {
+            if repository_metadata(&root, ignore, &dir, true).is_none() {
+                continue;
+            }
             if seen.len() >= MAX_INDEX_ENTRIES {
                 oversize = true;
                 break;
@@ -151,10 +155,6 @@ impl ContextIndex {
                     Ok(relative) => relative.to_path_buf(),
                     Err(_) => continue,
                 };
-                let key = forward_slash(&relative);
-                if key.is_empty() {
-                    continue;
-                }
                 let file_type = match entry.file_type() {
                     Ok(file_type) => file_type,
                     Err(_) => continue,
@@ -172,9 +172,12 @@ impl ContextIndex {
                 if ignore.is_ignored(relative.as_path(), false) {
                     continue;
                 }
-                let metadata = match entry.metadata() {
-                    Ok(metadata) => metadata,
-                    Err(_) => continue,
+                let metadata = match repository_metadata(&root, ignore, &entry.path(), false) {
+                    Some(metadata) => metadata,
+                    None => continue,
+                };
+                let Some(key) = file_key(&root, &entry.path()) else {
+                    continue;
                 };
                 let mtime_ms = modified_millis(&metadata);
                 let size = metadata.len();
@@ -198,7 +201,7 @@ impl ContextIndex {
                         // fingerprint (legacy manifest) fails this check on
                         // purpose, so old entries are re-read and backfilled
                         // exactly once.
-                        match read_stable(&entry.path()) {
+                        match read_stable(&root, ignore, &entry.path()) {
                             Some((bytes, _stat))
                                 if cached.content_hash.as_deref()
                                     == Some(sha256_hex(&bytes).as_str()) =>
@@ -211,7 +214,7 @@ impl ContextIndex {
                     }
                 }
                 let (symbols, content_hash, size, mtime_ms) = if symbol_eligible {
-                    match read_stable(&entry.path()) {
+                    match read_stable(&root, ignore, &entry.path()) {
                         Some((bytes, stat)) => {
                             let hash = sha256_hex(&bytes);
                             let symbols = extract_symbols(
@@ -276,12 +279,20 @@ impl RefreshStats {
 /// retry uses the newer bytes. The returned metadata describes exactly the
 /// returned bytes, so the fingerprint, symbols, and recorded size/mtime stay
 /// consistent. Two unstable attempts yield `None`.
-fn read_stable(path: &Path) -> Option<(Vec<u8>, std::fs::Metadata)> {
+fn read_stable(
+    root: &Path,
+    ignore: &IgnoreRules,
+    path: &Path,
+) -> Option<(Vec<u8>, std::fs::Metadata)> {
     for _ in 0..2 {
-        let before = std::fs::metadata(path).ok()?;
-        let bytes = std::fs::read(path).ok()?;
-        let after = std::fs::metadata(path).ok()?;
-        if before.len() == after.len() && modified_millis(&before) == modified_millis(&after) {
+        let mut file = open_repository_file(root, ignore, path)?;
+        let before = file.metadata().ok()?;
+        let bytes = read_bounded(&mut file, before.len())?;
+        let after = file.metadata().ok()?;
+        if before.len() == after.len()
+            && bytes.len() as u64 == after.len()
+            && modified_millis(&before) == modified_millis(&after)
+        {
             return Some((bytes, after));
         }
     }
@@ -362,7 +373,11 @@ pub struct IndexSummary {
 }
 
 pub fn forward_slash(path: &Path) -> String {
-    let mut text = path.to_string_lossy().replace('\\', "/");
+    let mut text = path.to_string_lossy().into_owned();
+    #[cfg(windows)]
+    {
+        text = text.replace('\\', "/");
+    }
     while text.starts_with("./") {
         text = text.trim_start_matches("./").to_string();
     }

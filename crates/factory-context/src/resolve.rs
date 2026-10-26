@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::ContextConfig;
 use crate::error::Result;
+use crate::files::{read_repository_file, repository_metadata};
 use crate::ignore::IgnoreRules;
 use crate::index::{
     load_manifest, normalize, now_secs, save_manifest, ContextIndex, IndexSummary, IndexedFile,
@@ -181,6 +182,10 @@ impl ContextEngine {
         self.ensure_index()?;
         let index = self.index.as_ref().expect("index loaded");
         let mut hits = search_index(index, query, limit);
+        hits.retain(|hit| {
+            repository_metadata(&self.root, &self.ignore, &self.root.join(&hit.path), false)
+                .is_some()
+        });
         if hits.len() < limit {
             let content_hits = search::search_content(&self.root, &self.ignore, query, limit)?;
             for content_hit in content_hits {
@@ -214,8 +219,17 @@ impl ContextEngine {
             scope_git_info(&request.scope_dir, request.base_sha.as_deref());
 
         let mut ranked = rank::rank_candidates(index, request);
-        ranked.retain(|file| file.score > 0);
-        rank::expand_links(&mut ranked, &self.root);
+        ranked.retain(|file| {
+            file.score > 0
+                && repository_metadata(
+                    &self.root,
+                    &self.ignore,
+                    &self.root.join(&file.file.path),
+                    false,
+                )
+                .is_some()
+        });
+        rank::expand_links_with_ignore(&mut ranked, &self.root, &self.ignore);
 
         // Test files are surfaced as *related* tests, never as selected
         // working files, so the budget stays on the code being changed and the
@@ -235,7 +249,7 @@ impl ContextEngine {
         let mut selected: Vec<SelectedFile> = Vec::with_capacity(selected_ranked.len());
         let anchor_terms = query_terms_for(request);
         for ranked_file in &selected_ranked {
-            let span = extract_excerpt(&self.root, &ranked_file.file, &anchor_terms);
+            let span = extract_excerpt(&self.root, &self.ignore, &ranked_file.file, &anchor_terms);
             selected.push(SelectedFile {
                 path: ranked_file.file.path.clone(),
                 language: ranked_file.file.language.clone(),
@@ -304,14 +318,16 @@ fn scope_git_info(
 /// Reads a file (bounded) and produces an excerpt anchored near the first
 /// matching symbol line, otherwise the first matching query-term line,
 /// otherwise the file head.
-fn extract_excerpt(root: &Path, file: &IndexedFile, anchor_terms: &[String]) -> String {
+fn extract_excerpt(
+    root: &Path,
+    ignore: &IgnoreRules,
+    file: &IndexedFile,
+    anchor_terms: &[String],
+) -> String {
     let path = root.join(&file.path);
-    let Ok(bytes) = std::fs::read(&path) else {
+    let Some(bytes) = read_repository_file(root, ignore, &path) else {
         return String::new();
     };
-    if bytes.len() as u64 > crate::index::MAX_INDEX_FILE_READ_BYTES {
-        return String::new();
-    }
     let content = String::from_utf8_lossy(&bytes);
     let lines: Vec<&str> = content.lines().collect();
     let anchor = file

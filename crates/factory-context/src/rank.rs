@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use factory_types::TaskOperation;
 
 use crate::config::MAX_CONTEXT_FILES_LIMIT;
-use crate::index::{ContextIndex, IndexedFile, MAX_INDEX_FILE_READ_BYTES};
+use crate::index::{ContextIndex, IndexedFile};
 
 /// Everything the resolver knows about the task being served. Supplied by the
 /// Factory (mission builder) and by the dashboard/CLI inspector routes.
@@ -310,6 +310,16 @@ pub fn rank_candidates(index: &ContextIndex, request: &ContextRequest) -> Vec<Ra
 /// reference (or are referenced by) one another. The reads are bounded, and
 /// the pair order is deterministic (sorted pool).
 pub fn expand_links(pool: &mut [RankedFile], root: &Path) {
+    let root = crate::index::normalize(root);
+    let ignore = crate::ignore::IgnoreRules::collect(&root);
+    expand_links_with_ignore(pool, &root, &ignore);
+}
+
+pub(crate) fn expand_links_with_ignore(
+    pool: &mut [RankedFile],
+    root: &Path,
+    ignore: &crate::ignore::IgnoreRules,
+) {
     let n = pool.len().min(LINK_POOL_LIMIT);
     if n < 2 {
         return;
@@ -318,12 +328,8 @@ pub fn expand_links(pool: &mut [RankedFile], root: &Path) {
     for file in pool.iter().take(n) {
         let path = root.join(&file.file.path);
         contents.push(
-            std::fs::read(&path)
-                .ok()
-                .and_then(|bytes| {
-                    (bytes.len() as u64 <= MAX_INDEX_FILE_READ_BYTES)
-                        .then(|| String::from_utf8_lossy(&bytes).to_ascii_lowercase())
-                })
+            crate::files::read_repository_file(root, ignore, &path)
+                .map(|bytes| String::from_utf8_lossy(&bytes).to_ascii_lowercase())
                 .unwrap_or_default(),
         );
     }

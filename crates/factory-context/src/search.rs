@@ -17,6 +17,7 @@
 //!   deadline and bounded stdout/stderr capture, NUL-separated output, and
 //!   explicit exit-code semantics (1 = no matches, not a failure).
 
+use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -24,8 +25,9 @@ use std::sync::OnceLock;
 use factory_proc::{Bounds, ProcCommand};
 
 use crate::error::Result;
+use crate::files::{file_key, read_repository_file, repository_metadata};
 use crate::ignore::IgnoreRules;
-use crate::index::{forward_slash, normalize, ContextIndex, MAX_INDEX_FILE_READ_BYTES};
+use crate::index::{ContextIndex, MAX_INDEX_FILE_READ_BYTES};
 use crate::rank::query_tokens;
 use crate::symbols::Symbol;
 
@@ -210,20 +212,22 @@ pub fn search_content(
     if terms.is_empty() || limit == 0 {
         return Ok(Vec::new());
     }
-    let root = normalize(root);
-    let matched_paths: Vec<PathBuf> = match ripgrep_paths(&root, ignore, query) {
+    let Ok(root) = root.canonicalize() else {
+        return Ok(Vec::new());
+    };
+    let matched_paths = match ripgrep_paths(&root, ignore, query) {
         // `None` means the tool path is unusable; the fallback stays bounded.
         Some(paths) => paths,
         None => fallback_paths(&root, ignore, query),
     };
 
     let mut hits: Vec<SearchHit> = Vec::new();
-    for path in matched_paths.into_iter().take(limit) {
-        let relative = path.strip_prefix(&root).ok();
-        let key = relative
-            .map(forward_slash)
-            .unwrap_or_else(|| path.to_string_lossy().into_owned());
-        let (line, snippet) = first_match_line(&path, query);
+    for key in matched_paths {
+        let path = root.join(&key);
+        let Some(bytes) = read_repository_file(&root, ignore, &path) else {
+            continue;
+        };
+        let (line, snippet) = first_match_line(&bytes, query);
         hits.push(SearchHit {
             path: key,
             match_kind: MatchKind::Content,
@@ -231,15 +235,17 @@ pub fn search_content(
             snippet,
             symbols: Vec::new(),
         });
+        if hits.len() >= limit {
+            break;
+        }
     }
-    hits.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(hits)
 }
 
 /// Ripgrep-based candidates, or `None` when the tool path must not be
 /// trusted (missing, failed, timed out, truncated, or unusable output) and
 /// the bounded fallback should run instead.
-fn ripgrep_paths(root: &Path, ignore: &IgnoreRules, query: &str) -> Option<Vec<PathBuf>> {
+fn ripgrep_paths(root: &Path, ignore: &IgnoreRules, query: &str) -> Option<BTreeSet<String>> {
     if !ripgrep_available() {
         return None;
     }
@@ -276,22 +282,22 @@ fn ripgrep_paths(root: &Path, ignore: &IgnoreRules, query: &str) -> Option<Vec<P
         Some(0) => {}
         // 1: ripgrep's documented "no matches" — not a tool failure. Do NOT
         // fall back: the answer is authoritative and empty.
-        Some(1) => return Some(Vec::new()),
+        Some(1) => return Some(BTreeSet::new()),
         // 2 or anything else: real tool failure — fall back.
         _ => return None,
     }
-    let mut paths = Vec::new();
+    if !output.stdout.is_empty() && !output.stdout.ends_with(&[0]) {
+        return None;
+    }
+    let mut paths = BTreeSet::new();
     for raw in output.stdout.split(|byte| *byte == 0) {
         if raw.is_empty() {
             continue;
         }
-        let os_raw: OsString = os_from_bytes(raw);
+        let os_raw = os_from_bytes(raw)?;
         let path = PathBuf::from(os_raw);
         if accept_candidate(root, ignore, &path) {
-            paths.push(path);
-            if paths.len() >= MAX_MATCHED_PATHS {
-                break;
-            }
+            retain_smallest(&mut paths, file_key(root, &path)?);
         }
     }
     Some(paths)
@@ -300,14 +306,14 @@ fn ripgrep_paths(root: &Path, ignore: &IgnoreRules, query: &str) -> Option<Vec<P
 /// Converts raw ripgrep bytes into a path losslessly on Unix (arbitrary
 /// bytes are legal path content) and via UTF-8 on Windows.
 #[cfg(unix)]
-fn os_from_bytes(raw: &[u8]) -> OsString {
+fn os_from_bytes(raw: &[u8]) -> Option<OsString> {
     use std::os::unix::ffi::OsStringExt;
-    OsString::from_vec(raw.to_vec())
+    Some(OsString::from_vec(raw.to_vec()))
 }
 
 #[cfg(windows)]
-fn os_from_bytes(raw: &[u8]) -> OsString {
-    OsString::from(String::from_utf8_lossy(raw).into_owned())
+fn os_from_bytes(raw: &[u8]) -> Option<OsString> {
+    Some(OsString::from(std::str::from_utf8(raw).ok()?))
 }
 
 /// Boundary revalidation for every externally produced candidate (ASF-F01):
@@ -316,27 +322,18 @@ fn os_from_bytes(raw: &[u8]) -> OsString {
 /// String-prefix containment alone proves nothing — `strip_prefix` is the
 /// first check, not the only one.
 fn accept_candidate(root: &Path, ignore: &IgnoreRules, path: &Path) -> bool {
-    let Ok(relative) = path.strip_prefix(root) else {
-        return false;
-    };
-    if relative.as_os_str().is_empty() {
-        return false;
+    repository_metadata(root, ignore, path, false)
+        .is_some_and(|metadata| metadata.len() <= MAX_INDEX_FILE_READ_BYTES)
+}
+
+fn retain_smallest(paths: &mut BTreeSet<String>, key: String) {
+    if paths.len() == MAX_MATCHED_PATHS {
+        if paths.last().is_some_and(|last| &key >= last) || paths.contains(&key) {
+            return;
+        }
+        paths.pop_last();
     }
-    // Non-following metadata: the entry itself must not be a link, whatever
-    // it points at or where it resides.
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) if !metadata.file_type().is_symlink() => {}
-        _ => return false,
-    }
-    if ignore.is_ignored(relative, false) {
-        return false;
-    }
-    // Pre-read size check from the same non-following metadata.
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.len() <= MAX_INDEX_FILE_READ_BYTES => {}
-        _ => return false,
-    }
-    true
+    paths.insert(key);
 }
 
 /// Pure-Rust bounded fallback: a directory walk that decides on
@@ -344,25 +341,36 @@ fn accept_candidate(root: &Path, ignore: &IgnoreRules, path: &Path) -> bool {
 /// traverses linked directories, so link cycles cannot loop), skips ignored
 /// and built-in paths, bounds visited entries, and reads every file through
 /// a size-checked bounded reader.
-fn fallback_paths(root: &Path, ignore: &IgnoreRules, query: &str) -> Vec<PathBuf> {
+fn fallback_paths(root: &Path, ignore: &IgnoreRules, query: &str) -> BTreeSet<String> {
+    fallback_paths_with_budget(root, ignore, query, crate::config::MAX_INDEX_ENTRIES)
+}
+
+fn fallback_paths_with_budget(
+    root: &Path,
+    ignore: &IgnoreRules,
+    query: &str,
+    mut remaining: usize,
+) -> BTreeSet<String> {
     let query = query.to_ascii_lowercase();
-    let mut found: Vec<PathBuf> = Vec::new();
-    let mut visited: usize = 0;
+    let mut found = BTreeSet::new();
     let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
+        if repository_metadata(root, ignore, &dir, true).is_none() {
+            continue;
+        }
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
-        for entry in entries.flatten() {
-            visited += 1;
-            // Traversal budget mirrors the index walk so a pathological
-            // tree cannot make search unbounded; the result is then a
-            // bounded partial scan, not an exhaustive one.
-            if visited > crate::config::MAX_INDEX_ENTRIES {
-                return found;
-            }
-            // ASF-F01: decide on the entry's own type — a symlink is never
-            // a directory to traverse and never a file to read.
+        let Some(mut ordered) = complete_directory(entries, &mut remaining) else {
+            return found;
+        };
+        ordered.sort_by(|a, b| {
+            a.file_name()
+                .as_encoded_bytes()
+                .cmp(b.file_name().as_encoded_bytes())
+        });
+        let mut directories = Vec::new();
+        for entry in ordered {
             let Ok(file_type) = entry.file_type() else {
                 continue;
             };
@@ -375,7 +383,7 @@ fn fallback_paths(root: &Path, ignore: &IgnoreRules, query: &str) -> Vec<PathBuf
             };
             if file_type.is_dir() {
                 if !ignore.is_ignored(relative, true) {
-                    stack.push(path);
+                    directories.push(path);
                 }
                 continue;
             }
@@ -385,15 +393,30 @@ fn fallback_paths(root: &Path, ignore: &IgnoreRules, query: &str) -> Vec<PathBuf
             if ignore.is_ignored(relative, false) {
                 continue;
             }
-            if file_matches_bounded(&path, &query) {
-                found.push(path);
-                if found.len() >= MAX_MATCHED_PATHS {
-                    return found;
+            if file_matches_bounded(root, ignore, &path, &query) {
+                if let Some(key) = file_key(root, &path) {
+                    retain_smallest(&mut found, key);
                 }
             }
         }
+        stack.extend(directories.into_iter().rev());
     }
     found
+}
+
+fn complete_directory<T>(
+    mut entries: impl Iterator<Item = std::io::Result<T>>,
+    remaining: &mut usize,
+) -> Option<Vec<T>> {
+    let mut ordered = Vec::new();
+    while *remaining > 0 {
+        let Some(entry) = entries.next() else {
+            return Some(ordered);
+        };
+        *remaining -= 1;
+        ordered.push(entry.ok()?);
+    }
+    None
 }
 
 /// Reads at most `MAX_INDEX_FILE_READ_BYTES + 1` bytes of `path` through an
@@ -401,47 +424,16 @@ fn fallback_paths(root: &Path, ignore: &IgnoreRules, query: &str) -> Vec<PathBuf
 /// `needle`. Memory stays bounded even when the file grows concurrently:
 /// the handle's own metadata gates the allocation, and `take()` caps the
 /// read; a file that crosses the limit mid-read is rejected, not parsed.
-fn file_matches_bounded(path: &Path, needle: &str) -> bool {
-    bounded_bytes(path).is_some_and(|bytes| {
+fn file_matches_bounded(root: &Path, ignore: &IgnoreRules, path: &Path, needle: &str) -> bool {
+    read_repository_file(root, ignore, path).is_some_and(|bytes| {
         String::from_utf8_lossy(&bytes)
             .to_ascii_lowercase()
             .contains(needle)
     })
 }
 
-/// Opens `path`, checks the handle's own size, and reads up to one byte past
-/// the read limit. `Some(bytes)` longer than the limit means the file is
-/// oversized (or grew past the limit while reading) and must be rejected by
-/// the caller.
-fn bounded_bytes(path: &Path) -> Option<Vec<u8>> {
-    use std::io::Read;
-    let file = std::fs::File::open(path).ok()?;
-    let metadata = file.metadata().ok()?;
-    if metadata.len() > MAX_INDEX_FILE_READ_BYTES {
-        return None;
-    }
-    // Preallocate at most the limit (+1): the allocation itself stays
-    // bounded even if the file grows between the metadata check and read.
-    let mut buffer = Vec::with_capacity(
-        metadata
-            .len()
-            .saturating_add(1)
-            .min(MAX_INDEX_FILE_READ_BYTES + 1) as usize,
-    );
-    let mut limited = file.take(MAX_INDEX_FILE_READ_BYTES + 1);
-    limited.read_to_end(&mut buffer).ok()?;
-    Some(buffer)
-}
-
-fn first_match_line(path: &Path, query: &str) -> (Option<usize>, Option<String>) {
-    let Some(bytes) = bounded_bytes(path) else {
-        return (None, None);
-    };
-    // One byte past the limit means oversized: no snippet.
-    if bytes.len() as u64 > MAX_INDEX_FILE_READ_BYTES {
-        return (None, None);
-    }
-    let text = String::from_utf8_lossy(&bytes);
+fn first_match_line(bytes: &[u8], query: &str) -> (Option<usize>, Option<String>) {
+    let text = String::from_utf8_lossy(bytes);
     let lower = text.to_ascii_lowercase();
     let needle = query.to_ascii_lowercase();
     if !lower.contains(&needle) {
@@ -466,8 +458,116 @@ fn first_match_line(path: &Path, query: &str) -> (Option<usize>, Option<String>)
 mod tests {
     use super::*;
     use crate::symbols::{extract_symbols, language_for};
+    use std::io::Read;
     use std::path::PathBuf;
     use tempfile::TempDir;
+
+    #[test]
+    fn v02_a_read_that_grows_past_reported_size_is_rejected() {
+        let limit = MAX_INDEX_FILE_READ_BYTES as usize;
+        let reader =
+            std::io::Cursor::new(vec![b'x'; limit]).chain(std::io::Cursor::new(vec![b'!']));
+        assert!(crate::files::read_bounded(reader, limit as u64).is_none());
+    }
+
+    #[test]
+    fn v03_selection_is_bounded_sorted_and_deduplicated_past_one_thousand() {
+        let count = MAX_MATCHED_PATHS + 101;
+        let expected: BTreeSet<_> = (0..MAX_MATCHED_PATHS)
+            .map(|i| format!("src/{i:04}.rs"))
+            .collect();
+        for order in [
+            (0..count).collect::<Vec<_>>(),
+            (0..count).rev().collect(),
+            (0..count).map(|i| (i * 37) % count).collect(),
+        ] {
+            let mut paths = BTreeSet::new();
+            for i in order {
+                for _ in 0..2 {
+                    retain_smallest(&mut paths, format!("src/{i:04}.rs"));
+                    assert!(paths.len() <= MAX_MATCHED_PATHS);
+                }
+            }
+            assert_eq!(paths, expected);
+        }
+    }
+
+    #[test]
+    fn v03_incomplete_directory_is_discarded_within_the_entry_budget() {
+        let budget = crate::config::MAX_INDEX_ENTRIES;
+        for reversed in [false, true] {
+            let mut visited = 0;
+            let mut remaining = budget;
+            let entries = (0..=budget).map(|i| {
+                visited += 1;
+                Ok(if reversed { budget - i } else { i })
+            });
+            assert!(complete_directory(entries, &mut remaining).is_none());
+            assert_eq!(visited, budget);
+            assert_eq!(remaining, 0);
+        }
+        let mut remaining = 2;
+        let entries = [Ok(1), Err(std::io::Error::other("unreadable directory"))];
+        assert!(complete_directory(entries.into_iter(), &mut remaining).is_none());
+    }
+
+    #[test]
+    fn v03_partial_fallback_scope_is_independent_of_creation_order() {
+        let mut results = Vec::new();
+        for reversed in [false, true] {
+            let fixture = TempDir::new().unwrap();
+            let root = fixture.path().canonicalize().unwrap();
+            let mut paths = vec![
+                "a/first.rs",
+                "b/one.rs",
+                "b/two.rs",
+                "b/three.rs",
+                "b/four.rs",
+                "c/last.rs",
+            ];
+            if reversed {
+                paths.reverse();
+            }
+            for path in paths {
+                let path = root.join(path);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, "BUDGET_MATCH").unwrap();
+            }
+            let result =
+                fallback_paths_with_budget(&root, &IgnoreRules::empty(), "BUDGET_MATCH", 8);
+            assert_eq!(result, BTreeSet::from(["a/first.rs".to_string()]));
+            results.push(result);
+        }
+        assert_eq!(results[0], results[1]);
+    }
+
+    #[test]
+    fn v02_matching_and_snippets_share_the_same_eligible_content() {
+        let fixture = TempDir::new().unwrap();
+        let root = fixture.path().canonicalize().unwrap();
+        let path = root.join("text.rs");
+        let tail = "\ncafé 日本語 NEEDLE";
+        let content = format!(
+            "{}{tail}",
+            ".".repeat(MAX_INDEX_FILE_READ_BYTES as usize - tail.len())
+        );
+        std::fs::write(&path, &content).unwrap();
+        let ignore = IgnoreRules::empty();
+        assert!(file_matches_bounded(&root, &ignore, &path, "needle"));
+        let bytes = read_repository_file(&root, &ignore, &path).unwrap();
+        assert_eq!(
+            first_match_line(&bytes, "NEEDLE"),
+            (Some(2), Some("café 日本語 NEEDLE".into()))
+        );
+        let mut writer = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        std::io::Write::write_all(&mut writer, b"!").unwrap();
+        assert!(!file_matches_bounded(&root, &ignore, &path, "needle"));
+        assert!(!accept_candidate(&root, &ignore, &path));
+        assert!(read_repository_file(&root, &ignore, &path).is_none());
+    }
 
     fn index_with(content: std::collections::BTreeMap<&str, &str>) -> ContextIndex {
         let files = content

@@ -140,20 +140,50 @@ long-lived engine re-collects the effective rules on every `refresh()`, so
 deliberately not consulted, so indexing and search are identical on every
 machine.
 
-Boundary and resource rules (ASF-F01/ASF-F04): symbolic links (including
-Windows junctions) are never followed and never read — traversal decides on
-`DirEntry::file_type()`, so external targets, cycles, and reparse points
-cannot pull out-of-repository content into the index or search results, and
-every path returned by the ripgrep subprocess is revalidated against the
-canonical root, the non-symlink rule, the ignore policy, and the read-size
-limit before any byte is read. Ripgrep itself runs under the `factory-proc`
-supervisor (deadline, bounded stdout/stderr capture, NUL-separated output,
-explicit no-match/error exit semantics; a hung, failed, or truncated run
-falls back to the bounded pure-Rust scanner, which caps visited entries at
-`MAX_INDEX_ENTRIES`, matched paths at 1,000, and every file read at
-`MAX_INDEX_FILE_READ_BYTES` through a `take()`d reader). Gitignore parsing
-is Unicode-safe (patterns with multi-byte characters parse and match per
-character, never per byte).
+Boundary and resource rules (ASF-F01/F04, ASF-V01/V02): repository content
+reads share component-by-component, non-following validation starting at the
+canonical root. External candidates must be absolute, have only normal
+repository-relative components (explicit `.` and `..` are rejected), pass
+the ignore policy, and end in an ordinary file. Symlinks at any depth and
+Windows reparse points, including junctions, are rejected independently of
+canonical containment. Canonical filesystem names also pass the ignore
+policy, preventing Windows case aliases from bypassing it. Eligibility is
+checked again around opening; Unix uses `O_NOFOLLOW` and file-identity
+checks, and Windows opens the final reparse point itself and rejects it.
+These checks are not directory-handle-based traversal: adversarial concurrent
+parent replacement remains a documented limitation, not a sandbox guarantee.
+Index fingerprints, link expansion, content matching, snippets, and resolution
+excerpts use the same bounded reader. It reads at most 1 MiB + 1 byte and
+returns content only at or below `MAX_INDEX_FILE_READ_BYTES` (1 MiB), even
+with stale size metadata. Oversized files retain metadata-only index entries.
+
+Content selection (ASF-V03) retains at most 1,000 distinct canonical,
+repository-relative keys in a bounded ordered set throughout discovery,
+then returns the first `min(limit, 1,000)` eligible keys. Ordering is
+case-sensitive UTF-8 lexicographic order with `/` separators and no manual
+case folding. Unix backslashes and newlines remain filename characters;
+non-UTF-8 relative filenames are skipped because the public response uses
+strings. Ripgrep output order does not affect selection. Its supervisor
+retains the 30-second default deadline, 1 MiB stdout / 64 KiB stderr capture,
+NUL-delimited paths, and existing exit semantics. Failed, timed-out,
+truncated, or unterminated output falls back to Rust; exit 1 remains an
+authoritative empty result.
+
+The fallback examines at most `MAX_INDEX_ENTRIES` (50,000) directory entries,
+including ignored entries. Each directory must be completely collected within
+the remaining budget before its entries are sorted by encoded filename;
+ordinary files are processed before descending into sorted child directories.
+If collection consumes the last budget entry, the unproven directory is
+discarded and scanning stops with results from earlier complete directories.
+This conservatively treats even an exactly-at-budget directory as incomplete;
+it never chooses an arbitrary enumeration prefix. Candidate storage remains
+1,000 paths, enumeration/frontier storage is bounded by 50,000 entries, and
+discovery does not stop at the first 1,000 matches. For a stable filesystem and
+fixed ignore rules, selection is deterministic over this explicit scope. A
+budget-limited result is partial, not a global exhaustive ranking; the existing
+search API does not add a partial-result flag. Ripgrep and fallback agree
+where both fully evaluate the same literal-query fixture. Gitignore parsing
+remains Unicode-safe and differential-tested against Git.
 
 ## Evaluation
 

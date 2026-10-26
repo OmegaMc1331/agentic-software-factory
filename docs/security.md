@@ -219,6 +219,18 @@ against the canonical repository root before use. This bounds *Factory-managed
 context*; it is not an OS sandbox — a separately launched coding agent retains
 its own filesystem access.
 
+Candidate validation rejects explicit `.`/`..` components, relative tool output,
+non-file targets, symlinks in every component, and Windows reparse points.
+Canonical names must pass the same ignore rules as the supplied names.
+Repository content reads repeat eligibility checks at opening, reject final
+links through platform no-follow options, check the opened handle, and share a
+1 MiB reader that rejects overflow instead of treating a truncated prefix as
+complete content. This also applies to index fingerprints, link expansion and
+resolution excerpts. It does not provide fully race-proof filesystem isolation:
+parent directories are not traversed through pinned OS handles, so malicious
+concurrent replacements remain outside the guarantee. Static traversal and
+intermediate-link attacks are covered by deterministic regression fixtures.
+
 **Bounded subprocess supervision.** Every Factory-owned `git`/`gh` command runs
 under a shared supervisor with an explicit per-operation deadline, concurrent
 stdout/stderr draining, hard output-capture limits, a null stdin, and

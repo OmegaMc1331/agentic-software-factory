@@ -18,6 +18,7 @@
 
 pub mod config;
 pub mod error;
+mod files;
 pub mod ignore;
 pub mod index;
 pub mod rank;
