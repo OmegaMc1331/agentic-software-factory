@@ -787,7 +787,17 @@ fn v01_unix_newlines_and_backslashes_are_lossless_and_non_utf8_paths_fail_closed
         })
         .collect();
     let non_utf8 = root.join(std::ffi::OsString::from_vec(b"invalid-\xff.rs".to_vec()));
-    write(&non_utf8, "UNIX_NEEDLE SYNTHETIC_PRIVATE_NON_UTF8\n");
+    match std::fs::write(&non_utf8, "UNIX_NEEDLE SYNTHETIC_PRIVATE_NON_UTF8\n") {
+        Ok(()) => {}
+        Err(error) if error.raw_os_error() == Some(libc::EILSEQ) => {
+            eprintln!("filesystem rejects non-UTF-8 names; the raw candidate is still tested");
+        }
+        Err(error) => panic!("cannot create non-UTF-8 fixture: {error}"),
+    }
+    write(
+        &root.join("invalid-\u{fffd}.rs"),
+        "SYNTHETIC_PRIVATE_NON_UTF8_ALIAS\n",
+    );
     candidates.push(non_utf8);
     for fallback in [false, true] {
         let _fake = if fallback {

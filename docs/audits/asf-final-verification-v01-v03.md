@@ -7,11 +7,10 @@ Date: 2026-10-26
 - Base commit: `437050822ddcc7cc0683797ecf2e174fc3b1e1d8`, matching the
   requested reviewed revision. Initial `git status --short` was empty;
   `git rev-parse HEAD` and `git log -10 --oneline` were inspected first.
-- Implementation revision: the commit introducing this report and
-  `crates/factory-context/src/files.rs`, identifiable with
-  `git log -1 --format=%H -- crates/factory-context/src/files.rs`.
+- Implementation revision: `96cd3603c782a92ba5ef1cbe589637c772ccc1fb`.
   Local validation completed before committing. The user subsequently
-  authorized committing and pushing the corrections to GitHub. Tags,
+  authorized committing and pushing the corrections to GitHub; the
+  implementation was pushed to `main`. Tags,
   releases, deployments and changes to production repositories remain outside
   the authorization; none were performed.
 - Native validation: Windows 11 Home, version 10.0.26200, x64;
@@ -84,8 +83,7 @@ Engine search/resolution also reject cached paths replaced by directory links.
   attribute is asserted. Case aliases cannot bypass `*.env` or duplicate hits.
 - A deterministic cached-directory replacement test rejects the link without
   requiring a concurrent race. Ordinary Unicode and space-containing names
-  still work. Unix newline/backslash and non-UTF-8-name tests are platform-gated
-  and await Unix execution.
+  still work. Unix newline/backslash and non-UTF-8-name tests are platform-gated.
 - **Remaining limitation:** parent components are checked by path, not walked
   through pinned directory handles. This is not complete protection against an
   adversary replacing directories during validation/opening. No such guarantee
@@ -213,6 +211,18 @@ back. No `factory-proc`, git/gh supervision, secret-redaction or delivery code
 was changed. Fake-rg environment changes are serialized under the existing
 process lock and now restore any previous override on drop.
 
+The first pushed CI run
+[40380682163](https://github.com/OmegaMc1331/agentic-software-factory/actions/runs/40380682163)
+passed Linux Rust and dashboard checks but exposed a macOS fixture failure:
+creating `invalid-\xff.rs` returned `EILSEQ` before search ran. The follow-up
+fixture accepts only that explicit filesystem rejection; all other creation
+errors still fail. The raw non-UTF-8 candidate is always injected into fake rg,
+newline/backslash assertions always run, and a UTF-8 replacement-name alias
+ensures a lossy path conversion cannot open a different file. Linux continues
+testing a real non-UTF-8 directory entry. No platform test or assertion was
+disabled and production code is unchanged by this follow-up. Final CI is
+pending the follow-up push.
+
 ## Validation
 
 Local logs are retained under ignored `.factory/verification-v01-v03/`.
@@ -278,5 +288,5 @@ Actions endpoint supplied the actual push run and its jobs.
 Release readiness: **VALIDATION INCOMPLETE**. The confirmed V01–V03 corrections
 are implemented; targeted tests, both full Rust test modes, formatting, Clippy,
 and every requested dashboard check pass natively. Final-implementation CI is
-pending the authorized push. Historical CI results are not substituted for
+pending the fixture-correction push. Historical CI results are not substituted for
 validation of this implementation. No release is published.
