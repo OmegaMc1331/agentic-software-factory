@@ -2,7 +2,7 @@
 
 Date: 2026-10-26
 Base commit: `2303535d7c7a0606f955469310d68d14b714f9f6` (the audited revision
-after ASF-N01..N08; all work builds on it).
+after ASF-N01..N08; all work builds on it). Final revision: `2a56af5`.
 Validation platform: Windows 11 x64 local (rustc 1.99.1 / cargo 1.99.1);
 CI (Linux, Windows, macOS) — see §E.
 
@@ -165,11 +165,15 @@ CI (Linux, Windows, macOS) — see §E.
 
 - **Windows**: full local validation — all suites, both test-thread modes,
   symlink/junction fixtures, Job Object descendant cleanup, dashboard
-  gates. CI: pending push at report time; to be recorded on the run.
-- **Linux/macOS**: exercised by the CI matrix (`sh` fixtures, process
-  groups, SIGTERM-ignoring descendant escalation test on Unix; the
-  Windows-only job-object tests cfg-skip with an explicit message where
-  applicable). CI results: pending push at report time.
+  gates — and green CI.
+- **Linux/macOS**: green CI on the final revision (run 40350905987,
+  commit 2a56af5): `sh` fixtures, process groups, held-pipe descendant
+  deadlines, SIGTERM-ignoring descendant escalation, gitignore
+  differential against git. Two CI-only fixture issues were found and
+  fixed on the way: the search-boundary suite now serializes under the
+  env lock (CI runners have no ripgrep, and a concurrently installed fake
+  rg leaked into parallel plain tests as their tool), and the Unix
+  descendant fixture's single quotes prevented $(dirname) substitution.
 
 ## F. Regression status
 
@@ -187,8 +191,11 @@ Local gate totals: `cargo fmt --all -- --check` PASS;
 dashboard format/lint/typecheck PASS, tests 303/303, build PASS. One
 environmental hiccup (MSVC LNK1140 PDB-size limit from a 32 GB accumulated
 target dir) was resolved by deleting stale PDBs — not a code failure.
-Not executed: GitHub Actions on the final commit (pending push);
-release/installer jobs unchanged in configuration.
+GitHub Actions: PASS on the final revision — run 40350905987
+(commit 2a56af5): Rust on ubuntu/windows/macos, Dashboard, installer
+end-to-end, embedded-dashboard smoke, and release-checksum jobs all
+green (after intermediate runs 40342933556 and 40348063974 surfaced the
+two fixture issues above).
 
 ## G. Remaining risks
 
