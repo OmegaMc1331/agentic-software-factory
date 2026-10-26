@@ -7,7 +7,11 @@ Date: 2026-10-26
 - Base commit: `437050822ddcc7cc0683797ecf2e174fc3b1e1d8`, matching the
   requested reviewed revision. Initial `git status --short` was empty;
   `git rev-parse HEAD` and `git log -10 --oneline` were inspected first.
-- Implementation revision: `96cd3603c782a92ba5ef1cbe589637c772ccc1fb`.
+- Final tested implementation: `5e2c4871fc9bea08d0ef8381acd819a6c6e41c4e`.
+  Production changes were introduced by
+  `96cd3603c782a92ba5ef1cbe589637c772ccc1fb`; the final implementation adds the
+  macOS fixture correction described below. Subsequent audit-only commits
+  record validation evidence without changing Rust or dashboard code.
   Local validation completed before committing. The user subsequently
   authorized committing and pushing the corrections to GitHub; the
   implementation was pushed to `main`. Tags,
@@ -83,7 +87,8 @@ Engine search/resolution also reject cached paths replaced by directory links.
   attribute is asserted. Case aliases cannot bypass `*.env` or duplicate hits.
 - A deterministic cached-directory replacement test rejects the link without
   requiring a concurrent race. Ordinary Unicode and space-containing names
-  still work. Unix newline/backslash and non-UTF-8-name tests are platform-gated.
+  still work. Unix newline/backslash and non-UTF-8-name tests passed on Linux
+  and macOS in the final implementation CI run.
 - **Remaining limitation:** parent components are checked by path, not walked
   through pinned directory handles. This is not complete protection against an
   adversary replacing directories during validation/opening. No such guarantee
@@ -220,8 +225,9 @@ errors still fail. The raw non-UTF-8 candidate is always injected into fake rg,
 newline/backslash assertions always run, and a UTF-8 replacement-name alias
 ensures a lossy path conversion cannot open a different file. Linux continues
 testing a real non-UTF-8 directory entry. No platform test or assertion was
-disabled and production code is unchanged by this follow-up. Final CI is
-pending the follow-up push.
+disabled and production code is unchanged by this follow-up. The corrected
+implementation passed all nine jobs in
+[40381494482](https://github.com/OmegaMc1331/agentic-software-factory/actions/runs/40381494482).
 
 ## Validation
 
@@ -251,8 +257,8 @@ boundary run confirmed three existing fixtures return early because this Windows
 account cannot create file symlinks: `a_symlink_to_an_external_file_exposes_nothing`,
 `e_internal_symlinks_are_not_followed_either`, and
 `f_broken_symlinks_are_ignored_without_error`. Those leaf-link scenarios were
-not exercised natively and await final-patch Unix/privileged CI; they are not
-presented as local security evidence. The new directory-link and junction
+not exercised natively and are not presented as local security evidence.
+The corresponding Unix suites passed on Linux and macOS CI. The new directory-link and junction
 regressions assert creation and executed successfully without elevation.
 The timing diagnostic was not run because no benchmark is required here.
 
@@ -272,21 +278,27 @@ tests and the embedded-dashboard smoke job.
 Read-only GitHub inspection verified base-commit CI run
 [40353722668](https://github.com/OmegaMc1331/agentic-software-factory/actions/runs/40353722668):
 all nine jobs completed successfully, including all three Rust platforms and
-all preserved integration jobs. That run validates the base, **not this local
-patch**. The PR-only workflow-run tool returned no runs; the general read-only
-Actions endpoint supplied the actual push run and its jobs.
+all preserved integration jobs. That run validates the base only.
 
-| Platform/job | Base run | V01–V03 implementation |
+Final implementation CI run
+[40381494482](https://github.com/OmegaMc1331/agentic-software-factory/actions/runs/40381494482)
+completed with conclusion `success` for
+`5e2c4871fc9bea08d0ef8381acd819a6c6e41c4e`. All nine job conclusions were checked
+through GitHub's read-only Actions API after completion.
+
+| Platform/job | Base run | Final implementation run |
 | --- | --- | --- |
-| Windows Rust CI | PASS | Pending; native local gates listed above |
-| Linux Rust CI | PASS | Pending; no local Linux target/runtime execution |
-| macOS Rust CI | PASS | Pending; no local macOS execution |
-| Dashboard CI | PASS | Pending; local checks pass |
-| Installer end-to-end / embedded dashboard | PASS | Not executed locally; pending final-patch CI |
-| Release checksums, three platforms | PASS | Native Windows helper tests pass with the two documented utility skips; final-patch CI pending |
+| Windows Rust CI | PASS | PASS: formatting, Clippy and full workspace tests |
+| Linux Rust CI | PASS | PASS: formatting, Clippy and full workspace tests |
+| macOS Rust CI | PASS | PASS: formatting, Clippy and full workspace tests, including the corrected Unix fixture |
+| Dashboard CI | PASS | PASS: format, lint, typecheck, tests and build |
+| Installer end-to-end | PASS | PASS |
+| Embedded dashboard smoke test | PASS | PASS: release build, embedded API tests and standalone binary smoke test |
+| Release checksums, three platforms | PASS | PASS on Linux, Windows and macOS |
 
-Release readiness: **VALIDATION INCOMPLETE**. The confirmed V01–V03 corrections
-are implemented; targeted tests, both full Rust test modes, formatting, Clippy,
-and every requested dashboard check pass natively. Final-implementation CI is
-pending the fixture-correction push. Historical CI results are not substituted for
-validation of this implementation. No release is published.
+Release readiness: **READY FOR RELEASE CANDIDATE**. The confirmed V01–V03
+corrections and their security/correctness regressions pass, prior regression
+suites remain green, all requested local gates pass, and the final tested
+implementation passed all nine CI jobs. The documented filesystem race and
+bounded-scope limitations remain unchanged; no blocking defect is known.
+This is a recommendation only. No tag, GitHub release or deployment was created.
