@@ -184,7 +184,7 @@ impl FakeGh {
                  issue) cat '{issue}' ;;\n\
                  pr)\n  case \"$2\" in\n\
                  list) if [ -f '{list_fail}' ]; then echo 'could not resolve host api.github.com network' >&2; exit 1; fi; cat '{pr_list}' ;;\n\
-                 create) if [ -f '{create_fail}' ]; then echo 'gh: something exploded' >&2; exit 1; fi; echo create >> '{create_log}'; if [ '{hang_create}' = 'yes' ]; then sleep 300; fi; prev=; for a in \"$@\"; do if [ \"$prev\" = '--body-file' ]; then cp \"$a\" '{body_capture}'; fi; prev=$a; done; echo https://github.com/octocat/example/pull/58 ;;\n\
+                 create) if [ -f '{create_fail}' ]; then echo 'gh: something exploded' >&2; exit 1; fi; echo create >> '{create_log}'; if [ '{hang_create}' = 'yes' ]; then sleep 300; fi; prev=; for a in \"$@\"; do if [ \"$prev\" = '--body-file' ] && [ '{body_capture}' != '/dev/null' ]; then cp \"$a\" '{body_capture}'; fi; prev=$a; done; echo https://github.com/octocat/example/pull/58 ;;\n\
                  *) echo unknown >&2; exit 1 ;;\n  esac ;;\n\
                  *) echo unknown gh subcommand >&2; exit 1 ;;\nesac\n",
                 issue = issue_file.display(),
