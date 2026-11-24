@@ -242,6 +242,8 @@ pub enum AgentError {
     InvalidInvocation(String, String),
     #[error("Agent `{0}` appears to require an interactive terminal. Configure a non-interactive workflow invocation for this agent.")]
     RequiresTerminal(String),
+    #[error("HOST_SANDBOX_RESTRICTED: owned process-tree supervision is unavailable for {0}")]
+    SupervisionUnavailable(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -257,6 +259,7 @@ impl AgentError {
                 | AgentError::InteractiveUnavailable(_)
                 | AgentError::InvalidInvocation(_, _)
                 | AgentError::RequiresTerminal(_)
+                | AgentError::SupervisionUnavailable(_)
         )
     }
 }
@@ -265,6 +268,7 @@ impl AgentError {
 pub struct CommandAgent {
     config: AgentConfig,
     output_limit: usize,
+    timeout: Option<Duration>,
 }
 
 impl CommandAgent {
@@ -272,11 +276,17 @@ impl CommandAgent {
         CommandAgent {
             config,
             output_limit: DEFAULT_AGENT_OUTPUT_LIMIT_BYTES,
+            timeout: None,
         }
     }
 
     pub fn with_output_limit(mut self, limit: usize) -> Self {
         self.output_limit = limit.max(1);
+        self
+    }
+
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
         self
     }
 
@@ -493,10 +503,24 @@ impl CommandAgent {
         &self,
         request: &AgentRequest,
         cancel: &AtomicBool,
+        on_output: F,
+    ) -> Result<AgentResult, AgentError>
+    where
+        F: FnMut(OutputStream, &str),
+    {
+        self.run_supervised(request, cancel, |_| Ok(()), on_output)
+    }
+
+    pub fn run_supervised<F, S>(
+        &self,
+        request: &AgentRequest,
+        cancel: &AtomicBool,
+        mut on_start: S,
         mut on_output: F,
     ) -> Result<AgentResult, AgentError>
     where
         F: FnMut(OutputStream, &str),
+        S: FnMut(&AgentOutputMetadata) -> Result<(), AgentError>,
     {
         let invocation = self.automated_invocation(request)?;
         let launch = invocation.process_launch()?;
@@ -524,9 +548,28 @@ impl CommandAgent {
             cmd.env(key, value);
         }
         let started = Instant::now();
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| spawn_error(&self.config.command, &invocation.working_dir, &e))?;
+        let mut child = OwnedAgentChild(
+            cmd.spawn()
+                .map_err(|e| spawn_error(&self.config.command, &invocation.working_dir, &e))?,
+        );
+        let process_id = child.id();
+        let process_started = unix_millis();
+        #[cfg(windows)]
+        let process_job = factory_proc::windows_job::JobGuard::assign(&child);
+        #[cfg(windows)]
+        let tree_supervised = process_job.is_some();
+        #[cfg(unix)]
+        let tree_supervised = true;
+        let initial_metadata = AgentOutputMetadata {
+            process_id: Some(process_id),
+            process_started_unix_ms: Some(process_started),
+            process_tree_supervised: tree_supervised,
+            ..AgentOutputMetadata::default()
+        };
+        if let Err(error) = on_start(&initial_metadata) {
+            terminate_and_reap(&mut child);
+            return Err(error);
+        }
         let stdin = child.stdin.take();
         let stdout = match child.stdout.take() {
             Some(stdout) => stdout,
@@ -600,17 +643,40 @@ impl CommandAgent {
                     break;
                 }
             }
-            if cancel.load(std::sync::atomic::Ordering::Relaxed) && !was_cancelled {
+            if (cancel.load(std::sync::atomic::Ordering::Relaxed)
+                || self.timeout.is_some_and(|limit| started.elapsed() >= limit))
+                && !was_cancelled
+            {
                 was_cancelled = true;
                 terminate_process_tree(&mut child);
             }
             if let Some(status) = child.try_wait()? {
+                #[cfg(windows)]
+                if let Some(job) = &process_job {
+                    job.terminate();
+                }
+                #[cfg(unix)]
+                {
+                    let _ = Command::new("kill")
+                        .args(["-KILL", "--", &format!("-{process_id}")])
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status();
+                }
                 break status;
             }
             if !received {
                 std::thread::sleep(Duration::from_millis(40));
             }
         };
+        let process_finished = unix_millis();
+        #[cfg(windows)]
+        let cleanup_confirmed = process_job
+            .as_ref()
+            .is_some_and(|job| job.wait_empty(Duration::from_secs(5)));
+        #[cfg(unix)]
+        let cleanup_confirmed = factory_proc::owned_process_absent(process_id);
         while let Ok((stream, chunk)) = receiver.recv() {
             let text = match stream {
                 OutputStream::Stdout => stdout_decoder.push(&chunk),
@@ -656,8 +722,14 @@ impl CommandAgent {
         drop(handle_text);
         let stdout_capture = stdout_capture.finish();
         let stderr_capture = stderr_capture.finish();
-        let (stdout_text, stderr_text, output_metadata) =
+        let (stdout_text, stderr_text, mut output_metadata) =
             stdout_capture.into_streams(stderr_capture);
+        output_metadata.process_id = Some(process_id);
+        output_metadata.process_started_unix_ms = Some(process_started);
+        output_metadata.process_finished_unix_ms = Some(process_finished);
+        output_metadata.process_tree_supervised = tree_supervised;
+        output_metadata.process_tree_cleanup_confirmed = cleanup_confirmed;
+        output_metadata.process_cleanup_observed_unix_ms = cleanup_confirmed.then(unix_millis);
         let duration = started.elapsed();
         if !was_cancelled {
             if let Some(err) = stdout_error.or(stderr_error) {
@@ -733,7 +805,7 @@ fn spawn_error(command: &str, working_dir: &Path, error: &std::io::Error) -> Age
     let invalid_directory = matches!(error.raw_os_error(), Some(267));
     let reason = match error.kind() {
         std::io::ErrorKind::PermissionDenied => {
-            format!("permission denied while starting the process in `{directory}` ({error})")
+            format!("OS_ACCESS_DENIED: permission denied while starting the process in `{directory}` ({error})")
         }
         std::io::ErrorKind::NotFound => {
             format!("the executable or working directory `{directory}` was not found ({error})")
@@ -760,6 +832,35 @@ fn terminal_required(stdout: &str, stderr: &str) -> bool {
     .any(|message| output.contains(message))
 }
 
+struct OwnedAgentChild(std::process::Child);
+impl std::ops::Deref for OwnedAgentChild {
+    type Target = std::process::Child;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for OwnedAgentChild {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+impl Drop for OwnedAgentChild {
+    fn drop(&mut self) {
+        if !matches!(self.0.try_wait(), Ok(Some(_))) {
+            terminate_and_reap(&mut self.0);
+        }
+    }
+}
+
+fn unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
 fn terminate_and_reap(child: &mut std::process::Child) {
     terminate_process_tree(child);
     let _ = child.wait();
@@ -778,7 +879,7 @@ fn terminate_process_tree(child: &mut std::process::Child) {
     #[cfg(unix)]
     {
         let _ = Command::new("kill")
-            .args(["-TERM", "--", &format!("-{}", child.id())])
+            .args(["-KILL", "--", &format!("-{}", child.id())])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -899,6 +1000,31 @@ mod tests {
         let mut cfg = AgentConfig::new("test", command);
         cfg.args = args;
         CommandAgent::new(cfg)
+    }
+
+    #[test]
+    fn process_identity_is_observed_before_dispatching_mission_input() {
+        let dir = TempDir::new().unwrap();
+        let mut observed = None;
+        let result = agent("echo")
+            .run_supervised(
+                &AgentRequest::new("mission", dir.path()),
+                &AtomicBool::new(false),
+                |metadata| {
+                    observed = Some(metadata.clone());
+                    Ok(())
+                },
+                |_, _| {},
+            )
+            .unwrap();
+        let initial = observed.unwrap();
+        assert!(initial.process_id.is_some_and(|pid| pid > 0));
+        assert_eq!(initial.process_id, result.output_metadata.process_id);
+        assert_eq!(
+            initial.process_started_unix_ms,
+            result.output_metadata.process_started_unix_ms
+        );
+        assert!(result.output_metadata.process_finished_unix_ms >= initial.process_started_unix_ms);
     }
 
     #[test]

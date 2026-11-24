@@ -1,0 +1,29 @@
+[package]
+name = "factory-files"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cap-std = "=4.0.3"
+factory-proc = { workspace = true }
+factory-git = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+sha2 = "0.10"
+rand = "0.8"
+regex = "1"
+ignore = "0.4"
+rusqlite.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+filetime = "0.2"

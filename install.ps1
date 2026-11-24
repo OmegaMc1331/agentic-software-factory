@@ -20,6 +20,21 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
+function Remove-AsfTemporaryDirectory {
+  param([string]$Directory)
+  $absolute = [IO.Path]::GetFullPath($Directory)
+  $parent = [IO.Path]::GetDirectoryName($absolute).TrimEnd([IO.Path]::DirectorySeparatorChar)
+  $expected = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd([IO.Path]::DirectorySeparatorChar)
+  if ($parent -ne $expected -or [IO.Path]::GetFileName($absolute) -notmatch '^factory-install-[a-f0-9]{32}$') {
+    throw 'Temporary cleanup target is outside the owned installer directory.'
+  }
+  if (Test-Path -LiteralPath $absolute) {
+    $item = Get-Item -LiteralPath $absolute -Force
+    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'Temporary cleanup target is a reparse point.' }
+    Remove-Item -LiteralPath $absolute -Recurse -Force
+  }
+}
+
 function Get-AsfInstallDir {
   if ($env:FACTORY_INSTALL_DIR) {
     return [IO.Path]::GetFullPath($env:FACTORY_INSTALL_DIR)
@@ -99,19 +114,19 @@ Invoke-WebRequest -Uri "$base/$asset" -OutFile $zipPath
 try {
   Invoke-WebRequest -Uri "$base/$asset.sha256" -OutFile $shaPath
 } catch {
-  Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+  Remove-AsfTemporaryDirectory $tmp
   throw 'No published checksum for this release. Refusing to install an unverified binary.'
 }
 if (-not (Test-Path $shaPath)) {
-  Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+  Remove-AsfTemporaryDirectory $tmp
   throw 'No published checksum for this release. Refusing to install an unverified binary.'
 }
 if (-not (Test-Path $zipPath)) {
-  Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+  Remove-AsfTemporaryDirectory $tmp
   throw 'The archive download is missing. Aborting.'
 }
 if ((Get-Item $zipPath).Length -eq 0) {
-  Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+  Remove-AsfTemporaryDirectory $tmp
   throw 'The archive download is empty. Aborting.'
 }
 
@@ -139,7 +154,7 @@ try {
     throw "Checksum mismatch for $asset. Expected $expected, got $actual. Aborting."
   }
 } catch {
-  Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+  Remove-AsfTemporaryDirectory $tmp
   throw
 }
 Write-Host 'Checksum OK.'
@@ -148,7 +163,7 @@ Write-Host 'Checksum OK.'
 Expand-Archive -Path $zipPath -DestinationPath $tmp -Force
 $extracted = Join-Path $tmp 'factory.exe'
 if (-not (Test-Path $extracted)) {
-  Remove-Item -Recurse -Force $tmp
+  Remove-AsfTemporaryDirectory $tmp
   throw 'The archive does not contain factory.exe.'
 }
 New-Item -ItemType Directory -Path $installDir -Force | Out-Null
@@ -167,7 +182,7 @@ if (-not $env:FACTORY_INSTALL_DIR) {
 }
 
 # 7. clean up
-Remove-Item -Recurse -Force $tmp
+Remove-AsfTemporaryDirectory $tmp
 
 # 8. done
 Write-Host ''

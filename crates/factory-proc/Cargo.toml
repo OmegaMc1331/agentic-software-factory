@@ -11,3 +11,6 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Securit
 
 [dev-dependencies]
 tempfile = "3"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

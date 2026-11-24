@@ -4,6 +4,11 @@ import react from "@vitejs/plugin-react";
 
 export default defineConfig({
   plugins: [react()],
+  build: {
+    rollupOptions: {
+      input: { dashboard: "index.html", projects: "projects.html", workspace: "workspace.html" },
+    },
+  },
   server: {
     proxy: {
       "/api": {
@@ -16,5 +21,6 @@ export default defineConfig({
   test: {
     environment: "jsdom",
     globals: true,
+    maxWorkers: 2,
   },
 });

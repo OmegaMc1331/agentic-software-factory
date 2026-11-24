@@ -117,10 +117,14 @@ command = "legacy-agent"
 fn legacy_custom_configuration_keeps_stdin_transport() {
     let entry = build_entry("my-coding-agent", vec!["--batch".into()]);
     let config = Config {
+        profile_bindings: Default::default(),
+        profile_policy_snapshots: Default::default(),
         agents: BTreeMap::from([("custom".into(), entry)]),
         roles: BTreeMap::new(),
         role_assignments: Vec::new(),
         runtime: Default::default(),
+        scheduler: Default::default(),
+        integration_checks: Vec::new(),
         routing: Default::default(),
         context: Default::default(),
         policies: Default::default(),
@@ -508,6 +512,8 @@ fn init_does_not_require_agents_to_be_installed() {
 fn write_atomic_round_trips_configuration() {
     let dir = TempDir::new().unwrap();
     let config = Config {
+        profile_bindings: Default::default(),
+        profile_policy_snapshots: Default::default(),
         agents: BTreeMap::from([(
             "codex".to_string(),
             build_entry(
@@ -527,6 +533,8 @@ fn write_atomic_round_trips_configuration() {
             preferred: true,
         }],
         runtime: Default::default(),
+        scheduler: Default::default(),
+        integration_checks: Vec::new(),
         routing: Default::default(),
         context: Default::default(),
         policies: Default::default(),
@@ -549,6 +557,8 @@ fn write_atomic_round_trips_configuration() {
 #[test]
 fn validation_rejects_unknown_role_agent() {
     let config = Config {
+        profile_bindings: Default::default(),
+        profile_policy_snapshots: Default::default(),
         agents: BTreeMap::from([("codex".into(), build_entry("codex", vec![]))]),
         roles: BTreeMap::new(),
         role_assignments: vec![RoleAssignment {
@@ -557,6 +567,8 @@ fn validation_rejects_unknown_role_agent() {
             preferred: false,
         }],
         runtime: Default::default(),
+        scheduler: Default::default(),
+        integration_checks: Vec::new(),
         routing: Default::default(),
         context: Default::default(),
         policies: Default::default(),
@@ -569,10 +581,14 @@ fn validation_rejects_unknown_role_agent() {
 #[test]
 fn validation_rejects_empty_commands_and_invalid_names() {
     let config = Config {
+        profile_bindings: Default::default(),
+        profile_policy_snapshots: Default::default(),
         agents: BTreeMap::from([("bad name".into(), build_entry("", vec![]))]),
         roles: BTreeMap::new(),
         role_assignments: Vec::new(),
         runtime: Default::default(),
+        scheduler: Default::default(),
+        integration_checks: Vec::new(),
         routing: Default::default(),
         context: Default::default(),
         policies: Default::default(),
@@ -582,10 +598,14 @@ fn validation_rejects_empty_commands_and_invalid_names() {
     assert!(err.contains("invalid agent name"));
 
     let config = Config {
+        profile_bindings: Default::default(),
+        profile_policy_snapshots: Default::default(),
         agents: BTreeMap::from([("codex".into(), build_entry("", vec![]))]),
         roles: BTreeMap::new(),
         role_assignments: Vec::new(),
         runtime: Default::default(),
+        scheduler: Default::default(),
+        integration_checks: Vec::new(),
         routing: Default::default(),
         context: Default::default(),
         policies: Default::default(),

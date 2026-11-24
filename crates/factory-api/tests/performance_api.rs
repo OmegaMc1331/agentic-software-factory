@@ -98,6 +98,7 @@ fn seed_history(state: &factory_api::ApiState) {
     })
     .unwrap();
     let evidence = TaskEvidence {
+        git_snapshot: None,
         changed_files: vec!["src/lib.rs".into()],
         diff_summary: "1 file changed".into(),
         commit_sha: None,

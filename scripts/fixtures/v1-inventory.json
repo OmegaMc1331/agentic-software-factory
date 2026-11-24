@@ -1,0 +1,2256 @@
+{
+  "schema_version": 1,
+  "reference_commit": "580eeaa29117edc7c2a6255341483dc798890f11",
+  "routes": [
+    {
+      "path": "/api/*rest",
+      "methods": [
+        "GET"
+      ]
+    },
+    {
+      "path": "/api/agents",
+      "methods": [
+        "GET"
+      ]
+    },
+    {
+      "path": "/api/agents/:agent/sessions",
+      "methods": [
+        "GET",
+        "POST"
+      ]
+    },
+    {
+      "path": "/api/agents/:agent/tools",
+      "methods": [
+        "GET"
+      ]
+    },
+    {
+      "path": "/api/auth/session",
+      "methods": [
+        "POST"
+      ]
+    },
+    {
+      "path": "/api/config",
+      "methods": [
+        "GET",
+        "PUT"
+      ]
+    },
+    {
+      "path": "/api/github/status",
+      "methods": [
+        "GET"
+      ]
+    },
+    {
+      "path": "/api/graph",
+      "methods": [
+        "GET"
+      ]
+    },
+    {
+      "path": "/api/graph/workspace",
+      "methods": [
+        "GET",
+        "PUT"
+      ]
+    },
+    {
+      "path": "/api/health",
+      "methods": [
+        "GET"
+      ]
+    },
+    {
+      "path": "/api/mcp/invocations",
+      "methods": [
+        "GET"
+      ]
+    },
+    {
+      "path": "/api/mcp/metrics",
+      "methods": [
+        "GET"
+      ]
+    },
+    {
+      "path": "/api/mcp/servers",
+      "methods": [
+        "GET",
+        "POST"
+      ]
+    },
+    {
+      "path": "/api/mcp/servers/:id",
+      "methods": [
+        "DELETE",
+        "PUT"
+      ]
+    },
+    {
+      "path": "/api/mcp/servers/:id/test",
+      "methods": [
+        "POST"
+      ]
+    },
+    {
+      "path": "/api/mcp/servers/:id/tools",
+      "methods": [
+        "GET"
+      ]
+    },
+    {
+      "path": "/api/performance/agents",
+      "methods": [
+        "GET"
+      ]
+    },
+    {
+      "path": "/api/performance/agents/:agent",
+      "methods": [
+        "GET"
+      ]
+    },
+    {
+      "path": "/api/recipes",
+      "methods": [
+        "GET",
+        "POST"
+      ]
+    },
+    {
+      "path": "/api/recipes/:id",
+      "methods": [
+        "DELETE",
+        "PUT"
+      ]
+    },
+    {
+      "path": "/api/roles",
+      "methods": [
+        "GET",
+        "POST"
+      ]
+    },
+    {
+      "path": "/api/roles/:id",
+      "methods": [
+        "DELETE",
+        "PUT"
+      ]
+    },
+    {
+      "path": "/api/roles/:id/assignments",
+      "methods": [
+        "POST"
+      ]
+    },
+    {
+      "path": "/api/roles/:id/assignments/:agent",
+      "methods": [
+        "DELETE"
+      ]
+    },
+    {
+      "path": "/api/roles/:id/policy",
+      "methods": [
+        "PUT"
+      ]
+    },
+    {
+      "path": "/api/roles/:id/preferred",
+      "methods": [
+        "PUT"
+      ]
+    },
+    {
+      "path": "/api/roles/:id/tools",
+      "methods": [
+        "GET"
+      ]
+    },
+    {
+      "path": "/api/runs",
+      "methods": [
+        "GET",
+        "POST"
+      ]
+    },
+    {
+      "path": "/api/runs/:id",
+      "methods": [
+        "GET"
+      ]
+    },
+    {
+      "path": "/api/runs/:id/artifacts",
+      "methods": [
+        "GET"
+      ]
+    },
+    {
+      "path": "/api/runs/:id/cancel",
+      "methods": [
+        "POST"
+      ]
+    },
+    {
+      "path": "/api/runs/:id/delivery",
+      "methods": [
+        "GET"
+      ]
+    },
+    {
+      "path": "/api/runs/:id/delivery/reconcile",
+      "methods": [
+        "POST"
+      ]
+    },
+    {
+      "path": "/api/runs/:id/pr-preview",
+      "methods": [
+        "GET"
+      ]
+    },
+    {
+      "path": "/api/runs/:id/pull-request",
+      "methods": [
+        "POST"
+      ]
+    },
+    {
+      "path": "/api/runs/:id/recipe",
+      "methods": [
+        "POST"
+      ]
+    },
+    {
+      "path": "/api/runs/:id/start",
+      "methods": [
+        "POST"
+      ]
+    },
+    {
+      "path": "/api/runs/:id/team",
+      "methods": [
+        "PUT"
+      ]
+    },
+    {
+      "path": "/api/runs/from-issue",
+      "methods": [
+        "POST"
+      ]
+    },
+    {
+      "path": "/api/sessions/:id",
+      "methods": [
+        "DELETE",
+        "GET"
+      ]
+    },
+    {
+      "path": "/api/sessions/:id/stream",
+      "methods": [
+        "GET"
+      ]
+    },
+    {
+      "path": "/api/sessions/:id/terminal",
+      "methods": [
+        "GET"
+      ]
+    },
+    {
+      "path": "/api/tasks/:id/artifacts",
+      "methods": [
+        "GET"
+      ]
+    },
+    {
+      "path": "/api/tasks/:id/retry",
+      "methods": [
+        "POST"
+      ]
+    },
+    {
+      "path": "/api/tasks/:id/routing",
+      "methods": [
+        "PUT"
+      ]
+    },
+    {
+      "path": "/api/tasks/:id/routing-decisions",
+      "methods": [
+        "GET"
+      ]
+    },
+    {
+      "path": "/api/tasks/:id/routing-preview",
+      "methods": [
+        "GET"
+      ]
+    }
+  ],
+  "explicit_method_path_count": 58,
+  "implicit_http_behavior": "Axum GET also accepts HEAD; /api/*rest is the explicit 404 fallback; dashboard assets use a fallback service.",
+  "migration_constants": [
+    {
+      "version": 1,
+      "name": "V1_SCHEMA",
+      "source_sha256": "12a3a76d9b7792a4c259637694ab532be464bbe3cc8d03eb091b3d218ac232f6"
+    },
+    {
+      "version": 2,
+      "name": "V2_SCHEMA",
+      "source_sha256": "cd38b1fed4ba8b1dff70746a074ac3522aa529d6ab61deabaa85191e38fc48d6"
+    },
+    {
+      "version": 3,
+      "name": "V3_SCHEMA",
+      "source_sha256": "7486fe3d0589875e868deed1cb211b71047ce8a8b640ecd01f465a2237bf5901"
+    },
+    {
+      "version": 4,
+      "name": "V4_SCHEMA",
+      "source_sha256": "6fa5d205defae6eaf9dbf050b461ff8fdf6a5268468f0d332b9ccd5ec3cc338e"
+    },
+    {
+      "version": 5,
+      "name": "V5_SCHEMA",
+      "source_sha256": "9780eefcbcd40dde0e2f798ed9123d9a9c35a64393a59b74eb730c965a841639"
+    },
+    {
+      "version": 6,
+      "name": "V6_SCHEMA",
+      "source_sha256": "6d6203b33929931a1cdb5c11f82399e54e64753807305ff813876e53c4c4dfa9"
+    },
+    {
+      "version": 7,
+      "name": "V7_SCHEMA",
+      "source_sha256": "f165230009680759cff65265049c8bf8566ad2b4b982de2b58f5a9994fa0f225"
+    },
+    {
+      "version": 8,
+      "name": "V8_SCHEMA",
+      "source_sha256": "16f55f8a857830a9347974d447a625dca67a8ee85cf3145c43135265314f4f7d"
+    },
+    {
+      "version": 9,
+      "name": "V9_SCHEMA",
+      "source_sha256": "8dbbf3b3a229db1ca765e79343fc9d7bee09dcab4187cfae43c1275b676f275e"
+    },
+    {
+      "version": 10,
+      "name": "V10_SCHEMA",
+      "source_sha256": "ed198509d938b93372462a436cd87e0a446e49bc421efc7384f141c6ca6895f1"
+    },
+    {
+      "version": 11,
+      "name": "V11_SCHEMA",
+      "source_sha256": "7a96cb3bd5ac9ac10a4ba2e5f8ba94f8443c86485201580d33f646cb81681487"
+    },
+    {
+      "version": 12,
+      "name": "V12_SCHEMA",
+      "source_sha256": "f2ce2dd65ef021aae88e6619ef91a3072d2847502950a69c3d8e88fefad4bbd0"
+    },
+    {
+      "version": 13,
+      "name": "V13_SCHEMA",
+      "source_sha256": "dbd702d4d30f18e7a68588166ea3a19c2e3d1bfcb5d3d7cecd1354f409098590"
+    },
+    {
+      "version": 14,
+      "name": "V14_SCHEMA",
+      "source_sha256": "993c6fa1c9d3943e6f30b149c346fa523feb8e3fcbe3658d6d3747f8ab273748"
+    },
+    {
+      "version": 15,
+      "name": "V15_SCHEMA",
+      "source_sha256": "ea0f012857f9f51238f13f633c07f6e020bc1e3d504ffbafbe40a4254075a387"
+    },
+    {
+      "version": 16,
+      "name": "V16_SCHEMA",
+      "source_sha256": "b1f3f5857c9ea34b0d3e0d82b1146b074b26c9bcebe6d102ebd24179b95d4d5c"
+    },
+    {
+      "version": 17,
+      "name": "V17_SCHEMA",
+      "source_sha256": "2bf915a725168aba8aa3c96eb1944f4d0e235931f0ef838d745c20d58be6d7fc"
+    },
+    {
+      "version": 18,
+      "name": "V18_SCHEMA",
+      "source_sha256": "e25ad50d7a29b4f14ab73df89604486451118cf8889b2f2c23903348ddbe4f79"
+    }
+  ],
+  "fixture_sha256": "50a572ef2b458ac243cc0aec6a15e478d1e021224eb80dae689d2e1abcf3eefe",
+  "fixture_database": {
+    "migrations": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18
+    ],
+    "tables": [
+      {
+        "name": "agent_sessions",
+        "sql": "CREATE TABLE agent_sessions (\n    id INTEGER PRIMARY KEY AUTOINCREMENT,\n    run_id INTEGER REFERENCES runs(id) ON DELETE CASCADE,\n    task_id INTEGER REFERENCES tasks(id) ON DELETE CASCADE,\n    role TEXT NOT NULL,\n    agent TEXT NOT NULL,\n    command TEXT NOT NULL,\n    status TEXT NOT NULL,\n    started_at TEXT NOT NULL,\n    finished_at TEXT,\n    exit_code INTEGER,\n    duration_ms INTEGER,\n    stdout TEXT,\n    stderr TEXT\n, attempt_id INTEGER REFERENCES task_attempts(id) ON DELETE SET NULL, mode TEXT NOT NULL DEFAULT 'automated', operation TEXT, policy_audit TEXT, output_meta TEXT)",
+        "columns": [
+          {
+            "id": 0,
+            "name": "id",
+            "type": "INTEGER",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 1
+          },
+          {
+            "id": 1,
+            "name": "run_id",
+            "type": "INTEGER",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 2,
+            "name": "task_id",
+            "type": "INTEGER",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 3,
+            "name": "role",
+            "type": "TEXT",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 4,
+            "name": "agent",
+            "type": "TEXT",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 5,
+            "name": "command",
+            "type": "TEXT",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 6,
+            "name": "status",
+            "type": "TEXT",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 7,
+            "name": "started_at",
+            "type": "TEXT",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 8,
+            "name": "finished_at",
+            "type": "TEXT",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 9,
+            "name": "exit_code",
+            "type": "INTEGER",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 10,
+            "name": "duration_ms",
+            "type": "INTEGER",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 11,
+            "name": "stdout",
+            "type": "TEXT",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 12,
+            "name": "stderr",
+            "type": "TEXT",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 13,
+            "name": "attempt_id",
+            "type": "INTEGER",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 14,
+            "name": "mode",
+            "type": "TEXT",
+            "not_null": 1,
+            "default": "'automated'",
+            "primary_key": 0
+          },
+          {
+            "id": 15,
+            "name": "operation",
+            "type": "TEXT",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 16,
+            "name": "policy_audit",
+            "type": "TEXT",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 17,
+            "name": "output_meta",
+            "type": "TEXT",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 0
+          }
+        ],
+        "foreign_keys": [
+          {
+            "id": 0,
+            "sequence": 0,
+            "table": "task_attempts",
+            "from": "attempt_id",
+            "to": "id",
+            "on_update": "NO ACTION",
+            "on_delete": "SET NULL",
+            "match": "NONE"
+          },
+          {
+            "id": 1,
+            "sequence": 0,
+            "table": "tasks",
+            "from": "task_id",
+            "to": "id",
+            "on_update": "NO ACTION",
+            "on_delete": "CASCADE",
+            "match": "NONE"
+          },
+          {
+            "id": 2,
+            "sequence": 0,
+            "table": "runs",
+            "from": "run_id",
+            "to": "id",
+            "on_update": "NO ACTION",
+            "on_delete": "CASCADE",
+            "match": "NONE"
+          }
+        ],
+        "fixture_rows": 5
+      },
+      {
+        "name": "github_deliveries",
+        "sql": "CREATE TABLE github_deliveries (\n    id INTEGER PRIMARY KEY AUTOINCREMENT,\n    run_id INTEGER NOT NULL UNIQUE REFERENCES runs(id) ON DELETE CASCADE,\n    state TEXT NOT NULL DEFAULT 'not_ready',\n    repository TEXT,\n    remote TEXT,\n    base_branch TEXT,\n    head_branch TEXT NOT NULL,\n    pushed_head TEXT,\n    pr_number INTEGER,\n    pr_url TEXT,\n    pr_state TEXT,\n    pr_is_draft INTEGER,\n    error TEXT,\n    created_at TEXT NOT NULL,\n    updated_at TEXT NOT NULL\n, operation_id TEXT, recovery_required INTEGER NOT NULL DEFAULT 0)",
+        "columns": [
+          {
+            "id": 0,
+            "name": "id",
+            "type": "INTEGER",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 1
+          },
+          {
+            "id": 1,
+            "name": "run_id",
+            "type": "INTEGER",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 2,
+            "name": "state",
+            "type": "TEXT",
+            "not_null": 1,
+            "default": "'not_ready'",
+            "primary_key": 0
+          },
+          {
+            "id": 3,
+            "name": "repository",
+            "type": "TEXT",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 4,
+            "name": "remote",
+            "type": "TEXT",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 5,
+            "name": "base_branch",
+            "type": "TEXT",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 6,
+            "name": "head_branch",
+            "type": "TEXT",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 7,
+            "name": "pushed_head",
+            "type": "TEXT",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 8,
+            "name": "pr_number",
+            "type": "INTEGER",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 9,
+            "name": "pr_url",
+            "type": "TEXT",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 10,
+            "name": "pr_state",
+            "type": "TEXT",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 11,
+            "name": "pr_is_draft",
+            "type": "INTEGER",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 12,
+            "name": "error",
+            "type": "TEXT",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 13,
+            "name": "created_at",
+            "type": "TEXT",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 14,
+            "name": "updated_at",
+            "type": "TEXT",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 15,
+            "name": "operation_id",
+            "type": "TEXT",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 16,
+            "name": "recovery_required",
+            "type": "INTEGER",
+            "not_null": 1,
+            "default": "0",
+            "primary_key": 0
+          }
+        ],
+        "foreign_keys": [
+          {
+            "id": 0,
+            "sequence": 0,
+            "table": "runs",
+            "from": "run_id",
+            "to": "id",
+            "on_update": "NO ACTION",
+            "on_delete": "CASCADE",
+            "match": "NONE"
+          }
+        ],
+        "fixture_rows": 1
+      },
+      {
+        "name": "github_links",
+        "sql": "CREATE TABLE github_links (\n    id INTEGER PRIMARY KEY AUTOINCREMENT,\n    run_id INTEGER NOT NULL UNIQUE REFERENCES runs(id) ON DELETE CASCADE,\n    provider TEXT NOT NULL,\n    repository TEXT NOT NULL,\n    issue_number INTEGER NOT NULL,\n    issue_url TEXT,\n    issue_title TEXT NOT NULL,\n    issue_body TEXT NOT NULL,\n    issue_state TEXT,\n    issue_author TEXT,\n    issue_labels TEXT NOT NULL DEFAULT '[]',\n    issue_comments TEXT NOT NULL DEFAULT '[]',\n    imported_at TEXT NOT NULL\n)",
+        "columns": [
+          {
+            "id": 0,
+            "name": "id",
+            "type": "INTEGER",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 1
+          },
+          {
+            "id": 1,
+            "name": "run_id",
+            "type": "INTEGER",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 2,
+            "name": "provider",
+            "type": "TEXT",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 3,
+            "name": "repository",
+            "type": "TEXT",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 4,
+            "name": "issue_number",
+            "type": "INTEGER",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 5,
+            "name": "issue_url",
+            "type": "TEXT",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 6,
+            "name": "issue_title",
+            "type": "TEXT",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 7,
+            "name": "issue_body",
+            "type": "TEXT",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 8,
+            "name": "issue_state",
+            "type": "TEXT",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 9,
+            "name": "issue_author",
+            "type": "TEXT",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 10,
+            "name": "issue_labels",
+            "type": "TEXT",
+            "not_null": 1,
+            "default": "'[]'",
+            "primary_key": 0
+          },
+          {
+            "id": 11,
+            "name": "issue_comments",
+            "type": "TEXT",
+            "not_null": 1,
+            "default": "'[]'",
+            "primary_key": 0
+          },
+          {
+            "id": 12,
+            "name": "imported_at",
+            "type": "TEXT",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 0
+          }
+        ],
+        "foreign_keys": [
+          {
+            "id": 0,
+            "sequence": 0,
+            "table": "runs",
+            "from": "run_id",
+            "to": "id",
+            "on_update": "NO ACTION",
+            "on_delete": "CASCADE",
+            "match": "NONE"
+          }
+        ],
+        "fixture_rows": 1
+      },
+      {
+        "name": "integration_outcomes",
+        "sql": "CREATE TABLE integration_outcomes (\n    id INTEGER PRIMARY KEY AUTOINCREMENT,\n    run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,\n    task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,\n    attempt_id INTEGER NOT NULL REFERENCES task_attempts(id) ON DELETE CASCADE,\n    agent TEXT NOT NULL,\n    outcome TEXT NOT NULL,\n    created_at TEXT NOT NULL\n)",
+        "columns": [
+          {
+            "id": 0,
+            "name": "id",
+            "type": "INTEGER",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 1
+          },
+          {
+            "id": 1,
+            "name": "run_id",
+            "type": "INTEGER",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 2,
+            "name": "task_id",
+            "type": "INTEGER",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 3,
+            "name": "attempt_id",
+            "type": "INTEGER",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 4,
+            "name": "agent",
+            "type": "TEXT",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 5,
+            "name": "outcome",
+            "type": "TEXT",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 6,
+            "name": "created_at",
+            "type": "TEXT",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 0
+          }
+        ],
+        "foreign_keys": [
+          {
+            "id": 0,
+            "sequence": 0,
+            "table": "task_attempts",
+            "from": "attempt_id",
+            "to": "id",
+            "on_update": "NO ACTION",
+            "on_delete": "CASCADE",
+            "match": "NONE"
+          },
+          {
+            "id": 1,
+            "sequence": 0,
+            "table": "tasks",
+            "from": "task_id",
+            "to": "id",
+            "on_update": "NO ACTION",
+            "on_delete": "CASCADE",
+            "match": "NONE"
+          },
+          {
+            "id": 2,
+            "sequence": 0,
+            "table": "runs",
+            "from": "run_id",
+            "to": "id",
+            "on_update": "NO ACTION",
+            "on_delete": "CASCADE",
+            "match": "NONE"
+          }
+        ],
+        "fixture_rows": 1
+      },
+      {
+        "name": "mcp_server_leases",
+        "sql": "CREATE TABLE mcp_server_leases (\n    server_id TEXT PRIMARY KEY,\n    active_calls INTEGER NOT NULL DEFAULT 0,\n    updated_at TEXT NOT NULL\n)",
+        "columns": [
+          {
+            "id": 0,
+            "name": "server_id",
+            "type": "TEXT",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 1
+          },
+          {
+            "id": 1,
+            "name": "active_calls",
+            "type": "INTEGER",
+            "not_null": 1,
+            "default": "0",
+            "primary_key": 0
+          },
+          {
+            "id": 2,
+            "name": "updated_at",
+            "type": "TEXT",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 0
+          }
+        ],
+        "foreign_keys": [],
+        "fixture_rows": 1
+      },
+      {
+        "name": "mcp_tools",
+        "sql": "CREATE TABLE mcp_tools (\n    server_id TEXT NOT NULL,\n    tool_name TEXT NOT NULL,\n    description TEXT NOT NULL,\n    input_schema TEXT NOT NULL,\n    annotations TEXT,\n    classification TEXT NOT NULL,\n    discovered_at TEXT NOT NULL,\n    PRIMARY KEY (server_id, tool_name)\n)",
+        "columns": [
+          {
+            "id": 0,
+            "name": "server_id",
+            "type": "TEXT",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 1
+          },
+          {
+            "id": 1,
+            "name": "tool_name",
+            "type": "TEXT",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 2
+          },
+          {
+            "id": 2,
+            "name": "description",
+            "type": "TEXT",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 3,
+            "name": "input_schema",
+            "type": "TEXT",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 4,
+            "name": "annotations",
+            "type": "TEXT",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 5,
+            "name": "classification",
+            "type": "TEXT",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 6,
+            "name": "discovered_at",
+            "type": "TEXT",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 0
+          }
+        ],
+        "foreign_keys": [],
+        "fixture_rows": 1
+      },
+      {
+        "name": "plan_revisions",
+        "sql": "CREATE TABLE plan_revisions (\n    id INTEGER PRIMARY KEY AUTOINCREMENT,\n    run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,\n    revision INTEGER NOT NULL,\n    source TEXT NOT NULL,\n    reason TEXT,\n    planner_session_id INTEGER REFERENCES agent_sessions(id) ON DELETE SET NULL,\n    snapshot TEXT NOT NULL,\n    created_at TEXT NOT NULL,\n    UNIQUE(run_id, revision)\n)",
+        "columns": [
+          {
+            "id": 0,
+            "name": "id",
+            "type": "INTEGER",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 1
+          },
+          {
+            "id": 1,
+            "name": "run_id",
+            "type": "INTEGER",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 2,
+            "name": "revision",
+            "type": "INTEGER",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 3,
+            "name": "source",
+            "type": "TEXT",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 4,
+            "name": "reason",
+            "type": "TEXT",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 5,
+            "name": "planner_session_id",
+            "type": "INTEGER",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 6,
+            "name": "snapshot",
+            "type": "TEXT",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 7,
+            "name": "created_at",
+            "type": "TEXT",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 0
+          }
+        ],
+        "foreign_keys": [
+          {
+            "id": 0,
+            "sequence": 0,
+            "table": "agent_sessions",
+            "from": "planner_session_id",
+            "to": "id",
+            "on_update": "NO ACTION",
+            "on_delete": "SET NULL",
+            "match": "NONE"
+          },
+          {
+            "id": 1,
+            "sequence": 0,
+            "table": "runs",
+            "from": "run_id",
+            "to": "id",
+            "on_update": "NO ACTION",
+            "on_delete": "CASCADE",
+            "match": "NONE"
+          }
+        ],
+        "fixture_rows": 1
+      },
+      {
+        "name": "role_artifacts",
+        "sql": "CREATE TABLE role_artifacts (\n    id INTEGER PRIMARY KEY AUTOINCREMENT,\n    run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,\n    task_id INTEGER REFERENCES tasks(id) ON DELETE CASCADE,\n    attempt_id INTEGER REFERENCES task_attempts(id) ON DELETE SET NULL,\n    role TEXT NOT NULL,\n    operation TEXT,\n    kind TEXT NOT NULL,\n    content TEXT NOT NULL,\n    created_at TEXT NOT NULL\n)",
+        "columns": [
+          {
+            "id": 0,
+            "name": "id",
+            "type": "INTEGER",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 1
+          },
+          {
+            "id": 1,
+            "name": "run_id",
+            "type": "INTEGER",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 2,
+            "name": "task_id",
+            "type": "INTEGER",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 3,
+            "name": "attempt_id",
+            "type": "INTEGER",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 4,
+            "name": "role",
+            "type": "TEXT",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 5,
+            "name": "operation",
+            "type": "TEXT",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 6,
+            "name": "kind",
+            "type": "TEXT",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 7,
+            "name": "content",
+            "type": "TEXT",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 8,
+            "name": "created_at",
+            "type": "TEXT",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 0
+          }
+        ],
+        "foreign_keys": [
+          {
+            "id": 0,
+            "sequence": 0,
+            "table": "task_attempts",
+            "from": "attempt_id",
+            "to": "id",
+            "on_update": "NO ACTION",
+            "on_delete": "SET NULL",
+            "match": "NONE"
+          },
+          {
+            "id": 1,
+            "sequence": 0,
+            "table": "tasks",
+            "from": "task_id",
+            "to": "id",
+            "on_update": "NO ACTION",
+            "on_delete": "CASCADE",
+            "match": "NONE"
+          },
+          {
+            "id": 2,
+            "sequence": 0,
+            "table": "runs",
+            "from": "run_id",
+            "to": "id",
+            "on_update": "NO ACTION",
+            "on_delete": "CASCADE",
+            "match": "NONE"
+          }
+        ],
+        "fixture_rows": 1
+      },
+      {
+        "name": "routing_decisions",
+        "sql": "CREATE TABLE routing_decisions (\n    id INTEGER PRIMARY KEY AUTOINCREMENT,\n    task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,\n    attempt_id INTEGER REFERENCES task_attempts(id) ON DELETE SET NULL,\n    mode TEXT NOT NULL,\n    selected_agent TEXT NOT NULL,\n    role TEXT,\n    operation TEXT,\n    language TEXT,\n    candidate_scores TEXT,\n    reason TEXT NOT NULL,\n    created_at TEXT NOT NULL\n)",
+        "columns": [
+          {
+            "id": 0,
+            "name": "id",
+            "type": "INTEGER",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 1
+          },
+          {
+            "id": 1,
+            "name": "task_id",
+            "type": "INTEGER",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 2,
+            "name": "attempt_id",
+            "type": "INTEGER",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 3,
+            "name": "mode",
+            "type": "TEXT",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 4,
+            "name": "selected_agent",
+            "type": "TEXT",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 5,
+            "name": "role",
+            "type": "TEXT",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 6,
+            "name": "operation",
+            "type": "TEXT",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 7,
+            "name": "language",
+            "type": "TEXT",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 8,
+            "name": "candidate_scores",
+            "type": "TEXT",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 9,
+            "name": "reason",
+            "type": "TEXT",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 10,
+            "name": "created_at",
+            "type": "TEXT",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 0
+          }
+        ],
+        "foreign_keys": [
+          {
+            "id": 0,
+            "sequence": 0,
+            "table": "task_attempts",
+            "from": "attempt_id",
+            "to": "id",
+            "on_update": "NO ACTION",
+            "on_delete": "SET NULL",
+            "match": "NONE"
+          },
+          {
+            "id": 1,
+            "sequence": 0,
+            "table": "tasks",
+            "from": "task_id",
+            "to": "id",
+            "on_update": "NO ACTION",
+            "on_delete": "CASCADE",
+            "match": "NONE"
+          }
+        ],
+        "fixture_rows": 1
+      },
+      {
+        "name": "runs",
+        "sql": "CREATE TABLE runs (\n    id INTEGER PRIMARY KEY AUTOINCREMENT,\n    objective TEXT NOT NULL,\n    status TEXT NOT NULL DEFAULT 'planned',\n    planner_agent TEXT,\n    created_at TEXT NOT NULL,\n    updated_at TEXT NOT NULL\n, team TEXT, integration_sha TEXT, base_sha TEXT, plan_revision INTEGER NOT NULL DEFAULT 1, recipe TEXT)",
+        "columns": [
+          {
+            "id": 0,
+            "name": "id",
+            "type": "INTEGER",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 1
+          },
+          {
+            "id": 1,
+            "name": "objective",
+            "type": "TEXT",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 2,
+            "name": "status",
+            "type": "TEXT",
+            "not_null": 1,
+            "default": "'planned'",
+            "primary_key": 0
+          },
+          {
+            "id": 3,
+            "name": "planner_agent",
+            "type": "TEXT",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 4,
+            "name": "created_at",
+            "type": "TEXT",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 5,
+            "name": "updated_at",
+            "type": "TEXT",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 6,
+            "name": "team",
+            "type": "TEXT",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 7,
+            "name": "integration_sha",
+            "type": "TEXT",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 8,
+            "name": "base_sha",
+            "type": "TEXT",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 9,
+            "name": "plan_revision",
+            "type": "INTEGER",
+            "not_null": 1,
+            "default": "1",
+            "primary_key": 0
+          },
+          {
+            "id": 10,
+            "name": "recipe",
+            "type": "TEXT",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 0
+          }
+        ],
+        "foreign_keys": [],
+        "fixture_rows": 2
+      },
+      {
+        "name": "schema_migrations",
+        "sql": "CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)",
+        "columns": [
+          {
+            "id": 0,
+            "name": "version",
+            "type": "INTEGER",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 1
+          },
+          {
+            "id": 1,
+            "name": "applied_at",
+            "type": "TEXT",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 0
+          }
+        ],
+        "foreign_keys": [],
+        "fixture_rows": 18
+      },
+      {
+        "name": "task_attempts",
+        "sql": "CREATE TABLE task_attempts (\n    id INTEGER PRIMARY KEY AUTOINCREMENT,\n    task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,\n    attempt_number INTEGER NOT NULL,\n    agent TEXT NOT NULL,\n    status TEXT NOT NULL,\n    started_at TEXT NOT NULL,\n    finished_at TEXT,\n    worktree_path TEXT NOT NULL,\n    commit_sha TEXT,\n    exit_code INTEGER,\n    error TEXT,\n    evidence TEXT,\n    review TEXT, role TEXT, operation TEXT, source_base TEXT,\n    UNIQUE(task_id, attempt_number)\n)",
+        "columns": [
+          {
+            "id": 0,
+            "name": "id",
+            "type": "INTEGER",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 1
+          },
+          {
+            "id": 1,
+            "name": "task_id",
+            "type": "INTEGER",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 2,
+            "name": "attempt_number",
+            "type": "INTEGER",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 3,
+            "name": "agent",
+            "type": "TEXT",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 4,
+            "name": "status",
+            "type": "TEXT",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 5,
+            "name": "started_at",
+            "type": "TEXT",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 6,
+            "name": "finished_at",
+            "type": "TEXT",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 7,
+            "name": "worktree_path",
+            "type": "TEXT",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 8,
+            "name": "commit_sha",
+            "type": "TEXT",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 9,
+            "name": "exit_code",
+            "type": "INTEGER",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 10,
+            "name": "error",
+            "type": "TEXT",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 11,
+            "name": "evidence",
+            "type": "TEXT",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 12,
+            "name": "review",
+            "type": "TEXT",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 13,
+            "name": "role",
+            "type": "TEXT",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 14,
+            "name": "operation",
+            "type": "TEXT",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 15,
+            "name": "source_base",
+            "type": "TEXT",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 0
+          }
+        ],
+        "foreign_keys": [
+          {
+            "id": 0,
+            "sequence": 0,
+            "table": "tasks",
+            "from": "task_id",
+            "to": "id",
+            "on_update": "NO ACTION",
+            "on_delete": "CASCADE",
+            "match": "NONE"
+          }
+        ],
+        "fixture_rows": 2
+      },
+      {
+        "name": "task_dependencies",
+        "sql": "CREATE TABLE task_dependencies (\n    task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,\n    depends_on INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,\n    PRIMARY KEY (task_id, depends_on)\n)",
+        "columns": [
+          {
+            "id": 0,
+            "name": "task_id",
+            "type": "INTEGER",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 1
+          },
+          {
+            "id": 1,
+            "name": "depends_on",
+            "type": "INTEGER",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 2
+          }
+        ],
+        "foreign_keys": [
+          {
+            "id": 0,
+            "sequence": 0,
+            "table": "tasks",
+            "from": "depends_on",
+            "to": "id",
+            "on_update": "NO ACTION",
+            "on_delete": "CASCADE",
+            "match": "NONE"
+          },
+          {
+            "id": 1,
+            "sequence": 0,
+            "table": "tasks",
+            "from": "task_id",
+            "to": "id",
+            "on_update": "NO ACTION",
+            "on_delete": "CASCADE",
+            "match": "NONE"
+          }
+        ],
+        "fixture_rows": 2
+      },
+      {
+        "name": "tasks",
+        "sql": "CREATE TABLE tasks (\n    id INTEGER PRIMARY KEY AUTOINCREMENT,\n    run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,\n    title TEXT NOT NULL,\n    objective TEXT NOT NULL,\n    acceptance_criteria TEXT NOT NULL DEFAULT '[]',\n    state TEXT NOT NULL DEFAULT 'pending',\n    position INTEGER NOT NULL,\n    worktree_path TEXT,\n    created_at TEXT NOT NULL,\n    updated_at TEXT NOT NULL\n, role TEXT, operation TEXT, agent_override TEXT)",
+        "columns": [
+          {
+            "id": 0,
+            "name": "id",
+            "type": "INTEGER",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 1
+          },
+          {
+            "id": 1,
+            "name": "run_id",
+            "type": "INTEGER",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 2,
+            "name": "title",
+            "type": "TEXT",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 3,
+            "name": "objective",
+            "type": "TEXT",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 4,
+            "name": "acceptance_criteria",
+            "type": "TEXT",
+            "not_null": 1,
+            "default": "'[]'",
+            "primary_key": 0
+          },
+          {
+            "id": 5,
+            "name": "state",
+            "type": "TEXT",
+            "not_null": 1,
+            "default": "'pending'",
+            "primary_key": 0
+          },
+          {
+            "id": 6,
+            "name": "position",
+            "type": "INTEGER",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 7,
+            "name": "worktree_path",
+            "type": "TEXT",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 8,
+            "name": "created_at",
+            "type": "TEXT",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 9,
+            "name": "updated_at",
+            "type": "TEXT",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 10,
+            "name": "role",
+            "type": "TEXT",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 11,
+            "name": "operation",
+            "type": "TEXT",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 12,
+            "name": "agent_override",
+            "type": "TEXT",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 0
+          }
+        ],
+        "foreign_keys": [
+          {
+            "id": 0,
+            "sequence": 0,
+            "table": "runs",
+            "from": "run_id",
+            "to": "id",
+            "on_update": "NO ACTION",
+            "on_delete": "CASCADE",
+            "match": "NONE"
+          }
+        ],
+        "fixture_rows": 4
+      },
+      {
+        "name": "tool_grants",
+        "sql": "CREATE TABLE tool_grants (\n    id TEXT PRIMARY KEY,\n    token_hash TEXT NOT NULL UNIQUE,\n    run_id INTEGER REFERENCES runs(id) ON DELETE CASCADE,\n    task_id INTEGER REFERENCES tasks(id) ON DELETE CASCADE,\n    attempt_id INTEGER REFERENCES task_attempts(id) ON DELETE CASCADE,\n    session_id INTEGER REFERENCES agent_sessions(id) ON DELETE CASCADE,\n    agent TEXT NOT NULL,\n    role TEXT NOT NULL,\n    operation TEXT,\n    allowed_tools TEXT NOT NULL,\n    expires_at TEXT NOT NULL,\n    revoked_at TEXT\n)",
+        "columns": [
+          {
+            "id": 0,
+            "name": "id",
+            "type": "TEXT",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 1
+          },
+          {
+            "id": 1,
+            "name": "token_hash",
+            "type": "TEXT",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 2,
+            "name": "run_id",
+            "type": "INTEGER",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 3,
+            "name": "task_id",
+            "type": "INTEGER",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 4,
+            "name": "attempt_id",
+            "type": "INTEGER",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 5,
+            "name": "session_id",
+            "type": "INTEGER",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 6,
+            "name": "agent",
+            "type": "TEXT",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 7,
+            "name": "role",
+            "type": "TEXT",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 8,
+            "name": "operation",
+            "type": "TEXT",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 9,
+            "name": "allowed_tools",
+            "type": "TEXT",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 10,
+            "name": "expires_at",
+            "type": "TEXT",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 11,
+            "name": "revoked_at",
+            "type": "TEXT",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 0
+          }
+        ],
+        "foreign_keys": [
+          {
+            "id": 0,
+            "sequence": 0,
+            "table": "agent_sessions",
+            "from": "session_id",
+            "to": "id",
+            "on_update": "NO ACTION",
+            "on_delete": "CASCADE",
+            "match": "NONE"
+          },
+          {
+            "id": 1,
+            "sequence": 0,
+            "table": "task_attempts",
+            "from": "attempt_id",
+            "to": "id",
+            "on_update": "NO ACTION",
+            "on_delete": "CASCADE",
+            "match": "NONE"
+          },
+          {
+            "id": 2,
+            "sequence": 0,
+            "table": "tasks",
+            "from": "task_id",
+            "to": "id",
+            "on_update": "NO ACTION",
+            "on_delete": "CASCADE",
+            "match": "NONE"
+          },
+          {
+            "id": 3,
+            "sequence": 0,
+            "table": "runs",
+            "from": "run_id",
+            "to": "id",
+            "on_update": "NO ACTION",
+            "on_delete": "CASCADE",
+            "match": "NONE"
+          }
+        ],
+        "fixture_rows": 1
+      },
+      {
+        "name": "tool_invocations",
+        "sql": "CREATE TABLE tool_invocations (\n    id INTEGER PRIMARY KEY AUTOINCREMENT,\n    run_id INTEGER REFERENCES runs(id) ON DELETE SET NULL,\n    task_id INTEGER REFERENCES tasks(id) ON DELETE SET NULL,\n    attempt_id INTEGER REFERENCES task_attempts(id) ON DELETE SET NULL,\n    session_id INTEGER REFERENCES agent_sessions(id) ON DELETE SET NULL,\n    agent TEXT NOT NULL,\n    role TEXT NOT NULL,\n    server TEXT NOT NULL,\n    tool TEXT NOT NULL,\n    classification TEXT NOT NULL,\n    status TEXT NOT NULL,\n    started_at TEXT NOT NULL,\n    duration_ms INTEGER,\n    input_summary TEXT NOT NULL,\n    output_summary TEXT,\n    error TEXT\n)",
+        "columns": [
+          {
+            "id": 0,
+            "name": "id",
+            "type": "INTEGER",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 1
+          },
+          {
+            "id": 1,
+            "name": "run_id",
+            "type": "INTEGER",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 2,
+            "name": "task_id",
+            "type": "INTEGER",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 3,
+            "name": "attempt_id",
+            "type": "INTEGER",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 4,
+            "name": "session_id",
+            "type": "INTEGER",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 5,
+            "name": "agent",
+            "type": "TEXT",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 6,
+            "name": "role",
+            "type": "TEXT",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 7,
+            "name": "server",
+            "type": "TEXT",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 8,
+            "name": "tool",
+            "type": "TEXT",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 9,
+            "name": "classification",
+            "type": "TEXT",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 10,
+            "name": "status",
+            "type": "TEXT",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 11,
+            "name": "started_at",
+            "type": "TEXT",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 12,
+            "name": "duration_ms",
+            "type": "INTEGER",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 13,
+            "name": "input_summary",
+            "type": "TEXT",
+            "not_null": 1,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 14,
+            "name": "output_summary",
+            "type": "TEXT",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 0
+          },
+          {
+            "id": 15,
+            "name": "error",
+            "type": "TEXT",
+            "not_null": 0,
+            "default": null,
+            "primary_key": 0
+          }
+        ],
+        "foreign_keys": [
+          {
+            "id": 0,
+            "sequence": 0,
+            "table": "agent_sessions",
+            "from": "session_id",
+            "to": "id",
+            "on_update": "NO ACTION",
+            "on_delete": "SET NULL",
+            "match": "NONE"
+          },
+          {
+            "id": 1,
+            "sequence": 0,
+            "table": "task_attempts",
+            "from": "attempt_id",
+            "to": "id",
+            "on_update": "NO ACTION",
+            "on_delete": "SET NULL",
+            "match": "NONE"
+          },
+          {
+            "id": 2,
+            "sequence": 0,
+            "table": "tasks",
+            "from": "task_id",
+            "to": "id",
+            "on_update": "NO ACTION",
+            "on_delete": "SET NULL",
+            "match": "NONE"
+          },
+          {
+            "id": 3,
+            "sequence": 0,
+            "table": "runs",
+            "from": "run_id",
+            "to": "id",
+            "on_update": "NO ACTION",
+            "on_delete": "SET NULL",
+            "match": "NONE"
+          }
+        ],
+        "fixture_rows": 1
+      }
+    ],
+    "indexes": [
+      {
+        "name": "idx_artifacts_run_task",
+        "table": "role_artifacts",
+        "sql": "CREATE INDEX idx_artifacts_run_task ON role_artifacts(run_id, task_id)"
+      },
+      {
+        "name": "idx_artifacts_task",
+        "table": "role_artifacts",
+        "sql": "CREATE INDEX idx_artifacts_task ON role_artifacts(task_id)"
+      },
+      {
+        "name": "idx_attempts_task",
+        "table": "task_attempts",
+        "sql": "CREATE INDEX idx_attempts_task ON task_attempts(task_id, attempt_number)"
+      },
+      {
+        "name": "idx_github_links_issue",
+        "table": "github_links",
+        "sql": "CREATE INDEX idx_github_links_issue ON github_links(repository, issue_number)"
+      },
+      {
+        "name": "idx_integration_outcomes_attempt",
+        "table": "integration_outcomes",
+        "sql": "CREATE INDEX idx_integration_outcomes_attempt ON integration_outcomes(attempt_id)"
+      },
+      {
+        "name": "idx_integration_outcomes_task",
+        "table": "integration_outcomes",
+        "sql": "CREATE INDEX idx_integration_outcomes_task ON integration_outcomes(task_id)"
+      },
+      {
+        "name": "idx_mcp_tools_server",
+        "table": "mcp_tools",
+        "sql": "CREATE INDEX idx_mcp_tools_server ON mcp_tools(server_id)"
+      },
+      {
+        "name": "idx_plan_revisions_run",
+        "table": "plan_revisions",
+        "sql": "CREATE INDEX idx_plan_revisions_run ON plan_revisions(run_id, revision)"
+      },
+      {
+        "name": "idx_routing_decisions_attempt",
+        "table": "routing_decisions",
+        "sql": "CREATE INDEX idx_routing_decisions_attempt ON routing_decisions(attempt_id)"
+      },
+      {
+        "name": "idx_routing_decisions_task",
+        "table": "routing_decisions",
+        "sql": "CREATE INDEX idx_routing_decisions_task ON routing_decisions(task_id)"
+      },
+      {
+        "name": "idx_sessions_attempt",
+        "table": "agent_sessions",
+        "sql": "CREATE INDEX idx_sessions_attempt ON agent_sessions(attempt_id)"
+      },
+      {
+        "name": "idx_sessions_mode_status",
+        "table": "agent_sessions",
+        "sql": "CREATE INDEX idx_sessions_mode_status ON agent_sessions(mode, status)"
+      },
+      {
+        "name": "idx_sessions_run",
+        "table": "agent_sessions",
+        "sql": "CREATE INDEX idx_sessions_run ON agent_sessions(run_id)"
+      },
+      {
+        "name": "idx_sessions_status",
+        "table": "agent_sessions",
+        "sql": "CREATE INDEX idx_sessions_status ON agent_sessions(status)"
+      },
+      {
+        "name": "idx_task_deps_dep",
+        "table": "task_dependencies",
+        "sql": "CREATE INDEX idx_task_deps_dep ON task_dependencies(depends_on)"
+      },
+      {
+        "name": "idx_tasks_run",
+        "table": "tasks",
+        "sql": "CREATE INDEX idx_tasks_run ON tasks(run_id)"
+      },
+      {
+        "name": "idx_tasks_run_state",
+        "table": "tasks",
+        "sql": "CREATE INDEX idx_tasks_run_state ON tasks(run_id, state)"
+      },
+      {
+        "name": "idx_tool_grants_session",
+        "table": "tool_grants",
+        "sql": "CREATE INDEX idx_tool_grants_session ON tool_grants(session_id)"
+      },
+      {
+        "name": "idx_tool_invocations_agent",
+        "table": "tool_invocations",
+        "sql": "CREATE INDEX idx_tool_invocations_agent ON tool_invocations(agent)"
+      },
+      {
+        "name": "idx_tool_invocations_run",
+        "table": "tool_invocations",
+        "sql": "CREATE INDEX idx_tool_invocations_run ON tool_invocations(run_id)"
+      },
+      {
+        "name": "idx_tool_invocations_task",
+        "table": "tool_invocations",
+        "sql": "CREATE INDEX idx_tool_invocations_task ON tool_invocations(task_id)"
+      }
+    ]
+  },
+  "fixture_hash_format": "SHA-256 of UTF-8 SQL text with LF newlines"
+}

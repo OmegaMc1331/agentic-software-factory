@@ -281,3 +281,44 @@ temp-file-and-rename writes. The graph workspace contains visual metadata only.
 verify their published SHA-256 checksums. Installation is user-local and doesn't
 require administrator rights. The installers don't run the downloaded binary or store
 credentials.
+
+
+## V2 P03 project registry and scoping
+
+The production local server applies one browser security policy to project
+management and every project-scoped HTTP/SSE/WebSocket route. Project management
+mutations require the authenticated session, Origin/Host checks and CSRF header.
+Repository registration additionally acknowledges local tool trust; it cannot grant
+a path outside directories authorized at server startup. Canonical roots and DB
+file identities are checked against the registry before binding existing handlers.
+A malformed, removed, closed or corrupt scope never falls back to another project.
+
+Separate runtime maps, OS project/Git-common locks and a shared resource budget
+prevent run/session numeric collisions from changing cancellation, terminal,
+MCP, policy or delivery ownership. Git and agent execution continue using the
+existing supervisors and Core permission resolver. No arbitrary-shell project
+management API is introduced. Clone accepts bounded, explicitly authorized local
+or HTTPS/SSH operations using the user's existing Git authentication.
+
+Stable filesystem aliases/replacements are tested, including Windows junctions,
+case aliases and DB hard links. These checks do not sandbox a local user, Git
+helper, agent, extension or adapter with underlying OS privileges. Hostile
+concurrent path replacement remains a documented TOCTOU boundary. Linked worktree
+metadata must also be under an authorized directory. UNC roots and other platform
+qualification limits are explicit in [the architecture](v2/multi-project-architecture.md).
+P03 does not enable an OS sandbox or change uncertain-publication retry guards.
+
+Configuration parse errors expose the file path and byte range, with source text
+omitted. This applies to legacy config responses and project open/list recovery
+errors, so malformed TOML cannot reflect configured secret values into diagnostics.
+The multi-project API regression uses a synthetic marker to check all three paths.
+
+## P04 workspace presentation boundary
+
+Workspace GET/PUT routes use the existing browser session, Host, Origin and CSRF enforcement. IDs and saved layout references grant no project capability. The Rust sidecar bounds document bytes, record count and concurrent blocking storage work; SQLite revisions refuse stale writers. The frontend validates/reconstructs an allowlisted Dockview tree, keeps recovery copies per browser tab and does not execute arbitrary components or serialized parameters.
+
+Workspace notes are local presentation content stored in the application workspace database. Authentication tokens/credentials and privileged runtime state are not automatically persisted in layouts. This storage is not encrypted or an OS sandbox. Existing project permissions, file/context boundaries, process ownership, MCP grants and uncertain-publication guards are unchanged. Project views and SSE/WebSocket connections carry explicit project/resource identities; restored state cannot start a process or authorize an external effect. See [workspace persistence](v2/layout-persistence.md) and validation limits (historical record held privately).
+
+## P05 repository editing
+
+The opt-in V2 workspace adds authenticated, project/root-scoped filesystem access. Portable relative paths, component-wise no-follow/reparse checks, hardlink refusal and protected Git/Factory internals constrain ordinary operations. Agent worktrees are inspection-only. Saves use expected revisions, synchronized preparation and verified native replacement; uncertain outcomes retain recovery evidence. These are logical filesystem/policy controls, not an OS sandbox or a universal atomic CAS against arbitrary external processes. [File-service architecture](v2/file-service-architecture.md), [V2 security model](v2/security-model.md) and [security test matrix](v2/editor-test-matrix.md) document actual bounds and platform/race limitations. Existing process, terminal, origin, CSRF and publication controls are unchanged.

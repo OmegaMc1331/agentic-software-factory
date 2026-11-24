@@ -1,0 +1,6 @@
+{
+  "name": "asf-p01-theia-service-spike",
+  "private": true,
+  "version": "0.1.0",
+  "dependencies": { "@theia/filesystem": "1.76.0" }
+}

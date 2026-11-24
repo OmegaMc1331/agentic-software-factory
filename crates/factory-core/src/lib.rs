@@ -1,5 +1,8 @@
+pub mod agent_profiles;
+mod authorization;
 pub mod capacity;
 pub mod config;
+pub mod execution;
 pub mod factory;
 pub mod github;
 pub mod mission;
@@ -7,6 +10,7 @@ pub mod planner;
 pub mod recipes;
 pub mod roles;
 pub mod routing;
+mod source_control;
 pub mod workflow;
 
 pub use config::{
@@ -14,6 +18,7 @@ pub use config::{
     Config, ConfigError, RoleAssignment, RoleAssignmentInfo, RoleDefinitionEntry, RoleInfo,
     RoutingConfig, UpdateError, UpdateOutcome,
 };
+pub use execution::{ProjectExecution, TaskBudget};
 pub use factory::{
     DeliveryClaim, DeliveryRequest, Factory, FactoryError, MarkOutcome, RunOutcome, WorkflowResult,
     FACTORY_DIR, MAX_TASK_ATTEMPTS,

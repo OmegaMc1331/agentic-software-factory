@@ -11,8 +11,6 @@ your own — and Factory plans the work into a real task DAG, runs tasks in isol
 Git worktrees, reviews the evidence, integrates approved work onto a per-run branch,
 and can deliver it as a pull request. All state stays on your machine.
 
-![Factory Agent Graph](docs/assets/dashboard-network.png)
-
 ```text
 Objective / GitHub Issue
         ↓
@@ -245,6 +243,10 @@ not post vulnerability details in public issues.
 
 ## Documentation
 
+The V2 product specification and phased migration are tracked in
+[docs/v2](docs/v2/README.md). This is development work; the current application
+remains V1 until all V2 release gates are met.
+
 | Guide | Purpose |
 | --- | --- |
 | [Architecture](docs/architecture.md) | How Factory is structured |
@@ -283,3 +285,20 @@ npm ci && npm run format:check && npm run lint && npm run typecheck && npm test 
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+
+### Multi-project server (V2 P03 development branch)
+
+A single local server can manage independent repositories. Start from your existing
+initialized project with `factory start --allow-project-root "C:/work"`, then use
+**Projects** (`/projects.html`) to register, initialize, create, clone, open,
+close or repair projects. The V1 workspace stays bound to its startup repository;
+project switching does not redirect running work. Network clone needs explicit
+authorization. This development phase does not qualify a V2 release.
+See the [architecture](docs/v2/multi-project-architecture.md),
+[API contracts](docs/v2/api-contracts.md) and
+[V1 migration/recovery guide](docs/v2/migration-v1-v2.md).
+
+## V2.0 candidate qualification
+
+ASF V2.0 remains **NO-GO**. The [qualification guide](docs/v2/release/README.md) explains the exact-source build and release checks.

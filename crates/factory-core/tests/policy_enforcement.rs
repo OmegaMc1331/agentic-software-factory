@@ -187,6 +187,134 @@ fn write_file_script(file: &str) -> String {
 const STANDARD_REPORT: &str = r#"{"commands":["fake-worker"],"tests":["fake-test"]}"#;
 
 #[test]
+fn reported_permission_blockers_stop_without_worker_retry_or_reviewer_dispatch() {
+    for code in [
+        "POLICY_DENIED",
+        "APPROVAL_REQUIRED",
+        "APPROVAL_UNAVAILABLE",
+        "HOST_SANDBOX_RESTRICTED",
+        "OS_ACCESS_DENIED",
+    ] {
+        let report = format!(
+            r#"{{"commands":[],"permissionBlocker":{{"code":"{code}","reason":"Required operation was refused; no approval granted"}}}}"#
+        );
+        let (_dir, factory) = Fixture::new("cd .", &report).build();
+        let outcome = factory
+            .create_run("permission denial must not consume three retries")
+            .unwrap();
+        factory.prepare_start(outcome.run.id).unwrap();
+        let error = factory
+            .execute_active_run(outcome.run.id, &AtomicBool::new(false))
+            .unwrap_err();
+        assert!(error.to_string().contains(code));
+        assert!(error
+            .to_string()
+            .contains("agent_report; denying layer unverified"));
+        assert_eq!(
+            factory.get_run(outcome.run.id).unwrap().unwrap().status,
+            RunStatus::Blocked
+        );
+        assert_eq!(
+            factory.list_tasks(outcome.run.id).unwrap()[0].state,
+            TaskState::Blocked
+        );
+        let attempts = factory.list_task_attempts(outcome.run.id).unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].status, AttemptStatus::Failed);
+        let sessions = factory.list_agent_sessions(Some(outcome.run.id)).unwrap();
+        assert_eq!(sessions.iter().filter(|s| s.role == "worker").count(), 1);
+        assert!(!sessions.iter().any(|s| s.role == "reviewer"));
+        let worker = sessions.iter().find(|s| s.role == "worker").unwrap();
+        assert_eq!(worker.exit_code, Some(0));
+        assert_eq!(worker.status, "blocked");
+    }
+}
+
+#[test]
+fn malformed_permission_blocker_is_validation_failure_without_a_retry() {
+    let (_dir, factory) = Fixture::new(
+        "cd .",
+        r#"{"permissionBlocker":{"code":"RUN_SHELL","reason":"override"}}"#,
+    )
+    .build();
+    let outcome = factory
+        .create_run("reject malformed authorization data")
+        .unwrap();
+    factory.prepare_start(outcome.run.id).unwrap();
+    let error = factory
+        .execute_active_run(outcome.run.id, &AtomicBool::new(false))
+        .unwrap_err();
+    assert!(error.to_string().starts_with("VALIDATION_FAILED:"));
+    assert_eq!(
+        factory.get_run(outcome.run.id).unwrap().unwrap().status,
+        RunStatus::Failed
+    );
+    assert_eq!(factory.list_task_attempts(outcome.run.id).unwrap().len(), 1);
+    assert!(!factory
+        .list_agent_sessions(Some(outcome.run.id))
+        .unwrap()
+        .iter()
+        .any(|s| s.role == "reviewer"));
+}
+
+#[test]
+fn ordinary_readonly_prose_does_not_override_actual_successful_implementation() {
+    let (_dir, factory) = Fixture::new(&write_file_script("worker-output.txt"), r#"{"summary":"Regression fixture includes the words read-only and blocked by policy","commands":[]}"#).build();
+    let outcome = factory
+        .create_run("ordinary source content is not a permission signal")
+        .unwrap();
+    factory.prepare_start(outcome.run.id).unwrap();
+    assert_eq!(
+        factory
+            .execute_active_run(outcome.run.id, &AtomicBool::new(false))
+            .unwrap(),
+        WorkflowResult::Completed
+    );
+    assert_eq!(
+        factory.list_task_attempts(outcome.run.id).unwrap()[0].status,
+        AttemptStatus::Approved
+    );
+}
+
+#[test]
+fn native_cli_readonly_diagnostic_stops_after_one_real_process_launch() {
+    let script = if cfg!(windows) {
+        "1>&2 echo OpenAI Codex v0.165.0 & 1>&2 echo sandbox: read-only"
+    } else {
+        "printf 'OpenAI Codex v0.165.0\\nsandbox: read-only\\n' >&2"
+    };
+    let (dir, _) = Fixture::new(script, r#"{"commands":[]}"#).build();
+    let mut config = Config::load(dir.path()).unwrap();
+    config.agents.get_mut("worker-test").unwrap().kind = Some(factory_agent::AgentKind::Codex);
+    config.write_atomic(dir.path()).unwrap();
+    let factory = Factory::open(dir.path()).unwrap();
+    let outcome = factory
+        .create_run("controlled native CLI diagnostic fixture")
+        .unwrap();
+    factory.prepare_start(outcome.run.id).unwrap();
+    let error = factory
+        .execute_active_run(outcome.run.id, &AtomicBool::new(false))
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("POLICY_DENIED [agent_cli_native]"));
+    assert_eq!(factory.list_task_attempts(outcome.run.id).unwrap().len(), 1);
+    let sessions = factory.list_agent_sessions(Some(outcome.run.id)).unwrap();
+    assert_eq!(
+        sessions
+            .iter()
+            .filter(|session| session.role == "worker")
+            .count(),
+        1
+    );
+    assert!(!sessions.iter().any(|session| session.role == "reviewer"));
+    assert_eq!(
+        factory.get_run(outcome.run.id).unwrap().unwrap().status,
+        RunStatus::Blocked
+    );
+}
+
+#[test]
 fn read_only_worker_blocks_the_run_before_any_agent_runs() {
     let (_dir, factory) = Fixture::new(&write_file_script("worker-output.txt"), STANDARD_REPORT)
         .policies(
@@ -342,34 +470,43 @@ write = ["**"]
 
 #[test]
 fn reported_commands_outside_the_policy_fail_the_attempt() {
-    let (_dir, factory) = Fixture::new(
-        &write_file_script("worker-output.txt"),
-        r#"{"commands":["fake-worker","bash -c leak"],"tests":[]}"#,
-    )
-    .policies(
-        r#"
+    for rejected in [
+        "bash -c leak",
+        "Read src/main.rs with Get-Content; inspected repository instructions.",
+    ] {
+        let report = serde_json::json!({"commands":["fake-worker", rejected],"tests":[]});
+        let (_dir, factory) =
+            Fixture::new(&write_file_script("worker-output.txt"), &report.to_string())
+                .policies(
+                    r#"
 [policies]
 [policies.roles.worker.commands]
 mode = "restricted"
-allow = ["fake-worker"]
+allow = ["fake-worker", "Get-Content"]
 deny = ["bash"]
 "#,
-    )
-    .build();
+                )
+                .build();
 
-    let outcome = factory.create_run("command policy").unwrap();
-    factory.prepare_start(outcome.run.id).unwrap();
-    let error = factory
-        .execute_active_run(outcome.run.id, &AtomicBool::new(false))
-        .unwrap_err();
-    let message = error.to_string();
-    assert!(
-        message.contains("bash -c leak"),
-        "the violation must name the command: {message}"
-    );
-    let attempts = factory.list_task_attempts(outcome.run.id).unwrap();
-    assert_eq!(attempts.len(), 1, "violations are not retried");
-    assert_eq!(attempts[0].status, AttemptStatus::Failed);
+        let outcome = factory.create_run("command policy").unwrap();
+        factory.prepare_start(outcome.run.id).unwrap();
+        let error = factory
+            .execute_active_run(outcome.run.id, &AtomicBool::new(false))
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains(rejected),
+            "the violation must name the command: {message}"
+        );
+        let attempts = factory.list_task_attempts(outcome.run.id).unwrap();
+        assert_eq!(attempts.len(), 1, "violations are not retried");
+        assert_eq!(attempts[0].status, AttemptStatus::Failed);
+        assert!(factory
+            .list_agent_sessions(Some(outcome.run.id))
+            .unwrap()
+            .iter()
+            .all(|session| session.role != "reviewer"));
+    }
 }
 
 #[test]

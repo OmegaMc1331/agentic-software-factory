@@ -1,0 +1,7 @@
+/node_modules/
+/backend/target/
+/dist/
+/theia/node_modules/
+/theia/lib/
+/theia/src-gen/
+__pycache__/

@@ -1,0 +1,15 @@
+:root {
+  --button-bg: var(--color-panel-muted);
+  --button-text: var(--color-text);
+  --input-bg: var(--color-panel);
+  --input-border: var(--color-control-border);
+  --panel-tab-bg: var(--color-panel-muted);
+  --panel-tab-active-bg: var(--color-panel);
+  --panel-toolbar-height: 2.25rem;
+  --workspace-top-height: 2.75rem;
+  --workspace-rail-width: 3rem;
+  --workspace-status-height: 1.625rem;
+  --workspace-sidebar-width: 14rem;
+  --workspace-detail-width: 18rem;
+  --workspace-output-height: 10rem;
+}

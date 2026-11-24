@@ -1,242 +1,211 @@
-name: CI
+name: Integrated qualification
 
 on:
   push:
-    branches: [main]
+    branches: [main, codex/v2-p14-release-qualification]
   pull_request:
+  workflow_dispatch:
+    inputs:
+      retain_artifacts:
+        description: Retain native candidate packages in this authorized Actions run
+        type: boolean
+        default: false
+  workflow_call:
+    inputs:
+      retain_artifacts:
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: qualification-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_INCREMENTAL: '0'
+  CARGO_BUILD_JOBS: '1'
+  CARGO_PROFILE_DEV_DEBUG: '0'
+  CARGO_PROFILE_TEST_DEBUG: '0'
+  PYTHONDONTWRITEBYTECODE: '1'
 
 jobs:
-  checksums:
-    name: Release checksum tests (${{ matrix.os }})
+  frontend:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version-file: .node-version
+          cache: npm
+          cache-dependency-path: apps/dashboard/package-lock.json
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.14.5'
+      - run: npm install --global --ignore-scripts npm@12.0.2
+      - run: npm ci
+        working-directory: apps/dashboard
+      - run: python -B scripts/v2_p14/run.py frontend --output .factory/v2/p14/frontend
+      - run: python -B scripts/v2_p14/run.py frontend-tests --output .factory/v2/p14/frontend
+      - run: python -B scripts/v2_p14/run.py contracts --output .factory/v2/p14/frontend
+
+  native:
+    name: Native ${{ matrix.target }}
     strategy:
       fail-fast: false
+      max-parallel: 2
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        include:
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+            archive: factory-windows-x86_64.zip
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            archive: factory-linux-x86_64.tar.gz
+          - os: macos-15
+            target: aarch64-apple-darwin
+            archive: factory-macos-aarch64.tar.gz
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            archive: factory-macos-x86_64.tar.gz
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
-          node-version: 22
-      - name: Test release checksum helpers
-        run: node --test scripts/release-checksums.test.mjs
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version-file: .node-version
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.14.5'
+      - name: Verify native host and pinned Rust
+        run: python -B scripts/v2_p14/package.py host --target ${{ matrix.target }}
+      - run: npm install --global --ignore-scripts npm@12.0.2
+      - run: npm ci
+        working-directory: apps/dashboard
+      - run: npm run build
+        working-directory: apps/dashboard
+      - run: python -B scripts/v2_p14/run.py rust --output .factory/v2/p14/native
+      - run: python -B scripts/v2_p14/run.py normal --output .factory/v2/p14/native
+      - run: python -B scripts/v2_p14/run.py contracts --output .factory/v2/p14/native
+      - run: python -B scripts/v2_p14/run.py build --output .factory/v2/p14/native
+      - run: python -B scripts/v2_p14/run.py embedded-tests --output .factory/v2/p14/native
+      - name: Package actual native executable
+        run: python -B scripts/v2_p14/package.py build --target ${{ matrix.target }} --output .factory/v2/p14/packages
+      - name: Test unpacked package outside checkout
+        run: python -B scripts/v2_p14/smoke.py --package-dir .factory/v2/p14/packages --output .factory/v2/p14/native/packaged-smoke.json
+      - name: Independently verify archive checksum
+        run: node scripts/release-checksums.mjs verify .factory/v2/p14/packages/${{ matrix.archive }}
+      - name: Retain explicitly requested candidate evidence
+        if: (inputs.retain_artifacts || (github.event_name == 'push' && github.ref == 'refs/heads/codex/v2-p14-release-qualification')) && always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: candidate-${{ matrix.target }}-${{ github.sha }}
+          path: .factory/v2/p14/
+          if-no-files-found: error
+          retention-days: 14
 
-  rust:
-    name: Rust (${{ matrix.os }})
+  integrity:
+    needs: native
+    if: inputs.retain_artifacts || (github.event_name == 'push' && github.ref == 'refs/heads/codex/v2-p14-release-qualification')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version-file: .node-version
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.14.5'
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          pattern: candidate-*-${{ github.sha }}
+          path: .factory/v2/p14/downloaded
+      - name: Verify native identities and assemble exact inventory
+        run: python -B scripts/v2_p14/assemble.py --input .factory/v2/p14/downloaded --output .factory/v2/p14/assembled --source ${{ github.sha }}
+      - name: Verify the exact release artifact inventory
+        run: node scripts/release-checksums.mjs verify-release .factory/v2/p14/assembled
+      - name: Generate and verify the consolidated manifest
+        run: node scripts/release-checksums.mjs finalize-release .factory/v2/p14/assembled
+      - name: Independently verify consolidated manifest
+        run: sha256sum -c SHA256SUMS.txt
+        working-directory: .factory/v2/p14/assembled
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: verified-candidate-inventory-${{ github.sha }}
+          path: .factory/v2/p14/assembled/
+          if-no-files-found: error
+          retention-days: 14
+
+  dependencies:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version-file: .node-version
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.14.5'
+      - run: npm install --global --ignore-scripts npm@12.0.2
+      - run: npm ci
+        working-directory: apps/dashboard
+      - run: npm audit --audit-level=high
+        working-directory: apps/dashboard
+      - run: python -B scripts/v2_p14/dependencies.py --output .factory/v2/p14/dependencies
+
+  browsers:
+    needs: native
+    if: inputs.retain_artifacts || (github.event_name == 'push' && github.ref == 'refs/heads/codex/v2-p14-release-qualification')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     strategy:
       fail-fast: false
+      max-parallel: 1
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+        engine: [chromium, firefox, webkit]
+    env:
+      ASF_BROWSER_ENGINE: ${{ matrix.engine }}
+      ASF_P13_BINARY: ${{ github.workspace }}/.factory/v2/p14/browser-package/factory
+      ASF_P13_OUTPUT: ${{ github.workspace }}/.factory/v2/p14/browsers/${{ matrix.engine }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - name: Report platform and toolchain
-        if: runner.os != 'Windows'
-        run: |
-          uname -s
-          uname -m
-          rustc -vV
-          cargo --version
-          git --version
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: Test
-        run: cargo test --workspace
-
-  dashboard:
-    name: Dashboard (lint, typecheck, test, build)
-    runs-on: ubuntu-latest
-    defaults:
-      run:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version-file: .node-version
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.14.5'
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: candidate-x86_64-unknown-linux-gnu-${{ github.sha }}
+          path: .factory/v2/p14/downloaded-linux
+      - name: Unpack verified native application
+        run: python -B -c "import sys; from pathlib import Path; sys.path.insert(0, 'scripts/v2_p14'); from package import unpack; unpack(Path('.factory/v2/p14/downloaded-linux/packages/factory-linux-x86_64.tar.gz'), Path('.factory/v2/p14/browser-package'))"
+      - run: npm install --global --ignore-scripts npm@12.0.2
+      - run: npm ci
         working-directory: apps/dashboard
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: apps/dashboard/package-lock.json
-      - name: Install
-        run: npm ci
-      - name: Format
-        run: npm run format:check
-      - name: Lint
-        run: npm run lint
-      - name: Typecheck
-        run: npm run typecheck
-      - name: Test
-        run: npm test
-      - name: Build
-        run: npm run build
-
-  embedded-dashboard:
-    name: Release-style embedded dashboard smoke test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: apps/dashboard/package-lock.json
-      - name: Build the dashboard
+      - run: npx playwright install --with-deps chromium firefox webkit
         working-directory: apps/dashboard
-        run: |
-          npm ci
-          npm run build
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Build the release binary with the embedded dashboard
-        run: cargo build --release --features embedded-dashboard -p factory-cli
-      - name: Run the embedded dashboard tests
-        run: cargo test --release --features embedded-dashboard -p factory-api
-      - name: Smoke test a standalone copy of the binary
-        run: |
-          set -euo pipefail
-          dir="$(mktemp -d)"
-          cp target/release/factory "$dir/factory"
-          cd "$dir"
-          ./factory --version | grep -q factory
-          ./factory init
-          ./factory start --no-browser &
-          pid=$!
-          trap 'kill $pid 2>/dev/null || true' EXIT
-          for i in $(seq 1 50); do
-            curl --max-time 2 -fsS http://127.0.0.1:4321/api/health >/tmp/factory-health.json 2>/dev/null && break
-            sleep 0.2
-          done
-          python3 -c 'import json; assert json.load(open("/tmp/factory-health.json"))["status"] == "ok"'
-          status="$(curl --max-time 2 -s -o /tmp/factory-unauthorized.json -w '%{http_code}' http://127.0.0.1:4321/api/runs)"
-          test "$status" = "401"
-          curl --max-time 2 -fsS -c /tmp/factory-cookies.txt \
-            -H 'Origin: http://127.0.0.1:4321' \
-            -H 'Content-Type: application/json' \
-            -d '{}' \
-            http://127.0.0.1:4321/api/auth/session >/tmp/factory-session.json
-          python3 -c 'import json; assert len(json.load(open("/tmp/factory-session.json"))["csrfToken"]) == 64'
-          curl --max-time 2 -fsS -b /tmp/factory-cookies.txt \
-            http://127.0.0.1:4321/api/runs >/tmp/factory-runs.json
-          python3 -c 'import json; assert isinstance(json.load(open("/tmp/factory-runs.json")), list)'
-          curl -fsS http://127.0.0.1:4321/ | grep -q 'id="root"'
-          echo "OK: standalone binary serves health, runs, and the embedded dashboard"
-
-  installers:
-    name: Installer end-to-end test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - run: node scripts/v2_p13/browser.mjs
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
         with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: apps/dashboard/package-lock.json
-      - name: Build the dashboard
-        working-directory: apps/dashboard
-        run: |
-          npm ci
-          npm run build
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Build the release binary
-        run: cargo build --release --features embedded-dashboard -p factory-cli
-      - name: Package the release-style archives
-        run: |
-          set -euo pipefail
-          mkdir -p assets
-          tar -czf assets/factory-linux-x86_64.tar.gz -C target/release factory -C "$GITHUB_WORKSPACE" LICENSE
-          python3 - "$GITHUB_WORKSPACE" <<'EOF'
-          import sys, zipfile
-          with zipfile.ZipFile("assets/factory-windows-x86_64.zip", "w") as z:
-              z.write("target/release/factory", "factory.exe")
-              z.write(f"{sys.argv[1]}/LICENSE", "LICENSE")
-          EOF
-          for f in factory-linux-x86_64.tar.gz factory-windows-x86_64.zip; do
-            node scripts/release-checksums.mjs generate "assets/$f"
-          done
-          ls -la assets
-      - name: Exercise install.sh and install.ps1 against the archives
-        run: |
-          set -euo pipefail
-          python3 -m http.server 8765 --bind 127.0.0.1 --directory assets >/tmp/httpserver.log 2>&1 &
-          server=$!
-          trap 'kill $server 2>/dev/null || true' EXIT
-          sleep 1
-
-          export FACTORY_VERSION=v0.1.0-test
-          export FACTORY_BASE_URL=http://127.0.0.1:8765
-
-          sh install.sh
-          "$HOME/.local/bin/factory" --version | grep -q factory
-          sh install.sh
-          "$HOME/.local/bin/factory" --version | grep -q factory
-
-          FACTORY_INSTALL_DIR=/tmp/ps-install pwsh -NoProfile -File install.ps1
-          test -x /tmp/ps-install/factory.exe || test -f /tmp/ps-install/factory.exe
-          FACTORY_INSTALL_DIR=/tmp/ps-install pwsh -NoProfile -File install.ps1
-
-          linux_sha="assets/factory-linux-x86_64.tar.gz.sha256"
-          windows_sha="assets/factory-windows-x86_64.zip.sha256"
-          cp "$linux_sha" /tmp/linux.sha256.good
-          cp "$windows_sha" /tmp/windows.sha256.good
-          rm -rf /tmp/factory-bad-sh /tmp/factory-bad-ps /tmp/factory-legacy /tmp/factory-legacy-ps
-
-          printf '%064d  factory-linux-x86_64.tar.gz\n' 0 > "$linux_sha"
-          if FACTORY_INSTALL_DIR=/tmp/factory-bad-sh sh install.sh; then
-            echo "install.sh accepted a mismatched checksum" >&2
-            exit 1
-          fi
-          test ! -e /tmp/factory-bad-sh/factory
-
-          printf 'not a checksum\n' > "$linux_sha"
-          if FACTORY_INSTALL_DIR=/tmp/factory-bad-sh sh install.sh; then
-            echo "install.sh accepted a malformed checksum" >&2
-            exit 1
-          fi
-
-          rm -f "$linux_sha"
-          if FACTORY_INSTALL_DIR=/tmp/factory-bad-sh sh install.sh; then
-            echo "install.sh accepted a missing checksum" >&2
-            exit 1
-          fi
-          cp /tmp/linux.sha256.good "$linux_sha"
-
-          digest="$(awk '{print $1}' "$linux_sha")"
-          printf '%s  release/factory-linux-x86_64.tar.gz\n' "$digest" > "$linux_sha"
-          FACTORY_INSTALL_DIR=/tmp/factory-legacy sh install.sh
-          test -x /tmp/factory-legacy/factory
-          cp /tmp/linux.sha256.good "$linux_sha"
-
-          printf '%064d  factory-windows-x86_64.zip\n' 0 > "$windows_sha"
-          if FACTORY_INSTALL_DIR=/tmp/factory-bad-ps pwsh -NoProfile -File install.ps1; then
-            echo "install.ps1 accepted a mismatched checksum" >&2
-            exit 1
-          fi
-          test ! -e /tmp/factory-bad-ps/factory.exe
-
-          printf 'not a checksum\n' > "$windows_sha"
-          if FACTORY_INSTALL_DIR=/tmp/factory-bad-ps pwsh -NoProfile -File install.ps1; then
-            echo "install.ps1 accepted a malformed checksum" >&2
-            exit 1
-          fi
-
-          rm -f "$windows_sha"
-          if FACTORY_INSTALL_DIR=/tmp/factory-bad-ps pwsh -NoProfile -File install.ps1; then
-            echo "install.ps1 accepted a missing checksum" >&2
-            exit 1
-          fi
-          cp /tmp/windows.sha256.good "$windows_sha"
-
-          digest="$(awk '{print $1}' "$windows_sha")"
-          printf '%s  release/factory-windows-x86_64.zip\n' "$digest" > "$windows_sha"
-          FACTORY_INSTALL_DIR=/tmp/factory-legacy-ps pwsh -NoProfile -File install.ps1
-          test -f /tmp/factory-legacy-ps/factory.exe
-          cp /tmp/windows.sha256.good "$windows_sha"
-
-          echo "OK: installers verified and rejected bad checksums"
+          name: candidate-browser-${{ matrix.engine }}-${{ github.sha }}
+          path: .factory/v2/p14/browsers/
+          if-no-files-found: error
+          retention-days: 14

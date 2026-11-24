@@ -1,4 +1,5 @@
 pub mod error;
+pub mod source_control;
 
 pub use error::GitError;
 
@@ -58,7 +59,7 @@ fn run_git(
     let seconds = bounds.timeout.as_secs();
     let mut command = ProcCommand::new(git_program())
         .arg("-C")
-        .arg(normalize_path(dir))
+        .arg(git_path(&normalize_path(dir)))
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0");
     for (key, value) in extra_env {
@@ -95,9 +96,57 @@ impl WorktreeEvidence {
 
 pub struct Repo {
     root: PathBuf,
+    common: PathBuf,
 }
 
 impl Repo {
+    pub fn initialize(root: &Path) -> Result<()> {
+        let output = run_git(root, &["init"], &[], default_bounds())?;
+        if !output.success() {
+            return Err(GitError::CommandFailed(
+                "repository initialization failed".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn clone_into(remote: &str, destination: &Path) -> Result<()> {
+        let local_remote = Path::new(remote)
+            .is_absolute()
+            .then(|| git_path(Path::new(remote)));
+        let remote = local_remote.as_deref().unwrap_or(remote);
+        let output = run_git(
+            destination,
+            &[
+                "-c",
+                "protocol.allow=never",
+                "-c",
+                "protocol.https.allow=always",
+                "-c",
+                "protocol.ssh.allow=always",
+                "-c",
+                "protocol.file.allow=always",
+                "clone",
+                "--no-hardlinks",
+                "--",
+                remote,
+                ".",
+            ],
+            &[],
+            default_bounds(),
+        )?;
+        if !output.success() {
+            return Err(GitError::CommandFailed(
+                "clone failed; the destination is retained for inspection".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn common_directory(&self) -> Result<PathBuf> {
+        std::fs::canonicalize(&self.common).map_err(GitError::Io)
+    }
+
     pub fn detect(start: &Path) -> Result<Repo> {
         Self::discover(start, None)
     }
@@ -116,7 +165,14 @@ impl Repo {
                 return Err(GitError::NotARepository);
             }
         }
-        Ok(Repo { root })
+        let common = PathBuf::from(git(&root, &["rev-parse", "--git-common-dir"], ceiling)?.trim());
+        let common = std::fs::canonicalize(if common.is_absolute() {
+            common
+        } else {
+            root.join(common)
+        })
+        .map_err(GitError::Io)?;
+        Ok(Repo { root, common })
     }
 
     pub fn root(&self) -> &Path {
@@ -146,22 +202,23 @@ impl Repo {
         branch: &str,
         base: Option<&str>,
     ) -> Result<()> {
+        let _mutation = self.runtime_mutation_guard()?;
         if self.find_worktree(worktree_path)?.is_some() {
             return Ok(());
         }
         let mut args: Vec<String> = vec!["worktree".into(), "add".into(), "--quiet".into()];
         if self.branch_exists(branch)? {
-            args.push(worktree_path.display().to_string());
+            args.push(git_path(worktree_path));
             args.push(branch.into());
         } else if let Some(base) = base {
             args.push("-b".into());
             args.push(branch.into());
-            args.push(worktree_path.display().to_string());
+            args.push(git_path(worktree_path));
             args.push(base.into());
         } else {
             args.push("-b".into());
             args.push(branch.into());
-            args.push(worktree_path.display().to_string());
+            args.push(git_path(worktree_path));
         }
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let output = run_git(
@@ -245,13 +302,14 @@ impl Repo {
     }
 
     fn remove_internal(&self, worktree_path: &Path, force: bool) -> Result<()> {
+        let mutation = self.runtime_mutation_guard()?;
         let registered = self.find_worktree(worktree_path)?.is_some();
         if registered {
             let mut args: Vec<String> = vec!["worktree".into(), "remove".into()];
             if force {
                 args.push("--force".into());
             }
-            args.push(worktree_path.display().to_string());
+            args.push(git_path(worktree_path));
             let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
             let output = run_git(
                 &self.root,
@@ -265,11 +323,13 @@ impl Repo {
         } else if worktree_path.exists() {
             std::fs::remove_dir_all(worktree_path).map_err(GitError::Io)?;
         }
+        drop(mutation);
         self.prune()?;
         Ok(())
     }
 
     pub fn prune(&self) -> Result<()> {
+        let _mutation = self.runtime_mutation_guard()?;
         let output = run_git(
             &self.root,
             &["worktree", "prune"],
@@ -307,6 +367,7 @@ impl Repo {
         message: &str,
         identity: (&str, &str),
     ) -> Result<Option<String>> {
+        let _mutation = self.runtime_mutation_guard()?;
         let (name, email) = identity;
         let dir = normalize_path(worktree_path);
         let diagnostic = Bounds::new(git_timeout(), 64 * 1024, DIAGNOSTIC_STDERR_LIMIT);
@@ -371,7 +432,20 @@ impl Repo {
     /// Fast-forwards (or creates) the local branch `name` to `sha` without a
     /// checkout. Used to advance the per-run integration branch; it never
     /// touches the current branch or working tree.
+    pub fn compare_update_ref(&self, name: &str, sha: &str, expected: Option<&str>) -> Result<()> {
+        let _mutation = self.runtime_mutation_guard()?;
+        let reference = format!("refs/heads/{name}");
+        let zero = "0".repeat(sha.len());
+        git(
+            &self.root,
+            &["update-ref", &reference, sha, expected.unwrap_or(&zero)],
+            None,
+        )?;
+        Ok(())
+    }
+
     pub fn update_ref(&self, name: &str, sha: &str) -> Result<()> {
+        let _mutation = self.runtime_mutation_guard()?;
         git(
             &self.root,
             &["update-ref", &format!("refs/heads/{name}"), sha],
@@ -384,6 +458,7 @@ impl Repo {
     /// name or sha). Fails if a conflict occurs; the worktree is left mid-rebase
     /// for inspection.
     pub fn rebase_onto_in(&self, worktree_path: &Path, onto: &str) -> Result<()> {
+        let _mutation = self.runtime_mutation_guard()?;
         let output = run_git(
             &normalize_path(worktree_path),
             &["rebase", onto],
@@ -405,35 +480,130 @@ impl Repo {
             .to_string())
     }
 
+    pub fn checkpoint_material(&self, worktree: &Path) -> Result<String> {
+        let root =
+            std::fs::canonicalize(worktree).map_err(|e| GitError::CommandFailed(e.to_string()))?;
+        if self.find_worktree(&root)?.is_none() {
+            return Err(GitError::CommandFailed(
+                "Checkpoint worktree is not owned by this repository".into(),
+            ));
+        }
+        let mut material = git(worktree, &["diff", "--binary", "HEAD", "--", "."], None)?;
+        material.push_str(&git(
+            worktree,
+            &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+            None,
+        )?);
+        let untracked = git(
+            worktree,
+            &["ls-files", "--others", "--exclude-standard", "-z"],
+            None,
+        )?;
+        let mut total_bytes = 0u64;
+        for (index, path) in untracked.split('\0').filter(|s| !s.is_empty()).enumerate() {
+            if index >= 256 {
+                return Err(GitError::CommandFailed(
+                    "Checkpoint has more than 256 untracked files".into(),
+                ));
+            }
+            let joined = root.join(path);
+            let canonical = std::fs::canonicalize(&joined)
+                .map_err(|e| GitError::CommandFailed(e.to_string()))?;
+            let size = std::fs::metadata(&canonical)
+                .map_err(|e| GitError::CommandFailed(e.to_string()))?
+                .len();
+            total_bytes = total_bytes.saturating_add(size);
+            if size > 4 * 1024 * 1024 || total_bytes > 32 * 1024 * 1024 {
+                return Err(GitError::CommandFailed(
+                    "Untracked checkpoint content exceeds bounded inspection size".into(),
+                ));
+            }
+            if !canonical.starts_with(&root) || canonical == root {
+                return Err(GitError::CommandFailed(
+                    "Checkpoint file escapes worktree".into(),
+                ));
+            }
+            let mut parent = joined.as_path();
+            while parent != root {
+                let metadata = std::fs::symlink_metadata(parent)
+                    .map_err(|e| GitError::CommandFailed(e.to_string()))?;
+                if metadata.file_type().is_symlink() {
+                    return Err(GitError::CommandFailed(
+                        "Checkpoint refuses symbolic links".into(),
+                    ));
+                }
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::MetadataExt;
+                    if metadata.file_attributes() & 0x400 != 0 {
+                        return Err(GitError::CommandFailed(
+                            "Checkpoint refuses reparse points".into(),
+                        ));
+                    }
+                }
+                parent = parent
+                    .parent()
+                    .ok_or_else(|| GitError::CommandFailed("Invalid checkpoint path".into()))?;
+            }
+            material.push_str(path);
+            material.push_str(&git(
+                worktree,
+                &["hash-object", "--no-filters", "--", path],
+                None,
+            )?);
+        }
+        Ok(material)
+    }
+
     pub fn evidence_since(&self, worktree_path: &Path, base_sha: &str) -> Result<WorktreeEvidence> {
         let head = self.head_sha(worktree_path)?;
         let committed = git(
             worktree_path,
-            &["diff", "--name-only", base_sha, "HEAD"],
+            &[
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-renames",
+                "--name-only",
+                "-z",
+                base_sha,
+                "HEAD",
+                "--",
+            ],
             None,
         )?;
-        let working = git(worktree_path, &["status", "--porcelain"], None)?;
+        let working = git(
+            worktree_path,
+            &["status", "--porcelain", "-z", "--no-renames"],
+            None,
+        )?;
         let mut changed_files = std::collections::BTreeSet::new();
-        for path in committed
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-        {
+        for path in committed.split('\0').filter(|path| !path.is_empty()) {
             changed_files.insert(path.to_string());
         }
-        for line in working.lines().filter(|line| line.len() > 3) {
-            let raw_path = &line[3..];
-            let path = raw_path
-                .rsplit_once(" -> ")
-                .map_or(raw_path, |(_, target)| target)
-                .trim();
-            if !path.is_empty() {
-                changed_files.insert(path.to_string());
-            }
+        for entry in working.split('\0').filter(|entry| !entry.is_empty()) {
+            let path = entry
+                .get(3..)
+                .filter(|path| !path.is_empty())
+                .ok_or_else(|| {
+                    GitError::Invalid("Invalid working-tree evidence metadata".into())
+                })?;
+            changed_files.insert(path.to_string());
         }
-        let mut diff_summary = git(worktree_path, &["diff", "--stat", base_sha], None)?;
+        let mut diff_summary = git(
+            worktree_path,
+            &[
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--stat",
+                base_sha,
+                "--",
+            ],
+            None,
+        )?;
         if diff_summary.trim().is_empty() && !working.trim().is_empty() {
-            diff_summary = working;
+            diff_summary = working.replace('\0', "\n");
         }
         Ok(WorktreeEvidence {
             changed_files: changed_files.into_iter().collect(),
@@ -499,7 +669,7 @@ impl Repo {
 fn git(dir: &Path, args: &[&str], ceiling: Option<&Path>) -> Result<String> {
     let mut extra_env: Vec<(&str, String)> = Vec::new();
     if let Some(ceiling) = ceiling {
-        let mut value = ceiling.display().to_string();
+        let mut value = git_path(ceiling);
         if let Ok(existing) = std::env::var("GIT_CEILING_DIRECTORIES") {
             if !existing.is_empty() {
                 value.push(';');
@@ -536,6 +706,20 @@ fn diagnostic_excerpt(stderr: &[u8]) -> String {
     } else {
         format!(": {trimmed}")
     }
+}
+
+pub fn git_path(path: &Path) -> String {
+    let value = path.to_string_lossy().into_owned();
+    #[cfg(windows)]
+    {
+        if let Some(tail) = value.strip_prefix(r"\\?\UNC\") {
+            return format!(r"\\{tail}");
+        }
+        if let Some(tail) = value.strip_prefix(r"\\?\") {
+            return tail.into();
+        }
+    }
+    value
 }
 
 fn normalize_path(path: &Path) -> PathBuf {

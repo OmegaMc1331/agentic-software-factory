@@ -328,3 +328,49 @@ narrowing, environment filtering with secret redaction, and per-session audits.
 `factory-policy` unit tests cover resolution precedence, glob matching, deny-wins,
 traversal rejection, and the preset expansion. Keep new enforcement points in
 Factory Core centralized — do not add scattered permission checks.
+
+
+## V2 P03 multi-project development
+
+Build dashboard assets, then run a single local server with the directories it may
+manage explicitly authorized:
+
+```text
+cd apps/dashboard
+npm run build
+cd ../..
+cargo run -p factory-cli -- start --no-browser --allow-project-root "C:/work"
+```
+
+The current initialized repository remains the V1 default. `/projects.html` uses
+real project management operations and P02 components. `--registry FILE` (or
+`FACTORY_REGISTRY`) isolates application metadata; `--no-default-project` starts
+without a V1 default and requires explicit allowed directories. Registration does
+not initialize an existing repository silently. Create/clone requires a new
+absolute destination under an authorized existing parent. Git common directories
+for linked worktrees must also be authorized. Do not point tests at user projects
+or the real application registry; every CLI child test sets its own registry.
+
+Run `cargo test -p factory-api --test multi_project -j 1 -- --test-threads=1`
+and `cargo test -p factory-projects -j 1 -- --test-threads=1`, then ordinary workspace
+serial and normal-threading suites. `cargo run -p factory-projects --example benchmark`
+produces raw JSON from owned temporary fixtures. For the native browser flow,
+first build `cargo build -p factory-cli --features embedded-dashboard`, set
+`ASF_P03_BINARY` to that binary, then run `node scripts/v2_p03/browser.mjs`.
+The script uses Playwright Edge by default (`ASF_BROWSER_CHANNEL` override),
+Python's SQLite module, Git and owned fixtures beneath `.factory/v2/p03`.
+It performs local clones only, starts/stops its own server and never publishes.
+
+## P04 production workspace
+
+V1 remains `/`; actual project management is `/projects.html`; the opt-in production workspace is `/workspace.html`. P02's `v2.html` is still an isolated fixture preview. To develop the production shell, start Rust from an initialized authorized repository with `factory start --no-browser --dev-origin http://127.0.0.1:5183` (API port 4321), then run `npm run dev:workspace` in `apps/dashboard`. Vite proxies the same API and terminal protocols. Browser authentication and CSRF remain active.
+
+`npm run build` builds all three production entries. `cargo build -p factory-cli --features embedded-dashboard -j 1` after that build packages their assets, fonts and licenses into the native executable; end users need no Node/Rust toolchain. Test the copied embedded binary outside development asset lookup, as described in the P04 delivery.
+
+Run `node scripts/v2_p04/validate.mjs frontend` and `node scripts/v2_p04/validate.mjs rust` for logged gates. `ASF_TEST_WORKERS=1` optionally bounds the complete Vitest suite on memory-constrained hosts; it does not filter tests. For actual-browser integration, set `ASF_P04_BINARY` to the copied native executable and run `node scripts/v2_p04/browser.mjs`. Playwright Edge is the default (`ASF_BROWSER_CHANNEL` override). The test uses Git, Python SQLite and rustc to build a controlled fixture agent. These are developer test prerequisites, not runtime installation requirements. All repositories/registries/profiles are owned fixtures; no provider agent, cloud service or GitHub publication is used.
+
+## P05 production editor validation
+
+The real workspace remains opt-in at `/workspace.html`; start one ordinary ASF server and open an authorized project. Run `node scripts/v2_p05/validate.mjs targeted`, `rust`, `parallel`, `frontend`, and `embedded` from the repository root (one mode per invocation). For frontend-memory comparisons use `frontend-default`, `frontend-1`, `frontend-2`; these run the same complete suite with different worker counts. The runner writes exact commands, exits, durations and sampled owned-process memory under `.factory/v2/p05/logs`.
+
+Build the frontend before the embedded binary. Set `ASF_P05_BINARY` to the packaged native executable and run `node scripts/v2_p05/browser.mjs` for real isolated repositories, disk verification, recovery, multi-window ownership, screenshots and performance. Git, Python, Rust and Playwright/Edge are validation prerequisites, not end-user editor runtime dependencies. The browser harness never pushes or publishes. Do not point validation at user project data. P05 delivery (historical record held privately) records qualification and platform limitations.

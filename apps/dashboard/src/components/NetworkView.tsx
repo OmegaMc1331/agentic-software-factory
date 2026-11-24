@@ -58,7 +58,17 @@ import { WorkflowInspector } from "./WorkflowInspector";
 import type { RoleFormValue } from "./RoleForm";
 
 const POLL_MS = 3000;
-const STATE_ORDER: TaskState[] = ["pending", "ready", "running", "blocked", "failed", "completed"];
+const STATE_ORDER: TaskState[] = [
+  "pending",
+  "ready",
+  "running",
+  "awaiting_integration",
+  "integrating",
+  "blocked",
+  "failed",
+  "completed",
+  "superseded",
+];
 
 function Loading() {
   return <p className="empty-title">Loading...</p>;

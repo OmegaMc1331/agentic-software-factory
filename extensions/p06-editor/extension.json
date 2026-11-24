@@ -1,0 +1,41 @@
+{
+  "id": "asf.p06-editor",
+  "name": "ASF Source Hygiene",
+  "version": "1.0.0",
+  "publisher": "asf",
+  "description": "Original declarative formatter and maintenance-marker diagnostics for ASF.",
+  "entrypoint": "contributions",
+  "extension_api_version": 1,
+  "capabilities": ["editor", "commands"],
+  "permissions": ["editor", "commands"],
+  "supported_platforms": ["any"],
+  "dependencies": {},
+  "contributions": {
+    "formatters": [
+      {
+        "id": "trim",
+        "title": "Trim trailing whitespace",
+        "operation": "trim-trailing-whitespace",
+        "languages": []
+      }
+    ],
+    "diagnostics": [
+      {
+        "id": "fixme",
+        "needle": "FIXME",
+        "message": "Unresolved maintenance marker",
+        "severity": "warning"
+      }
+    ],
+    "commands": [
+      {
+        "id": "trim-source",
+        "title": "Trim source whitespace",
+        "action": "format",
+        "target": "trim",
+        "keybinding": "Alt-Shift-w",
+        "context_menu": true
+      }
+    ]
+  }
+}

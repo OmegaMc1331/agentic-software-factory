@@ -3,21 +3,27 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "1.0.5"
+version = "2.0.0-rc.11"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/OmegaMc1331/agentic-software-factory"
 
 [workspace.dependencies]
+rusqlite = { version = "0.41", features = ["bundled", "fallible_uint"] }
+factory-conversation = { path = "crates/factory-conversation" }
+factory-ide = { path = "crates/factory-ide" }
 factory-proc = { path = "crates/factory-proc" }
 factory-types = { path = "crates/factory-types" }
 factory-agent = { path = "crates/factory-agent" }
 factory-context = { path = "crates/factory-context" }
+factory-memory = { path = "crates/factory-memory" }
+factory-files = { path = "crates/factory-files" }
 factory-policy = { path = "crates/factory-policy" }
 factory-db = { path = "crates/factory-db" }
 factory-git = { path = "crates/factory-git" }
 factory-core = { path = "crates/factory-core" }
 factory-api = { path = "crates/factory-api" }
+factory-projects = { path = "crates/factory-projects" }
 factory-runtime = { path = "crates/factory-runtime" }
 factory-github = { path = "crates/factory-github" }
 factory-eval = { path = "crates/factory-eval" }

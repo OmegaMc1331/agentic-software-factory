@@ -10,6 +10,13 @@ class Handler(BaseHTTPRequestHandler):
         return
 
     def do_POST(self):
+        if sys.argv[-1] == "oversized":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(32 * 1024 * 1024))
+            self.end_headers()
+            self.close_connection = True
+            return
         length = int(self.headers.get("Content-Length", "0"))
         message = json.loads(self.rfile.read(length) or b"{}")
         method = message.get("method")

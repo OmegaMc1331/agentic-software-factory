@@ -1,0 +1,205 @@
+.product-settings {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  font-size: var(--font-sm);
+  container-type: inline-size;
+}
+.product-settings > header {
+  padding: var(--space-md);
+  border-bottom: 1px solid var(--color-border);
+}
+.product-settings-body {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+.product-settings nav {
+  width: 190px;
+  flex-shrink: 0;
+  overflow: auto;
+  padding: var(--space-sm);
+  border-right: 1px solid var(--color-border);
+}
+.product-settings nav .ds-button {
+  display: flex;
+  width: 100%;
+  height: auto;
+  text-align: left;
+  justify-content: flex-start;
+  white-space: normal;
+  padding: 8px;
+}
+.product-settings nav small {
+  display: block;
+  color: var(--color-text-muted);
+}
+.product-settings [aria-current="page"] {
+  background: var(--color-selection);
+  color: var(--color-selection-text);
+}
+.product-settings-content {
+  flex: 1;
+  min-width: 0;
+  overflow: auto;
+  padding: var(--space-lg);
+}
+.product-settings-content > h2 {
+  font-size: var(--font-title);
+  margin: 0 0 var(--space-sm);
+}
+.product-settings-content p {
+  max-width: 70ch;
+  overflow-wrap: anywhere;
+}
+.product-settings-content .ds-field {
+  margin-bottom: var(--space-lg);
+  max-width: 32rem;
+}
+.product-settings-content pre {
+  max-width: 100%;
+  overflow: auto;
+  font-family: var(--font-code);
+}
+.product-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 12px 0;
+}
+.product-muted {
+  color: var(--color-text-muted);
+}
+.product-command-list {
+  max-height: min(56vh, 480px);
+  overflow: auto;
+  border: 1px solid var(--color-border);
+  margin-top: 12px;
+}
+.product-command {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--color-border);
+  cursor: pointer;
+}
+.product-command strong {
+  display: block;
+  font-weight: 500;
+}
+.product-command small {
+  display: block;
+  color: var(--color-text-muted);
+  overflow-wrap: anywhere;
+}
+.product-command[aria-selected="true"] {
+  background: var(--color-selection);
+  color: var(--color-selection-text);
+}
+.product-command[aria-disabled="true"] {
+  cursor: default;
+}
+.product-command kbd {
+  white-space: nowrap;
+  font-family: var(--font-code);
+}
+@media (max-width: 1100px) {
+  .product-settings-body {
+    flex-direction: column;
+  }
+  .product-settings nav {
+    width: 100%;
+    max-height: 145px;
+    display: flex;
+    flex-wrap: wrap;
+    border-right: 0;
+    border-bottom: 1px solid var(--color-border);
+  }
+  .product-settings nav .ds-button {
+    width: auto;
+    max-width: 210px;
+  }
+}
+@container (max-width:600px) {
+  .product-settings-body {
+    flex-direction: column;
+  }
+  .product-settings nav {
+    width: 100%;
+    max-height: 145px;
+    display: flex;
+    flex-wrap: wrap;
+    border-right: 0;
+    border-bottom: 1px solid var(--color-border);
+  }
+  .product-settings nav .ds-button {
+    width: auto;
+  }
+}
+.product-notifications {
+  overflow: auto;
+  height: 100%;
+  padding: 16px;
+  font-size: var(--font-sm);
+}
+.product-notifications h2 {
+  font-size: var(--font-title);
+  margin-top: 0;
+}
+.product-notification-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+.product-notification-list li {
+  border-top: 1px solid var(--color-border);
+  padding: 12px 0;
+  overflow-wrap: anywhere;
+}
+.product-notification-list li > div:first-child {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+}
+.product-notification-list strong {
+  font-weight: 500;
+}
+.product-notification-list li[data-unread="true"] strong::before {
+  content: "● ";
+  color: var(--color-accent);
+}
+.product-notification-list time,
+.product-notification-list span {
+  color: var(--color-text-muted);
+  font-size: var(--font-xs);
+}
+.product-notification-list details {
+  color: var(--color-text-secondary);
+}
+.product-toast {
+  position: fixed;
+  z-index: var(--layer-notification, 40);
+  right: 16px;
+  bottom: 40px;
+  max-width: min(380px, calc(100vw - 32px));
+  padding: 12px;
+  border: 1px solid var(--color-control-border);
+  background: var(--color-panel);
+  color: var(--color-text);
+}
+.ws-command-access {
+  white-space: nowrap;
+}
+@media (max-width: 1280px) {
+  .ws-connection {
+    display: none;
+  }
+  .ws-session-secondary {
+    display: none;
+  }
+}

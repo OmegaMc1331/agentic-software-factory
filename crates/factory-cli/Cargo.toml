@@ -16,6 +16,7 @@ factory-core = { workspace = true }
 factory-db = { workspace = true }
 factory-types = { workspace = true }
 factory-api = { workspace = true }
+factory-projects = { workspace = true }
 factory-mcp = { workspace = true }
 factory-policy = { workspace = true }
 clap = { version = "4", features = ["derive", "env"] }
@@ -23,7 +24,7 @@ anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 dotenvy = "0.15"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "signal"] }
 
 [dev-dependencies]
 tempfile = "3"

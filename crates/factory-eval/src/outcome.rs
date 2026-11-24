@@ -81,6 +81,10 @@ const CONFIGURATION_ERROR_PREFIXES: &[&str] = &[
     "No agent is assigned to the",
     "is not available. Check the agent configuration",
     "executable installation is broken",
+    "STALE_PROFILE_REVISION:",
+    "MODEL_CONFIGURATION_UNSUPPORTED:",
+    "MODEL_UNAVAILABLE:",
+    "MODEL_MISMATCH:",
 ];
 
 /// The error-string prefix the runtime writes when the policy engine rejects
@@ -93,11 +97,14 @@ pub fn classify_attempt(attempt: &TaskAttempt) -> Outcome {
         AttemptStatus::Approved => Outcome::Approved,
         AttemptStatus::ChangesRequested => Outcome::ChangesRequested,
         AttemptStatus::Cancelled => Outcome::Cancelled,
-        AttemptStatus::Interrupted => Outcome::Interrupted,
+        AttemptStatus::Interrupted | AttemptStatus::HandedOff => Outcome::Interrupted,
         AttemptStatus::Running | AttemptStatus::Reviewing => Outcome::InProgress,
         AttemptStatus::Failed => {
             let error = attempt.error.as_deref().unwrap_or("");
-            if error.starts_with(POLICY_BLOCKED_PREFIX) {
+            if error.starts_with(POLICY_BLOCKED_PREFIX)
+                || error.contains("PROFILE_NOT_ELIGIBLE:")
+                || error.contains("READ_SCOPE_DENIED:")
+            {
                 Outcome::PolicyBlocked
             } else if CONFIGURATION_ERROR_PREFIXES
                 .iter()

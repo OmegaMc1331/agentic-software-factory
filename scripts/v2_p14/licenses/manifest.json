@@ -1,0 +1,61 @@
+{
+  "schemaVersion": 1,
+  "source": "Published Cargo package VCS identity plus official upstream content at that exact commit",
+  "licenses": [
+    {
+      "purl": "pkg:cargo/jsonschema-regex@0.50.1",
+      "license": "MIT",
+      "repository": "Stranger6667/jsonschema",
+      "revision": "60a563d3e7a3e9b4facb2abb15c6b30687e06050",
+      "path": "LICENSE",
+      "url": "https://github.com/Stranger6667/jsonschema/blob/60a563d3e7a3e9b4facb2abb15c6b30687e06050/LICENSE",
+      "file": "jsonschema-regex-0.50.1-LICENSE.txt",
+      "sha256": "117829c3ca21efb132d81a44b55363d395ab8eea18526873bc828da4c0e5f038",
+      "result": "PASS"
+    },
+    {
+      "purl": "pkg:cargo/jsonschema-value@0.50.1",
+      "license": "MIT",
+      "repository": "Stranger6667/jsonschema",
+      "revision": "60a563d3e7a3e9b4facb2abb15c6b30687e06050",
+      "path": "LICENSE",
+      "url": "https://github.com/Stranger6667/jsonschema/blob/60a563d3e7a3e9b4facb2abb15c6b30687e06050/LICENSE",
+      "file": "jsonschema-value-0.50.1-LICENSE.txt",
+      "sha256": "117829c3ca21efb132d81a44b55363d395ab8eea18526873bc828da4c0e5f038",
+      "result": "PASS"
+    },
+    {
+      "purl": "pkg:cargo/uuid-simd@0.8.0",
+      "license": "MIT",
+      "repository": "Nugine/simd",
+      "revision": "d74c030d9dc4f3cae02146d1f497ff62726ef09a",
+      "path": "LICENSE",
+      "url": "https://github.com/Nugine/simd/blob/d74c030d9dc4f3cae02146d1f497ff62726ef09a/LICENSE",
+      "file": "uuid-simd-0.8.0-LICENSE.txt",
+      "sha256": "71674605ec4c087fe9eb534e3e4f9e26eb2e4aabcd76a29fd156c6a844d44b3d",
+      "result": "PASS"
+    },
+    {
+      "purl": "pkg:cargo/vsimd@0.8.0",
+      "license": "MIT",
+      "repository": "Nugine/simd",
+      "revision": "d74c030d9dc4f3cae02146d1f497ff62726ef09a",
+      "path": "LICENSE",
+      "url": "https://github.com/Nugine/simd/blob/d74c030d9dc4f3cae02146d1f497ff62726ef09a/LICENSE",
+      "file": "vsimd-0.8.0-LICENSE.txt",
+      "sha256": "71674605ec4c087fe9eb534e3e4f9e26eb2e4aabcd76a29fd156c6a844d44b3d",
+      "result": "PASS"
+    },
+    {
+      "purl": "pkg:cargo/rmcp@3.9.0",
+      "license": "Apache-2.0",
+      "repository": "modelcontextprotocol/rust-sdk",
+      "revision": "5596a8a0bba2a1ec5519cc855cdadf23e4dcecdc",
+      "path": "LICENSE",
+      "url": "https://github.com/modelcontextprotocol/rust-sdk/blob/5596a8a0bba2a1ec5519cc855cdadf23e4dcecdc/LICENSE",
+      "file": "rmcp-3.9.0-LICENSE.txt",
+      "sha256": "0382b0057770ca05e9c350a50aa3b1c1fea84da0bc81d723bf00b9aa841be58a",
+      "result": "PASS"
+    }
+  ]
+}

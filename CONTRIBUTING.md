@@ -5,8 +5,11 @@ changes aligned with its core principles.
 
 ## Principles
 
-1. **The system owns state.** Never scatter state outside `.factory/`. The main working
-   tree stays clean.
+1. **The system owns state.** Project execution state stays in `.factory/`. The V2
+   application registry is the documented exception: it belongs in the platform's
+   application-data directory, outside individual projects. The shared Git ownership
+   lock belongs in Git's common metadata directory. Experimental outputs stay in
+   `.factory/`; the main working tree stays clean.
 2. **No comments in source code.** Code must read clearly on its own. If a block needs
    prose to be understood, extract it into a named function or a doc rendered elsewhere.
 3. **No filler.** No unused functions, no placeholder exports, no boilerplate copied

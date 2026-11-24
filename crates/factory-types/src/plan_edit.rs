@@ -55,6 +55,132 @@ pub struct ResolvedPlan {
     pub superseded: Vec<i64>,
 }
 
+pub fn resolve_unfinished_replan(
+    state: &PlanState,
+    plan: &crate::Plan,
+) -> std::result::Result<ResolvedPlan, Vec<PlanDiagnostic>> {
+    let mut diagnostics = Vec::new();
+    if state.tasks.iter().any(|task| {
+        matches!(
+            task.state,
+            TaskState::Running | TaskState::AwaitingIntegration | TaskState::Integrating
+        )
+    }) {
+        return Err(vec![diag(
+            None,
+            None,
+            "active_barrier",
+            "Active work must settle before replanning.".into(),
+        )]);
+    }
+    if plan.objective.trim().is_empty()
+        || plan.tasks.is_empty()
+        || plan.tasks.len() > MAX_PLAN_TASKS
+    {
+        diagnostics.push(diag(
+            None,
+            None,
+            "invalid_plan_size",
+            "A revised plan needs an objective and 1-50 tasks.".into(),
+        ));
+    }
+    let anchors: HashSet<i64> = state
+        .tasks
+        .iter()
+        .filter(|task| task.state == TaskState::Completed)
+        .map(|task| task.id)
+        .collect();
+    let mut ids = HashMap::new();
+    for (index, task) in plan.tasks.iter().enumerate() {
+        if task.id.trim().is_empty()
+            || task.id != task.id.trim()
+            || ids.insert(task.id.clone(), -(index as i64) - 1).is_some()
+            || task.id.parse::<i64>().is_ok()
+        {
+            diagnostics.push(diag(
+                None,
+                Some("id"),
+                "invalid_task_id",
+                "New task IDs must be unique nonnumeric strings.".into(),
+            ));
+        }
+        let reference = TaskRef::ClientId(task.id.clone());
+        check_content(
+            Some(reference.clone()),
+            &task.title,
+            &task.objective,
+            &task.acceptance_criteria,
+            &mut diagnostics,
+        );
+        check_planning_role(&reference, &task.role, task.operation, &mut diagnostics);
+    }
+    let mut tasks: Vec<ResolvedTask> = state
+        .tasks
+        .iter()
+        .filter(|task| matches!(task.state, TaskState::Completed | TaskState::Superseded))
+        .map(resolved_from_task)
+        .collect();
+    let offset = state
+        .tasks
+        .iter()
+        .map(|task| task.position)
+        .max()
+        .unwrap_or(-1)
+        + 1;
+    for (index, task) in plan.tasks.iter().enumerate() {
+        let mut dependencies = Vec::new();
+        for dependency in &task.dependencies {
+            if let Some(id) = ids.get(dependency) {
+                dependencies.push(*id);
+            } else if let Some(id) = dependency
+                .parse::<i64>()
+                .ok()
+                .filter(|id| anchors.contains(id))
+            {
+                dependencies.push(id);
+            } else {
+                diagnostics.push(diag(
+                    Some(TaskRef::ClientId(task.id.clone())),
+                    Some("dependencies"),
+                    "unknown_dependency",
+                    format!(
+                        "Dependency {dependency} is neither a new task nor a completed anchor."
+                    ),
+                ));
+            }
+        }
+        tasks.push(ResolvedTask {
+            id: -(index as i64) - 1,
+            insert: true,
+            title: task.title.clone(),
+            objective: task.objective.clone(),
+            acceptance_criteria: task.acceptance_criteria.clone(),
+            state: TaskState::Pending,
+            position: offset + index as i32,
+            dependencies,
+            role: task.role.clone(),
+            operation: task.operation,
+        });
+    }
+    detect_cycle(&tasks, &mut diagnostics);
+    recompute_states(&mut tasks, &state.attempts);
+    if !diagnostics.is_empty() {
+        return Err(diagnostics);
+    }
+    Ok(ResolvedPlan {
+        revision: state.revision + 1,
+        objective: state.objective.clone(),
+        tasks,
+        removed: Vec::new(),
+        superseded: state
+            .tasks
+            .iter()
+            .filter(|task| !matches!(task.state, TaskState::Completed | TaskState::Superseded))
+            .map(|task| task.id)
+            .collect(),
+    })
+}
+
 /// Outcome of applying a plan change in the database.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlanApplyOutcome {

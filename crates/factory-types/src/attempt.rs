@@ -10,6 +10,7 @@ pub enum AttemptStatus {
     Failed,
     Interrupted,
     Cancelled,
+    HandedOff,
 }
 
 impl AttemptStatus {
@@ -22,6 +23,7 @@ impl AttemptStatus {
             AttemptStatus::Failed => "failed",
             AttemptStatus::Interrupted => "interrupted",
             AttemptStatus::Cancelled => "cancelled",
+            AttemptStatus::HandedOff => "handed_off",
         }
     }
 }
@@ -38,6 +40,7 @@ impl std::str::FromStr for AttemptStatus {
             "failed" => Ok(AttemptStatus::Failed),
             "interrupted" => Ok(AttemptStatus::Interrupted),
             "cancelled" => Ok(AttemptStatus::Cancelled),
+            "handed_off" => Ok(AttemptStatus::HandedOff),
             other => Err(format!("unknown attempt status '{other}'")),
         }
     }
@@ -46,6 +49,8 @@ impl std::str::FromStr for AttemptStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskEvidence {
+    #[serde(default)]
+    pub git_snapshot: Option<GitEvidenceSnapshot>,
     pub changed_files: Vec<String>,
     pub diff_summary: String,
     pub commit_sha: Option<String>,
@@ -60,6 +65,15 @@ pub struct TaskEvidence {
     /// worktree.
     #[serde(default)]
     pub diff_patch: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitEvidenceSnapshot {
+    pub base_sha: String,
+    pub head_sha: String,
+    pub patch_sha256: String,
+    pub patch_truncated: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

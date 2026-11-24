@@ -5,15 +5,25 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+factory-proc.workspace = true
 factory-agent = { workspace = true }
 factory-core = { workspace = true }
 factory-db = { workspace = true }
+factory-git = { workspace = true }
 factory-types = { workspace = true }
 chrono = { workspace = true }
 fs4 = { workspace = true }
 portable-pty = "0.9"
 thiserror = { workspace = true }
+serde_json.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }
 
 [dev-dependencies]
 tempfile = "3"
+rusqlite.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

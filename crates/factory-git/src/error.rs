@@ -4,6 +4,16 @@ use std::path::PathBuf;
 
 #[derive(Debug, Error)]
 pub enum GitError {
+    #[error("invalid source-control request: {0}")]
+    Invalid(String),
+    #[error("repository state changed; refresh before retrying")]
+    Stale,
+    #[error("source-control operation is not authorized: {0}")]
+    Protected(String),
+    #[error("repository operation is busy; no changes were applied")]
+    Busy,
+    #[error("Git helpers require explicit trust: {0}")]
+    TrustRequired(String),
     #[error("current directory is not inside a git repository")]
     NotARepository,
     #[error("git command failed: {0}")]

@@ -161,6 +161,7 @@ impl HistoryBuilder {
             }
 
             let evidence = (!changed_files.is_empty()).then(|| TaskEvidence {
+                git_snapshot: None,
                 changed_files: changed_files.iter().map(|file| file.to_string()).collect(),
                 diff_summary: "changed".into(),
                 commit_sha: None,

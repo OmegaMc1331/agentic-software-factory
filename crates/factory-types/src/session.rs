@@ -60,6 +60,12 @@ pub struct SessionPolicyAudit {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct AgentOutputMetadata {
+    pub process_id: Option<u32>,
+    pub process_started_unix_ms: Option<u64>,
+    pub process_finished_unix_ms: Option<u64>,
+    pub process_tree_supervised: bool,
+    pub process_tree_cleanup_confirmed: bool,
+    pub process_cleanup_observed_unix_ms: Option<u64>,
     pub limit_bytes: u64,
     pub stdout_bytes: u64,
     pub stderr_bytes: u64,

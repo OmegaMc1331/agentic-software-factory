@@ -232,3 +232,25 @@ influences scheduling by itself. See [Evaluations](evaluations.md).
 
 Task agents call tools through the scoped `factory mcp call` bridge, not through
 this API. See [External Tools / MCP](mcp.md).
+
+
+## V2 P03 multi-project namespace
+
+The development application exposes `/api/projects` management and
+`/api/projects/<project_id>/...` versions of all project-specific routes above.
+`GET /api/application` reports the immutable startup default, authorized path roots
+and application caps. Authentication, CSRF, SSE/WebSocket checks and existing
+handler contracts remain in force. Numeric run/task/session IDs are local to their
+project. Unscoped routes remain bound to the startup default for V1 clients;
+`--no-default-project` makes unscoped project requests fail explicitly.
+
+See [typed management contracts, error semantics and compatibility](v2/api-contracts.md).
+The production `/projects.html` entry manages real local projects while the V1
+workspace remains available at `/`. Project selection in that page does not change
+the V1 default, close a project, suspend a mission or select another browser's root.
+
+## Application workspace metadata (P04)
+
+`GET /api/workspaces` lists saved presentation documents. `GET /api/workspaces/:id` reads one, and authenticated/CSRF-protected `PUT /api/workspaces/:id` saves `{base_revision,document}`. IDs use `w_` plus 32 lowercase hexadecimal characters. Writes compare the current revision atomically; stale writers receive 409. Invalid envelope/identity is 400, missing record 404, size/capacity 413, request capacity 429 and unavailable storage 503.
+
+This is application presentation storage, separate from project DBs and execution. Limits, schema, recovery and request/response contracts are in [V2 API contracts](v2/api-contracts.md) and [layout persistence](v2/layout-persistence.md). `/workspace.html` passes project IDs on every project operation; the explicit V1 compatibility entry `/?project=<p_id>` binds that V1 document to the chosen scope while authentication stays global.

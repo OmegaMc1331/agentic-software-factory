@@ -28,6 +28,25 @@ mod embedded {
     #[folder = "../../apps/dashboard/dist/"]
     struct Assets;
 
+    #[cfg(test)]
+    mod tests {
+        use super::Assets;
+
+        #[test]
+        fn projects_assets_and_font_licenses_are_embedded() {
+            for path in [
+                "index.html",
+                "projects.html",
+                "workspace.html",
+                "licenses/inter-OFL.txt",
+                "licenses/jetbrains-mono-OFL.txt",
+            ] {
+                let asset = Assets::get(path).expect("required embedded asset");
+                assert!(matches!(asset.data, std::borrow::Cow::Borrowed(_)));
+            }
+        }
+    }
+
     async fn serve(request: Request<Body>) -> Response<Body> {
         let path = request.uri().path().trim_start_matches('/');
         let file = Assets::get(path).or_else(|| Assets::get("index.html"));

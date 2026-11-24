@@ -1,0 +1,21 @@
+# Git execution trust and Source Control safety
+
+Git and gh use structured arguments under the existing bounded process supervisor. The browser cannot select an executable, arbitrary argv, environment, filesystem root or OS process ID. P03 project authentication/ownership, Host, Origin and CSRF checks precede project routes. P05 resolves registered roots and protects links, hard links and internal paths. Active and retained managed worktrees stay read-only for ordinary users of these APIs.
+
+## Git programs
+
+Git reads are not assumed free of side effects. Source Control reads disable fsmonitor/untracked-cache updates and configured clean/smudge/process filter programs. Diffs disable external diff and textconv; history disables signature display/verification. Submodule recursion is disabled. Relevant inherited `GIT_*`/`SSH_*` execution overrides are removed from the new inspection command environment. These choices affect the new Source Control service, not the underlying OS privileges of Git.
+
+Manual mutations check effective attributes and refuse unsupported filters; a globally installed unused LFS driver alone is not a refusal. Hooks and signing settings are honoured only after explicit operation trust. They are not disabled to manufacture a successful commit. A restrictive project command ceiling cannot be widened by that checkbox. Approved helper execution runs with local OS privileges under the process deadline; it is not an OS sandbox.
+
+Repository/project changes by other trusted local programs can still race static checks. Git locks, generation checks, root identity validation and compare-and-swap refs reduce ordinary concurrency hazards; they do not claim complete hostile-path/config replacement protection. Failures and uncertain outcomes must remain inspectable.
+
+## Paths and refs
+
+Whole-file operations use literal pathspecs and `--` boundaries. Portable path validation and P05 checks precede reading/staging; `.git`, `.factory`, protected configuration and sensitive credential-like names are refused. Ref names reject option injection, malformed components and coordinator-owned `factory/` namespaces. Reserved `factory/` and `refs/` prefixes are compared without ASCII case sensitivity on every platform: Windows Git accepts a different-case ref spelling as the same filesystem-backed ref. The same check protects mutation of an already checked-out reserved alias. Branch selection requires the exact persisted local ref name; case-only duplicate creation is rejected. NUL-delimited registered worktree ownership is checked before checkout and before index/commit mutations. Every non-unborn registered worktree branch must match an exact full ref in the bounded catalog. A noncanonical Unicode or ASCII spelling fails closed without relying on a platform-specific case-folding table. Ambiguous duplicate owners and externally checked-out aliases require reconciliation; evidence is preserved. These checks supplement Git's native protection, which Windows case aliases can bypass. Case-only distinct ASCII branch identities are conservatively unsupported by manual operations on all platforms. No force flags, destructive cleanup, hard reset or automatic stash/drop are exposed.
+
+Project filesystem/Git/command ceilings apply to typed manual operations. Memory, agent instructions, PR text and review comments cannot grant permissions. Agent grants remain attempt/session-scoped and are not transferred through review UI records. GitHub uses existing authentication; API diagnostics redact known environment/configured secret values, with imperfect secret detection explicitly acknowledged. Tokens and authorization headers are not UI state or audit payloads.
+
+## Publication
+
+Opening Source Control, a review or delivery preview does not authorize external mutation. P12 delivery requires explicit repository-scoped consent, current commit/base/head checks, authenticated repository identity and effective authorization. Existing durable delivery ownership and uncertain-response reconciliation remain in use. Local automated review is not a remote GitHub review or merge authorization. No remote merge, force push, production deployment or repository administration is introduced.

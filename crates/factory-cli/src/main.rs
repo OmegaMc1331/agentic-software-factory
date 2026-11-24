@@ -42,9 +42,22 @@ enum Command {
         /// Do not open the dashboard in a browser
         #[arg(long)]
         no_browser: bool,
+        #[arg(
+            long,
+            help = "Open the V2 workspace; the default browser entry remains V1"
+        )]
+        workspace: bool,
         /// Exact development dashboard origin allowed to call the local API
         #[arg(long, env = "FACTORY_DEV_ORIGIN", value_name = "ORIGIN")]
         dev_origin: Option<String>,
+        #[arg(long, env = "FACTORY_REGISTRY", value_name = "FILE")]
+        registry: Option<std::path::PathBuf>,
+        #[arg(long, value_name = "DIRECTORY")]
+        allow_project_root: Vec<std::path::PathBuf>,
+        #[arg(long)]
+        no_default_project: bool,
+        #[arg(long,default_value_t=8,value_parser=clap::value_parser!(u8).range(1..=32))]
+        max_active_tasks: u8,
     },
     /// Show the current factory status
     Status,
@@ -149,9 +162,24 @@ impl Cli {
             Command::Start {
                 port,
                 no_browser,
+                workspace,
                 dev_origin,
+                registry,
+                allow_project_root,
+                no_default_project,
+                max_active_tasks,
             } => {
-                start(&root, *port, *no_browser, dev_origin.as_deref())?;
+                start(
+                    &root,
+                    *port,
+                    *no_browser,
+                    dev_origin.as_deref(),
+                    registry.as_deref(),
+                    allow_project_root,
+                    *no_default_project,
+                    *max_active_tasks,
+                    *workspace,
+                )?;
             }
             Command::Status => {
                 status(&root)?;
@@ -507,31 +535,78 @@ fn worktree_status(root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn api_state(root: &Path, dev_origin: Option<&str>) -> Result<factory_api::ApiState> {
+fn api_state(
+    root: &Path,
+    dev_origin: Option<&str>,
+    registry: Option<&Path>,
+    authorized: &[std::path::PathBuf],
+    no_default: bool,
+    max_tasks: u8,
+) -> Result<factory_api::FactoryApplication> {
     let mut options = factory_api::ApiOptions::default();
     if let Some(origin) = dev_origin {
         options = options
             .with_dev_origin(origin)
             .map_err(anyhow::Error::msg)?;
     }
-    Ok(factory_api::ApiState::new_with_options(
-        root.to_path_buf(),
-        options,
+    let mut allowed_roots = authorized.to_vec();
+    if !no_default {
+        allowed_roots.push(root.to_owned());
+    }
+    let registry_path = match registry {
+        Some(path) => path.to_owned(),
+        None => factory_projects::application_registry_path()?,
+    };
+    Ok(factory_api::FactoryApplication::new(
+        factory_api::ApplicationOptions {
+            registry_path,
+            allowed_roots,
+            default_root: (!no_default).then(|| root.to_owned()),
+            dashboard_root: root.to_owned(),
+            limits: factory_projects::ProjectLimits {
+                concurrent_tasks: usize::from(max_tasks),
+                ..Default::default()
+            },
+            api: options,
+        },
     )?)
 }
 
-fn start(root: &Path, port: u16, no_browser: bool, dev_origin: Option<&str>) -> Result<()> {
-    factory_root(root)?;
+#[allow(clippy::too_many_arguments)]
+fn start(
+    root: &Path,
+    port: u16,
+    no_browser: bool,
+    dev_origin: Option<&str>,
+    registry: Option<&Path>,
+    authorized: &[std::path::PathBuf],
+    no_default: bool,
+    max_tasks: u8,
+    workspace: bool,
+) -> Result<()> {
+    if !no_default {
+        factory_root(root)?;
+    }
     let listener = factory_api::bind(port)
         .with_context(|| format!("cannot bind the Factory API to 127.0.0.1:{port}"))?;
     let address = listener.local_addr()?;
-    let state = api_state(root, dev_origin)?;
-    let url = format!("http://127.0.0.1:{}", address.port());
+    let state = api_state(
+        root, dev_origin, registry, authorized, no_default, max_tasks,
+    )?;
+    let url = format!(
+        "http://127.0.0.1:{}{}",
+        address.port(),
+        if workspace { "/workspace.html" } else { "" }
+    );
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
     runtime.block_on(async move {
-        let mut server = tokio::spawn(factory_api::serve(Arc::new(state), listener));
+        let mut server = tokio::spawn(factory_api::serve_application_with_shutdown(
+            Arc::new(state),
+            listener,
+            shutdown_signal()?,
+        ));
         tokio::select! {
             result = &mut server => {
                 result.context("Factory API task failed")??;
@@ -547,6 +622,25 @@ fn start(root: &Path, port: u16, no_browser: bool, dev_origin: Option<&str>) -> 
 
         server.await.context("Factory API task failed")??;
         Ok(())
+    })
+}
+
+#[cfg(unix)]
+fn shutdown_signal() -> std::io::Result<impl std::future::Future<Output = ()> + Send> {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    let mut terminate = signal(SignalKind::terminate())?;
+    Ok(async move {
+        tokio::select! { _ = interrupt.recv() => {}, _ = terminate.recv() => {} }
+    })
+}
+
+#[cfg(windows)]
+fn shutdown_signal() -> std::io::Result<impl std::future::Future<Output = ()> + Send> {
+    let mut interrupt = tokio::signal::windows::ctrl_c()?;
+    let mut terminate = tokio::signal::windows::ctrl_break()?;
+    Ok(async move {
+        tokio::select! { _ = interrupt.recv() => {}, _ = terminate.recv() => {} }
     })
 }
 
@@ -588,7 +682,8 @@ fn serve(root: &Path, port: u16, dev_origin: Option<&str>) -> Result<()> {
     factory_root(root)?;
     let listener = factory_api::bind(port)
         .with_context(|| format!("cannot bind the Factory API to 127.0.0.1:{port}"))?;
-    let state = api_state(root, dev_origin)?;
+    let registry = std::env::var_os("FACTORY_REGISTRY").map(std::path::PathBuf::from);
+    let state = api_state(root, dev_origin, registry.as_deref(), &[], false, 8)?;
     println!(
         "Factory API listening on http://127.0.0.1:{}",
         listener.local_addr()?.port()
@@ -596,7 +691,10 @@ fn serve(root: &Path, port: u16, dev_origin: Option<&str>) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(factory_api::serve(Arc::new(state), listener))?;
+    runtime.block_on(async move {
+        factory_api::serve_application_with_shutdown(Arc::new(state), listener, shutdown_signal()?)
+            .await
+    })?;
     Ok(())
 }
 

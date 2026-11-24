@@ -38,6 +38,7 @@ pub struct ProcCommand {
     pub args: Vec<OsString>,
     pub current_dir: Option<PathBuf>,
     pub env: Vec<(OsString, OsString)>,
+    pub clear_environment: bool,
 }
 
 impl ProcCommand {
@@ -47,6 +48,7 @@ impl ProcCommand {
             args: Vec::new(),
             current_dir: None,
             env: Vec::new(),
+            clear_environment: false,
         }
     }
 
@@ -69,6 +71,11 @@ impl ProcCommand {
         self
     }
 
+    pub fn clear_environment(mut self) -> Self {
+        self.clear_environment = true;
+        self
+    }
+
     pub fn env(mut self, key: impl Into<OsString>, value: impl Into<OsString>) -> Self {
         self.env.push((key.into(), value.into()));
         self
@@ -86,14 +93,34 @@ impl ProcCommand {
         bounds: Bounds,
         cancel: Option<&AtomicBool>,
     ) -> Result<ProcOutput, ProcError> {
+        self.run_with_input(bounds, cancel, Stdio::null())
+    }
+
+    pub fn run_with_input_file(
+        &self,
+        bounds: Bounds,
+        input: std::fs::File,
+    ) -> Result<ProcOutput, ProcError> {
+        self.run_with_input(bounds, None, input.into())
+    }
+
+    fn run_with_input(
+        &self,
+        bounds: Bounds,
+        cancel: Option<&AtomicBool>,
+        input: Stdio,
+    ) -> Result<ProcOutput, ProcError> {
         let mut command = Command::new(&self.program);
         command
             .args(&self.args)
-            .stdin(Stdio::null())
+            .stdin(input)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         if let Some(dir) = &self.current_dir {
             command.current_dir(dir);
+        }
+        if self.clear_environment {
+            command.env_clear();
         }
         for (key, value) in &self.env {
             command.env(key, value);
@@ -473,6 +500,16 @@ pub mod windows_job {
         /// Creates a kill-on-close job and assigns `child` to it. `None`
         /// when the platform calls fail (callers fall back to taskkill).
         pub fn assign(child: &std::process::Child) -> Option<JobGuard> {
+            Self::assign_handle(child.as_raw_handle())
+        }
+
+        pub fn assign_borrowed(
+            child: std::os::windows::io::BorrowedHandle<'_>,
+        ) -> Option<JobGuard> {
+            Self::assign_handle(child.as_raw_handle())
+        }
+
+        fn assign_handle(child: std::os::windows::io::RawHandle) -> Option<JobGuard> {
             unsafe {
                 let job = CreateJobObjectW(core::ptr::null(), core::ptr::null());
                 if job.is_null() {
@@ -490,7 +527,7 @@ pub mod windows_job {
                     CloseHandle(job);
                     return None;
                 }
-                if AssignProcessToJobObject(job, child.as_raw_handle()) == 0 {
+                if AssignProcessToJobObject(job, child) == 0 {
                     CloseHandle(job);
                     return None;
                 }
@@ -506,12 +543,65 @@ pub mod windows_job {
         }
     }
 
+    impl JobGuard {
+        pub fn wait_empty(&self, timeout: std::time::Duration) -> bool {
+            let started = std::time::Instant::now();
+            loop {
+                let mut info: windows_sys::Win32::System::JobObjects::JOBOBJECT_BASIC_ACCOUNTING_INFORMATION=unsafe {core::mem::zeroed()};
+                let queried = unsafe {
+                    windows_sys::Win32::System::JobObjects::QueryInformationJobObject(
+                        self.handle,
+                        windows_sys::Win32::System::JobObjects::JobObjectBasicAccountingInformation,
+                        &mut info as *mut _ as *mut core::ffi::c_void,
+                        core::mem::size_of_val(&info) as u32,
+                        core::ptr::null_mut(),
+                    )
+                };
+                if queried == 0 {
+                    return false;
+                }
+                if info.ActiveProcesses == 0 {
+                    return true;
+                }
+                if started.elapsed() >= timeout {
+                    return false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+    }
+
     impl Drop for JobGuard {
         fn drop(&mut self) {
             unsafe {
                 CloseHandle(self.handle);
             }
         }
+    }
+}
+
+#[cfg(windows)]
+pub fn owned_process_absent(pid: u32) -> bool {
+    unsafe {
+        use windows_sys::Win32::{
+            Foundation::{CloseHandle, GetLastError, ERROR_INVALID_PARAMETER},
+            System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE},
+        };
+        let handle = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
+        if handle.is_null() {
+            return GetLastError() == ERROR_INVALID_PARAMETER;
+        }
+        let exited = WaitForSingleObject(handle, 0) == 0;
+        CloseHandle(handle);
+        exited
+    }
+}
+
+#[cfg(unix)]
+pub fn owned_process_absent(pid: u32) -> bool {
+    unsafe {
+        libc::kill(-(pid as i32), 0) == -1
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
     }
 }
 

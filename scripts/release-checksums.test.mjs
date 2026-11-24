@@ -20,7 +20,7 @@ const INVENTORY_PATH = fileURLToPath(
   new URL("release-artifacts.txt", import.meta.url),
 );
 const WORKFLOW_PATH = fileURLToPath(
-  new URL("../.github/workflows/release.yml", import.meta.url),
+  new URL("../.github/workflows/ci.yml", import.meta.url),
 );
 const ARCHIVES = [
   "factory-linux-x86_64.tar.gz",
@@ -537,44 +537,44 @@ test("finalize-release rejects duplicate inventory entries", (t) => {
   );
 });
 
-test("release workflow verifies checksums before publication", () => {
+test("candidate workflow verifies checksums before artifact retention and prevents publication", () => {
   const workflow = readText(WORKFLOW_PATH);
-  assert.match(workflow, /node scripts\/release-checksums\.mjs generate/);
   assert.match(workflow, /node scripts\/release-checksums\.mjs verify/);
   assert.match(
     workflow,
-    /node scripts\/release-checksums\.mjs verify-release release/,
+    /node scripts\/release-checksums\.mjs verify-release .factory\/v2\/p14\/assembled/,
   );
   assert.match(
     workflow,
-    /node scripts\/release-checksums\.mjs finalize-release release/,
+    /node scripts\/release-checksums\.mjs finalize-release .factory\/v2\/p14\/assembled/,
   );
   assert.match(workflow, /sha256sum -c SHA256SUMS\.txt/);
   assert.doesNotMatch(workflow, /cat release\/\*\.sha256/);
   assert.doesNotMatch(workflow, /release\/\*/);
-  const generateIndex = workflow.indexOf(
-    "node scripts/release-checksums.mjs generate",
-  );
   const verifyIndex = workflow.indexOf(
     "node scripts/release-checksums.mjs verify",
   );
-  const uploadIndex = workflow.indexOf("uses: actions/upload-artifact@v4");
+  const uploadIndex = workflow.indexOf("uses: actions/upload-artifact@");
   const inventoryIndex = workflow.indexOf(
-    "node scripts/release-checksums.mjs verify-release release",
+    "node scripts/release-checksums.mjs verify-release .factory/v2/p14/assembled",
   );
-  const contentIndex = workflow.indexOf("Verify all archive contents");
+  const contentIndex = workflow.indexOf("scripts/v2_p14/assemble.py");
   const finalizeIndex = workflow.indexOf(
-    "node scripts/release-checksums.mjs finalize-release release",
+    "node scripts/release-checksums.mjs finalize-release .factory/v2/p14/assembled",
   );
   const checkIndex = workflow.indexOf("sha256sum -c SHA256SUMS.txt");
-  const publishIndex = workflow.indexOf("gh release create");
-  assert.ok(generateIndex >= 0);
-  assert.ok(generateIndex < verifyIndex);
+  assert.ok(verifyIndex >= 0);
   assert.ok(verifyIndex < uploadIndex);
-  assert.ok(inventoryIndex < contentIndex);
-  assert.ok(contentIndex < finalizeIndex);
+  assert.ok(contentIndex >= 0 && contentIndex < inventoryIndex);
+  assert.ok(inventoryIndex < finalizeIndex);
   assert.ok(finalizeIndex < checkIndex);
-  assert.ok(checkIndex < publishIndex);
+  const launcher = readText(fileURLToPath(new URL("../.github/workflows/release.yml", import.meta.url)));
+  for (const file of [workflow, launcher]) {
+    assert.doesNotMatch(file, /gh release create|contents: write|pull_request_target|git push/);
+    for (const match of file.matchAll(/uses: ([\w-]+\/[\w-]+)@(\S+)/g)) assert.match(match[2], /^[a-f0-9]{40}$/);
+  }
+  assert.match(launcher, /workflow_dispatch:/);
+  assert.match(launcher, /inputs.authorization == 'QUALIFY ONLY'/);
 });
 
 test("release artifact inventory is explicit and complete", () => {

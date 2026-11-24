@@ -65,6 +65,11 @@ struct SessionIssue {
 }
 
 impl SecurityPolicy {
+    pub(crate) fn authenticated_identity(&self, headers: &HeaderMap) -> Option<String> {
+        let token = cookie_value(headers, SESSION_COOKIE)?;
+        self.validate_session(token)
+            .then(|| hex(&Sha256::digest(token.as_bytes())))
+    }
     pub(crate) fn new(options: ApiOptions) -> Self {
         let mut secret = [0u8; HMAC_DIGEST_BYTES];
         OsRng.fill_bytes(&mut secret);
@@ -261,6 +266,14 @@ pub(crate) async fn enforce_security(
     request: Request,
     next: Next,
 ) -> Response {
+    enforce_policy(&state.security, request, next).await
+}
+
+pub(crate) async fn enforce_policy(
+    policy: &SecurityPolicy,
+    request: Request,
+    next: Next,
+) -> Response {
     let path = request.uri().path().to_string();
     let method = request.method().clone();
     let headers = request.headers();
@@ -273,7 +286,7 @@ pub(crate) async fn enforce_security(
         Err(()) => return denial(StatusCode::FORBIDDEN, "unapproved Origin header"),
     };
     if let Some(origin) = &origin {
-        if !state.security.origin_allowed(origin, &host) {
+        if !policy.origin_allowed(origin, &host) {
             return denial(StatusCode::FORBIDDEN, "unapproved Origin header");
         }
     }
@@ -298,7 +311,7 @@ pub(crate) async fn enforce_security(
         }
     } else if path != "/api/health" && is_api_path(&path) {
         let authenticated = cookie_value(headers, SESSION_COOKIE)
-            .is_some_and(|token| state.security.validate_session(token));
+            .is_some_and(|token| policy.validate_session(token));
         if !authenticated {
             return denial(StatusCode::UNAUTHORIZED, "authentication required");
         }
@@ -341,14 +354,23 @@ pub(crate) async fn issue_browser_session(
     State(state): State<SharedState>,
     headers: HeaderMap,
 ) -> Response {
+    issue_policy_session(&state.security, headers)
+}
+
+pub(crate) fn issue_policy_session(policy: &SecurityPolicy, headers: HeaderMap) -> Response {
     let existing_csrf = cookie_value(&headers, CSRF_COOKIE)
         .filter(|value| {
             value.len() == HMAC_DIGEST_BYTES * 2
                 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
         })
         .map(str::to_owned);
-    let session = state.security.issue_session_with_csrf(existing_csrf);
-    let ttl = state.security.ttl.as_secs();
+    let mut session = policy.issue_session_with_csrf(existing_csrf);
+    if let Some(token) =
+        cookie_value(&headers, SESSION_COOKIE).filter(|token| policy.validate_session(token))
+    {
+        session.session = token.into();
+    }
+    let ttl = policy.ttl.as_secs();
     let session_cookie = format!(
         "{SESSION_COOKIE}={}; HttpOnly; SameSite=Strict; Path=/api; Max-Age={ttl}",
         session.session

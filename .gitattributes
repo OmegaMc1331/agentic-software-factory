@@ -1,0 +1,5 @@
+docs/v2/evidence/p11/** -text -whitespace
+docs/v2/evidence/p12/** -text -whitespace
+docs/v2/evidence/p14/** -text -whitespace
+docs/v2/evidence/p14-r1/** -text -whitespace
+docs/v2/evidence/p14-r2/** -text -whitespace

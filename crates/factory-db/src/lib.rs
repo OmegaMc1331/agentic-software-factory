@@ -1,4 +1,13 @@
+mod agent_profiles;
 pub mod error;
+mod lifecycle;
+mod memory;
+pub use memory::{memory_fingerprint, memory_hash, memory_normalize};
+mod migration_backup;
+mod notifications;
+pub use notifications::ServiceNotification;
+mod scheduler;
+mod source_control;
 
 pub use error::DbError;
 
@@ -27,6 +36,7 @@ fn now() -> String {
 
 impl FactoryDb {
     pub fn open(path: &Path) -> Result<Self> {
+        migration_backup::before_upgrade(path, MIGRATIONS.len())?;
         let mut conn = Connection::open(path)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
@@ -775,7 +785,9 @@ impl FactoryDb {
         let tasks = self.list_tasks(run_id)?;
         let status = RunStatus::from_tasks(&tasks);
         let current = self.get_run(run_id)?.map(|run| run.status);
-        if matches!(current, Some(RunStatus::Planning | RunStatus::Cancelled)) {
+        if matches!(current, Some(RunStatus::Planning | RunStatus::Cancelled))
+            || self.scheduler_running(run_id)?
+        {
             return Ok(());
         }
         if current != Some(status) {
@@ -814,7 +826,20 @@ impl FactoryDb {
         reason: Option<&str>,
         planner_session_id: Option<i64>,
     ) -> Result<PlanApplyOutcome> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let busy: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM scheduler_owners WHERE run_id=?1 AND finished_at IS NULL)",
+            [run_id],
+            |r| r.get(0),
+        )?;
+        if busy {
+            return Err(DbError::Busy(
+                "A scheduler owns this plan; wait for it to finish.".into(),
+            ));
+        }
         let state = load_plan_state(&tx, run_id)?;
         if state.revision != patch.expected_revision {
             return Err(DbError::Conflict {
@@ -855,7 +880,20 @@ impl FactoryDb {
         reason: Option<&str>,
         planner_session_id: Option<i64>,
     ) -> Result<PlanApplyOutcome> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let busy: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM scheduler_owners WHERE run_id=?1 AND finished_at IS NULL)",
+            [run_id],
+            |r| r.get(0),
+        )?;
+        if busy {
+            return Err(DbError::Busy(
+                "A scheduler owns this plan; wait for it to finish.".into(),
+            ));
+        }
         let state = load_plan_state(&tx, run_id)?;
         if state.revision != request.expected_revision {
             return Err(DbError::Conflict {
@@ -1123,12 +1161,16 @@ impl FactoryDb {
         worktree_path: &str,
         source_base: Option<&str>,
     ) -> Result<TaskAttempt> {
-        let attempt_number: u32 = self.conn.query_row(
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let attempt_number: u32 = tx.query_row(
             "SELECT COALESCE(MAX(attempt_number), 0) + 1 FROM task_attempts WHERE task_id = ?1",
             params![task_id],
             |row| row.get(0),
         )?;
-        self.conn.execute(
+        tx.execute(
             "INSERT INTO task_attempts
              (task_id, attempt_number, agent, role, operation, status, started_at, worktree_path, source_base)
              VALUES (?1, ?2, ?3, ?4, ?5, 'running', ?6, ?7, ?8)",
@@ -1143,7 +1185,9 @@ impl FactoryDb {
                 source_base
             ],
         )?;
-        self.get_task_attempt(self.conn.last_insert_rowid())?
+        let id = tx.last_insert_rowid();
+        tx.commit()?;
+        self.get_task_attempt(id)?
             .ok_or(DbError::NotFound("task attempt"))
     }
 
@@ -1739,6 +1783,7 @@ impl FactoryDb {
                     exit_code: row.get(7)?,
                     error: row.get(8)?,
                     evidence: changed_files.map(|files| TaskEvidence {
+                        git_snapshot: None,
                         changed_files: files,
                         ..TaskEvidence::default()
                     }),
@@ -1832,6 +1877,7 @@ impl FactoryDb {
 
     pub fn reconcile_interrupted(&self) -> Result<Reconciliation> {
         let timestamp = now();
+        self.conn.execute("UPDATE project_memory_extractions SET state='interrupted',payload=json_set(payload,'$.state','interrupted','$.error','RUNTIME_INTERRUPTION: source ownership and session history retained; no automatic retry','$.updatedAt',?1) WHERE state='running'",params![timestamp])?;
         self.conn.execute(
             "UPDATE tool_grants SET revoked_at = ?1 WHERE revoked_at IS NULL",
             params![timestamp],
@@ -1871,7 +1917,7 @@ impl FactoryDb {
         )?;
         let runs = self.conn.execute(
             "UPDATE runs SET status = 'failed', updated_at = ?1
-             WHERE status IN ('planning', 'active')",
+             WHERE status IN ('planning', 'active') AND id NOT IN (SELECT run_id FROM mission_lifecycle WHERE state='suspended')",
             params![timestamp],
         )?;
         Ok(Reconciliation {
@@ -2167,7 +2213,12 @@ fn apply_resolved(
     }
 
     for task in &resolved.tasks {
-        if task.insert {
+        if task.insert
+            || state.tasks.iter().any(|original| {
+                original.id == task.id
+                    && matches!(original.state, TaskState::Completed | TaskState::Superseded)
+            })
+        {
             continue;
         }
         let criteria = serde_json::to_string(&task.acceptance_criteria)?;
@@ -2205,6 +2256,14 @@ fn apply_resolved(
     }
 
     for task in &resolved.tasks {
+        if !task.insert
+            && state.tasks.iter().any(|original| {
+                original.id == task.id
+                    && matches!(original.state, TaskState::Completed | TaskState::Superseded)
+            })
+        {
+            continue;
+        }
         let real_id = id_map.get(&task.id).copied().unwrap_or(task.id);
         tx.execute(
             "DELETE FROM task_dependencies WHERE task_id = ?1",
@@ -2227,6 +2286,11 @@ fn apply_resolved(
         let mut task = original.clone();
         if resolved.superseded.contains(&original.id) {
             task.state = TaskState::Superseded;
+            task.updated_at = ts.clone();
+            final_tasks.push(task);
+            continue;
+        }
+        if matches!(original.state, TaskState::Completed | TaskState::Superseded) {
             final_tasks.push(task);
             continue;
         }
@@ -2281,7 +2345,12 @@ fn apply_resolved(
         params![run_id],
         |row| row.get(0),
     )?;
-    if !matches!(current.as_str(), "planning" | "cancelled") {
+    let owned: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM scheduler_owners WHERE run_id=?1 AND finished_at IS NULL)",
+        [run_id],
+        |r| r.get(0),
+    )?;
+    if !matches!(current.as_str(), "planning" | "cancelled") && !owned {
         tx.execute(
             "UPDATE runs SET status = ?1, updated_at = ?2 WHERE id = ?3",
             params![status.as_str(), ts, run_id],
@@ -2730,9 +2799,32 @@ ALTER TABLE github_deliveries ADD COLUMN recovery_required INTEGER NOT NULL DEFA
 ";
 
 const MIGRATIONS: &[&str] = &[
-    V1_SCHEMA, V2_SCHEMA, V3_SCHEMA, V4_SCHEMA, V5_SCHEMA, V6_SCHEMA, V7_SCHEMA, V8_SCHEMA,
-    V9_SCHEMA, V10_SCHEMA, V11_SCHEMA, V12_SCHEMA, V13_SCHEMA, V14_SCHEMA, V15_SCHEMA, V16_SCHEMA,
-    V17_SCHEMA, V18_SCHEMA,
+    V1_SCHEMA,
+    V2_SCHEMA,
+    V3_SCHEMA,
+    V4_SCHEMA,
+    V5_SCHEMA,
+    V6_SCHEMA,
+    V7_SCHEMA,
+    V8_SCHEMA,
+    V9_SCHEMA,
+    V10_SCHEMA,
+    V11_SCHEMA,
+    V12_SCHEMA,
+    V13_SCHEMA,
+    V14_SCHEMA,
+    V15_SCHEMA,
+    V16_SCHEMA,
+    V17_SCHEMA,
+    V18_SCHEMA,
+    conversations::SCHEMA,
+    scheduler::SCHEMA,
+    agent_profiles::SCHEMA,
+    lifecycle::SCHEMA,
+    memory::SCHEMA,
+    source_control::SCHEMA,
+    notifications::SCHEMA,
+    memory::PERFORMANCE_SCHEMA,
 ];
 
 fn migrate(conn: &mut Connection) -> Result<()> {
@@ -2740,13 +2832,24 @@ fn migrate(conn: &mut Connection) -> Result<()> {
 }
 
 fn migrate_schemas(conn: &mut Connection, schemas: &[&str]) -> Result<()> {
-    conn.execute_batch(
+    let current = conn
+        .prepare("SELECT COUNT(*), COALESCE(MAX(version),0) FROM schema_migrations")
+        .and_then(|mut query| {
+            query.query_row([], |row| {
+                Ok((row.get::<_, usize>(0)?, row.get::<_, usize>(1)?))
+            })
+        });
+    if current.is_ok_and(|(count, maximum)| count == schemas.len() && maximum == schemas.len()) {
+        return Ok(());
+    }
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    tx.execute_batch(
         "CREATE TABLE IF NOT EXISTS schema_migrations (
             version INTEGER PRIMARY KEY,
             applied_at TEXT NOT NULL
         );",
     )?;
-    let applied: Vec<i64> = conn
+    let applied: Vec<i64> = tx
         .prepare("SELECT version FROM schema_migrations ORDER BY version")?
         .query_map([], |r| r.get(0))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -2755,14 +2858,13 @@ fn migrate_schemas(conn: &mut Connection, schemas: &[&str]) -> Result<()> {
         if applied.contains(&version) {
             continue;
         }
-        let tx = conn.transaction()?;
         tx.execute_batch(schema)?;
         tx.execute(
             "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
             params![version, now()],
         )?;
-        tx.commit()?;
     }
+    tx.commit()?;
     Ok(())
 }
 
@@ -2780,23 +2882,29 @@ mod tests {
     use crate::{DbError, FactoryDb, TaskStateCounts, V1_SCHEMA};
 
     #[test]
+    fn linked_sqlite_contains_the_wal_memory_disclosure_fix() {
+        assert!(rusqlite::version_number() >= 3_054_000);
+        let directory = TempDir::new().unwrap();
+        let db = FactoryDb::open(&directory.path().join("sqlite-version.sqlite3")).unwrap();
+        let engine: String = db
+            .conn
+            .query_row("SELECT sqlite_version()", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(engine, rusqlite::version());
+    }
+
+    #[test]
     fn applies_all_migrations_exactly_once() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("test.db");
         let db = FactoryDb::open(&path).unwrap();
         let versions = schema_versions(&path);
-        assert_eq!(
-            versions,
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]
-        );
+        assert_eq!(versions, (1..=26).collect::<Vec<_>>());
         db.create_run("objective", Some("codex")).unwrap();
         drop(db);
 
         let db = FactoryDb::open(&path).unwrap();
-        assert_eq!(
-            schema_versions(&path),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]
-        );
+        assert_eq!(schema_versions(&path), (1..=26).collect::<Vec<_>>());
         db.list_runs().unwrap();
     }
 
@@ -2821,10 +2929,10 @@ mod tests {
         drop(conn);
 
         let db = FactoryDb::open(&path).unwrap();
-        assert_eq!(
-            schema_versions(&path),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]
-        );
+        assert_eq!(schema_versions(&path), (1..=26).collect::<Vec<_>>());
+        assert!(db.agent_profiles(true).unwrap().is_empty());
+        assert!(db.execution_snapshot(1).unwrap().is_none());
+        assert!(db.handoffs(1).unwrap().is_empty());
         let run = db.get_run(1).unwrap().unwrap();
         assert_eq!(run.objective, "legacy");
         let tasks = db.list_tasks(1).unwrap();
@@ -2879,10 +2987,7 @@ mod tests {
 
         let db = FactoryDb::open(&path).unwrap();
         // opening records versions 6 and 7 exactly once
-        assert_eq!(
-            schema_versions(&path),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]
-        );
+        assert_eq!(schema_versions(&path), (1..=26).collect::<Vec<_>>());
         let tasks = db.list_tasks(1).unwrap();
         let operation_of = |title: &str| {
             tasks
@@ -3290,6 +3395,7 @@ mod tests {
                 stderr_dropped_bytes: 0,
                 stdout_truncated: true,
                 stderr_truncated: false,
+                ..AgentOutputMetadata::default()
             }),
         };
         let saved = db.insert_agent_session(&session).unwrap();
@@ -3669,6 +3775,7 @@ mod tests {
             )
             .unwrap();
         let evidence = TaskEvidence {
+            git_snapshot: None,
             changed_files: vec!["src/lib.rs".into()],
             diff_summary: "1 file changed".into(),
             commit_sha: Some("abc123".into()),
@@ -3938,6 +4045,7 @@ mod tests {
             Some("abc"),
             Some("boom"),
             Some(&TaskEvidence {
+                git_snapshot: None,
                 changed_files: vec!["src/日本語.rs".to_string(), "lib/core.rs".to_string()],
                 diff_summary: "summary".to_string(),
                 commit_sha: Some("abc".to_string()),
@@ -4591,3 +4699,4 @@ mod tests {
         assert_eq!(db.demote_interrupted_deliveries().unwrap(), vec![1]);
     }
 }
+mod conversations;

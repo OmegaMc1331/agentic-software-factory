@@ -1,7 +1,17 @@
+pub mod agent_profile;
 pub mod artifact;
+pub use agent_profile::{
+    AgentExecutionSnapshot, AgentHandoff, AgentProfile, AgentProfileInput, HandoffRequest,
+};
 pub mod attempt;
 pub mod github;
 pub mod integration;
+pub mod lifecycle;
+pub mod memory;
+pub use lifecycle::{
+    CheckpointWorktree, MissionCheckpoint, MissionLifecycle, MissionLifecycleState,
+    WorkspaceSessionLifecycle,
+};
 pub mod mcp;
 pub mod plan;
 pub mod plan_edit;
@@ -9,6 +19,7 @@ pub mod plans;
 pub mod recipe;
 pub mod routing;
 pub mod run;
+pub mod scheduler;
 pub mod session;
 pub mod stats;
 pub mod task;
@@ -34,7 +45,10 @@ pub use plans::{
 pub use recipe::{Recipe, RecipeDelivery, RecipeRouting, RecipeSnapshot};
 pub use routing::{RoutingCandidateScore, RoutingDecision, RoutingMode, RoutingPreview};
 pub use run::{Run, RunStatus};
+pub use scheduler::{IntegrationRecord, SchedulerEvent, SchedulerPolicy};
 pub use session::{AgentOutputMetadata, AgentSession, AgentSessionMode, SessionPolicyAudit};
 pub use stats::median_u64;
 pub use task::{Task, TaskState};
 pub use team::WorkflowTeam;
+mod conversation;
+pub use conversation::{Conversation, ConversationCommand, ConversationEvent, ConversationMessage};

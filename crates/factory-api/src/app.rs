@@ -40,10 +40,12 @@ const TERMINAL_BACKPRESSURE_CLOSE_REASON: &str =
     "terminal output paused because this client fell behind";
 
 pub struct ApiState {
-    pub db: Mutex<FactoryDb>,
+    pub db: Arc<Mutex<FactoryDb>>,
     pub root: PathBuf,
     pub runtime: Runtime,
     pub(crate) security: SecurityPolicy,
+    pub(crate) _context: Option<Arc<factory_projects::ProjectContext>>,
+    pub(crate) source_requests: Arc<tokio::sync::Semaphore>,
 }
 
 impl ApiState {
@@ -56,10 +58,12 @@ impl ApiState {
         let db = FactoryDb::open(&root.join(".factory").join("db.sqlite3"))
             .map_err(factory_core::FactoryError::from)?;
         Ok(Self {
-            db: Mutex::new(db),
+            db: Arc::new(Mutex::new(db)),
             root,
             runtime,
             security: SecurityPolicy::new(options),
+            _context: None,
+            source_requests: Arc::new(tokio::sync::Semaphore::new(8)),
         })
     }
 }
@@ -89,11 +93,18 @@ impl IntoResponse for ApiError {
 impl From<factory_db::DbError> for ApiError {
     fn from(err: factory_db::DbError) -> Self {
         match err {
+            factory_db::DbError::Busy(_) => ApiError::new(StatusCode::CONFLICT, err.to_string()),
             factory_db::DbError::NotFound(_) => {
                 ApiError::new(StatusCode::NOT_FOUND, err.to_string())
             }
             other => ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
         }
+    }
+}
+
+impl From<factory_core::FactoryError> for ApiError {
+    fn from(error: factory_core::FactoryError) -> Self {
+        Self::from(RuntimeError::from(error))
     }
 }
 
@@ -132,6 +143,7 @@ impl From<factory_mcp::McpError> for ApiError {
 impl From<RuntimeError> for ApiError {
     fn from(error: RuntimeError) -> Self {
         let status = match &error {
+            RuntimeError::ResourceLimit(_) => StatusCode::TOO_MANY_REQUESTS,
             RuntimeError::AlreadyActive(_) => StatusCode::CONFLICT,
             RuntimeError::NotActive(_) => StatusCode::CONFLICT,
             RuntimeError::TerminalNotActive(_) => StatusCode::CONFLICT,
@@ -161,6 +173,17 @@ impl From<RuntimeError> for ApiError {
                 | factory_core::FactoryError::Git(_)
                 | factory_core::FactoryError::GitHub(_),
             ) => StatusCode::BAD_REQUEST,
+            RuntimeError::Factory(factory_core::FactoryError::SchedulerLimit(_)) => {
+                StatusCode::BAD_REQUEST
+            }
+            RuntimeError::Factory(factory_core::FactoryError::AgentResourceExhausted(_)) => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
+            RuntimeError::Factory(factory_core::FactoryError::CapacityBusy(_))
+            | RuntimeError::Factory(factory_core::FactoryError::Suspended)
+            | RuntimeError::Factory(factory_core::FactoryError::Db(factory_db::DbError::Busy(_))) => {
+                StatusCode::CONFLICT
+            }
             RuntimeError::Factory(factory_core::FactoryError::NotDeliverable(_))
             | RuntimeError::Factory(factory_core::FactoryError::DeliveryConflict(_)) => {
                 StatusCode::CONFLICT
@@ -191,9 +214,34 @@ pub fn router(state: SharedState) -> Router {
     Router::new()
         .route("/api/health", get(health))
         .route("/api/auth/session", post(security::issue_browser_session))
+        .merge(project_routes())
+        .route("/api/*rest", get(api_not_found))
+        .fallback_service(dashboard::router(&state.root))
+        .layer(middleware::from_fn_with_state(
+            security_state,
+            security::enforce_security,
+        ))
+        .with_state(state)
+}
+
+pub(crate) fn project_routes() -> Router<SharedState> {
+    Router::new()
+        .merge(crate::preferences::project_routes())
+        .merge(crate::notifications::routes())
+        .merge(crate::source_control::routes())
+        .merge(crate::conversations::routes())
+        .merge(crate::agent_profiles::routes())
+        .merge(crate::memory::routes())
+        .merge(crate::files::routes())
+        .merge(crate::ide::routes())
         .route("/api/runs", get(list_runs).post(create_run))
         .route("/api/runs/from-issue", post(create_run_from_issue))
         .route("/api/runs/:id", get(get_run))
+        .route(
+            "/api/runs/:id/scheduler",
+            get(run_scheduler).put(configure_scheduler),
+        )
+        .route("/api/runs/:id/scheduler/events", get(run_scheduler_events))
         .route("/api/runs/:id/start", post(start_run))
         .route("/api/runs/:id/cancel", post(cancel_run))
         .route("/api/runs/:id/delivery", get(run_delivery))
@@ -268,16 +316,13 @@ pub fn router(state: SharedState) -> Router {
         .route("/api/mcp/servers/:id/tools", get(list_mcp_tools))
         .route("/api/mcp/invocations", get(list_mcp_invocations))
         .route("/api/mcp/metrics", get(get_mcp_metrics))
-        .route("/api/*rest", get(api_not_found))
-        .fallback_service(dashboard::router(&state.root))
-        .layer(middleware::from_fn_with_state(
-            security_state,
-            security::enforce_security,
-        ))
-        .with_state(state)
+        .route(
+            "/api/context/search",
+            get(crate::application::search_context),
+        )
 }
 
-async fn api_not_found() -> ApiError {
+pub(crate) async fn api_not_found() -> ApiError {
     ApiError::new(StatusCode::NOT_FOUND, "unknown endpoint")
 }
 
@@ -616,6 +661,7 @@ async fn create_pull_request(
     // claimed operation without its worker. The claim and the worker start
     // are one unit from the client's perspective.
     let claim = tokio::task::spawn_blocking(move || {
+        let permit = state.runtime.reserve_operation()?;
         let factory = factory_core::Factory::open(&root).map_err(RuntimeError::from)?;
         let claim = factory
             .begin_delivery(
@@ -634,9 +680,12 @@ async fn create_pull_request(
                     .operation_id
                     .clone()
                     .expect("a claimed delivery always carries an operation id");
-                state
-                    .runtime
-                    .start_delivery(id, &operation_id, operation_request)?;
+                state.runtime.start_delivery_reserved(
+                    id,
+                    &operation_id,
+                    operation_request,
+                    permit,
+                )?;
                 Ok((StatusCode::ACCEPTED, delivery))
             }
         }
@@ -750,9 +799,10 @@ async fn get_run(
                         | factory_types::TaskOperation::Verify
                         | factory_types::TaskOperation::PostProcess
                 )
-            ) && latest
-                .get(&task.id)
-                .is_some_and(|attempt| attempt.status == factory_types::AttemptStatus::Approved)
+            ) && task.state == factory_types::TaskState::Completed
+                && latest
+                    .get(&task.id)
+                    .is_some_and(|attempt| attempt.status == factory_types::AttemptStatus::Approved)
         })
         .map(|task| task.id)
         .collect();
@@ -769,6 +819,48 @@ async fn get_run(
             integrated_tasks,
         },
     }))
+}
+
+async fn run_scheduler(
+    State(state): State<SharedState>,
+    UrlPath(id): UrlPath<i64>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let factory = state.runtime.factory()?;
+    factory
+        .get_run(id)?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "Run not found"))?;
+    Ok(Json(factory.scheduling_state(id)?))
+}
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct SchedulerCursor {
+    after: Option<i64>,
+}
+async fn run_scheduler_events(
+    State(state): State<SharedState>,
+    UrlPath(id): UrlPath<i64>,
+    Query(cursor): Query<SchedulerCursor>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let factory = state.runtime.factory()?;
+    factory
+        .get_run(id)?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "Run not found"))?;
+    Ok(Json(
+        factory.scheduling_events(id, cursor.after.unwrap_or(0))?,
+    ))
+}
+
+async fn configure_scheduler(
+    State(state): State<SharedState>,
+    UrlPath(id): UrlPath<i64>,
+    Json(policy): Json<factory_types::SchedulerPolicy>,
+) -> Result<StatusCode, ApiError> {
+    let factory = state.runtime.factory()?;
+    factory
+        .get_run(id)?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "Run not found"))?;
+    factory.configure_run_scheduler(id, policy)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn run_artifacts(
@@ -865,8 +957,7 @@ fn derive_stages(tasks: &[factory_types::Task]) -> Vec<StageStatus> {
 async fn get_agents(
     State(state): State<SharedState>,
 ) -> Result<Json<Vec<factory_core::AgentInfo>>, ApiError> {
-    let agents = Agents::load(&state.root)?;
-    Ok(Json(agents.list()))
+    Ok(Json(state.runtime.factory()?.agents().list()))
 }
 
 async fn get_config(State(state): State<SharedState>) -> Result<Response, ApiError> {
@@ -1238,8 +1329,9 @@ fn role_in_use(db: &FactoryDb, role: &str) -> Result<bool, factory_db::DbError> 
 async fn list_roles(
     State(state): State<SharedState>,
 ) -> Result<Json<Vec<factory_core::RoleInfo>>, ApiError> {
-    let config = load_config(&state)?;
-    Ok(Json(config.role_infos()))
+    Ok(Json(
+        state.runtime.factory()?.agents().config().role_infos(),
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1958,7 +2050,7 @@ async fn list_agent_sessions(
     let sessions = db.list_agent_sessions_for_agent(&agent, 12)?;
     if sessions.is_empty() {
         let config = Config::load(&state.root)?;
-        if !config.agents.contains_key(&agent) {
+        if !config.agents.contains_key(&agent) && db.agent_profile(&agent).is_err() {
             return Err(ApiError::new(
                 StatusCode::NOT_FOUND,
                 format!("agent '{agent}' not found"),
@@ -2001,6 +2093,9 @@ async fn stream_agent_session(
     tokio::spawn(async move {
         let mut previous = String::new();
         loop {
+            if sender.is_closed() {
+                break;
+            }
             let result = {
                 let db = state.db.lock().expect("db mutex poisoned");
                 db.get_agent_session(id)

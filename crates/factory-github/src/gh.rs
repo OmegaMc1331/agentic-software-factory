@@ -61,6 +61,188 @@ pub struct GhAuth {
 }
 
 impl GhCli {
+    pub fn repository_metadata(&self, repository: &str) -> Result<serde_json::Value> {
+        validate_repository(repository)?;
+        let value = self.read_api(&format!("repos/{repository}"), repository)?;
+        if !value["full_name"]
+            .as_str()
+            .is_some_and(|name| name.eq_ignore_ascii_case(repository))
+            || value["id"].as_i64().is_none()
+        {
+            return Err(GitHubError::RemoteParse(
+                "GitHub repository identity does not match the configured remote".into(),
+            ));
+        }
+        Ok(
+            serde_json::json!({"id":value["id"],"fullName":value["full_name"],"url":value["html_url"],"defaultBranch":value["default_branch"],"private":value["private"],"permissions":value["permissions"]}),
+        )
+    }
+
+    pub fn pull_requests_page(&self, repository: &str, page: usize) -> Result<serde_json::Value> {
+        validate_repository(repository)?;
+        if !(1..=1000).contains(&page) {
+            return Err(GitHubError::RemoteParse("Invalid PR page".into()));
+        }
+        let value = self.read_api(
+            &format!("repos/{repository}/pulls?state=all&per_page=30&page={page}"),
+            repository,
+        )?;
+        let rows = value
+            .as_array()
+            .ok_or_else(|| GitHubError::Gh("Invalid pull request list".into()))?;
+        if rows.len() > 30 {
+            return Err(GitHubError::Gh("Oversized PR page".into()));
+        }
+        Ok(
+            serde_json::json!({"items":rows.iter().map(pull_summary).collect::<Vec<_>>(),"page":page,"mayHaveMore":rows.len()==30}),
+        )
+    }
+
+    pub fn pull_request_details(
+        &self,
+        repository: &str,
+        number: i64,
+        page: usize,
+    ) -> Result<serde_json::Value> {
+        validate_repository(repository)?;
+        if number < 1 || !(1..=1000).contains(&page) {
+            return Err(GitHubError::RemoteParse("Invalid PR identity/page".into()));
+        }
+        let pull = self.read_api(&format!("repos/{repository}/pulls/{number}"), repository)?;
+        if !pull["base"]["repo"]["full_name"]
+            .as_str()
+            .is_some_and(|name| name.eq_ignore_ascii_case(repository))
+        {
+            return Err(GitHubError::RemoteParse(
+                "PR base repository mismatch".into(),
+            ));
+        }
+        let sha = pull["head"]["sha"]
+            .as_str()
+            .filter(|s| s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+            .ok_or_else(|| GitHubError::Gh("Missing PR head commit".into()))?;
+        let files = self.read_api(
+            &format!("repos/{repository}/pulls/{number}/files?per_page=100&page={page}"),
+            repository,
+        )?;
+        let reviews = self.read_api(
+            &format!("repos/{repository}/pulls/{number}/reviews?per_page=100&page={page}"),
+            repository,
+        )?;
+        let comments = self.read_api(
+            &format!("repos/{repository}/pulls/{number}/comments?per_page=100&page={page}"),
+            repository,
+        )?;
+        let check_runs = self.read_api(
+            &format!("repos/{repository}/commits/{sha}/check-runs?per_page=100&page={page}"),
+            repository,
+        );
+        let statuses = self.read_api(
+            &format!("repos/{repository}/commits/{sha}/statuses?per_page=100&page={page}"),
+            repository,
+        );
+        Ok(
+            serde_json::json!({"pullRequest":pull_summary(&pull),"body":pull["body"].as_str().unwrap_or_default(),"files":files,"reviews":reviews,"comments":comments,"checks":check_runs.as_ref().ok(),"checksError":check_runs.as_ref().err().map(ToString::to_string),"statuses":statuses.as_ref().ok(),"statusesError":statuses.as_ref().err().map(ToString::to_string),"page":page,"pageSize":100,"complete":false,"pagination":"Files/reviews/comments/checks are bounded pages; request subsequent pages explicitly"}),
+        )
+    }
+
+    pub fn update_pull_request(
+        &self,
+        repository: &str,
+        number: i64,
+        title: &str,
+        body: &str,
+        draft: bool,
+    ) -> Result<serde_json::Value> {
+        validate_repository(repository)?;
+        if number < 1
+            || title.trim().is_empty()
+            || title.len() > 256
+            || body.len() > MAX_PR_BODY_CHARS
+        {
+            return Err(GitHubError::BodyTooLarge(MAX_PR_BODY_CHARS));
+        }
+        let current = self.pull_request_details(repository, number, 1)?;
+        let mut file = tempfile::NamedTempFile::new().map_err(GitHubError::Io)?;
+        std::io::Write::write_all(&mut file, body.as_bytes()).map_err(GitHubError::Io)?;
+        std::io::Write::flush(&mut file).map_err(GitHubError::Io)?;
+        let number = number.to_string();
+        let args: Vec<OsString> = [
+            "pr",
+            "edit",
+            &number,
+            "--repo",
+            repository,
+            "--title",
+            title,
+            "--body-file",
+        ]
+        .iter()
+        .map(OsString::from)
+        .chain(std::iter::once(file.path().as_os_str().to_owned()))
+        .collect();
+        let output = self
+            .run_os(
+                &args,
+                GhBounds {
+                    timeout: gh_timeout(GH_PR_CREATE_TIMEOUT_SECS),
+                    stdout_limit: 1024 * 1024,
+                    stderr_limit: 256 * 1024,
+                },
+            )
+            .map_err(|error| GitHubError::Uncertain(error.to_string()))?;
+        if !output.success() {
+            return Err(classify_gh_failure(&output.combined_text(), repository));
+        }
+        if current["pullRequest"]["draft"] != draft {
+            let mut args = vec!["pr", "ready", &number, "--repo", repository];
+            if draft {
+                args.push("--undo");
+            }
+            let output = self
+                .run(
+                    &args,
+                    GhBounds {
+                        timeout: gh_timeout(GH_PR_CREATE_TIMEOUT_SECS),
+                        stdout_limit: 1024 * 1024,
+                        stderr_limit: 256 * 1024,
+                    },
+                )
+                .map_err(|error| GitHubError::Uncertain(error.to_string()))?;
+            if !output.success() {
+                return Err(GitHubError::Uncertain("PR text updated but draft transition was not confirmed; reconcile before retrying".into()));
+            }
+        }
+        let verified = self
+            .pull_request_details(repository, number.parse().unwrap_or(0), 1)
+            .map_err(|error| GitHubError::Uncertain(error.to_string()))?;
+        if verified["pullRequest"]["title"] != title
+            || verified["body"] != body
+            || verified["pullRequest"]["draft"] != draft
+        {
+            return Err(GitHubError::Uncertain(
+                "Remote PR state differs from the authorized update; no automatic retry".into(),
+            ));
+        }
+        Ok(verified)
+    }
+
+    fn read_api(&self, path: &str, repository: &str) -> Result<serde_json::Value> {
+        let output = self.run(
+            &["api", "--hostname", "github.com", "--method", "GET", path],
+            GhBounds {
+                timeout: gh_timeout(GH_PR_LIST_TIMEOUT_SECS),
+                stdout_limit: 4 * 1024 * 1024,
+                stderr_limit: 256 * 1024,
+            },
+        )?;
+        self.require_complete_stdout(&output, "api GET")?;
+        if !output.success() {
+            return Err(classify_gh_failure(&output.combined_text(), repository));
+        }
+        serde_json::from_slice(&output.stdout)
+            .map_err(|_| GitHubError::Gh("Invalid bounded GitHub JSON response".into()))
+    }
     pub fn discovered() -> GhCli {
         match std::env::var_os("FACTORY_GH_BIN") {
             Some(path) if !path.is_empty() => GhCli::wrap(path, Vec::new()),
@@ -114,6 +296,7 @@ impl GhCli {
         }
         let text = output.combined_text();
         if text.contains("not logged in")
+            || text.contains("authentication required")
             || text.contains("no accounts")
             || text.contains("auth login")
             || text.contains("To get started")
@@ -310,6 +493,7 @@ impl GhCli {
             // prompt guard only stops the git underneath gh from waiting for
             // terminal credentials; keyring and helper flows are unaffected.
             .env("GIT_TERMINAL_PROMPT", "0");
+        let command = command.env("GH_HOST", "github.com");
         let summary = args
             .iter()
             .map(|value| value.to_string_lossy().to_string())
@@ -363,6 +547,20 @@ pub fn parse_auth_user(text: &str) -> Option<String> {
     None
 }
 
+fn validate_repository(repository: &str) -> Result<()> {
+    let (owner, name) = crate::parse_remote_url(&format!("https://github.com/{repository}"))?;
+    if format!("{owner}/{name}") != repository {
+        return Err(GitHubError::RemoteParse(
+            "Invalid repository identity".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn pull_summary(value: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({"number":value["number"],"title":value["title"],"url":value["html_url"],"state":value["state"],"draft":value["draft"],"merged":value["merged"].as_bool().unwrap_or(!value["merged_at"].is_null()),"base":value["base"]["ref"],"baseRepository":value["base"]["repo"]["full_name"],"head":value["head"]["ref"],"headRepository":value["head"]["repo"]["full_name"],"headSha":value["head"]["sha"],"mergeable":value["mergeable"],"updatedAt":value["updated_at"],"requestedReviewers":value["requested_reviewers"]})
+}
+
 fn classify_spawn_failure(error: GitHubError) -> GitHubError {
     match error {
         GitHubError::Io(inner) if inner.kind() == std::io::ErrorKind::NotFound => {
@@ -378,6 +576,9 @@ fn classify_spawn_failure(error: GitHubError) -> GitHubError {
 /// Maps gh failure text onto actionable errors.
 pub(crate) fn classify_gh_failure(text: &str, repository: &str) -> GitHubError {
     let text = text.trim();
+    if text.to_ascii_lowercase().contains("rate limit") || text.contains("HTTP 429") {
+        return GitHubError::RateLimited;
+    }
     if text.contains("authentication required")
         || text.contains("not logged in")
         || text.contains("HTTP 401")

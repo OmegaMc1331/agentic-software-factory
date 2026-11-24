@@ -6,10 +6,11 @@ license.workspace = true
 
 [dependencies]
 factory-types = { workspace = true }
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { workspace = true, features = ["backup"] }
 chrono = { workspace = true }
 thiserror = { workspace = true }
 serde_json = { workspace = true }
+sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = "3"

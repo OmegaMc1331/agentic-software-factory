@@ -6,6 +6,8 @@ pub type Result<T> = std::result::Result<T, GitHubError>;
 /// collapsed into a generic "GitHub failed".
 #[derive(Debug, Error)]
 pub enum GitHubError {
+    #[error("GitHub rate limit exceeded; no automatic retry was started")]
+    RateLimited,
     #[error(
         "GitHub CLI not found. Install gh (https://cli.github.com) and make sure `gh` is on PATH."
     )]

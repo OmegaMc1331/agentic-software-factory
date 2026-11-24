@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+factory-policy = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

@@ -102,6 +102,10 @@ impl Server {
         let port = free_port();
         let child = Command::new(factory_bin())
             .current_dir(root)
+            .env(
+                "FACTORY_REGISTRY",
+                root.join("test-application-registry.sqlite3"),
+            )
             .args(["start", "--no-browser", "--port", &port.to_string()])
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
@@ -157,6 +161,10 @@ impl Drop for Server {
 fn run_factory(root: &Path, args: &[&str]) -> Output {
     let mut child = Command::new(factory_bin())
         .current_dir(root)
+        .env(
+            "FACTORY_REGISTRY",
+            root.join("test-application-registry.sqlite3"),
+        )
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

@@ -77,6 +77,10 @@ impl Default for RoutingConfig {
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
+    #[serde(skip)]
+    pub profile_bindings: BTreeMap<String, factory_types::AgentProfile>,
+    #[serde(skip)]
+    pub profile_policy_snapshots: BTreeMap<String, factory_policy::PoliciesConfig>,
     #[serde(default)]
     pub agents: BTreeMap<String, AgentEntry>,
     #[serde(default)]
@@ -85,6 +89,10 @@ pub struct Config {
     pub role_assignments: Vec<RoleAssignment>,
     #[serde(default)]
     pub runtime: RuntimeConfig,
+    #[serde(default)]
+    pub scheduler: factory_types::SchedulerPolicy,
+    #[serde(default)]
+    pub integration_checks: Vec<crate::execution::ValidationCommand>,
     /// Agent routing mode and tunables. Absent in older configs, so the
     /// serde default preserves the historical round-robin routing.
     #[serde(default)]
@@ -189,7 +197,7 @@ pub enum ConfigError {
     Missing(PathBuf),
     #[error("failed to read {0}: {1}")]
     Read(PathBuf, std::io::Error),
-    #[error("failed to parse {0}: {1}")]
+    #[error("failed to parse {0}: invalid TOML at {location} (source contents omitted)", location = .1.span().map(|range| format!("bytes {}..{}", range.start, range.end)).unwrap_or_else(|| "unknown position".to_owned()))]
     Parse(PathBuf, Box<toml::de::Error>),
     #[error("failed to write {0}: {1}")]
     Write(PathBuf, std::io::Error),
@@ -372,7 +380,69 @@ impl Config {
     /// scope. Used by execution, validation, audit, and the dashboard; the
     /// logic itself lives in `factory-policy`.
     pub fn effective_policy(&self, role: &str, agent: &str) -> EffectivePolicy {
-        self.policies.effective(role, agent)
+        let mut policy = self
+            .profile_policy_snapshots
+            .get(agent)
+            .unwrap_or(&self.policies)
+            .effective(role, agent);
+        if self.profile_policy_snapshots.contains_key(agent) {
+            if let Some(scope) = self.policies.role(role) {
+                policy = policy.narrowed("current_role", scope);
+            }
+            if let Some(scope) = self.policies.ceiling.as_ref() {
+                policy = policy.narrowed("current_project_ceiling", scope);
+            }
+            if let Some(scope) = self
+                .profile_bindings
+                .get(agent)
+                .and_then(|p| self.policies.agent(&p.configuration.provider_adapter_id))
+            {
+                policy = policy.narrowed("current_installation", scope);
+            }
+        }
+        match self.profile_bindings.get(agent) {
+            Some(profile) => {
+                let policy = policy.narrowed("profile", &profile.configuration.permissions);
+                if self
+                    .catalog()
+                    .get(role)
+                    .is_some_and(|r| r.execution_class == crate::roles::ExecutionClass::Review)
+                {
+                    policy.narrowed(
+                        "read_only_review",
+                        &factory_policy::PolicyScope {
+                            filesystem: Some(factory_policy::FilesystemPolicy {
+                                read: vec!["**".into()],
+                                write: Vec::new(),
+                                deny_write: Vec::new(),
+                            }),
+                            ..Default::default()
+                        },
+                    )
+                } else {
+                    policy
+                }
+            }
+            None => policy,
+        }
+    }
+
+    pub(crate) fn session_policies(
+        &self,
+        role: &str,
+        agent: &str,
+    ) -> factory_policy::PoliciesConfig {
+        let mut policies = factory_policy::PoliciesConfig {
+            ceiling: self.policies.ceiling.clone(),
+            ..Default::default()
+        };
+        if let Some(scope) = self.policies.role(role) {
+            policies.roles.insert(role.into(), scope.clone());
+        }
+        if let Some(scope) = self.policies.agent(agent) {
+            policies.agents.insert(agent.into(), scope.clone());
+        }
+        policies
     }
 
     /// Role-level effective policy (baseline + role scope), shown in the Role
@@ -384,7 +454,7 @@ impl Config {
     /// Agent-level effective policy (baseline + agent scope), shown in the
     /// Agent Inspector.
     pub fn effective_agent_policy(&self, agent: &str) -> EffectivePolicy {
-        self.policies.effective_for_agent(agent)
+        self.effective_policy("", agent)
     }
 
     /// Whether any policy is configured (used to visibly mark legacy configs
@@ -403,6 +473,11 @@ impl Config {
     /// The preferred assignment for a role, or the first declared one.
     pub fn preferred_assignment(&self, role: &str) -> Option<&RoleAssignment> {
         let mut assignments = self.assignments_for(role);
+        assignments.retain(|a| {
+            self.profile_bindings
+                .get(&a.agent)
+                .is_none_or(|p| p.configuration.automatic_delegation)
+        });
         assignments.sort_by_key(|assignment| !assignment.preferred);
         assignments.into_iter().next()
     }
@@ -455,6 +530,13 @@ impl Config {
             return Err(format!(
                 "runtime.max_parallel_tasks must be between 1 and {MAX_PARALLEL_TASKS_LIMIT}"
             ));
+        }
+        self.scheduler.validate()?;
+        if self.integration_checks.len() > 8 {
+            return Err("At most eight integration checks may be configured.".into());
+        }
+        for check in &self.integration_checks {
+            check.validate()?;
         }
         if let Err(error) = self.context.validate() {
             return Err(error.to_string());
@@ -725,6 +807,29 @@ impl Config {
         })
     }
 
+    pub(crate) fn scheduler_team(&self) -> std::result::Result<WorkflowTeam, String> {
+        let mut team = self.initial_team()?;
+        for (role, pool) in [
+            ("worker", &mut team.workers),
+            ("reviewer", &mut team.reviewers),
+        ] {
+            for assignment in self.assignments_for(role) {
+                if self
+                    .profile_bindings
+                    .get(&assignment.agent)
+                    .is_some_and(|p| !p.configuration.automatic_delegation)
+                {
+                    continue;
+                }
+                if !pool.contains(&assignment.agent) {
+                    pool.push(assignment.agent.clone());
+                }
+            }
+        }
+        self.validate_partial_team(&team)?;
+        Ok(team)
+    }
+
     /// The default team for a new workflow: the preferred assignment of each
     /// pipeline role. Optional roles are never added automatically.
     pub fn default_team(&self) -> std::result::Result<WorkflowTeam, String> {
@@ -982,11 +1087,15 @@ preferred = true
     .to_string()
 }
 
+#[derive(Clone)]
 pub struct Agents {
     config: Config,
 }
 
 impl Agents {
+    pub fn from_config(config: Config) -> Self {
+        Self { config }
+    }
     pub fn load(root: &Path) -> Result<Agents, ConfigError> {
         Ok(Agents {
             config: Config::load_and_migrate(root)?,
@@ -1109,11 +1218,30 @@ impl Agents {
                 agent.to_string(),
             ));
         }
-        let config = self
+        let mut config = self
             .config
             .agent_config(agent)
             .ok_or_else(|| AgentResolutionError::UnknownAgent(role.to_string(), agent.into()))?;
-        let command = CommandAgent::new(config);
+        if self.config.profile_bindings.contains_key(agent)
+            && config.kind == AgentKind::Codex
+            && self
+                .config
+                .effective_policy(role, agent)
+                .filesystem
+                .read_only()
+        {
+            crate::agent_profiles::replace_argument(
+                &mut config.args,
+                &["--sandbox", "-s"],
+                "read-only",
+            );
+        }
+        let mut command = CommandAgent::new(config);
+        if let Some(profile) = self.config.profile_bindings.get(agent) {
+            command = command.with_timeout(std::time::Duration::from_secs(
+                profile.configuration.timeout_secs,
+            ));
+        }
         match command.resolve_executable() {
             Ok(_) => {}
             Err(error @ AgentError::InvalidExecutable { .. }) => {
@@ -1182,7 +1310,7 @@ impl AgentEntry {
             .clamp(1, MAX_AGENT_CONCURRENCY)
     }
 
-    fn effective_args(&self, kind: AgentKind) -> Vec<String> {
+    pub(crate) fn effective_args(&self, kind: AgentKind) -> Vec<String> {
         if self.args.is_empty() && kind != AgentKind::Custom {
             kind.workflow_args()
                 .iter()
@@ -1508,6 +1636,11 @@ mod tests {
         assert_eq!(team.workers, ["claude"]);
         assert_eq!(team.reviewers, ["claude"]);
         assert!(config.validate_team(&team).is_ok());
+        let scheduled = config.scheduler_team().unwrap();
+        assert_eq!(scheduled.planner, "codex");
+        assert_eq!(scheduled.workers, ["claude", "codex"]);
+        assert_eq!(scheduled.reviewers, ["claude"]);
+        assert!(config.validate_team(&scheduled).is_ok());
     }
 
     #[test]

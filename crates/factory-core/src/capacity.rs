@@ -4,10 +4,6 @@ use std::sync::Mutex;
 /// Tracks in-flight work per agent across the factory so selection can prefer
 /// the least-loaded member of a pool.
 ///
-/// The factory executes workflows sequentially within a run, but may run
-/// several workflows concurrently in separate threads. Capacity is therefore
-/// shared and synchronized: every invocation that has been handed to an agent
-/// increments the agent's load until it finishes.
 #[derive(Debug, Default)]
 pub struct AgentCapacity {
     load: Mutex<HashMap<String, u64>>,

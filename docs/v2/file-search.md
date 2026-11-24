@@ -1,0 +1,15 @@
+# Repository search in P05
+
+Quick file search and content search use actual project/root files, not the agent context index. Both are exposed by the Search workspace view. File results open the matching authoritative file identity. Content hits include one-based line and Unicode-scalar column, converted to CodeMirror UTF-16 positions on navigation.
+
+`SearchRequest` contains `id,root_id,query,content,case_sensitive,regex,include_hidden,path_filter`. IDs are scoped to one project. Filename mode matches literal filenames/paths; ranking is basename exact, basename prefix, basename substring, then path match, with stable path ordering. Content mode supports literal text or Rust's bounded linear-time regex engine. `path_filter` is a literal path-substring filter, not a glob or privileged path.
+
+Root and ancestor `.gitignore` files are read through guarded bounded access (64 KiB each). Hidden dotfiles and ignored entries are omitted by default; the explicit toggle includes them. Explorer visibility, interactive search eligibility and mutation authority are separate. `.git`, `.factory`, `.gitmodules`, editor temporary names, links and invalid paths remain excluded even with that toggle. Binary/unsupported/oversized files are excluded from content search. Common secret-file names are additionally excluded from content search; this is not a comprehensive secret detector or a sandbox.
+
+Traversal is deterministic and bounded: default 50,000 entries, 16 MiB text read, 100 hits, 2 seconds, supported file size 1 MiB. Content previews/output are separately bounded; filename hits remain bounded by path and result limits. A response includes `complete,reason,scanned,bytes_read,elapsed_ms`. Complete means within these selected supported-file policies, not all disk bytes. Limit/cancel/unsupported-path states are explicit. Git status and OS calls have their own bounds and may add overhead; the traversal budget is not a hard real-time HTTP SLA.
+
+Cancel aborts the browser request and signals the same project's `q_…` token. Server search checks cancellation between bounded operations and releases its registration on all return paths. The frontend generation guard prevents a late result from replacing a newer query or another project's data. Each project has at most four file jobs and the application eight; one slow search cannot consume unlimited worker capacity.
+
+Current-editor find/replace uses CodeMirror's local search panel and edits the shared document. It still requires a normal revision-aware Save to reach disk. Repository-wide replacement is intentionally absent: no blind mass-write endpoint exists. Future replacement needs an explicit preview, per-file revisions, confirmation and accurate partial-failure reporting.
+
+The search panel uses application surface/focus tokens in both themes, including its native CodeMirror buttons. Action targets are at least 26 pixels high; the close action has its own reserved space. Undo/redo follow CodeMirror's platform keymap: Ctrl+Z/Ctrl+Y on Windows and Linux, Cmd+Z/Cmd+Shift+Z on macOS. Read-only source panes remain keyboard focusable for inspection.

@@ -31,7 +31,11 @@ import type {
   WorkflowTeam,
 } from "./types";
 
-const API_BASE = "/api";
+const legacyProject = ["/", "/index.html"].includes(window.location.pathname)
+  ? new URLSearchParams(window.location.search).get("project")
+  : null;
+const API_BASE =
+  legacyProject === null ? "/api" : `/api/projects/${encodeURIComponent(legacyProject)}`;
 const CSRF_HEADER = "X-Factory-CSRF";
 const SESSION_TIMEOUT_MS = 5_000;
 const MIN_REQUEST_TIMEOUT_MS = 100;
@@ -67,17 +71,19 @@ export class FactoryApiError extends Error {
   readonly kind: ApiErrorKind;
   readonly status: number | null;
   readonly uncertain: boolean;
+  readonly code: string | null;
 
   constructor(
     message: string,
     kind: ApiErrorKind,
-    options: { status?: number | null; uncertain?: boolean } = {}
+    options: { status?: number | null; uncertain?: boolean; code?: string | null } = {}
   ) {
     super(message);
     this.name = "FactoryApiError";
     this.kind = kind;
     this.status = options.status ?? null;
     this.uncertain = options.uncertain ?? false;
+    this.code = options.code ?? null;
   }
 }
 
@@ -243,11 +249,12 @@ async function establishSession(): Promise<string> {
   if (sessionRequest) return sessionRequest;
 
   const request = (async () => {
+    window.dispatchEvent(new CustomEvent("factory-auth-status", { detail: "refreshing" }));
     const deadline = createDeadline(SESSION_TIMEOUT_MS);
     try {
       let response: Response;
       try {
-        response = await fetch(`${API_BASE}/auth/session`, {
+        response = await fetch("/api/auth/session", {
           method: "POST",
           credentials: "same-origin",
           headers: { "Content-Type": "application/json" },
@@ -279,7 +286,11 @@ async function establishSession(): Promise<string> {
         throw invalidResponseError();
       }
       csrfToken = payload.csrfToken;
+      window.dispatchEvent(new CustomEvent("factory-auth-status", { detail: "ready" }));
       return csrfToken;
+    } catch (error) {
+      window.dispatchEvent(new CustomEvent("factory-auth-status", { detail: "failed" }));
+      throw error;
     } finally {
       deadline.cleanup();
     }
@@ -315,10 +326,13 @@ export async function refreshFactorySession(signal?: AbortSignal | null): Promis
 
 async function fail(response: Response): Promise<never> {
   let detail = "";
+  let code: string | null = null;
   try {
     const text = await response.text();
     try {
-      detail = JSON.parse(text).error ?? text;
+      const payload = JSON.parse(text) as { error?: string; code?: unknown };
+      detail = payload.error ?? text;
+      if (typeof payload.code === "string") code = payload.code;
     } catch {
       detail = text;
     }
@@ -329,11 +343,11 @@ async function fail(response: Response): Promise<never> {
   throw new FactoryApiError(
     `Factory API request failed (HTTP ${response.status})${suffix}`,
     response.status === 401 || response.status === 403 ? "authentication" : "http",
-    { status: response.status }
+    { status: response.status, code, uncertain: code === "file_write_uncertain" }
   );
 }
 
-async function request<T>(
+export async function request<T>(
   path: string,
   init?: RequestInit,
   options?: ApiRequestOptions
@@ -387,7 +401,13 @@ async function requestFull<T>(
           throw abortFailure(deadline, uncertain) ?? error;
         }
       }
-      if (response.status === 204) return { value: undefined as T, headers: response.headers };
+      if (
+        response.status === 204 ||
+        (method === "DELETE" &&
+          response.status === 202 &&
+          !response.headers.get("content-type")?.includes("json"))
+      )
+        return { value: undefined as T, headers: response.headers };
       try {
         const value = (await response.json()) as T;
         return { value, headers: response.headers };

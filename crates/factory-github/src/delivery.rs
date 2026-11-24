@@ -60,6 +60,40 @@ pub fn push_branch(root: &Path, remote: &str, branch: &str) -> Result<()> {
     Err(classify_push_failure(&output.combined_text()))
 }
 
+pub fn push_branch_at(root: &Path, remote: &str, branch: &str, sha: &str) -> Result<()> {
+    if remote.is_empty()
+        || remote.starts_with('-')
+        || !remote
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
+        || !branch
+            .strip_prefix("factory/run-")
+            .is_some_and(|suffix| !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit()))
+        || ![40, 64].contains(&sha.len())
+        || !sha.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return Err(GitHubError::BranchDrift(
+            "Invalid bounded delivery ref/commit identity".into(),
+        ));
+    }
+    let output = run_network_git(
+        root,
+        &[
+            "push",
+            "--no-follow-tags",
+            "--porcelain",
+            "--",
+            remote,
+            &format!("{sha}:refs/heads/{branch}"),
+        ],
+    )?;
+    if output.success() {
+        Ok(())
+    } else {
+        Err(classify_push_failure(&output.combined_text()))
+    }
+}
+
 fn classify_push_failure(text: &str) -> GitHubError {
     let text = text.trim();
     if text.contains("![rejected]")

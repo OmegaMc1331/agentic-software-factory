@@ -1,0 +1,16 @@
+* { box-sizing: border-box; }
+html, body, #root, main { width: 100%; height: 100%; margin: 0; }
+body { font: 13px system-ui, sans-serif; background: #12151a; color: #e1e6ee; }
+main { display: flex; flex-direction: column; }
+header { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-height: 43px; padding: 8px; border-bottom: 1px solid #363c47; }
+button, select { background: #212833; color: inherit; border: 1px solid #3d4654; padding: 4px 7px; border-radius: 3px; font: inherit; }
+button:focus-visible, select:focus-visible, textarea:focus-visible { outline: 2px solid #81a9eb; outline-offset: 1px; }
+button { cursor: pointer; } .status { padding: 5px 10px; color: #aab6c7; font-size: 12px; }
+.error { padding: 8px; background: #5b2929; white-space: pre-wrap; }
+.dock { flex: 1; min-height: 0; } .panel-content, .editor-host { height: 100%; width: 100%; overflow: hidden; }
+.panel-copy { padding: 16px; height: 100%; overflow: auto; } h1 { font-size: 18px; font-weight: 500; }
+textarea { width: 100%; height: 80px; color: inherit; background: #181d25; border: 1px solid #3d4654; padding: 10px; }
+.file-tree { height: 100%; overflow: auto; } .file-tree button { display: block; background: none; border: 0; border-radius: 0; width: 100%; text-align: left; font-size: 12px; white-space: nowrap; padding: 3px 8px; }
+.file-tree button:hover { background: #293446; } .file-tree button:disabled { color: #929cab; cursor: default; }
+.terminal-host { height: 100%; padding: 8px; overflow: auto; }
+pre { white-space: pre-wrap; font-size: 11px; }

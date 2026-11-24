@@ -102,6 +102,7 @@ impl BoundedOutputCapture {
             stderr_dropped_bytes: 0,
             stdout_truncated: truncated,
             stderr_truncated: false,
+            ..AgentOutputMetadata::default()
         };
         let mut retained = Vec::with_capacity(retained_bytes);
         retained.extend_from_slice(&self.head);

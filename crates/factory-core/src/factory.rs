@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use chrono::Utc;
@@ -29,6 +30,13 @@ use crate::planner::{
 use crate::recipes::{self, RecipeCatalog, RecipeError};
 use crate::roles::{self, RoleCatalog, RoleDefinition};
 use crate::routing::{self, CandidateFacts};
+
+#[path = "lifecycle.rs"]
+mod lifecycle;
+#[path = "memory.rs"]
+mod memory;
+#[path = "scheduler.rs"]
+mod scheduler;
 
 pub const FACTORY_DIR: &str = ".factory";
 pub const MAX_TASK_ATTEMPTS: u32 = 3;
@@ -62,6 +70,8 @@ pub enum FactoryError {
     /// retries.
     #[error("policy blocked: {0}")]
     PolicyBlocked(String),
+    #[error("VALIDATION_FAILED: {0}")]
+    AgentValidationFailed(String),
     /// An attempt tripped the effective policy (wrote outside scopes, ran a
     /// denied command). The attempt is failed and the run stops; a violation
     /// is not a transient execution failure and is never auto-retried.
@@ -84,6 +94,8 @@ pub enum FactoryError {
     Agent(#[from] AgentResolutionError),
     #[error("configuration error: {0}")]
     Config(#[from] ConfigError),
+    #[error("project memory: {0}")]
+    Memory(#[from] factory_memory::Error),
     #[error("database error: {0}")]
     Db(#[from] factory_db::DbError),
     #[error("git error: {0}")]
@@ -108,6 +120,24 @@ pub enum FactoryError {
     EmptyObjective,
     #[error("workflow operation was cancelled")]
     Cancelled,
+    #[error("conversation agent stopped in session #{session_id}")]
+    ConversationStopped {
+        session_id: i64,
+        cleanup_confirmed: bool,
+    },
+    #[error("conversation agent deadline reached in session #{session_id}")]
+    ConversationDeadline {
+        session_id: i64,
+        cleanup_confirmed: bool,
+    },
+    #[error("Mission execution is fenced for suspension or recovery")]
+    Suspended,
+    #[error("agent capacity is temporarily occupied: {0}")]
+    CapacityBusy(String),
+    #[error("RESOURCE_LIMIT: {0}")]
+    SchedulerLimit(String),
+    #[error("AGENT_RESOURCE_EXHAUSTED: {0}")]
+    AgentResourceExhausted(String),
     #[error("io error: {0}")]
     Io(std::io::Error),
 }
@@ -116,6 +146,27 @@ impl FactoryError {
     pub fn is_agent_configuration(&self) -> bool {
         matches!(self, FactoryError::AgentProcess(error) if error.is_configuration())
             || matches!(self, FactoryError::Agent(_))
+    }
+
+    fn is_non_retryable_agent_error(&self) -> bool {
+        self.is_agent_configuration()
+            || matches!(
+                self,
+                Self::PolicyBlocked(_)
+                    | Self::AgentValidationFailed(_)
+                    | Self::AgentResourceExhausted(_)
+            )
+    }
+
+    fn task_failure_state(&self) -> TaskState {
+        if matches!(
+            self,
+            Self::PolicyBlocked(_) | Self::AgentResourceExhausted(_)
+        ) {
+            TaskState::Blocked
+        } else {
+            TaskState::Failed
+        }
     }
 }
 
@@ -164,6 +215,9 @@ struct RoutingRecord {
 }
 
 struct InvocationScope<'a> {
+    memory_query: Option<&'a str>,
+    memory_extraction_id: Option<&'a str>,
+    review_evidence: Option<&'a TaskEvidence>,
     run_id: Option<i64>,
     task_id: Option<i64>,
     attempt_id: Option<i64>,
@@ -173,36 +227,191 @@ struct InvocationScope<'a> {
 }
 
 pub struct Factory {
-    db: FactoryDb,
-    agents: Agents,
-    root: std::path::PathBuf,
-    capacity: AgentCapacity,
+    pub(crate) db: FactoryDb,
+    pub(crate) agents: Agents,
+    pub(crate) root: std::path::PathBuf,
+    capacity: Arc<AgentCapacity>,
+    pub(crate) execution: Arc<crate::execution::ProjectExecution>,
 }
 
 impl Factory {
+    pub fn converse(
+        &self,
+        instruction: &str,
+        cancel: &AtomicBool,
+    ) -> Result<(i64, String), FactoryError> {
+        self.converse_with_memory_query(instruction, instruction, cancel)
+    }
+
+    pub fn converse_with_memory_query(
+        &self,
+        instruction: &str,
+        query: &str,
+        cancel: &AtomicBool,
+    ) -> Result<(i64, String), FactoryError> {
+        let agent = self
+            .agents
+            .command_agent(roles::PLANNER)?
+            .with_output_limit(64 * 1024);
+        let _capacity = self.wait_agent_capacity(agent.name(), cancel)?;
+        let invocation = self.invoke_with_agent(
+            agent,
+            InvocationScope {
+                memory_query: Some(query),
+                memory_extraction_id: None,
+                review_evidence: None,
+                run_id: None,
+                task_id: None,
+                attempt_id: None,
+                role: roles::PLANNER,
+                operation: Some(TaskOperation::Planning),
+                working_dir: &self.root,
+            },
+            instruction,
+            cancel,
+        )?;
+        if invocation.result.cancelled {
+            return Err(FactoryError::ConversationStopped {
+                session_id: invocation.session_id,
+                cleanup_confirmed: invocation
+                    .result
+                    .output_metadata
+                    .process_tree_cleanup_confirmed,
+            });
+        }
+        if invocation.result.exit_code != Some(0) {
+            return Err(FactoryError::AgentProcess(AgentError::ExecutionFailed {
+                command: format!("orchestrator agent session #{}", invocation.session_id),
+                exit_code: invocation.result.exit_code.unwrap_or(-1),
+            }));
+        }
+        if let Some(error) = agent_output_limit_error("orchestrator", &invocation.result) {
+            return Err(error);
+        }
+        let session = self
+            .db
+            .get_agent_session(invocation.session_id)?
+            .ok_or(factory_db::DbError::NotFound("orchestrator session"))?;
+        Ok((invocation.session_id, session.stdout.unwrap_or_default()))
+    }
+
+    pub fn begin_conversation_run(
+        &self,
+        command: i64,
+        objective: &str,
+        team: Option<WorkflowTeam>,
+        recipe: Option<&RecipeSnapshot>,
+    ) -> Result<Run, FactoryError> {
+        if objective.trim().is_empty() {
+            return Err(FactoryError::EmptyObjective);
+        }
+        if let Some(recipe) = recipe {
+            self.validate_recipe_roles_available(recipe)?;
+        }
+        let team = if team.is_none() && recipe.is_none() {
+            self.agents
+                .config()
+                .scheduler_team()
+                .map_err(FactoryError::InvalidTeam)?
+        } else {
+            self.resolve_new_team(team, recipe)?
+        };
+        self.agents
+            .command_agent_for(roles::PLANNER, &team.planner)?;
+        let run = self
+            .db
+            .conversation_begin_run(command, objective.trim(), &team, recipe)?;
+        if self.db.scheduler_policy(run.id)?.is_none() {
+            self.configure_run_scheduler(run.id, self.agents.config().scheduler.clone())?;
+        }
+        Ok(run)
+    }
+
+    pub fn persist_authored_plan(
+        &self,
+        run_id: i64,
+        plan: &factory_types::Plan,
+    ) -> Result<(), FactoryError> {
+        crate::planner::validate_plan(plan)
+            .map_err(|reason| FactoryError::InvalidDag(run_id, reason))?;
+        let run = self
+            .db
+            .get_run(run_id)?
+            .ok_or(FactoryError::RunNotFound(run_id))?;
+        if run.status != RunStatus::Planning {
+            return Err(FactoryError::InvalidRunState(
+                run_id,
+                run.status.as_str().into(),
+            ));
+        }
+        let team = self.resolve_team(&run)?;
+        let allowed = team.task_roles().into_iter().collect();
+        validate_plan_roles(plan, &allowed)
+            .map_err(|reason| FactoryError::InvalidDag(run_id, reason))?;
+        let plan = normalize_plan_with_operations(plan.clone(), &self.agents.config().catalog())
+            .map_err(|reason| FactoryError::InvalidDag(run_id, reason))?;
+        self.db.persist_plan(run_id, &plan)?;
+        Ok(())
+    }
     pub fn init(root: &Path) -> Result<Factory, FactoryError> {
         let factory_dir = root.join(FACTORY_DIR);
         std::fs::create_dir_all(&factory_dir).map_err(FactoryError::Io)?;
         crate::config::Config::ensure_default(root)?;
         let db = FactoryDb::open(&factory_dir.join("db.sqlite3"))?;
+        let agents = crate::agent_profiles::load_agents(root, &db)?;
+        let execution = Arc::new(crate::execution::ProjectExecution::new(
+            root.to_string_lossy().into_owned(),
+            Arc::new(crate::execution::TaskBudget::new(8)),
+        ));
         Ok(Factory {
             db,
-            agents: Agents::load(root)?,
+            agents,
             root: root.to_path_buf(),
-            capacity: AgentCapacity::new(),
+            capacity: execution.agents.clone(),
+            execution,
         })
     }
 
     pub fn open(root: &Path) -> Result<Factory, FactoryError> {
+        Self::open_with_execution(
+            root,
+            Arc::new(crate::execution::ProjectExecution::new(
+                root.to_string_lossy().into_owned(),
+                Arc::new(crate::execution::TaskBudget::new(8)),
+            )),
+        )
+    }
+
+    pub fn open_with_execution(
+        root: &Path,
+        execution: Arc<crate::execution::ProjectExecution>,
+    ) -> Result<Factory, FactoryError> {
+        execution.validate_root()?;
         let db_path = root.join(FACTORY_DIR).join("db.sqlite3");
         if !db_path.exists() {
             return Err(FactoryError::NotInitialized);
         }
+        let db = FactoryDb::open(&db_path)?;
+        let agents = crate::agent_profiles::load_agents(root, &db)?;
         Ok(Factory {
-            db: FactoryDb::open(&db_path)?,
-            agents: Agents::load(root)?,
+            db,
+            agents,
             root: root.to_path_buf(),
-            capacity: AgentCapacity::new(),
+            capacity: execution.agents.clone(),
+            execution,
+        })
+    }
+
+    pub(crate) fn task_factory(&self) -> Result<Self, FactoryError> {
+        self.execution.validate_root()?;
+        let db = FactoryDb::open(&self.root.join(FACTORY_DIR).join("db.sqlite3"))?;
+        let agents = crate::agent_profiles::load_agents(&self.root, &db)?;
+        Ok(Self {
+            db,
+            agents,
+            root: self.root.clone(),
+            capacity: self.capacity.clone(),
+            execution: self.execution.clone(),
         })
     }
 
@@ -345,7 +554,26 @@ impl Factory {
     /// a snapshot for runs created before teams existed.
     fn resolve_team(&self, run: &Run) -> Result<WorkflowTeam, FactoryError> {
         if let Some(team) = &run.team {
-            return Ok(team.clone());
+            let mut team = team.clone();
+            for handoff in self.db.active_handoffs_for_run(run.id)? {
+                if !matches!(handoff.state.as_str(), "ready" | "executing" | "completed") {
+                    continue;
+                }
+                let task = self
+                    .db
+                    .get_task(handoff.task_id)?
+                    .ok_or(FactoryError::TaskNotFound(handoff.task_id))?;
+                let role = task.role.as_deref().unwrap_or(roles::WORKER);
+                let pool = match role {
+                    roles::WORKER => &mut team.workers,
+                    roles::REVIEWER => &mut team.reviewers,
+                    _ => team.additional.entry(role.into()).or_default(),
+                };
+                if !pool.contains(&handoff.target.id) {
+                    pool.push(handoff.target.id);
+                }
+            }
+            return Ok(team);
         }
         let team = self
             .agents
@@ -368,6 +596,8 @@ impl Factory {
         base_sha: &str,
         changed_files: &[String],
         upstream: &[RoleArtifact],
+        role: &str,
+        agent: &str,
     ) -> String {
         let config = self.agents.config().context;
         if !config.enabled {
@@ -394,7 +624,19 @@ impl Factory {
         let mut engine =
             factory_context::ContextEngine::new(&self.root, &self.root.join(FACTORY_DIR), config);
         match engine.resolve(&request) {
-            Ok(resolved) => factory_context::render_repository_context(&resolved),
+            Ok(mut resolved) => {
+                let Some(run) = self.db.get_run(task.run_id).ok().flatten() else {
+                    return String::new();
+                };
+                let policy = self.policy_with_recipe(run.recipe.as_ref(), role, agent);
+                resolved
+                    .selected
+                    .retain(|file| policy.filesystem.read_allowed(&file.path));
+                resolved
+                    .related_tests
+                    .retain(|file| policy.filesystem.read_allowed(&file.path));
+                factory_context::render_repository_context(&resolved)
+            }
             Err(_) => String::new(),
         }
     }
@@ -513,10 +755,11 @@ impl Factory {
     ) -> factory_policy::EffectivePolicy {
         let restriction =
             recipe.and_then(|snapshot| recipes::snapshot_policy_restriction(snapshot, role));
-        self.agents
-            .config()
-            .policies
-            .effective_restricted(role, agent, restriction.as_ref())
+        let policy = self.agents.config().effective_policy(role, agent);
+        match restriction.as_ref() {
+            Some(scope) => policy.narrowed("recipe", scope),
+            None => policy,
+        }
     }
 
     /// Role-level variant of [`policy_with_recipe`](Self::policy_with_recipe)
@@ -535,10 +778,19 @@ impl Factory {
     }
 
     pub fn plan_run(&self, run_id: i64, cancel: &AtomicBool) -> Result<RunOutcome, FactoryError> {
+        self.require_lifecycle_active(run_id)?;
         let result = self.plan_run_inner(run_id, cancel);
-        if result.is_err() {
+        if let Err(error) = &result {
+            if self.db.lifecycle_fenced(run_id)? {
+                return result;
+            }
             let status = if cancel.load(Ordering::Relaxed) {
                 RunStatus::Cancelled
+            } else if matches!(
+                error,
+                FactoryError::PolicyBlocked(_) | FactoryError::AgentResourceExhausted(_)
+            ) {
+                RunStatus::Blocked
             } else {
                 RunStatus::Failed
             };
@@ -560,6 +812,7 @@ impl Factory {
         }
         let team = self.resolve_team(&run)?;
         let planner = self.agents.command_agent_for("planner", &team.planner)?;
+        let _planner_capacity = self.wait_agent_capacity(planner.name(), cancel)?;
         let catalog = self.agents.config().catalog();
         let available_roles = team.task_roles();
         let allowed_roles: std::collections::HashSet<String> =
@@ -584,6 +837,9 @@ impl Factory {
             let invocation = self.invoke_with_agent(
                 planner.clone(),
                 InvocationScope {
+                    memory_query: None,
+                    memory_extraction_id: None,
+                    review_evidence: None,
                     run_id: Some(run_id),
                     task_id: None,
                     attempt_id: None,
@@ -644,6 +900,7 @@ impl Factory {
     }
 
     pub fn prepare_start(&self, run_id: i64) -> Result<WorkflowTeam, FactoryError> {
+        self.require_lifecycle_active(run_id)?;
         let run = self
             .db
             .get_run(run_id)?
@@ -701,6 +958,7 @@ impl Factory {
                         task.id, pinned, role
                     )));
                 }
+                self.agents.command_agent_for(role, pinned)?;
                 let operation = roles::resolve_task_operation(task, &catalog_for_overrides);
                 let policy = self.policy_with_recipe(run.recipe.as_ref(), role, pinned);
                 if let Err(reason) =
@@ -718,8 +976,20 @@ impl Factory {
             }
         }
         for role in team.roles() {
+            let mut first_error = None;
+            let mut available = false;
             for agent in team.agents_for_role(&role) {
-                self.agents.command_agent_for(&role, agent)?;
+                match self.agents.command_agent_for(&role, agent) {
+                    Ok(_) => available = true,
+                    Err(error) => {
+                        first_error.get_or_insert(error);
+                    }
+                }
+            }
+            if !available {
+                if let Some(error) = first_error {
+                    return Err(error.into());
+                }
             }
         }
         let catalog = self.agents.config().catalog();
@@ -777,39 +1047,6 @@ impl Factory {
         Err(FactoryError::PolicyBlocked(blockers.join("; ")))
     }
 
-    /// Selects an agent from the pool that can legally execute the task under
-    /// its own effective policy. Prefers the capacity-aware selection; when
-    /// that agent is policy-blocked, the next pool candidate (round-robin from
-    /// `index`) is tried. Returns `None` when no assigned agent can legally
-    /// run the task.
-    fn select_agent_for_task(
-        &self,
-        pool: &[String],
-        index: usize,
-        capacity: &AgentCapacity,
-        role: &str,
-        operation: TaskOperation,
-        recipe: Option<&RecipeSnapshot>,
-    ) -> Option<String> {
-        if pool.is_empty() {
-            return None;
-        }
-        let preferred = roles::select_agent_with_capacity(pool, index, capacity);
-        if let Some(candidate) = preferred {
-            let policy = self.policy_with_recipe(recipe, role, candidate);
-            if factory_policy::validate_executable(&policy, operation.as_str()).is_ok() {
-                return Some(candidate.clone());
-            }
-        }
-        (0..pool.len()).find_map(|offset| {
-            let candidate = &pool[(index + offset) % pool.len()];
-            let policy = self.policy_with_recipe(recipe, role, candidate);
-            factory_policy::validate_executable(&policy, operation.as_str())
-                .ok()
-                .map(|_| candidate.clone())
-        })
-    }
-
     /// Routes one dispatch to an agent. The mode comes from the run's recipe
     /// snapshot when it pins one, else the project `[routing]` configuration;
     /// the routing engine itself (candidate filtering, performance scoring,
@@ -824,6 +1061,58 @@ impl Factory {
     /// agent's `max_concurrency` between ranking and reservation.
     #[allow(clippy::too_many_arguments)]
     fn route_agent_for_attempt(
+        &self,
+        task: &Task,
+        pool: &[String],
+        role: &str,
+        operation: TaskOperation,
+        rotation: usize,
+        language: Option<&str>,
+        honor_override: bool,
+        cancel: &AtomicBool,
+    ) -> Result<RoutedAgent<'_>, FactoryError> {
+        loop {
+            if cancel.load(Ordering::Acquire) {
+                return Err(FactoryError::Cancelled);
+            }
+            match self.try_route_agent_for_attempt(
+                task,
+                pool,
+                role,
+                operation,
+                rotation,
+                language,
+                honor_override,
+            ) {
+                Err(FactoryError::CapacityBusy(_)) => {
+                    std::thread::sleep(std::time::Duration::from_millis(25))
+                }
+                other => return other,
+            }
+        }
+    }
+
+    fn wait_agent_capacity(
+        &self,
+        name: &str,
+        cancel: &AtomicBool,
+    ) -> Result<LoadGuard<'_>, FactoryError> {
+        loop {
+            if cancel.load(Ordering::Acquire) {
+                return Err(FactoryError::Cancelled);
+            }
+            if let Some(guard) = self
+                .capacity
+                .try_acquire(name, self.agent_concurrency_limit(name))
+            {
+                return Ok(guard);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_route_agent_for_attempt(
         &self,
         task: &Task,
         pool: &[String],
@@ -871,7 +1160,10 @@ impl Factory {
             }
             let agent = self.agents.command_agent_for(role, &pinned)?;
             let name = agent.name().to_string();
-            let guard = self.capacity.acquire(&name);
+            let guard = self
+                .capacity
+                .try_acquire(&name, self.agent_concurrency_limit(&name))
+                .ok_or_else(|| FactoryError::CapacityBusy(name.clone()))?;
             let candidates = self.round_robin_notes(pool);
             return Ok(RoutedAgent {
                 agent,
@@ -947,19 +1239,40 @@ impl Factory {
         reason: &'static str,
         recipe: Option<&RecipeSnapshot>,
     ) -> Result<RoutedAgent<'_>, FactoryError> {
-        let name = self
-            .select_agent_for_task(
-                pool,
-                rotation_index,
-                &self.capacity,
-                role,
-                operation,
-                recipe,
-            )
-            .ok_or_else(|| self.no_executable_agent_error(task, role, pool, operation, recipe))?;
-        let agent = self.agents.command_agent_for(role, &name)?;
-        let name = agent.name().to_string();
-        let guard = self.capacity.acquire(&name);
+        let mut eligible = false;
+        let mut resolution_error = None;
+        let mut selected = None;
+        for offset in 0..pool.len() {
+            let name = &pool[(rotation_index + offset) % pool.len()];
+            let policy = self.policy_with_recipe(recipe, role, name);
+            if factory_policy::validate_executable(&policy, operation.as_str()).is_err() {
+                continue;
+            }
+            let agent = match self.agents.command_agent_for(role, name) {
+                Ok(agent) => agent,
+                Err(error) => {
+                    resolution_error.get_or_insert(error);
+                    continue;
+                }
+            };
+            eligible = true;
+            if let Some(guard) = self
+                .capacity
+                .try_acquire(name, self.agent_concurrency_limit(name))
+            {
+                selected = Some((agent, guard));
+                break;
+            }
+        }
+        let (agent, guard) = selected.ok_or_else(|| {
+            if eligible {
+                FactoryError::CapacityBusy(role.into())
+            } else if let Some(error) = resolution_error {
+                error.into()
+            } else {
+                self.no_executable_agent_error(task, role, pool, operation, recipe)
+            }
+        })?;
         Ok(RoutedAgent {
             agent,
             _guard: guard,
@@ -1450,15 +1763,28 @@ impl Factory {
         run_id: i64,
         cancel: &AtomicBool,
     ) -> Result<WorkflowResult, FactoryError> {
+        self.require_lifecycle_active(run_id)?;
         let result = self.execute_active_run_inner(run_id, cancel);
-        if result.is_err() {
+        if self.db.lifecycle_fenced(run_id)? {
+            return Err(FactoryError::Suspended);
+        }
+        if let Err(error) = &result {
+            if matches!(error, FactoryError::CapacityBusy(_)) {
+                return result;
+            }
             let status = if cancel.load(Ordering::Relaxed) {
                 RunStatus::Cancelled
+            } else if matches!(
+                error,
+                FactoryError::PolicyBlocked(_) | FactoryError::AgentResourceExhausted(_)
+            ) {
+                RunStatus::Blocked
             } else {
                 RunStatus::Failed
             };
             let _ = self.db.set_run_status(run_id, status);
         }
+        self.db.reconcile_handoffs(run_id)?;
         result
     }
 
@@ -1467,39 +1793,7 @@ impl Factory {
         run_id: i64,
         cancel: &AtomicBool,
     ) -> Result<WorkflowResult, FactoryError> {
-        loop {
-            if cancel.load(Ordering::Relaxed) {
-                self.db.set_run_status(run_id, RunStatus::Cancelled)?;
-                return Ok(WorkflowResult::Cancelled);
-            }
-            let tasks = self.db.list_tasks(run_id)?;
-            if tasks.iter().all(|task| task.state == TaskState::Completed) {
-                self.db.set_run_status(run_id, RunStatus::Completed)?;
-                return Ok(WorkflowResult::Completed);
-            }
-            let next = tasks
-                .iter()
-                .filter(|task| task.state == TaskState::Ready)
-                .min_by_key(|task| (task.position, task.id))
-                .cloned();
-            let Some(task) = next else {
-                let status = if tasks.iter().any(|task| task.state == TaskState::Failed) {
-                    RunStatus::Failed
-                } else {
-                    RunStatus::Blocked
-                };
-                self.db.set_run_status(run_id, status)?;
-                return Ok(WorkflowResult::Failed);
-            };
-            if !self.execute_task(task.id, cancel)? {
-                if cancel.load(Ordering::Relaxed) {
-                    self.db.set_run_status(run_id, RunStatus::Cancelled)?;
-                    return Ok(WorkflowResult::Cancelled);
-                }
-                self.db.set_run_status(run_id, RunStatus::Failed)?;
-                return Ok(WorkflowResult::Failed);
-            }
-        }
+        self.run_scheduler(run_id, cancel)
     }
 
     pub fn prepare_retry(&self, task_id: i64) -> Result<i64, FactoryError> {
@@ -1507,6 +1801,18 @@ impl Factory {
             .db
             .get_task(task_id)?
             .ok_or(FactoryError::TaskNotFound(task_id))?;
+        let settled = self
+            .db
+            .mission_lifecycle(task.run_id)?
+            .filter(|life| life.state == factory_types::MissionLifecycleState::Settled);
+        if settled.is_none() {
+            self.require_lifecycle_active(task.run_id)?;
+        }
+        if self.db.scheduler_running(task.run_id)? {
+            return Err(FactoryError::CapacityBusy(
+                "An active scheduler owns task transitions.".into(),
+            ));
+        }
         if !matches!(task.state, TaskState::Failed | TaskState::Blocked) {
             return Err(FactoryError::InvalidTransition(
                 task.state,
@@ -1523,6 +1829,13 @@ impl Factory {
                 "manual retry after the bounded attempt limit".into(),
             ));
         }
+        if self
+            .db
+            .latest_task_attempt(task_id)?
+            .is_some_and(|attempt| attempt.status == AttemptStatus::Interrupted)
+        {
+            return Err(FactoryError::CapacityBusy("Interrupted task ownership is uncertain. Inspect processes and retained worktree before authorizing new work; this attempt is not automatically replayed.".into()));
+        }
         let run = self
             .db
             .get_run(task.run_id)?
@@ -1537,8 +1850,13 @@ impl Factory {
         let tasks = self.db.list_tasks(task.run_id)?;
         let catalog = self.agents.config().catalog();
         self.validate_run_policies_run(task.run_id, &tasks, &team, &catalog, run.recipe.as_ref())?;
-        self.mark_task(task_id, TaskState::Ready)?;
-        self.db.set_run_status(task.run_id, RunStatus::Active)?;
+        if let Some(life) = settled {
+            self.db
+                .retry_settled_task(task_id, self.execution.project_id(), life.generation)?;
+        } else {
+            self.mark_task(task_id, TaskState::Ready)?;
+            self.db.set_run_status(task.run_id, RunStatus::Active)?;
+        }
         Ok(task.run_id)
     }
 
@@ -1570,7 +1888,7 @@ impl Factory {
                 self.execute_advisory(task_id, &role_definition, &catalog, cancel)
             }
             TaskOperation::Implement | TaskOperation::Verify | TaskOperation::PostProcess => {
-                self.execute_implementation(task_id, operation, &role_definition, &catalog, cancel)
+                self.execute_implementation(task_id, operation, &role_definition, cancel)
             }
             TaskOperation::Review => {
                 self.execute_specialized_review(task_id, &role_definition, &catalog, cancel)
@@ -1587,10 +1905,10 @@ impl Factory {
         task_id: i64,
         operation: TaskOperation,
         role_definition: &RoleDefinition,
-        catalog: &RoleCatalog,
         cancel: &AtomicBool,
     ) -> Result<bool, FactoryError> {
         loop {
+            let current = self.task_factory()?;
             let task = self
                 .db
                 .get_task(task_id)?
@@ -1600,46 +1918,43 @@ impl Factory {
                 .latest_task_attempt(task_id)?
                 .and_then(|attempt| attempt.review)
                 .filter(|review| review.decision == ReviewDecision::RequestChanges);
-            let next_attempt = self
-                .db
-                .latest_task_attempt(task_id)?
-                .map_or(1, |attempt| attempt.attempt_number + 1);
-            if next_attempt > MAX_TASK_ATTEMPTS {
+            if self.db.task_execution_attempt_count(task_id)? >= MAX_TASK_ATTEMPTS as usize {
                 return Ok(false);
             }
             let worktree = if let Some(path) = &task.worktree_path {
                 std::path::PathBuf::from(path)
             } else {
-                self.create_worktree(task_id)?
+                current.create_worktree(task_id)?
             };
-            let repo = Repo::detect_bounded(&worktree, &self.root)?;
-            let base_sha = self.attempt_base_sha(&task, &repo, &worktree)?;
+            let repo = Repo::detect_bounded(&worktree, &current.root)?;
+            let base_sha = current.attempt_base_sha(&task, &repo, &worktree)?;
             let run = self
                 .db
                 .get_run(task.run_id)?
                 .ok_or(FactoryError::RunNotFound(task.run_id))?;
-            let team = self.resolve_team(&run)?;
+            let team = current.resolve_team(&run)?;
             let role = task
                 .role
                 .clone()
                 .unwrap_or_else(|| roles::WORKER.to_string());
             let worker_pool = team.agents_for_role(&role).to_vec();
-            let worker_index = self.db.count_task_attempts(task.run_id)?;
+            let worker_index = current.db.count_task_attempts(task.run_id)?;
             let RoutedAgent {
                 agent: worker,
                 _guard: _worker_load,
                 record: worker_routing,
-            } = self.route_agent_for_attempt(
+            } = current.route_agent_for_attempt(
                 &task,
                 &worker_pool,
                 &role,
                 operation,
                 worker_index,
-                self.routing_language(task_id).as_deref(),
+                current.routing_language(task_id).as_deref(),
                 true,
+                cancel,
             )?;
             let worker_name = worker.name().to_string();
-            let attempt = self.db.create_task_attempt(
+            let attempt = current.db.create_task_attempt(
                 task_id,
                 &role,
                 Some(operation),
@@ -1647,7 +1962,7 @@ impl Factory {
                 &worktree.to_string_lossy(),
                 Some(&base_sha),
             )?;
-            self.record_routing_decision(
+            current.record_routing_decision(
                 task_id,
                 Some(attempt.id),
                 &role,
@@ -1655,13 +1970,24 @@ impl Factory {
                 &worker_routing,
                 &worker_name,
             )?;
-            self.mark_task(task_id, TaskState::Running)?;
+            if task.state != TaskState::Running {
+                current.mark_task(task_id, TaskState::Running)?;
+            }
 
-            let upstream = self.upstream_artifacts(&task)?;
-            let repository_context =
-                self.repository_context(&task, operation, &worktree, &base_sha, &[], &upstream);
-            let untrusted_notice = self.untrusted_issue_notice(task.run_id)?;
-            let worker_policy = self.policy_with_recipe(run.recipe.as_ref(), &role, &worker_name);
+            let upstream = current.upstream_artifacts(&task)?;
+            let repository_context = current.repository_context(
+                &task,
+                operation,
+                &worktree,
+                &base_sha,
+                &[],
+                &upstream,
+                &role,
+                &worker_name,
+            );
+            let untrusted_notice = current.untrusted_issue_notice(task.run_id)?;
+            let worker_policy =
+                current.policy_with_recipe(run.recipe.as_ref(), &role, &worker_name);
             let worker_instruction = build_mission(&MissionContext {
                 role: role_definition,
                 operation,
@@ -1675,9 +2001,12 @@ impl Factory {
                 final_review: false,
                 policy: Some(&worker_policy),
             });
-            let worker_run = self.invoke_with_agent(
+            let worker_run = current.invoke_with_agent(
                 worker,
                 InvocationScope {
+                    memory_query: None,
+                    memory_extraction_id: None,
+                    review_evidence: None,
                     run_id: Some(task.run_id),
                     task_id: Some(task.id),
                     attempt_id: Some(attempt.id),
@@ -1688,10 +2017,11 @@ impl Factory {
                 &worker_instruction,
                 cancel,
             );
+            drop(_worker_load);
             let worker_run = match worker_run {
                 Ok(run) => {
                     if let Some(error) = agent_output_limit_error(&role, &run.result) {
-                        return Err(self.record_output_limit_failure(
+                        return Err(current.record_output_limit_failure(
                             run.session_id,
                             attempt.id,
                             task_id,
@@ -1705,6 +2035,7 @@ impl Factory {
                 }
                 Err(error) => Err(error),
             };
+            current.execution.validate_root()?;
             let mut evidence = collect_evidence(
                 &repo,
                 &worktree,
@@ -1717,9 +2048,9 @@ impl Factory {
             // session's effective write scopes (or a denied command) fails the
             // attempt without consuming a normal retry.
             if let Err(policy_error) =
-                self.enforce_evidence_policy(run.recipe.as_ref(), &role, &worker_name, &evidence)
+                current.enforce_evidence_policy(run.recipe.as_ref(), &role, &worker_name, &evidence)
             {
-                self.db.finish_task_attempt(
+                current.db.finish_task_attempt(
                     attempt.id,
                     AttemptStatus::Failed,
                     worker_run
@@ -1731,22 +2062,26 @@ impl Factory {
                     Some(&evidence),
                     None,
                 )?;
-                self.mark_task(task_id, TaskState::Failed)?;
+                current.mark_task(task_id, TaskState::Failed)?;
                 return Err(policy_error);
             }
 
             let worker_run = match worker_run {
                 Ok(run) if run.result.cancelled => {
-                    self.db.finish_task_attempt(
+                    current.db.finish_task_attempt(
                         attempt.id,
-                        AttemptStatus::Cancelled,
+                        if self.db.lifecycle_fenced(task.run_id)? {
+                            AttemptStatus::Interrupted
+                        } else {
+                            AttemptStatus::Cancelled
+                        },
                         run.result.exit_code,
                         evidence.commit_sha.as_deref(),
                         Some("Workflow cancelled while the agent was running."),
                         Some(&evidence),
                         None,
                     )?;
-                    self.mark_task(task_id, TaskState::Failed)?;
+                    current.mark_task(task_id, TaskState::Failed)?;
                     return Ok(false);
                 }
                 Ok(run) if run.result.exit_code == Some(0) => {
@@ -1754,7 +2089,7 @@ impl Factory {
                         operation,
                         TaskOperation::Verify | TaskOperation::PostProcess
                     ) {
-                        self.persist_operation_artifact(
+                        current.persist_operation_artifact(
                             task.run_id,
                             task.id,
                             attempt.id,
@@ -1776,7 +2111,7 @@ impl Factory {
                         },
                         |code| format!("{} process exited with code {code}.", role_definition.name),
                     );
-                    self.db.finish_task_attempt(
+                    current.db.finish_task_attempt(
                         attempt.id,
                         AttemptStatus::Failed,
                         run.result.exit_code,
@@ -1785,16 +2120,17 @@ impl Factory {
                         Some(&evidence),
                         None,
                     )?;
-                    self.mark_task(task_id, TaskState::Failed)?;
-                    if attempt.attempt_number >= MAX_TASK_ATTEMPTS {
+                    current.mark_task(task_id, TaskState::Failed)?;
+                    if self.db.task_execution_attempt_count(task_id)? >= MAX_TASK_ATTEMPTS as usize
+                    {
                         return Ok(false);
                     }
-                    self.mark_task(task_id, TaskState::Ready)?;
+                    current.mark_task(task_id, TaskState::Ready)?;
                     continue;
                 }
                 Err(error) => {
                     let message = error.to_string();
-                    self.db.finish_task_attempt(
+                    current.db.finish_task_attempt(
                         attempt.id,
                         AttemptStatus::Failed,
                         None,
@@ -1803,25 +2139,52 @@ impl Factory {
                         Some(&evidence),
                         None,
                     )?;
-                    self.mark_task(task_id, TaskState::Failed)?;
-                    if error.is_agent_configuration() {
+                    current.mark_task(task_id, error.task_failure_state())?;
+                    if error.is_non_retryable_agent_error() {
                         return Err(error);
                     }
-                    if attempt.attempt_number >= MAX_TASK_ATTEMPTS {
+                    if self.db.task_execution_attempt_count(task_id)? >= MAX_TASK_ATTEMPTS as usize
+                    {
                         return Ok(false);
                     }
-                    self.mark_task(task_id, TaskState::Ready)?;
+                    current.mark_task(task_id, TaskState::Ready)?;
                     continue;
                 }
             };
 
-            self.db
-                .set_task_attempt_status(attempt.id, AttemptStatus::Reviewing)?;
+            if repo.has_uncommitted_changes(&worktree)? {
+                repo.commit_changes(
+                    &worktree,
+                    &format!(
+                        "factory: capture task-{} attempt-{}",
+                        task.id, attempt.attempt_number
+                    ),
+                    (
+                        &format!("{worker_name} via Factory {}", run.id),
+                        "factory@local",
+                    ),
+                )?;
+            }
+            evidence.commit_sha = Some(repo.head_sha(&worktree)?);
+            evidence.diff_patch =
+                Some(repo.diff_patch(&worktree, &base_sha, MAX_REVIEW_DIFF_CHARS)?);
+            evidence.git_snapshot = Some(git_snapshot(
+                &base_sha,
+                &repo.head_sha(&worktree)?,
+                evidence.diff_patch.as_deref().unwrap_or_default(),
+            ));
+            if current
+                .db
+                .handoff_boundary(task_id, attempt.id, &evidence)?
+            {
+                continue;
+            }
+            let review_factory = current.task_factory()?;
             let RoutedAgent {
                 agent: reviewer,
                 _guard: _reviewer_load,
                 record: reviewer_routing,
-            } = self.route_agent_for_attempt(
+            } = review_factory.route_agent_for_attempt(
                 &task,
                 &team.reviewers,
                 roles::REVIEWER,
@@ -1829,9 +2192,10 @@ impl Factory {
                 attempt.attempt_number.saturating_sub(1) as usize,
                 None,
                 false,
+                cancel,
             )?;
             let reviewer_name = reviewer.name().to_string();
-            self.record_routing_decision(
+            review_factory.record_routing_decision(
                 task_id,
                 Some(attempt.id),
                 roles::REVIEWER,
@@ -1839,12 +2203,27 @@ impl Factory {
                 &reviewer_routing,
                 &reviewer_name,
             )?;
-            let reviewer_role = catalog
+            let review_catalog = review_factory.agents.config().catalog();
+            let reviewer_role = review_catalog
                 .get(roles::REVIEWER)
                 .cloned()
                 .unwrap_or_else(|| roles::core_role(roles::REVIEWER).expect("core reviewer"));
-            let reviewer_policy =
-                self.policy_with_recipe(run.recipe.as_ref(), roles::REVIEWER, &reviewer_name);
+            let reviewer_policy = review_factory.policy_with_recipe(
+                run.recipe.as_ref(),
+                roles::REVIEWER,
+                &reviewer_name,
+            );
+            current.require_readable_evidence(attempt.id, task.id, &evidence, &reviewer_policy)?;
+            let review_context = review_factory.repository_context(
+                &task,
+                TaskOperation::Review,
+                &worktree,
+                &base_sha,
+                &evidence.changed_files,
+                &upstream,
+                roles::REVIEWER,
+                &reviewer_name,
+            );
             let review_instruction = build_mission(&MissionContext {
                 role: &reviewer_role,
                 operation: TaskOperation::Review,
@@ -1852,7 +2231,7 @@ impl Factory {
                 run_objective: &run.objective,
                 untrusted_context: untrusted_notice.as_deref(),
                 upstream_artifacts: &upstream,
-                repository_context: Some(&repository_context),
+                repository_context: Some(&review_context),
                 previous_feedback: None,
                 review_input: Some(&ReviewInput {
                     producer_title: task.title.clone(),
@@ -1864,9 +2243,12 @@ impl Factory {
                 final_review: true,
                 policy: Some(&reviewer_policy),
             });
-            let review_run = self.invoke_with_agent(
+            let review_run = review_factory.invoke_with_agent(
                 reviewer,
                 InvocationScope {
+                    memory_query: None,
+                    memory_extraction_id: None,
+                    review_evidence: Some(&evidence),
                     run_id: Some(task.run_id),
                     task_id: Some(task.id),
                     attempt_id: Some(attempt.id),
@@ -1879,21 +2261,25 @@ impl Factory {
             );
             let review = match review_run {
                 Ok(run) if run.result.cancelled => {
-                    self.db.finish_task_attempt(
+                    current.db.finish_task_attempt(
                         attempt.id,
-                        AttemptStatus::Cancelled,
+                        if self.db.lifecycle_fenced(task.run_id)? {
+                            AttemptStatus::Interrupted
+                        } else {
+                            AttemptStatus::Cancelled
+                        },
                         worker_run.result.exit_code,
                         evidence.commit_sha.as_deref(),
                         Some("Workflow cancelled while the Reviewer was running."),
                         Some(&evidence),
                         None,
                     )?;
-                    self.mark_task(task_id, TaskState::Failed)?;
+                    current.mark_task(task_id, TaskState::Failed)?;
                     return Ok(false);
                 }
                 Ok(run) if run.result.exit_code == Some(0) => {
                     if let Some(error) = agent_output_limit_error("reviewer", &run.result) {
-                        return Err(self.record_output_limit_failure(
+                        return Err(current.record_output_limit_failure(
                             run.session_id,
                             attempt.id,
                             task_id,
@@ -1906,7 +2292,8 @@ impl Factory {
                     match parse_review(&run.result.stdout) {
                         Ok(review) => review,
                         Err(reason) => {
-                            self.db
+                            current
+                                .db
                                 .set_agent_session_status(run.session_id, "rejected")?;
                             ReviewResult {
                                 decision: ReviewDecision::RequestChanges,
@@ -1928,9 +2315,9 @@ impl Factory {
                     ),
                     feedback: nonempty_lines(&run.result.stderr),
                 },
-                Err(error) if error.is_agent_configuration() => {
+                Err(error) if error.is_non_retryable_agent_error() => {
                     let message = error.to_string();
-                    self.db.finish_task_attempt(
+                    current.db.finish_task_attempt(
                         attempt.id,
                         AttemptStatus::Failed,
                         worker_run.result.exit_code,
@@ -1939,7 +2326,7 @@ impl Factory {
                         Some(&evidence),
                         None,
                     )?;
-                    self.mark_task(task_id, TaskState::Failed)?;
+                    current.mark_task(task_id, error.task_failure_state())?;
                     return Err(error);
                 }
                 Err(error) => ReviewResult {
@@ -1949,25 +2336,70 @@ impl Factory {
                 },
             };
 
+            if repo.has_uncommitted_changes(&worktree)?
+                || evidence.commit_sha.as_deref() != Some(repo.head_sha(&worktree)?.as_str())
+            {
+                let reason="Reviewer changed the source after the captured Worker commit; unreviewed modifications cannot be published.";
+                current.db.finish_task_attempt(
+                    attempt.id,
+                    AttemptStatus::Failed,
+                    worker_run.result.exit_code,
+                    evidence.commit_sha.as_deref(),
+                    Some(reason),
+                    Some(&evidence),
+                    Some(&review),
+                )?;
+                current.mark_task(task_id, TaskState::Failed)?;
+                return Err(FactoryError::PolicyViolation(reason.into()));
+            }
+
             if review.decision == ReviewDecision::Approve {
-                let integrated_sha =
-                    self.integrate_approved_task(&run, &task, attempt.id, &worker_name, &worktree)?;
-                let commit_sha = integrated_sha.or_else(|| evidence.commit_sha.clone());
-                self.db.finish_task_attempt(
+                if operation == TaskOperation::Implement
+                    && evidence.changed_files.is_empty()
+                    && current.db.scheduler_policy(run.id)?.is_some()
+                {
+                    current.db.finish_task_attempt(
+                        attempt.id,
+                        AttemptStatus::Failed,
+                        worker_run.result.exit_code,
+                        None,
+                        Some("Implementation approval refused: no source changes were captured."),
+                        Some(&evidence),
+                        Some(&review),
+                    )?;
+                    current.mark_task(task_id, TaskState::Failed)?;
+                    return Ok(false);
+                }
+                if repo.has_uncommitted_changes(&worktree)? {
+                    repo.commit_changes(
+                        &worktree,
+                        &format!(
+                            "factory: reviewed run-{} task-{} ({worker_name})",
+                            run.id, task.id
+                        ),
+                        (
+                            &format!("{worker_name} via Factory {}", run.id),
+                            "factory@local",
+                        ),
+                    )?;
+                }
+                let head = repo.head_sha(&worktree)?;
+                evidence.commit_sha = Some(head.clone());
+                current.db.finish_task_attempt(
                     attempt.id,
                     AttemptStatus::Approved,
                     worker_run.result.exit_code,
-                    commit_sha.as_deref(),
+                    Some(&head),
                     None,
                     Some(&evidence),
                     Some(&review),
                 )?;
-                self.mark_task(task_id, TaskState::Completed)?;
-                self.remove_worktree(task_id, false)?;
+                current.mark_task(task_id, TaskState::AwaitingIntegration)?;
+                current.db.scheduler_event(run.id,Some(task.id),"awaiting_integration",&serde_json::json!({"attemptId":attempt.id,"sourceSha":head,"baseSha":base_sha}))?;
                 return Ok(true);
             }
 
-            self.db.finish_task_attempt(
+            current.db.finish_task_attempt(
                 attempt.id,
                 AttemptStatus::ChangesRequested,
                 worker_run.result.exit_code,
@@ -1976,11 +2408,11 @@ impl Factory {
                 Some(&evidence),
                 Some(&review),
             )?;
-            self.mark_task(task_id, TaskState::Failed)?;
-            if attempt.attempt_number >= MAX_TASK_ATTEMPTS {
+            current.mark_task(task_id, TaskState::Failed)?;
+            if self.db.task_execution_attempt_count(task_id)? >= MAX_TASK_ATTEMPTS as usize {
                 return Ok(false);
             }
-            self.mark_task(task_id, TaskState::Ready)?;
+            current.mark_task(task_id, TaskState::Ready)?;
         }
     }
 
@@ -2000,11 +2432,7 @@ impl Factory {
                 .db
                 .get_task(task_id)?
                 .ok_or(FactoryError::TaskNotFound(task_id))?;
-            let next_attempt = self
-                .db
-                .latest_task_attempt(task_id)?
-                .map_or(1, |attempt| attempt.attempt_number + 1);
-            if next_attempt > MAX_TASK_ATTEMPTS {
+            if self.db.task_execution_attempt_count(task_id)? >= MAX_TASK_ATTEMPTS as usize {
                 return Ok(false);
             }
             let worktree = if let Some(path) = &task.worktree_path {
@@ -2037,6 +2465,7 @@ impl Factory {
                 index,
                 self.routing_language(task_id).as_deref(),
                 true,
+                cancel,
             )?;
             let agent_name = agent.name().to_string();
             let attempt = self.db.create_task_attempt(
@@ -2065,6 +2494,8 @@ impl Factory {
                 &base_sha,
                 &[],
                 &upstream,
+                &role,
+                &agent_name,
             );
             let advisory_policy = self.policy_with_recipe(run.recipe.as_ref(), &role, &agent_name);
             let untrusted_notice = self.untrusted_issue_notice(task.run_id)?;
@@ -2084,6 +2515,9 @@ impl Factory {
             let agent_run = self.invoke_with_agent(
                 agent,
                 InvocationScope {
+                    memory_query: None,
+                    memory_extraction_id: None,
+                    review_evidence: None,
                     run_id: Some(task.run_id),
                     task_id: Some(task.id),
                     attempt_id: Some(attempt.id),
@@ -2139,7 +2573,11 @@ impl Factory {
                 Ok(run) if run.result.cancelled => {
                     self.db.finish_task_attempt(
                         attempt.id,
-                        AttemptStatus::Cancelled,
+                        if self.db.lifecycle_fenced(task.run_id)? {
+                            AttemptStatus::Interrupted
+                        } else {
+                            AttemptStatus::Cancelled
+                        },
                         run.result.exit_code,
                         evidence.commit_sha.as_deref(),
                         Some("Workflow cancelled while the advisory agent was running."),
@@ -2194,7 +2632,8 @@ impl Factory {
                         None,
                     )?;
                     self.mark_task(task_id, TaskState::Failed)?;
-                    if attempt.attempt_number >= MAX_TASK_ATTEMPTS {
+                    if self.db.task_execution_attempt_count(task_id)? >= MAX_TASK_ATTEMPTS as usize
+                    {
                         return Ok(false);
                     }
                     self.mark_task(task_id, TaskState::Ready)?;
@@ -2210,11 +2649,12 @@ impl Factory {
                         Some(&evidence),
                         None,
                     )?;
-                    self.mark_task(task_id, TaskState::Failed)?;
-                    if error.is_agent_configuration() {
+                    self.mark_task(task_id, error.task_failure_state())?;
+                    if error.is_non_retryable_agent_error() {
                         return Err(error);
                     }
-                    if attempt.attempt_number >= MAX_TASK_ATTEMPTS {
+                    if self.db.task_execution_attempt_count(task_id)? >= MAX_TASK_ATTEMPTS as usize
+                    {
                         return Ok(false);
                     }
                     self.mark_task(task_id, TaskState::Ready)?;
@@ -2262,6 +2702,7 @@ impl Factory {
             index,
             self.routing_language(task_id).as_deref(),
             true,
+            cancel,
         )?;
         let reviewer_name = reviewer.name().to_string();
 
@@ -2270,11 +2711,7 @@ impl Factory {
                 .db
                 .get_task(task_id)?
                 .ok_or(FactoryError::TaskNotFound(task_id))?;
-            let next_attempt = self
-                .db
-                .latest_task_attempt(task_id)?
-                .map_or(1, |attempt| attempt.attempt_number + 1);
-            if next_attempt > MAX_TASK_ATTEMPTS {
+            if self.db.task_execution_attempt_count(task_id)? >= MAX_TASK_ATTEMPTS as usize {
                 return Ok(false);
             }
             let worktree = if let Some(path) = &task.worktree_path {
@@ -2312,8 +2749,16 @@ impl Factory {
                 &base_sha,
                 &review_input.evidence.changed_files,
                 &upstream,
+                &role,
+                &reviewer_name,
             );
             let review_policy = self.policy_with_recipe(run.recipe.as_ref(), &role, &reviewer_name);
+            self.require_readable_evidence(
+                attempt.id,
+                task.id,
+                &review_input.evidence,
+                &review_policy,
+            )?;
             let untrusted_notice = self.untrusted_issue_notice(task.run_id)?;
             let instruction = build_mission(&MissionContext {
                 role: role_definition,
@@ -2331,6 +2776,9 @@ impl Factory {
             let review_run = self.invoke_with_agent(
                 reviewer.clone(),
                 InvocationScope {
+                    memory_query: None,
+                    memory_extraction_id: None,
+                    review_evidence: Some(&review_input.evidence),
                     run_id: Some(task.run_id),
                     task_id: Some(task.id),
                     attempt_id: Some(attempt.id),
@@ -2394,7 +2842,11 @@ impl Factory {
                 Ok(run) if run.result.cancelled => {
                     self.db.finish_task_attempt(
                         attempt.id,
-                        AttemptStatus::Cancelled,
+                        if self.db.lifecycle_fenced(task.run_id)? {
+                            AttemptStatus::Interrupted
+                        } else {
+                            AttemptStatus::Cancelled
+                        },
                         run.result.exit_code,
                         evidence.commit_sha.as_deref(),
                         Some("Workflow cancelled while the review agent was running."),
@@ -2432,13 +2884,14 @@ impl Factory {
                         None,
                     )?;
                     self.mark_task(task_id, TaskState::Failed)?;
-                    if attempt.attempt_number >= MAX_TASK_ATTEMPTS {
+                    if self.db.task_execution_attempt_count(task_id)? >= MAX_TASK_ATTEMPTS as usize
+                    {
                         return Ok(false);
                     }
                     self.mark_task(task_id, TaskState::Ready)?;
                     continue;
                 }
-                Err(error) if error.is_agent_configuration() => {
+                Err(error) if error.is_non_retryable_agent_error() => {
                     let message = error.to_string();
                     self.db.finish_task_attempt(
                         attempt.id,
@@ -2449,7 +2902,7 @@ impl Factory {
                         Some(&evidence),
                         None,
                     )?;
-                    self.mark_task(task_id, TaskState::Failed)?;
+                    self.mark_task(task_id, error.task_failure_state())?;
                     return Err(error);
                 }
                 Err(error) => {
@@ -2463,7 +2916,8 @@ impl Factory {
                         None,
                     )?;
                     self.mark_task(task_id, TaskState::Failed)?;
-                    if attempt.attempt_number >= MAX_TASK_ATTEMPTS {
+                    if self.db.task_execution_attempt_count(task_id)? >= MAX_TASK_ATTEMPTS as usize
+                    {
                         return Ok(false);
                     }
                     self.mark_task(task_id, TaskState::Ready)?;
@@ -2544,6 +2998,9 @@ impl Factory {
         run_tasks: &[Task],
         catalog: &RoleCatalog,
     ) -> Result<bool, FactoryError> {
+        if self.db.scheduler_policy(review_task.run_id)?.is_some() {
+            return Ok(false);
+        }
         let Some(seed_id) = find_rework_seed(review_task, run_tasks, catalog) else {
             return Ok(false);
         };
@@ -2698,6 +3155,34 @@ impl Factory {
         Ok(error)
     }
 
+    fn require_readable_evidence(
+        &self,
+        attempt: i64,
+        task: i64,
+        evidence: &TaskEvidence,
+        policy: &factory_policy::EffectivePolicy,
+    ) -> Result<(), FactoryError> {
+        if evidence
+            .changed_files
+            .iter()
+            .all(|file| policy.filesystem.read_allowed(file))
+        {
+            return Ok(());
+        }
+        let reason="READ_SCOPE_DENIED: captured task changes require read access unavailable to the selected profile";
+        self.db.finish_task_attempt(
+            attempt,
+            AttemptStatus::Failed,
+            evidence.worker_exit_code,
+            evidence.commit_sha.as_deref(),
+            Some(reason),
+            Some(evidence),
+            None,
+        )?;
+        self.mark_task(task, TaskState::Blocked)?;
+        Err(FactoryError::PolicyBlocked(reason.into()))
+    }
+
     fn invoke_with_agent(
         &self,
         agent: CommandAgent,
@@ -2705,6 +3190,22 @@ impl Factory {
         mission: &str,
         cancel: &AtomicBool,
     ) -> Result<Invocation, FactoryError> {
+        self.execution.validate_root()?;
+        if let Some(run) = scope.run_id {
+            self.require_lifecycle_active(run)?;
+        }
+        let dependency_context = self.dependency_dispatch_context(&scope)?;
+        let resume_context = scope
+            .run_id
+            .map(|run| self.lifecycle_resume_context(run, scope.task_id))
+            .transpose()?
+            .flatten()
+            .unwrap_or_default();
+        let contextual_mission = Some(format!(
+            "{mission}{}{resume_context}",
+            dependency_context.unwrap_or_default()
+        ));
+        let mission = contextual_mission.as_deref().unwrap_or(mission);
         let started = chrono::Utc::now().to_rfc3339();
         // Resolve the one effective policy for this session (baseline → role →
         // agent, narrowed by the run's recipe preset when one applies). The
@@ -2715,6 +3216,32 @@ impl Factory {
             .and_then(|run_id| self.db.get_run(run_id).ok().flatten())
             .and_then(|run| run.recipe);
         let policy = self.policy_with_recipe(recipe.as_ref(), scope.role, agent.name());
+        if let Some(task) = scope.task_id {
+            if let Some(handoff) = self
+                .db
+                .active_handoff(task)?
+                .filter(|h| h.target.id == agent.name())
+            {
+                let preserved = handoff
+                    .evidence
+                    .get("evidence")
+                    .cloned()
+                    .filter(|v| !v.is_null())
+                    .map(serde_json::from_value::<TaskEvidence>)
+                    .transpose()
+                    .map_err(factory_db::DbError::from)?;
+                if preserved.as_ref().is_some_and(|e| {
+                    e.changed_files
+                        .iter()
+                        .any(|path| !policy.filesystem.read_allowed(path))
+                }) {
+                    return Err(FactoryError::PolicyBlocked(
+                        "READ_SCOPE_DENIED: replacement cannot receive preserved source evidence"
+                            .into(),
+                    ));
+                }
+            }
+        }
         let external_tools = self.external_tools_for_invocation(&scope, &policy);
         let policy_audit = factory_types::SessionPolicyAudit {
             source: policy.source.clone(),
@@ -2737,10 +3264,19 @@ impl Factory {
         let needs_clear = policy.environment.filtered || !policy.environment.denied.is_empty();
         let mut secrets =
             factory_policy::secrets_from_denied(std::env::vars(), &policy.environment.denied);
+        for (key, value) in std::env::vars() {
+            let key = key.to_ascii_uppercase();
+            if ["TOKEN", "SECRET", "PASSWORD", "API_KEY"]
+                .iter()
+                .any(|part| key.contains(part))
+            {
+                secrets.add(&value, 4);
+            }
+        }
         for value in agent.config().env.values() {
             secrets.add(value, 4);
         }
-        let session = self.db.insert_agent_session(&AgentSession {
+        let new_session = AgentSession {
             id: 0,
             run_id: scope.run_id,
             task_id: scope.task_id,
@@ -2759,7 +3295,58 @@ impl Factory {
             stderr: Some(String::new()),
             policy_audit: Some(policy_audit),
             output_meta: None,
-        })?;
+        };
+        let profile = self.agents.config().profile_bindings.get(agent.name());
+        let session = if let Some(profile) = profile {
+            self.db.insert_profile_session(
+                &new_session,
+                &factory_types::AgentExecutionSnapshot {
+                    schema_version: 1,
+                    profile: profile.clone(),
+                    role: scope.role.into(),
+                    provider_kind: serde_json::to_value(agent.kind())
+                        .map_err(factory_db::DbError::from)?
+                        .as_str()
+                        .unwrap_or("custom")
+                        .into(),
+                    requested_model: profile.configuration.model_id.clone(),
+                    effective_policy: serde_json::to_value(policy.view())
+                        .map_err(factory_db::DbError::from)?,
+                    policy_configuration: self
+                        .agents
+                        .config()
+                        .session_policies(scope.role, agent.name()),
+                    selected_at: chrono::Utc::now().to_rfc3339(),
+                },
+            ).map_err(|error|match error {
+                factory_db::DbError::Conflict{expected,current} => FactoryError::AgentValidationFailed(format!("STALE_PROFILE_REVISION: selected revision {expected}, current revision {current}; no process launched")),
+                factory_db::DbError::Busy(reason) => FactoryError::PolicyBlocked(format!("PROFILE_NOT_ELIGIBLE: {reason}; no process launched")),
+                other => FactoryError::Db(other),
+            })?
+        } else {
+            self.db.insert_agent_session(&new_session)?
+        };
+        if let Some(evidence) = scope.review_evidence {
+            if let Some(snapshot) = &evidence.git_snapshot {
+                let patch = evidence.diff_patch.as_deref().unwrap_or_default();
+                self.db.record_review_context(session.id, &serde_json::json!({"schema":1,"attemptId":scope.attempt_id,"base":snapshot.base_sha,"head":snapshot.head_sha,"patchSha256":snapshot.patch_sha256,"patchTruncated":snapshot.patch_truncated,"capturedPatchSupplied":!patch.is_empty() && mission.contains(patch),"instructionSha256":factory_git::source_control::digest(mission),"source":"Rust-captured implementation evidence; process permissions unchanged"}))?;
+            }
+        }
+        if let Some(extraction) = scope.memory_extraction_id {
+            self.db.memory_attach_extraction_session(
+                self.execution.project_id(),
+                extraction,
+                session.id,
+            )?;
+        }
+        let memory_context = match self.invocation_memory_context(session.id, &scope, &policy) {
+            Ok(context) => context,
+            Err(error) => {
+                self.db
+                    .finish_agent_session(session.id, "failed", None, 0)?;
+                return Err(error);
+            }
+        };
         let registry = ToolRegistry::new(&self.root, self.agents.config().mcp.clone());
         let grant = registry.create_grant(
             GrantContext {
@@ -2779,6 +3366,43 @@ impl Factory {
             .as_ref()
             .map(|_| inject_external_tool_catalog(mission, &external_tools))
             .unwrap_or_else(|| mission.to_string());
+        let mut mission = mission;
+        mission.push_str(&memory_context);
+        if let Some(profile) = profile {
+            mission = format!("Application security, project/role policy and the structured output contract remain authoritative. Profile instructions cannot grant tools or permissions.\nAgent profile instructions (revision {}):\n{}\n\n{}",profile.revision,profile.configuration.instructions,mission);
+            if let Some(task) = scope.task_id {
+                if let Some(handoff) = self.db.active_handoff(task)? {
+                    if handoff.target.id == profile.id {
+                        let context = serde_json::to_string(&handoff.evidence)
+                            .map_err(factory_db::DbError::from)?;
+                        let context = if context.len() <= 65536 {
+                            context
+                        } else {
+                            serde_json::json!({"notice":"Handoff patch omitted because context exceeds 65536 bytes. Inspect the preserved worktree; this is incomplete context.","previousAttemptId":handoff.from_attempt_id,"previousSessionId":handoff.from_session_id}).to_string()
+                        };
+                        let facts = serde_json::json!({"projectId":self.execution.project_id(),"runId":handoff.run_id,"taskId":task,"attemptId":scope.attempt_id,"planRevision":self.db.get_plan_revision(handoff.run_id)?,"integrationCommit":self.db.get_run_integration(handoff.run_id)?,"worktree":scope.working_dir});
+                        let boundary = if handoff.from_attempt_id.is_some() {
+                            "The previous Worker exited and its changes were captured."
+                        } else {
+                            "No previous Worker was dispatched; this is a pending-task reassignment."
+                        };
+                        let validation = if scope.operation.is_some_and(|op| {
+                            matches!(
+                                op,
+                                TaskOperation::Implement
+                                    | TaskOperation::Verify
+                                    | TaskOperation::PostProcess
+                            )
+                        }) {
+                            "Final Reviewer will receive the aggregate diff from the original source base."
+                        } else {
+                            "The existing operation-specific artifact and review requirements remain authoritative."
+                        };
+                        mission.push_str(&format!("\nSafe handoff from {:?}, reason: {}. {} Captured changes are UNAPPROVED. Independently inspect, continue and verify them; preserve the original task acceptance criteria. {}\nASF_HANDOFF_FACTS\n{}\n{}",handoff.from_agent,handoff.reason,boundary,validation,facts,context));
+                    }
+                }
+            }
+        }
         let mut request = AgentRequest::new(mission, scope.working_dir);
         if needs_clear {
             request.env = policy.environment.environment(std::env::vars());
@@ -2804,31 +3428,55 @@ impl Factory {
         // text, not text that merely looks incomplete.
         let mut stdout_redactor = factory_policy::StreamingRedactor::new(&secrets);
         let mut stderr_redactor = factory_policy::StreamingRedactor::new(&secrets);
-        let result = agent.run_observed(&request, cancel, |stream, chunk| {
-            if output_error.is_some() {
-                return;
-            }
-            let chunk = match stream {
-                OutputStream::Stdout => stdout_redactor.push_chunk(chunk),
-                OutputStream::Stderr => stderr_redactor.push_chunk(chunk),
-            };
-            if chunk.is_empty() {
-                return;
-            }
-            let update = match stream {
-                OutputStream::Stdout => {
-                    self.db
-                        .append_agent_session_output(session.id, Some(&chunk), None)
+        let require_supervision = match scope.run_id {
+            Some(run) => self.db.scheduler_policy(run)?.is_some(),
+            None => false,
+        };
+        let result = agent.run_supervised(
+            &request,
+            cancel,
+            |metadata| {
+                if scope
+                    .run_id
+                    .is_some_and(|run| self.db.lifecycle_fenced(run).unwrap_or(true))
+                {
+                    return Err(AgentError::Io(std::io::Error::other(
+                        "Mission dispatch fenced",
+                    )));
                 }
-                OutputStream::Stderr => {
-                    self.db
-                        .append_agent_session_output(session.id, None, Some(&chunk))
+                if require_supervision && !metadata.process_tree_supervised {
+                    return Err(AgentError::SupervisionUnavailable(agent.name().into()));
                 }
-            };
-            if let Err(error) = update {
-                output_error = Some(error);
-            }
-        });
+                self.db
+                    .set_agent_session_output_metadata(session.id, Some(metadata))
+                    .map_err(|error| AgentError::Io(std::io::Error::other(error.to_string())))
+            },
+            |stream, chunk| {
+                if output_error.is_some() {
+                    return;
+                }
+                let chunk = match stream {
+                    OutputStream::Stdout => stdout_redactor.push_chunk(chunk),
+                    OutputStream::Stderr => stderr_redactor.push_chunk(chunk),
+                };
+                if chunk.is_empty() {
+                    return;
+                }
+                let update = match stream {
+                    OutputStream::Stdout => {
+                        self.db
+                            .append_agent_session_output(session.id, Some(&chunk), None)
+                    }
+                    OutputStream::Stderr => {
+                        self.db
+                            .append_agent_session_output(session.id, None, Some(&chunk))
+                    }
+                };
+                if let Err(error) = update {
+                    output_error = Some(error);
+                }
+            },
+        );
         // Release each stream's held-back suffix (secret-free by construction)
         // so no path — success, cancellation, or failure — loses or leaks it.
         let stdout_tail = stdout_redactor.finish();
@@ -2854,7 +3502,14 @@ impl Factory {
         match result {
             Ok(result) => {
                 let status = if result.cancelled {
-                    "cancelled"
+                    if scope
+                        .run_id
+                        .is_some_and(|run| self.db.lifecycle_fenced(run).unwrap_or(true))
+                    {
+                        "interrupted"
+                    } else {
+                        "cancelled"
+                    }
                 } else if result.exit_code == Some(0) {
                     "success"
                 } else {
@@ -2872,13 +3527,117 @@ impl Factory {
                     .set_agent_session_output(session.id, Some(&stdout), Some(&stderr))?;
                 self.db
                     .set_agent_session_output_metadata(session.id, Some(&result.output_metadata))?;
+                if profile.is_some()
+                    && result.cancelled
+                    && !cancel.load(Ordering::Acquire)
+                    && profile
+                        .is_some_and(|p| result.duration.as_secs() >= p.configuration.timeout_secs)
+                {
+                    self.db.set_agent_session_status(session.id, "timed_out")?;
+                    if scope.run_id.is_none() && scope.operation == Some(TaskOperation::Planning) {
+                        return Err(FactoryError::ConversationDeadline {
+                            session_id: session.id,
+                            cleanup_confirmed: result
+                                .output_metadata
+                                .process_tree_cleanup_confirmed,
+                        });
+                    }
+                    return Err(FactoryError::AgentValidationFailed(format!("EXECUTION_DEADLINE: profile deadline reached in session #{}; process tree terminated and evidence retained",session.id)));
+                }
                 if let Some(error) = output_error {
                     return Err(error.into());
+                }
+                let blocker = crate::authorization::failure(
+                    agent.kind(),
+                    &result,
+                    scope.operation == Some(TaskOperation::Implement),
+                    matches!(
+                        scope.operation,
+                        Some(
+                            TaskOperation::Implement
+                                | TaskOperation::Verify
+                                | TaskOperation::PostProcess
+                        )
+                    ),
+                );
+                match blocker {
+                    Ok(Some(reason)) => {
+                        self.db.set_agent_session_status(session.id, "blocked")?;
+                        return Err(FactoryError::PolicyBlocked(format!(
+                            "{}; agent session #{}; exit {:?}",
+                            secrets.redact(&reason),
+                            session.id,
+                            result.exit_code
+                        )));
+                    }
+                    Err(reason) => {
+                        self.db.set_agent_session_status(session.id, "rejected")?;
+                        return Err(FactoryError::AgentValidationFailed(format!(
+                            "{}; agent session #{}",
+                            reason, session.id
+                        )));
+                    }
+                    Ok(None) => {}
+                }
+                if crate::authorization::resource_exhausted(agent.kind(), &result) {
+                    self.db.set_agent_session_status(session.id, "blocked")?;
+                    return Err(FactoryError::AgentResourceExhausted(format!("CLI reported its usage limit in agent session #{}. Current evidence is retained; restore authorized provider availability before an explicit retry. No automatic Worker retry or Planner recovery.",session.id)));
+                }
+                if let Some(profile) = profile {
+                    let observed = if agent.kind() == factory_agent::AgentKind::Codex {
+                        crate::agent_profiles::observed_model(&stderr)
+                    } else {
+                        None
+                    };
+                    self.db.record_model_observation(session.id, &serde_json::json!({"model":observed,"source":if observed.is_some(){"native_cli_header"}else{"not_reported"},"successfulExecution":result.exit_code==Some(0),"silentFallback":false}))?;
+                    if profile
+                        .configuration
+                        .model_id
+                        .as_ref()
+                        .zip(observed.as_ref())
+                        .is_some_and(|(requested, actual)| requested != actual)
+                    {
+                        self.db.set_agent_session_status(session.id, "rejected")?;
+                        return Err(FactoryError::AgentValidationFailed(format!("MODEL_MISMATCH: native CLI reported a different model in session #{}; output will not be accepted",session.id)));
+                    }
+                    let lower = stderr.to_ascii_lowercase();
+                    if result.exit_code != Some(0)
+                        && profile.configuration.reasoning_effort.is_some()
+                        && lower.contains("reasoning")
+                        && (lower.contains("not supported") || lower.contains("unsupported"))
+                    {
+                        return Err(FactoryError::AgentValidationFailed(format!("MODEL_CONFIGURATION_UNSUPPORTED: reasoning setting refused in session #{}; no automatic fallback",session.id)));
+                    }
+                    if result.exit_code != Some(0)
+                        && [
+                            "model is not supported",
+                            "model does not exist",
+                            "unknown model",
+                            "model_not_found",
+                            "unsupported model",
+                        ]
+                        .iter()
+                        .any(|message| lower.contains(message))
+                    {
+                        return Err(FactoryError::AgentValidationFailed(format!("MODEL_UNAVAILABLE: selected model refused in session #{}; no automatic fallback",session.id)));
+                    }
                 }
                 Ok(Invocation {
                     session_id: session.id,
                     result,
                 })
+            }
+            Err(AgentError::SupervisionUnavailable(name)) => {
+                let reason=format!("HOST_SANDBOX_RESTRICTED: owned process-tree supervision unavailable for {name}; child terminated without continuing execution. Argument transports retain spawn-to-assignment uncertainty; inspect any partial effects.");
+                self.db.finish_agent_session(
+                    session.id,
+                    "blocked",
+                    None,
+                    timer.elapsed().as_millis() as u64,
+                )?;
+                self.db
+                    .append_agent_session_output(session.id, None, Some(&reason))?;
+                Err(FactoryError::PolicyBlocked(reason))
             }
             Err(error) => {
                 let message = error.to_string();
@@ -2947,6 +3706,20 @@ impl Factory {
     }
 
     pub fn cancel_run(&self, run_id: i64) -> Result<(), FactoryError> {
+        if self.db.lifecycle_fenced(run_id)?
+            && self
+                .db
+                .lifecycle_processes(run_id)?
+                .iter()
+                .any(|(_, _, meta)| {
+                    meta.as_ref()
+                        .is_some_and(|m| !m.process_tree_cleanup_confirmed)
+                })
+        {
+            return Err(FactoryError::CapacityBusy(
+                "Owned process cleanup must be reconciled before terminal cancellation".into(),
+            ));
+        }
         let run = self
             .db
             .get_run(run_id)?
@@ -2957,16 +3730,30 @@ impl Factory {
                 run.status.as_str().to_string(),
             ));
         }
+        self.db.request_lifecycle_cancel(run_id)?;
+        if self.db.scheduler_running(run_id)? {
+            self.db.request_scheduler_stop(run_id)?;
+            return Ok(());
+        }
         self.db.set_run_status(run_id, RunStatus::Cancelled)?;
+        self.db.settle_cancelled_lifecycle(run_id)?;
         Ok(())
     }
 
     pub fn reconcile_interrupted(&self) -> Result<Reconciliation, FactoryError> {
-        let result = self.db.reconcile_interrupted()?;
+        let result = self.reconcile_interrupted_preserving_worktrees()?;
         // Clean task worktrees from a previous session are reclaimed; dirty
         // ones (work-in-progress) are kept for inspection.
         let _ = self.prune_clean_worktrees();
         Ok(result)
+    }
+
+    pub fn reconcile_interrupted_preserving_worktrees(
+        &self,
+    ) -> Result<Reconciliation, FactoryError> {
+        self.reconcile_integration_journal()?;
+        self.db.reconcile_scheduler_owners()?;
+        Ok(self.db.reconcile_interrupted()?)
     }
 
     pub fn mark_task(&self, task_id: i64, target: TaskState) -> Result<MarkOutcome, FactoryError> {
@@ -3076,105 +3863,20 @@ impl Factory {
         format!("factory/run-{run_id}")
     }
 
-    /// The diff base used for an attempt's evidence. Once the run has an
-    /// integration head, evidence is measured against it (stable across rework
-    /// and independent of where the worktree started); otherwise the worktree
-    /// head at attempt start is used.
     fn attempt_base_sha(
         &self,
         task: &Task,
         repo: &Repo,
         worktree: &Path,
     ) -> Result<String, FactoryError> {
-        if let Some(sha) = self.db.get_run_integration(task.run_id)? {
-            return Ok(sha);
+        if let Some(base) = self
+            .db
+            .latest_task_attempt(task.id)?
+            .and_then(|attempt| attempt.source_base)
+        {
+            return Ok(base);
         }
         Ok(repo.head_sha(worktree)?)
-    }
-
-    /// Integrates an approved implementation-family task's worktree into the
-    /// run's `factory/run-<id>` branch:
-    ///
-    /// 1. The run branch is created at the main repository head the first time.
-    /// 2. Any uncommitted agent output is committed under the agent's identity
-    ///    (authorship attribution) without relying on local git configuration.
-    /// 3. The run branch is fast-forwarded to the worktree head; if it has
-    ///    diverged, the task worktree is rebased onto it first.
-    /// 4. The new head is recorded as the run's integration sha.
-    ///
-    /// Every integration attempt (clean fast-forward, stale-base rebase, or
-    /// rebase conflict) is recorded as a durable `integration_outcomes` row so
-    /// the evaluation engine can measure integration quality. A conflict is
-    /// still surfaced as an error exactly as before.
-    ///
-    /// Returns the new integration head, or `None` when the task introduced no
-    /// commits (nothing was integrated).
-    fn integrate_approved_task(
-        &self,
-        run: &Run,
-        task: &Task,
-        attempt_id: i64,
-        agent_name: &str,
-        worktree: &Path,
-    ) -> Result<Option<String>, FactoryError> {
-        let repo = Repo::detect_bounded(&self.root, &self.root)?;
-        let run_branch = self.run_branch(run.id);
-        if !repo.branch_exists(&run_branch)? {
-            let main_head = repo.head_sha(repo.root())?;
-            repo.update_ref(&run_branch, &main_head)?;
-        }
-        if repo.has_uncommitted_changes(worktree)? {
-            let message = format!(
-                "factory: integrate run-{} task-{} ({agent_name})",
-                run.id, task.id
-            );
-            repo.commit_changes(
-                worktree,
-                &message,
-                (
-                    &format!("{agent_name} via Factory {}", run.id),
-                    "factory@local",
-                ),
-            )?;
-        }
-        let head = repo.head_sha(worktree)?;
-        let run_head = repo.resolve_ref(&run_branch)?;
-        if head == run_head {
-            return Ok(None);
-        }
-        if !repo.is_ancestor(&run_head, &head)? {
-            if let Err(error) = repo.rebase_onto_in(worktree, &run_branch) {
-                self.db.record_integration_outcome(
-                    run.id,
-                    task.id,
-                    attempt_id,
-                    agent_name,
-                    factory_types::IntegrationOutcomeKind::Conflict,
-                )?;
-                return Err(error.into());
-            }
-            let rebased = repo.head_sha(worktree)?;
-            repo.update_ref(&run_branch, &rebased)?;
-            self.db.set_run_integration(run.id, Some(&rebased))?;
-            self.db.record_integration_outcome(
-                run.id,
-                task.id,
-                attempt_id,
-                agent_name,
-                factory_types::IntegrationOutcomeKind::Rebased,
-            )?;
-            return Ok(Some(rebased));
-        }
-        repo.update_ref(&run_branch, &head)?;
-        self.db.set_run_integration(run.id, Some(&head))?;
-        self.db.record_integration_outcome(
-            run.id,
-            task.id,
-            attempt_id,
-            agent_name,
-            factory_types::IntegrationOutcomeKind::Clean,
-        )?;
-        Ok(Some(head))
     }
 
     /// Removes an advisory/specialized-review task's worktree once it no longer
@@ -3228,22 +3930,32 @@ impl Factory {
     }
 
     pub fn create_worktree(&self, task_id: i64) -> Result<std::path::PathBuf, FactoryError> {
+        self.execution.validate_root()?;
         let task = self
             .db
             .get_task(task_id)?
             .ok_or(FactoryError::TaskNotFound(task_id))?;
-        if task.state != TaskState::Ready {
+        if task.state != TaskState::Ready
+            && !(task.state == TaskState::Running && self.db.task_has_dispatch(task_id)?)
+        {
             return Err(FactoryError::NotReady(task_id));
         }
         let repo = Repo::detect_bounded(&self.root, &self.root)?;
         let directory = self.worktree_dir(task_id);
         let run_branch = self.run_branch(task.run_id);
         let base = if repo.branch_exists(&run_branch)? {
-            Some(run_branch.as_str())
+            repo.resolve_ref(&run_branch)?
         } else {
-            None
+            repo.head_sha(repo.root())?
         };
-        repo.add_worktree(&directory, &format!("factory/t{task_id}"), base)?;
+        let started = Instant::now();
+        repo.add_worktree(&directory, &format!("factory/t{task_id}"), Some(&base))?;
+        self.db.scheduler_event(
+            task.run_id,
+            Some(task_id),
+            "worktree_created",
+            &serde_json::json!({"baseSha":base,"elapsedMs":started.elapsed().as_millis()}),
+        )?;
         self.db.set_worktree_path(task_id, directory.to_str())?;
         Ok(directory)
     }
@@ -3564,6 +4276,7 @@ impl Factory {
         body: Option<&str>,
         draft: bool,
     ) -> Result<DeliveryClaim, FactoryError> {
+        self.authorize_manual_delivery(run_id)?;
         let run = self
             .db
             .get_run(run_id)?
@@ -3685,8 +4398,38 @@ impl Factory {
             .base_branch
             .clone()
             .expect("claim persists the base branch");
-        if let Err(error) = factory_github::push_branch(&self.root, &remote, &delivery.head_branch)
-        {
+        self.authorize_manual_delivery(run_id)?;
+        let current_remote = self.github_remote()?;
+        if current_remote.repository != repository || current_remote.remote != remote {
+            return self.finish_failed_delivery(
+                operation_id,
+                &mut delivery,
+                factory_github::GitHubError::BranchDrift(
+                    "Delivery repository changed after authorization".into(),
+                ),
+            );
+        }
+        let approved_head = self
+            .db
+            .get_run_integration(run_id)?
+            .ok_or_else(|| FactoryError::NotDeliverable("No recorded integration commit".into()))?;
+        let local_head =
+            Repo::detect_bounded(&self.root, &self.root)?.resolve_ref(&delivery.head_branch)?;
+        if local_head != approved_head {
+            return self.finish_failed_delivery(
+                operation_id,
+                &mut delivery,
+                factory_github::GitHubError::BranchDrift(
+                    "Integration branch changed after authorization".into(),
+                ),
+            );
+        }
+        if let Err(error) = factory_github::push_branch_at(
+            &self.root,
+            &remote,
+            &delivery.head_branch,
+            &approved_head,
+        ) {
             return self.finish_failed_delivery(operation_id, &mut delivery, error);
         }
         delivery.state = DeliveryState::CreatingPr;
@@ -3716,9 +4459,8 @@ impl Factory {
         if matches!(outcome, factory_github::DeliveryOutcome::Created(_)) {
             pull_request.is_draft = request.draft;
         }
-        let integration_head = self.db.get_run_integration(run_id)?;
         delivery.pull_request = Some(pull_request);
-        delivery.pushed_head = integration_head;
+        delivery.pushed_head = Some(approved_head);
         delivery.state = DeliveryState::Published;
         delivery.error = None;
         delivery.recovery_required = false;
@@ -4097,6 +4839,11 @@ fn collect_evidence(
         None
     };
     Ok(TaskEvidence {
+        git_snapshot: Some(git_snapshot(
+            base_sha,
+            &repo.head_sha(worktree)?,
+            diff_patch.as_deref().unwrap_or_default(),
+        )),
         changed_files: git.changed_files,
         diff_summary: git.diff_summary,
         commit_sha: git.commit_sha,
@@ -4106,6 +4853,20 @@ fn collect_evidence(
         artifacts: Vec::new(),
         diff_patch,
     })
+}
+
+fn git_snapshot(
+    base: &str,
+    head: &str,
+    patch: &str,
+) -> factory_types::attempt::GitEvidenceSnapshot {
+    use sha2::Digest;
+    factory_types::attempt::GitEvidenceSnapshot {
+        base_sha: base.into(),
+        head_sha: head.into(),
+        patch_sha256: format!("{:x}", sha2::Sha256::digest(patch.as_bytes())),
+        patch_truncated: patch.contains("[DIFF TRUNCATED:"),
+    }
 }
 
 fn describe_policy_scopes(config: &crate::config::Config, role: &str) -> String {

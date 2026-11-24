@@ -247,6 +247,42 @@ pub fn validate_plan_operations(plan: &Plan, catalog: &RoleCatalog) -> Result<()
     Ok(())
 }
 
+pub fn parse_replan(content: &str) -> std::result::Result<Plan, String> {
+    let value: serde_json::Value = serde_json::from_str(strip_code_fence(content))
+        .map_err(|error| format!("Invalid recovery plan JSON: {error}"))?;
+    if value.as_object().is_none_or(|object| {
+        object
+            .keys()
+            .any(|key| !["objective", "tasks"].contains(&key.as_str()))
+    }) {
+        return Err("Unknown recovery plan fields.".into());
+    }
+    if let Some(tasks) = value.get("tasks").and_then(|value| value.as_array()) {
+        if tasks.iter().any(|task| {
+            task.as_object().is_none_or(|object| {
+                object.keys().any(|key| {
+                    ![
+                        "id",
+                        "title",
+                        "objective",
+                        "dependencies",
+                        "acceptanceCriteria",
+                        "role",
+                        "operation",
+                    ]
+                    .contains(&key.as_str())
+                })
+            })
+        }) {
+            return Err(
+                "Unknown task fields; commands and permissions cannot be supplied by a Planner."
+                    .into(),
+            );
+        }
+    }
+    serde_json::from_value(value).map_err(|error| format!("Invalid recovery plan schema: {error}"))
+}
+
 pub fn parse_plan(content: &str) -> std::result::Result<Plan, String> {
     let content = strip_code_fence(content);
     let value: serde_json::Value =

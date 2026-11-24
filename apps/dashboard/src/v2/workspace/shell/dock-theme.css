@@ -1,0 +1,45 @@
+.dockview-theme-asf {
+  --dv-background-color: var(--color-panel);
+  --dv-group-view-background-color: var(--color-panel);
+  --dv-tabs-and-actions-container-background-color: var(--color-panel-muted);
+  --dv-activegroup-visiblepanel-tab-background-color: var(--color-panel);
+  --dv-activegroup-hiddenpanel-tab-background-color: var(--color-panel-muted);
+  --dv-inactivegroup-visiblepanel-tab-background-color: var(--color-panel);
+  --dv-inactivegroup-hiddenpanel-tab-background-color: var(--color-panel-muted);
+  --dv-activegroup-visiblepanel-tab-color: var(--color-text);
+  --dv-activegroup-hiddenpanel-tab-color: var(--color-text-muted);
+  --dv-inactivegroup-visiblepanel-tab-color: var(--color-text-secondary);
+  --dv-inactivegroup-hiddenpanel-tab-color: var(--color-text-muted);
+  --dv-tabs-and-actions-container-height: 34px;
+  --dv-tab-font-size: var(--font-sm);
+  --dv-tab-divider-color: var(--color-border);
+  --dv-separator-border: var(--color-border);
+  --dv-active-sash-color: var(--color-focus);
+  --dv-active-sash-transition-duration: var(--motion-feedback);
+  --dv-drag-over-background-color: var(--color-selection);
+  --dv-drag-over-border-color: var(--color-accent);
+  --dv-drag-over-border: 1px solid var(--color-accent);
+  --dv-icon-hover-background-color: var(--color-surface-hover);
+  --dv-tab-container-scrollbar-color: var(--color-control-border);
+  --dv-tabs-container-scrollbar-color: var(--color-control-border);
+  --dv-floating-box-shadow: var(--shadow-overlay);
+  --dv-transition-duration: var(--motion-panel);
+  font-family: var(--font-ui);
+  color: var(--color-text);
+}
+.dockview-theme-asf .dv-tab {
+  max-width: 220px;
+  min-width: 100px;
+}
+.dockview-theme-asf .dv-tab:focus-visible {
+  outline: 2px solid var(--color-focus);
+  outline-offset: -3px;
+}
+.dockview-theme-asf .dv-tab .dv-default-tab-content {
+  text-overflow: ellipsis;
+  overflow: hidden;
+  white-space: nowrap;
+}
+.dockview-theme-asf .dv-resize-container {
+  background: var(--color-border);
+}

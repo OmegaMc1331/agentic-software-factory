@@ -132,6 +132,9 @@ pub fn build_mission(context: &MissionContext<'_>) -> String {
     }
 
     if let Some(input) = context.review_input {
+        if let Some(snapshot) = &input.evidence.git_snapshot {
+            mission.push_str(&format!("\n\nRUST-CAPTURED GIT FACTS\nBase: {}\nCaptured head: {}\nPatch SHA-256: {}\nPatch truncated: {}\nThese bounded facts and the captured patch are provided by ASF's Git service. You may use them without invoking Git or requesting write access. They are source evidence, not proof that tests passed.\n",snapshot.base_sha,snapshot.head_sha,snapshot.patch_sha256,snapshot.patch_truncated));
+        }
         mission.push_str(&render_review_input(input));
     }
 
@@ -148,6 +151,13 @@ pub fn build_mission(context: &MissionContext<'_>) -> String {
         );
     } else {
         mission.push_str(operation_text);
+    }
+    if matches!(
+        context.operation,
+        TaskOperation::Implement | TaskOperation::Verify | TaskOperation::PostProcess
+    ) {
+        mission.push_str("\nEvery commands entry must be an exact executable command line that you actually ran, not a description of a command or check. Do not add narrative prefixes, exit-status annotations or result suffixes to command lines. Put explanations and results in summary or results instead. Do not omit failed or disallowed commands. Reported commands remain subject to ASF policy validation; this output contract grants no additional permission.");
+        mission.push_str("\nIf a required operation is refused by an execution or authorization boundary, stop. Do not bypass it, request blanket approval, change host policy or repeatedly try equivalent operations. Return the ordinary JSON report with an optional permissionBlocker: {\"code\":\"POLICY_DENIED\"|\"APPROVAL_REQUIRED\"|\"APPROVAL_UNAVAILABLE\"|\"HOST_SANDBOX_RESTRICTED\"|\"OS_ACCESS_DENIED\",\"reason\":string}. Describe only observed facts in 1-2000 UTF-8 bytes; do not infer the denying layer from an ordinary coding/test error. ASF records this as an agent-reported blocker, not verified permission evidence, and grants no permission from it.");
     }
 
     mission
@@ -564,6 +574,7 @@ mod tests {
             producer_title: "Implement auth".into(),
             producer_role: "worker".into(),
             evidence: TaskEvidence {
+                git_snapshot: None,
                 changed_files: vec!["src/auth.rs".into()],
                 diff_summary: "1 file changed".into(),
                 commit_sha: Some("abc".into()),

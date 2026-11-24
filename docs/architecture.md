@@ -522,3 +522,28 @@ by task agents), plus `--help` and `--version`. Debugging commands remain under
 
 Release builds embed the compiled dashboard with `rust-embed`; development builds read
 `apps/dashboard/dist`. See [Development](development.md) and [Security](security.md).
+
+
+## V2 P03 application and project ownership
+
+The development branch adds `factory-projects` and `FactoryApplication`. One local
+listener hosts a durable application registry and independent `ProjectContext`s.
+Each context retains its own `.factory` DB, configuration and Runtime; existing
+project handlers are reused with explicit project scope. The legacy `ApiState` API
+remains available to embedders, and unscoped HTTP routes use an immutable startup
+default rather than a shared current-project variable. Resource identity is now
+`(project_id, run_id/task_id/session_id)` across the application.
+
+Runtime ownership uses the existing `.factory/runtime.lock` plus a Git-common
+metadata lock (`asf-runtime.lock`) to prevent branch-namespace collisions through
+linked worktrees or another registry. Opening preserves worktrees while retaining
+existing interrupted-state and uncertain-delivery reconciliation. See
+[V2 multi-project architecture](v2/multi-project-architecture.md) and the
+[isolation test matrix](v2/project-isolation-test-matrix.md). P04 navigation and P10
+browser/session suspension are not implemented by this backend phase.
+
+## P04 production presentation layer
+
+The opt-in `/workspace.html` shell now composes project-owned views with Dockview; V1 remains the default entry. Navigation sessions and tab IDs are presentation identities, distinct from workflows and numeric agent-process sessions. Requests and subscriptions always retain their explicit P03 project context. Moving/closing a view cannot cancel its backend work.
+
+A separate application workspace SQLite sidecar stores versioned JSON documents using revision compare-and-swap. It is not a project database, process lease or orchestration checkpoint. See [workspace architecture](v2/workspace-architecture.md), [navigation](v2/navigation-contracts.md), [persistence](v2/layout-persistence.md) and P04 evidence (historical record held privately). P10 suspension/recovery and P05-P14 services remain outside this integration.

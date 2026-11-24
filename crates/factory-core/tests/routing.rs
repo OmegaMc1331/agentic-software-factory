@@ -214,6 +214,7 @@ fn seed(
             )
             .unwrap();
         let evidence = TaskEvidence {
+            git_snapshot: None,
             changed_files: vec![changed_file.to_string()],
             ..TaskEvidence::default()
         };

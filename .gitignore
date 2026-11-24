@@ -6,6 +6,9 @@
 # Factory runtime state
 .factory/
 
+# Private qualification receipts
+/docs/v2/evidence/
+
 # Environment
 .env
 .env.local
@@ -15,6 +18,7 @@ node_modules/
 dist/
 *.log
 .vite/
+__pycache__/
 
 # Editors / OS
 .idea/

@@ -107,7 +107,8 @@ pub(crate) async fn set_routing_override(
     };
 
     if let Some(pinned) = agent {
-        let config = factory_core::Config::load(&state.root)?;
+        let factory = state.runtime.factory()?;
+        let config = factory.agents().config();
         let role = task
             .role
             .clone()
@@ -131,7 +132,7 @@ pub(crate) async fn set_routing_override(
     }
 
     let db = state.db.lock().expect("db mutex poisoned");
-    db.set_task_agent_override(id, agent)?;
+    db.pin_idle_task(id, agent)?;
     Ok(Json(RoutingOverrideResponse {
         task_id: id,
         agent_override: agent.map(str::to_string),

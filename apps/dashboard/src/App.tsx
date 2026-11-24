@@ -181,6 +181,12 @@ export default function App() {
           <span className="brand-name">Agentic Software Factory</span>
         </div>
         <nav className="nav">
+          <a className="nav-link" href="/projects.html">
+            Projects
+          </a>
+          <a className="nav-link" href="/workspace.html">
+            V2 workspace
+          </a>
           {NAV.map((item) => (
             <button
               key={item.view}

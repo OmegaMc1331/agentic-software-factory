@@ -1,4 +1,13 @@
-export type TaskState = "pending" | "ready" | "running" | "blocked" | "failed" | "completed";
+export type TaskState =
+  | "pending"
+  | "ready"
+  | "running"
+  | "awaiting_integration"
+  | "integrating"
+  | "blocked"
+  | "failed"
+  | "completed"
+  | "superseded";
 
 export type TaskOperation =
   "planning" | "advisory" | "implement" | "verify" | "review" | "post_process";
@@ -721,6 +730,12 @@ export type AttemptStatus =
   | "cancelled";
 
 export interface TaskEvidence {
+  gitSnapshot?: {
+    baseSha: string;
+    headSha: string;
+    patchSha256: string;
+    patchTruncated: boolean;
+  } | null;
   changedFiles: string[];
   diffSummary: string;
   commitSha: string | null;

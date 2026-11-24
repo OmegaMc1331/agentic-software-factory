@@ -1,0 +1,16 @@
+@font-face {
+  font-family: "ASF Inter";
+  src: url("@fontsource-variable/inter/files/inter-latin-wght-normal.woff2") format("woff2");
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "ASF JetBrains Mono";
+  src: url("@fontsource-variable/jetbrains-mono/files/jetbrains-mono-latin-wght-normal.woff2")
+    format("woff2");
+  font-style: normal;
+  font-weight: 100 800;
+  font-display: swap;
+}

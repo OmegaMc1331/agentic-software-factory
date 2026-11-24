@@ -1,0 +1,90 @@
+.asf-agents {
+  container-type: inline-size;
+}
+.asf-legacy-agents {
+  border-top: 1px solid var(--border-subtle, #7775);
+  margin-top: 12px;
+  padding-top: 12px;
+}
+.asf-agent-toolbar,
+.asf-agent-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.asf-agent-toolbar h2 {
+  margin-right: auto;
+}
+.asf-agent-row {
+  border-top: 1px solid var(--border-subtle, #7775);
+  padding: 12px 0;
+}
+.asf-agent-row small {
+  display: block;
+  overflow-wrap: anywhere;
+  opacity: 0.7;
+  margin-top: 4px;
+}
+.asf-agent-row p {
+  margin: 6px 0;
+  overflow-wrap: anywhere;
+}
+.asf-profile-editor {
+  display: grid;
+  gap: 12px;
+  max-width: 850px;
+}
+.asf-profile-editor fieldset {
+  display: grid;
+  gap: 10px;
+  border: 1px solid var(--border-subtle, #7775);
+  padding: 12px;
+  min-width: 0;
+}
+.asf-profile-editor label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.asf-profile-editor .ds-field {
+  display: grid;
+}
+.asf-profile-editor input,
+.asf-profile-editor textarea,
+.asf-profile-editor select {
+  min-width: 0;
+  max-width: 100%;
+}
+.asf-agents pre,
+.asf-handoffs pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 400px;
+  overflow: auto;
+  font-size: 12px;
+}
+.asf-handoffs {
+  border-top: 1px solid var(--border-subtle, #7775);
+  padding: 10px 0;
+}
+.asf-handoffs form {
+  display: grid;
+  gap: 8px;
+  margin: 8px 0;
+}
+.asf-handoff-record {
+  border-top: 1px solid var(--border-subtle, #7775);
+  padding: 8px 0;
+}
+.asf-execution-snapshot {
+  padding: 8px;
+  font-size: 12px;
+  border-bottom: 1px solid var(--border-subtle, #7775);
+}
+.asf-execution-snapshot pre {
+  max-height: 320px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}

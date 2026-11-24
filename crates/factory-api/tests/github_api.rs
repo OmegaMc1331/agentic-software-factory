@@ -552,7 +552,7 @@ async fn pull_request_runs_asynchronously_and_publishes() {
             break;
         }
         assert_eq!(report["operationActive"], true, "while running: {report}");
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     let report = published.unwrap_or_else(|| panic!("delivery never published"));
     assert_eq!(report["state"], "published");
@@ -577,7 +577,7 @@ async fn repeat_request_after_publication_returns_the_existing_pr() {
             done = true;
             break;
         }
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     assert!(done, "delivery never published");
 
@@ -619,7 +619,7 @@ async fn concurrent_requests_launch_exactly_one_operation() {
             published = true;
             break;
         }
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     assert!(published, "delivery never published");
 }
@@ -744,12 +744,13 @@ fn install_gated_fake_gh(dir: &Path) {
              exit /b 0\r\n\
              :prcreate\r\n\
              echo create>>\"{create_log}\"\r\n\
-             set /a tries=0\r\n\
-             :waitloop\r\n\
-             if exist \"{release}\" goto done\r\n\
-             choice /t 1 /d y /n >nul\r\n\
-             set /a tries+=1\r\n\
-             if %tries% lss 60 goto waitloop\r\n\
+             set \"FACTORY_TEST_PR_RELEASE={release}\"\r\n\
+             powershell.exe -NoLogo -NoProfile -NonInteractive -Command \"\
+             $clock = [Diagnostics.Stopwatch]::StartNew(); \
+             while ($clock.Elapsed.TotalSeconds -lt 60) {{ \
+             if ([IO.File]::Exists($env:FACTORY_TEST_PR_RELEASE)) {{ exit 0 }}; \
+             Start-Sleep -Milliseconds 100 }}; exit 1\"\r\n\
+             if not errorlevel 1 goto done\r\n\
              echo gate never released 1>&2\r\n\
              exit /b 1\r\n\
              :done\r\n\
@@ -818,14 +819,37 @@ async fn wait_for_delivery(
     run_id: i64,
     ready: impl Fn(&serde_json::Value) -> bool,
 ) -> serde_json::Value {
+    let mut last = serde_json::Value::Null;
     for _ in 0..300 {
         let report = delivery_report(app, run_id).await;
         if ready(&report) {
             return report;
         }
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        last = report;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    panic!("delivery status never satisfied the condition");
+    panic!("delivery status never satisfied the condition; last report: {last}");
+}
+
+#[tokio::test]
+async fn delivery_status_polling_yields_to_background_work() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let progressed = Arc::new(AtomicBool::new(false));
+    let task_state = progressed.clone();
+    let task = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        task_state.store(true, Ordering::SeqCst);
+    });
+    let app = Router::new().route(
+        "/api/runs/:id/delivery",
+        axum::routing::get(move || {
+            let progressed = progressed.clone();
+            async move { axum::Json(json!({"backgroundReady":progressed.load(Ordering::SeqCst)})) }
+        }),
+    );
+    let report = wait_for_delivery(&app, 1, |r| r["backgroundReady"] == true).await;
+    task.await.unwrap();
+    assert_eq!(report["backgroundReady"], true);
 }
 
 /// ASF-R02 primary scenario: `gh pr create` slower than any HTTP request
@@ -853,7 +877,9 @@ async fn slow_pr_create_is_acknowledged_active_and_never_duplicated() {
     let active = wait_for_delivery(&app, run_id, |report| {
         // Wait for the blocked create itself, not merely an active push: the
         // create log line is written before the gate wait begins.
-        report["persistedState"] == "creating_pr" || report["pullRequest"].is_object()
+        report["persistedState"] == "creating_pr"
+            && report["operationActive"] == true
+            && gated_creates(dir.path()) == 1
     })
     .await;
     assert!(active["retrySafe"] == serde_json::Value::Bool(false));
@@ -1055,7 +1081,7 @@ async fn lost_acknowledgement_does_not_lose_the_operation() {
         {
             break;
         }
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 
     // A second submission is safe in every branch: 409 while the lost
@@ -1105,7 +1131,7 @@ async fn lost_acknowledgement_does_not_lose_the_operation() {
                 return;
             }
         }
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     server.abort();
     panic!("delivery never published after the lost acknowledgement");

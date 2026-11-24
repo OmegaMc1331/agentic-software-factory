@@ -8,13 +8,22 @@ license.workspace = true
 # Release builds embed apps/dashboard/dist into the binary, so `factory start`
 # serves the dashboard without a source checkout. The folder must exist at
 # compile time: `cd apps/dashboard && npm run build` first.
-embedded-dashboard = ["dep:rust-embed"]
+embedded-dashboard = ["dep:rust-embed", "rust-embed/debug-embed"]
 
 [dependencies]
+factory-conversation.workspace = true
 factory-types = { workspace = true }
 factory-db = { workspace = true }
 factory-core = { workspace = true }
 factory-runtime = { workspace = true }
+factory-projects = { workspace = true }
+factory-context = { workspace = true }
+factory-files = { workspace = true }
+factory-memory.workspace = true
+factory-git.workspace = true
+factory-github.workspace = true
+factory-ide.workspace = true
+tower = { version = "0.4", features = ["util"] }
 factory-policy = { workspace = true }
 factory-eval = { workspace = true }
 factory-mcp = { workspace = true }
@@ -29,8 +38,10 @@ rust-embed = { version = "8", features = ["mime-guess"], optional = true }
 tokio-stream = "0.1"
 rand = "0.8"
 sha2 = "0.10"
+rusqlite.workspace = true
 
 [dev-dependencies]
+rusqlite.workspace = true
 tempfile = "3"
 tower = { version = "0.4", features = ["util"] }
 http-body-util = "0.1"

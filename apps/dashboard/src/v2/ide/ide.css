@@ -1,0 +1,173 @@
+.ide-settings {
+  border-block-start: 1px solid var(--color-border);
+  margin-block-start: 24px;
+  padding-block: 16px;
+}
+.ide-settings .ds-textarea {
+  font-family: var(--font-code);
+  tab-size: 2;
+}
+.ide-list {
+  list-style: none;
+  margin: 8px 0;
+  padding: 0;
+}
+.ide-list > li {
+  border-block-end: 1px solid var(--color-border);
+  padding-block: 6px;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.ide-list > li > span:first-child {
+  flex: 1;
+}
+.ide-extension-row {
+  align-items: start !important;
+  padding-block: 12px !important;
+}
+.ide-extension-row > div:first-child {
+  flex: 1;
+  min-width: 180px;
+}
+.ide-extension-row p {
+  margin-block: 6px;
+}
+.ide-extension-row code {
+  overflow-wrap: anywhere;
+}
+.ide-extension-text {
+  white-space: pre-wrap;
+}
+.ide-intelligence {
+  flex: 0 0 auto;
+  border-block-end: 1px solid var(--color-border);
+}
+.ide-intelligence details {
+  padding: 4px 10px;
+}
+.ide-intelligence .ds-field {
+  flex: 1 1 260px;
+  min-width: 240px;
+  max-width: 340px;
+}
+.ide-intelligence .ds-field-label {
+  font-size: 11px;
+}
+.ide-debug-panel .ds-field-label,
+.ide-intelligence .ds-field-label,
+.ide-terminal-panel .ds-field-label {
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.ide-variable-scope {
+  color: var(--color-text-muted);
+  font-size: 11px;
+}
+.ide-intelligence .files-toolbar {
+  gap: 4px;
+}
+.ide-intelligence .ide-list .ds-button {
+  max-width: 100%;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  text-align: start;
+}
+.ide-status {
+  color: var(--color-text-muted);
+  font-size: 11px;
+  white-space: nowrap;
+}
+.ide-terminal-panel {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+.ide-terminal-panel > .ws-terminal {
+  flex: 1;
+  min-height: 100px;
+}
+.ide-terminal-tabs {
+  display: flex;
+  overflow-x: auto;
+  flex-shrink: 0;
+  padding-inline: 8px;
+  gap: 2px;
+  border-block-end: 1px solid var(--color-border);
+}
+.ide-terminal-panel > details {
+  padding-inline: 8px;
+}
+.ide-debug-output {
+  background: var(--color-canvas);
+  border-block: 1px solid var(--color-border);
+  font: 12px/1.6 var(--font-code);
+  padding: 12px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 240px;
+  overflow-y: auto;
+}
+.ide-variables {
+  margin: 8px 0;
+  font-family: var(--font-code);
+  font-size: 12px;
+}
+.ide-variables > div {
+  display: grid;
+  grid-template-columns: minmax(80px, 1fr) minmax(100px, 2fr);
+  border-block-end: 1px solid var(--color-border);
+  padding: 4px;
+}
+.ide-variables dt {
+  overflow-wrap: anywhere;
+}
+.ide-variables dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.ide-edit-preview {
+  max-height: 55vh;
+  overflow: auto;
+}
+.ide-edit-preview pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-family: var(--font-code);
+  font-size: 12px;
+}
+.ide-breakpoint-gutter {
+  min-width: 18px;
+  cursor: pointer;
+}
+.ide-breakpoint {
+  color: var(--color-danger);
+  font-size: 12px;
+}
+.ide-execution-line {
+  background: var(--color-selection);
+  box-shadow: inset 2px 0 var(--color-accent);
+}
+.ide-diagnostics .ds-button {
+  white-space: normal;
+  text-align: start;
+  display: flex;
+  flex-direction: column;
+  align-items: start;
+  gap: 2px;
+  max-width: 100%;
+}
+.files-editor .cm-tooltip {
+  max-width: min(600px, 80vw);
+  max-height: 40vh;
+  overflow: auto;
+}
+.files-editor .cm-lsp-documentation {
+  overflow-wrap: anywhere;
+}
+.files-editor .cm-lsp-documentation pre {
+  white-space: pre-wrap;
+}

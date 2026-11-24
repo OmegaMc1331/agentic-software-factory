@@ -25,9 +25,14 @@ struct FakeHttp {
 
 impl FakeHttp {
     fn start() -> Self {
+        Self::with_mode("normal")
+    }
+
+    fn with_mode(mode: &str) -> Self {
         let mut child = Command::new(python())
             .arg("-u")
             .arg(fixture())
+            .arg(mode)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -42,6 +47,28 @@ impl FakeHttp {
             url: format!("http://127.0.0.1:{}/mcp", port.trim()),
         }
     }
+}
+
+#[tokio::test]
+async fn streamable_http_rejects_an_oversized_body_before_buffering() {
+    let server = FakeHttp::with_mode("oversized");
+    let config = McpServerConfig {
+        transport: McpTransport::Http,
+        command: None,
+        args: Vec::new(),
+        cwd: None,
+        url: Some(server.url.clone()),
+        env: BTreeMap::new(),
+        headers: BTreeMap::new(),
+        timeout_ms: 2_000,
+        discovery_timeout_ms: 2_000,
+        max_response_bytes: 32_000,
+        max_concurrency: 1,
+        classifications: BTreeMap::new(),
+    };
+    let client = McpClient::new(env!("CARGO_MANIFEST_DIR"));
+    let error = client.discover("oversized", &config).await.unwrap_err();
+    assert!(error.to_string().contains("maximum size"), "{error}");
 }
 
 impl Drop for FakeHttp {

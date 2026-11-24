@@ -164,6 +164,39 @@ pub fn list_remotes(root: &Path) -> Result<Vec<(String, String)>> {
     Ok(remotes)
 }
 
+pub fn verify_push_destination(root: &Path, remote: &str, repository: &str) -> Result<()> {
+    if remote.is_empty()
+        || remote.starts_with('-')
+        || !remote
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte))
+    {
+        return Err(GitHubError::RemoteParse("Unsupported remote name".into()));
+    }
+    let output = run_read_git(root, &["remote", "get-url", "--push", "--all", remote])?;
+    if !output.success() || output.stdout_truncated {
+        return Err(GitHubError::RemoteParse(
+            "Cannot verify effective push destination".into(),
+        ));
+    }
+    let text = String::from_utf8(output.stdout)
+        .map_err(|_| GitHubError::RemoteParse("Non-UTF-8 push destination".into()))?;
+    let urls: Vec<_> = text.lines().collect();
+    if urls.len() != 1 {
+        return Err(GitHubError::RemoteParse(
+            "Exactly one verified GitHub push destination is required".into(),
+        ));
+    }
+    let (owner,name)=parse_remote_url(urls[0]).map_err(|_|GitHubError::RemoteParse("Effective push URL is not the authorized GitHub repository; URL rewrites/local transports require separate qualification".into()))?;
+    if !format!("{owner}/{name}").eq_ignore_ascii_case(repository) || urls[0].starts_with("http://")
+    {
+        return Err(GitHubError::RemoteParse(
+            "Effective push repository/protocol differs from the authorized destination".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Detects the GitHub remote for the repository at `root`. Prefers `origin`;
 /// otherwise the first remote whose URL parses as GitHub.
 pub fn detect(root: &Path) -> Result<GitHubRemote> {

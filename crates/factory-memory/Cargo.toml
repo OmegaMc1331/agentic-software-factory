@@ -1,0 +1,24 @@
+[package]
+name = "factory-memory"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+factory-db.workspace = true
+factory-types.workspace = true
+factory-files.workspace = true
+factory-context.workspace = true
+factory-policy.workspace = true
+factory-git.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+thiserror.workspace = true
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4"] }
+regex = "1"
+
+[dev-dependencies]
+tempfile = "3"
+rusqlite.workspace = true

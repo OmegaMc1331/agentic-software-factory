@@ -139,6 +139,11 @@ impl AgentError {
                     "Correct the configured arguments or prompt transport in Settings.".to_string(),
                 ),
             ),
+            AgentError::SupervisionUnavailable(name) => AgentDiagnostic::new(
+                AgentDiagnosticCode::ProcessSpawnFailed,
+                format!("HOST_SANDBOX_RESTRICTED: cannot supervise the process tree for {name}."),
+                Some("Use a supported host process-supervision configuration. No mission input was dispatched and no broader permission was granted.".into()),
+            ),
             AgentError::RequiresTerminal(name) => AgentDiagnostic::new(
                 AgentDiagnosticCode::InteractiveRequired,
                 format!("`{name}` started but requires an interactive terminal."),

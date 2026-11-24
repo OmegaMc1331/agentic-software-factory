@@ -1,0 +1,33 @@
+{
+  "id": "asf.p06-workspace",
+  "name": "ASF Workspace Notes",
+  "version": "1.0.0",
+  "publisher": "asf",
+  "description": "Original Dockview workspace contribution and command, without executable JavaScript.",
+  "entrypoint": "contributions",
+  "extension_api_version": 1,
+  "capabilities": ["views", "commands", "settings"],
+  "permissions": ["views", "commands", "settings"],
+  "supported_platforms": ["any"],
+  "dependencies": {},
+  "contributions": {
+    "views": [
+      {
+        "id": "checklist",
+        "title": "Workspace checklist",
+        "text": "Review current diagnostics before delivery.\nInspect file revisions and unsaved buffers.\nRun the project’s actual tests.\nReview external-operation permissions."
+      }
+    ],
+    "commands": [
+      {
+        "id": "open-checklist",
+        "title": "Open workspace checklist",
+        "action": "open-view",
+        "target": "checklist",
+        "keybinding": "Alt-Shift-k",
+        "context_menu": true
+      }
+    ],
+    "settings": { "review-mode": "manual" }
+  }
+}

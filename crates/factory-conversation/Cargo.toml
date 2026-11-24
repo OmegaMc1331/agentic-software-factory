@@ -1,0 +1,24 @@
+[package]
+name = "factory-conversation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+factory-core.workspace = true
+factory-runtime.workspace = true
+factory-db.workspace = true
+factory-files.workspace = true
+factory-types.workspace = true
+factory-policy.workspace = true
+factory-agent.workspace = true
+factory-context.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { version = "1", features = ["rt", "sync", "time"] }
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,19 @@
+# Agent permission governance
+
+Effective access is the intersection of application invariants, optional TOML `policies.ceiling`, role restrictions, trusted installation restrictions, profile restrictions, recipe/task requirements and the available CLI/OS permissions. Profile instructions are text and cannot grant capabilities. Allow lists intersect; explicit denies remain effective. MCP tools remain deny-by-default and require an exact role grant where the existing service demands one.
+
+The project ceiling is server-owned policy. Profile APIs cannot modify it. Copying an installation into a profile retains its restrictions; changing the profile name or model cannot remove them. Custom review-class profiles have an additional read-only filesystem restriction. Codex read-only sessions retain a native read-only sandbox even if their installation also supports Worker execution. P07-R1 workspace-write/mxc configuration is preserved for authorized Workers.
+
+The API exposes effective policy and source descriptions. Requested scopes are only restrictions. Empty writes deny modification. Protected `.factory` and Git internals retain their invariant protection. A read-only replacement is rejected before execution of an implementation-family task. The browser cannot convert an unknown provider ID into a command or inject switches through a model identifier.
+
+Policy dimensions retain their existing enforcement levels. MCP grants and project/root authorization are enforced by Rust. Filesystem and reported-command evidence is validated before acceptance; unauthorized changes fail the attempt and remain available for inspection. The CLI/OS sandbox independently constrains process capabilities. Network policy is advisory rather than a claimed OS firewall. No profile grants an unrestricted terminal, debugger, integration operation or publication permission.
+
+Worker output is not sufficient for integration. The main Reviewer receives the captured aggregate patch and Git facts. Reviewer modifications after capture refuse publication. GitHub delivery still requires the existing separate authorization, and no P09 endpoint publishes externally. Managed agent worktrees remain read-only through the P05 ordinary editor service.
+
+Profiles and handoffs use the established authenticated project routes with Host/Origin and mutation CSRF checks. Configuration values, instructions and bounded history are local retained data; users should not put credentials into instructions. CLI environment secrets are not reflected in profile/provider API responses or snapshots. Archival preserves local execution evidence; it is not data erasure.
+
+These policies are not an operating-system sandbox. ASF does not override a stricter parent environment, grant blanket approvals or migrate permissions from one subprocess to another. Immediate unsafe handoff and in-flight model-state transfer are unsupported.
+
+Read scopes filter Rust-provided repository excerpts and related test references. Handoff and review source evidence is refused when the selected profile cannot read its changed files. The shared project index remains an application-owned service. Native CLI filesystem tools are governed by their own sandbox and host; ASF does not claim to intercept every direct read. The UI labels this control as file-context read scopes. Existing explicit user-supplied message data does not grant new filesystem tools.
+
+For new profile/ceiling narrowing declarations, an empty read list denies these context paths. Older TOML resolver semantics remain compatible; P09 does not reinterpret prior execution history. Effective policy views show all read constraint layers, including an explicit no-paths layer. A later integration freshness-review refusal preserves the original approved attempt rather than rewriting its historical decision.

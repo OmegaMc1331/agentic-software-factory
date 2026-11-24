@@ -1,7 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc as std_mpsc, Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
@@ -14,8 +14,14 @@ use thiserror::Error;
 use tokio::sync::Notify;
 
 mod project_lock;
-
-use project_lock::ProjectLock;
+pub use project_lock::ProjectOwnership;
+mod development;
+mod lifecycle;
+mod resources;
+mod terminal_process;
+pub use development::DevelopmentTerminal;
+use lifecycle::tracing_lifecycle_failure;
+pub use resources::{ResourcePermit, RuntimeBudget};
 
 const MAX_TERMINAL_HISTORY_BYTES: usize = 1_000_000;
 const MAX_TERMINAL_SUBSCRIBERS: usize = 8;
@@ -36,6 +42,8 @@ pub struct ActiveOperation {
 
 #[derive(Debug, Error)]
 pub enum RuntimeError {
+    #[error("application-wide {0} limit reached")]
+    ResourceLimit(&'static str),
     #[error("workflow #{0} already has an active operation")]
     AlreadyActive(i64),
     #[error("workflow #{0} is not active in this Factory process")]
@@ -68,8 +76,11 @@ pub enum RuntimeError {
 
 #[derive(Clone)]
 pub struct Runtime {
+    execution: Arc<factory_core::ProjectExecution>,
+    budget: Arc<RuntimeBudget>,
     root: Arc<PathBuf>,
     active: Arc<Mutex<HashMap<i64, Active>>>,
+    finishing: Arc<AtomicUsize>,
     terminals: Arc<Mutex<HashMap<i64, Arc<InteractiveTerminal>>>>,
     /// In-flight GitHub delivery operations: run id -> operation id. The
     /// durable database claim is authoritative; this map only reflects the
@@ -77,18 +88,28 @@ pub struct Runtime {
     delivery_operations: Arc<Mutex<HashMap<i64, String>>>,
     /// Runs currently being reconciled (single-flight, read-only).
     delivery_reconciles: Arc<Mutex<HashMap<i64, ()>>>,
-    _project_lock: Arc<ProjectLock>,
+    _project_lock: Arc<ProjectOwnership>,
 }
 
 struct Active {
+    _permit: ResourcePermit,
     kind: OperationKind,
     cancel: Arc<AtomicBool>,
 }
 
+struct Finishing(Arc<AtomicUsize>);
+
+impl Drop for Finishing {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 struct InteractiveTerminal {
+    _permit: Mutex<Option<ResourcePermit>>,
     master: Mutex<Option<Box<dyn MasterPty + Send>>>,
     writer: Mutex<Option<Box<dyn Write + Send>>>,
-    killer: Mutex<Box<dyn portable_pty::ChildKiller + Send + Sync>>,
+    killer: Mutex<terminal_process::TerminalKiller>,
     stopping: AtomicBool,
     output: Arc<Mutex<TerminalOutput>>,
 }
@@ -350,7 +371,82 @@ fn subscribe_terminal_output(
 }
 
 impl Runtime {
+    pub fn execute_conversation_mission(
+        &self,
+        run_id: i64,
+        plan: Option<&factory_types::Plan>,
+        permit: ResourcePermit,
+    ) -> Result<(), RuntimeError> {
+        let cancel = match self.reserve_with_permit(run_id, OperationKind::Planning, permit) {
+            Ok(cancel) => cancel,
+            Err(error @ RuntimeError::ResourceLimit("application shutting down")) => {
+                self.suspend_for_shutdown(run_id)?;
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
+        let outcome = self.guard_execution(run_id, || {
+            let factory = self.factory()?;
+            if factory
+                .get_run(run_id)?
+                .is_some_and(|run| run.status == factory_types::RunStatus::Cancelled)
+            {
+                return Err(FactoryError::Cancelled.into());
+            }
+            if let Some(plan) = plan {
+                factory.persist_authored_plan(run_id, plan)?;
+            } else {
+                factory.plan_run(run_id, &cancel)?;
+            }
+            if cancel.load(Ordering::Relaxed) {
+                return Err(FactoryError::Cancelled.into());
+            }
+            factory.prepare_start(run_id)?;
+            if let Some(active) = self
+                .active
+                .lock()
+                .expect("runtime mutex poisoned")
+                .get_mut(&run_id)
+            {
+                active.kind = OperationKind::Executing;
+            }
+            factory.execute_active_run(run_id, &cancel)?;
+            Ok(())
+        });
+        if outcome.is_err() {
+            if let Ok(db) = FactoryDb::open(&self.root.join(".factory/db.sqlite3")) {
+                if !db.lifecycle_fenced(run_id).unwrap_or(true) {
+                    let _ = db.conversation_fail_unplanned_run(run_id);
+                }
+            }
+        }
+        self.clone().release(run_id);
+        outcome
+    }
     pub fn new(root: &Path) -> Result<Self, RuntimeError> {
+        Self::with_budget(root, Arc::new(RuntimeBudget::default()))
+    }
+
+    pub fn factory(&self) -> Result<Factory, FactoryError> {
+        Factory::open_with_execution(&self.root, self.execution.clone())
+    }
+
+    pub fn bind_project_identity(&self, project: &str) -> Result<(), RuntimeError> {
+        self.execution
+            .bind_project_id(project)
+            .map_err(|reason| FactoryError::PolicyBlocked(reason).into())
+    }
+
+    pub fn with_budget(root: &Path, budget: Arc<RuntimeBudget>) -> Result<Self, RuntimeError> {
+        Self::with_project_validation(root, budget, None)
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub fn with_project_validation(
+        root: &Path,
+        budget: Arc<RuntimeBudget>,
+        check: Option<Arc<dyn Fn() -> Result<(), String> + Send + Sync>>,
+    ) -> Result<Self, RuntimeError> {
         let canonical_root =
             std::fs::canonicalize(root).map_err(|source| RuntimeError::ProjectRoot {
                 root: root.to_path_buf(),
@@ -359,16 +455,29 @@ impl Runtime {
         if !canonical_root.join(FACTORY_DIR).join("db.sqlite3").exists() {
             return Err(FactoryError::NotInitialized.into());
         }
-        let project_lock = ProjectLock::acquire(&canonical_root, root)?;
-        let factory = Factory::open(root)?;
-        factory.reconcile_interrupted()?;
+        let project_lock = ProjectOwnership::acquire(root)?;
+        let execution = Arc::new(factory_core::ProjectExecution::new(
+            canonical_root.to_string_lossy().into_owned(),
+            budget.tasks.clone(),
+        ));
+        if let Some(check) = check {
+            execution
+                .bind_root(check)
+                .map_err(FactoryError::PolicyBlocked)?;
+        }
+        let factory = Factory::open_with_execution(root, execution.clone())?;
+        factory.reconcile_interrupted_preserving_worktrees()?;
+        factory.recover_lifecycle_after_restart()?;
         // Deliveries left mid-operation by a previous process have unknown
         // outcomes; they become `interrupted` and require reconciliation
         // before any retry. Nothing is pushed or created at startup.
         factory.demote_interrupted_deliveries()?;
         Ok(Self {
+            execution,
+            budget,
             root: Arc::new(root.to_path_buf()),
             active: Arc::new(Mutex::new(HashMap::new())),
+            finishing: Arc::new(AtomicUsize::new(0)),
             terminals: Arc::new(Mutex::new(HashMap::new())),
             delivery_operations: Arc::new(Mutex::new(HashMap::new())),
             delivery_reconciles: Arc::new(Mutex::new(HashMap::new())),
@@ -397,6 +506,21 @@ impl Runtime {
         operation_id: &str,
         request: factory_core::DeliveryRequest,
     ) -> Result<(), RuntimeError> {
+        let permit = self.budget.operation()?;
+        self.start_delivery_reserved(run_id, operation_id, request, permit)
+    }
+
+    pub fn reserve_operation(&self) -> Result<ResourcePermit, RuntimeError> {
+        self.budget.operation()
+    }
+
+    pub fn start_delivery_reserved(
+        &self,
+        run_id: i64,
+        operation_id: &str,
+        request: factory_core::DeliveryRequest,
+        permit: ResourcePermit,
+    ) -> Result<(), RuntimeError> {
         {
             let mut operations = self
                 .delivery_operations
@@ -412,11 +536,13 @@ impl Runtime {
             operations.insert(run_id, operation_id.to_string());
         }
         let root = self.root.clone();
+        let execution = self.execution.clone();
         let operations = Arc::clone(&self.delivery_operations);
         let operation_id = operation_id.to_string();
         tokio::task::spawn_blocking(move || {
+            let _permit = permit;
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                match Factory::open(&root) {
+                match Factory::open_with_execution(&root, execution.clone()) {
                     Ok(factory) => factory
                         .execute_delivery(run_id, &operation_id, &request)
                         .map(|_| ()),
@@ -424,7 +550,7 @@ impl Runtime {
                 }
             }));
             if outcome.is_err() {
-                if let Ok(factory) = Factory::open(&root) {
+                if let Ok(factory) = Factory::open_with_execution(&root, execution.clone()) {
                     let _ = factory.mark_delivery_interrupted(
                         run_id,
                         &operation_id,
@@ -447,6 +573,7 @@ impl Runtime {
         &self,
         run_id: i64,
     ) -> Result<factory_core::github::DeliveryReconciliation, RuntimeError> {
+        let permit = self.budget.operation()?;
         {
             let operations = self
                 .delivery_operations
@@ -470,18 +597,21 @@ impl Runtime {
             )));
         }
         let root = self.root.clone();
+        let execution = self.execution.clone();
         let reconciles = Arc::clone(&self.delivery_reconciles);
-        let result = tokio::task::spawn_blocking(move || {
-            Factory::open(&root).and_then(|factory| factory.reconcile_delivery(run_id))
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let result = Factory::open_with_execution(&root, execution.clone())
+                .and_then(|factory| factory.reconcile_delivery(run_id));
+            reconciles
+                .lock()
+                .expect("runtime mutex poisoned")
+                .remove(&run_id);
+            result
         })
         .await
         .map_err(|error| RuntimeError::Terminal(error.to_string()))
-        .and_then(|outcome| outcome.map_err(RuntimeError::from));
-        reconciles
-            .lock()
-            .expect("runtime mutex poisoned")
-            .remove(&run_id);
-        result
+        .and_then(|outcome| outcome.map_err(RuntimeError::from))
     }
 
     pub fn start_interactive_session(
@@ -490,7 +620,8 @@ impl Runtime {
         cols: u16,
         rows: u16,
     ) -> Result<AgentSession, RuntimeError> {
-        let factory = Factory::open(&self.root)?;
+        let permit = self.budget.terminal()?;
+        let factory = self.factory()?;
         let agent = factory
             .agents()
             .named_agent(agent_name)
@@ -513,7 +644,8 @@ impl Runtime {
             .slave
             .spawn_command(command)
             .map_err(|error| RuntimeError::Terminal(error.to_string()))?;
-        let killer = child.clone_killer();
+        let setup = terminal_process::TerminalSetup::new(child.as_mut())
+            .map_err(|error| RuntimeError::Terminal(error.to_string()))?;
         let reader = pair
             .master
             .try_clone_reader()
@@ -550,14 +682,14 @@ impl Runtime {
         let session = match db.insert_agent_session(&session) {
             Ok(session) => session,
             Err(error) => {
-                let _ = child.kill();
                 return Err(FactoryError::from(error).into());
             }
         };
         let terminal = Arc::new(InteractiveTerminal {
+            _permit: Mutex::new(Some(permit)),
             master: Mutex::new(Some(pair.master)),
             writer: Mutex::new(Some(writer)),
-            killer: Mutex::new(killer),
+            killer: Mutex::new(setup.finish()),
             stopping: AtomicBool::new(false),
             output: Arc::new(Mutex::new(TerminalOutput::default())),
         });
@@ -636,13 +768,15 @@ impl Runtime {
         team: Option<WorkflowTeam>,
         recipe: Option<RecipeSnapshot>,
     ) -> Result<Run, RuntimeError> {
-        let factory = Factory::open(&self.root)?;
+        let permit = self.budget.operation()?;
+        let factory = self.factory()?;
         let run = factory.begin_run_with_recipe(objective, team, recipe.as_ref())?;
-        let cancel = self.reserve(run.id, OperationKind::Planning)?;
+        let cancel = self.reserve_with_permit(run.id, OperationKind::Planning, permit)?;
         let runtime = self.clone();
         let root = self.root.clone();
+        let execution = self.execution.clone();
         tokio::task::spawn_blocking(move || {
-            if let Ok(factory) = Factory::open(&root) {
+            if let Ok(factory) = Factory::open_with_execution(&root, execution.clone()) {
                 let _ = factory.plan_run(run.id, &cancel);
             }
             runtime.release(run.id);
@@ -668,13 +802,15 @@ impl Runtime {
         team: Option<WorkflowTeam>,
         recipe: Option<RecipeSnapshot>,
     ) -> Result<Run, RuntimeError> {
-        let factory = Factory::open(&self.root)?;
+        let permit = self.budget.operation()?;
+        let factory = self.factory()?;
         let run = factory.import_github_issue(reference, team, recipe.as_ref())?;
-        let cancel = self.reserve(run.id, OperationKind::Planning)?;
+        let cancel = self.reserve_with_permit(run.id, OperationKind::Planning, permit)?;
         let runtime = self.clone();
         let root = self.root.clone();
+        let execution = self.execution.clone();
         tokio::task::spawn_blocking(move || {
-            if let Ok(factory) = Factory::open(&root) {
+            if let Ok(factory) = Factory::open_with_execution(&root, execution.clone()) {
                 let _ = factory.plan_run(run.id, &cancel);
             }
             runtime.release(run.id);
@@ -683,12 +819,12 @@ impl Runtime {
     }
 
     pub fn start_workflow(&self, run_id: i64) -> Result<WorkflowTeam, RuntimeError> {
-        let factory = Factory::open(&self.root)?;
+        let factory = self.factory()?;
         let cancel = self.reserve(run_id, OperationKind::Executing)?;
         let team = match factory.prepare_start(run_id) {
             Ok(team) => team,
             Err(error) => {
-                self.release(run_id);
+                self.clone().release(run_id);
                 return Err(error.into());
             }
         };
@@ -701,20 +837,25 @@ impl Runtime {
         run_id: i64,
         team: WorkflowTeam,
     ) -> Result<WorkflowTeam, RuntimeError> {
-        let factory = Factory::open(&self.root)?;
+        let factory = self.factory()?;
         Ok(factory.update_run_team(run_id, team)?)
     }
 
     pub fn retry_task(&self, task_id: i64) -> Result<i64, RuntimeError> {
-        let factory = Factory::open(&self.root)?;
+        let factory = self.factory()?;
         let task = factory
             .get_task(task_id)?
             .ok_or(FactoryError::TaskNotFound(task_id))?;
-        let cancel = self.reserve(task.run_id, OperationKind::Executing)?;
+        let cancel = self.reserve_lifecycle(
+            task.run_id,
+            OperationKind::Executing,
+            self.budget.operation()?,
+            true,
+        )?;
         let run_id = match factory.prepare_retry(task_id) {
             Ok(run_id) => run_id,
             Err(error) => {
-                self.release(task.run_id);
+                self.clone().release(task.run_id);
                 return Err(error.into());
             }
         };
@@ -731,7 +872,7 @@ impl Runtime {
                 .ok_or(RuntimeError::NotActive(run_id))?
         };
         cancel.store(true, Ordering::Relaxed);
-        Factory::open(&self.root)?.cancel_run(run_id)?;
+        self.factory()?.request_cancellation(run_id)?;
         Ok(())
     }
 
@@ -750,19 +891,99 @@ impl Runtime {
         operations
     }
 
+    pub fn is_idle(&self) -> bool {
+        self.active
+            .lock()
+            .expect("runtime mutex poisoned")
+            .is_empty()
+            && self
+                .terminals
+                .lock()
+                .expect("terminal mutex poisoned")
+                .is_empty()
+            && self.finishing.load(Ordering::Acquire) == 0
+            && self
+                .delivery_operations
+                .lock()
+                .expect("delivery mutex poisoned")
+                .is_empty()
+            && self
+                .delivery_reconciles
+                .lock()
+                .expect("delivery mutex poisoned")
+                .is_empty()
+    }
+
+    fn guard_execution<T>(
+        &self,
+        run_id: i64,
+        work: impl FnOnce() -> Result<T, RuntimeError>,
+    ) -> Result<T, RuntimeError> {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)) {
+            Ok(result) => result,
+            Err(_) => {
+                if let Ok(factory) = self.factory() {
+                    let _ = factory.record_execution_panic(run_id);
+                }
+                Err(FactoryError::AgentValidationFailed("Execution coordinator panicked; owned operations stopped and evidence requires inspection.".into()).into())
+            }
+        }
+    }
+
     fn spawn_execution(&self, run_id: i64, cancel: Arc<AtomicBool>) {
         let runtime = self.clone();
         let root = self.root.clone();
+        let execution = self.execution.clone();
         tokio::task::spawn_blocking(move || {
-            if let Ok(factory) = Factory::open(&root) {
-                let _ = factory.execute_active_run(run_id, &cancel);
-            }
+            let _ = runtime.guard_execution(run_id, || {
+                let factory = Factory::open_with_execution(&root, execution.clone())?;
+                factory.execute_active_run(run_id, &cancel)?;
+                Ok(())
+            });
             runtime.release(run_id);
         });
     }
 
     fn reserve(&self, run_id: i64, kind: OperationKind) -> Result<Arc<AtomicBool>, RuntimeError> {
+        self.reserve_with_permit(run_id, kind, self.budget.operation()?)
+    }
+
+    fn reserve_with_permit(
+        &self,
+        run_id: i64,
+        kind: OperationKind,
+        permit: ResourcePermit,
+    ) -> Result<Arc<AtomicBool>, RuntimeError> {
+        self.reserve_lifecycle(run_id, kind, permit, false)
+    }
+
+    fn reserve_lifecycle(
+        &self,
+        run_id: i64,
+        kind: OperationKind,
+        permit: ResourcePermit,
+        allow_settled_retry: bool,
+    ) -> Result<Arc<AtomicBool>, RuntimeError> {
+        if self.budget.is_closed() {
+            return Err(RuntimeError::ResourceLimit("application shutting down"));
+        }
+        let db =
+            FactoryDb::open(&self.root.join(".factory/db.sqlite3")).map_err(FactoryError::from)?;
+        let settled_retry = allow_settled_retry
+            && db
+                .mission_lifecycle(run_id)
+                .map_err(FactoryError::from)?
+                .is_some_and(|life| {
+                    life.state == factory_types::MissionLifecycleState::Settled
+                        && life.project_id == self.execution.project_id()
+                });
+        if db.lifecycle_fenced(run_id).map_err(FactoryError::from)? && !settled_retry {
+            return Err(FactoryError::Suspended.into());
+        }
         let mut active = self.active.lock().expect("runtime mutex poisoned");
+        if self.budget.is_closed() {
+            return Err(RuntimeError::ResourceLimit("application shutting down"));
+        }
         if active.contains_key(&run_id) {
             return Err(RuntimeError::AlreadyActive(run_id));
         }
@@ -770,6 +991,7 @@ impl Runtime {
         active.insert(
             run_id,
             Active {
+                _permit: permit,
                 kind,
                 cancel: cancel.clone(),
             },
@@ -777,11 +999,19 @@ impl Runtime {
         Ok(cancel)
     }
 
-    fn release(&self, run_id: i64) {
-        self.active
+    fn release(self, run_id: i64) {
+        self.finishing.fetch_add(1, Ordering::AcqRel);
+        let _finishing = Finishing(self.finishing.clone());
+        let runtime = self;
+        runtime
+            .active
             .lock()
             .expect("runtime mutex poisoned")
             .remove(&run_id);
+        if let Err(error) = runtime.finish_lifecycle_operation(run_id) {
+            tracing_lifecycle_failure(&error);
+        }
+        drop(runtime);
     }
 
     fn terminal(&self, session_id: i64) -> Result<Arc<InteractiveTerminal>, RuntimeError> {
@@ -996,6 +1226,37 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    #[test]
+    fn repeated_shutdown_preserves_legacy_planner_cancellation_while_draining() {
+        let dir = TempDir::new().unwrap();
+        Factory::init(dir.path()).unwrap();
+        let runtime = Runtime::new(dir.path()).unwrap();
+        let db = FactoryDb::open(&dir.path().join(".factory/db.sqlite3")).unwrap();
+        let run = db
+            .create_run_with_status("Legacy shutdown", None, factory_types::RunStatus::Planning)
+            .unwrap();
+        let cancel = runtime.reserve(run.id, OperationKind::Planning).unwrap();
+
+        runtime.shutdown().unwrap();
+        assert!(cancel.load(Ordering::Acquire));
+        assert!(!runtime.is_idle());
+        assert_eq!(
+            db.get_run(run.id).unwrap().unwrap().status,
+            factory_types::RunStatus::Cancelled
+        );
+
+        runtime.shutdown().unwrap();
+        assert!(!runtime.is_idle());
+        assert_eq!(
+            db.get_run(run.id).unwrap().unwrap().status,
+            factory_types::RunStatus::Cancelled
+        );
+        assert!(db.mission_lifecycle(run.id).unwrap().is_none());
+        runtime.clone().release(run.id);
+        assert!(runtime.is_idle());
+        runtime.finish_shutdown_checkpoints().unwrap();
+    }
 
     #[test]
     fn pty_child_probe() {

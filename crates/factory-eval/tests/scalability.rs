@@ -75,6 +75,7 @@ fn populate(attempt_budget: usize) -> (TempDir, FactoryDb) {
                 )
                 .unwrap();
             let evidence = TaskEvidence {
+                git_snapshot: None,
                 changed_files: vec![
                     format!("src/module{}/main.rs", task_index % 40),
                     "lib/core/text.rs".to_string(),

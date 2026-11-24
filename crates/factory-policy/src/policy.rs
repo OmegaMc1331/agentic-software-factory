@@ -32,6 +32,8 @@ use crate::path::{matches_glob, normalize_repo_relative, validate_scope};
 /// `[policies.agents.<name>]`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PoliciesConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ceiling: Option<PolicyScope>,
     #[serde(default)]
     pub roles: BTreeMap<String, PolicyScope>,
     #[serde(default)]
@@ -40,7 +42,7 @@ pub struct PoliciesConfig {
 
 impl PoliciesConfig {
     pub fn is_empty(&self) -> bool {
-        self.roles.is_empty() && self.agents.is_empty()
+        self.ceiling.is_none() && self.roles.is_empty() && self.agents.is_empty()
     }
 
     pub fn role(&self, id: &str) -> Option<&PolicyScope> {
@@ -62,6 +64,9 @@ impl PoliciesConfig {
     /// Validates every declared scope, returning the first problem as a
     /// human-readable reason.
     pub fn validate(&self) -> Result<(), String> {
+        if let Some(ceiling) = &self.ceiling {
+            ceiling.validate("policies.ceiling")?;
+        }
         for (id, scope) in &self.roles {
             scope
                 .validate(&format!("policies.roles.{id}"))
@@ -140,7 +145,7 @@ impl PoliciesConfig {
         let role = merged_scope(self.role(role_id));
         let agent = merged_scope(self.agent(agent_name));
         let restriction = merged_scope(restriction);
-        EffectivePolicy {
+        let policy = EffectivePolicy {
             source,
             permissive,
             filesystem: EffectiveFilesystem::resolve(role.as_ref(), agent.as_ref())
@@ -155,6 +160,10 @@ impl PoliciesConfig {
                 .restrict(restriction.as_ref()),
             tools: EffectiveTools::resolve(role.as_ref(), agent.as_ref())
                 .restrict(restriction.as_ref()),
+        };
+        match &self.ceiling {
+            Some(scope) => policy.narrowed("project_ceiling", scope),
+            None => policy,
         }
     }
 }
@@ -813,7 +822,12 @@ impl EffectiveFilesystem {
     pub fn mode_name(&self) -> &'static str {
         if self.read_only() {
             "read_only"
-        } else if self.write_scopes.iter().any(|scope| scope != "**") {
+        } else if self.write_scopes.iter().any(|scope| scope != "**")
+            || self
+                .write_layers
+                .iter()
+                .any(|(_, scopes)| scopes.iter().any(|scope| scope != "**"))
+        {
             "restricted"
         } else {
             "open"
@@ -1335,13 +1349,53 @@ pub struct PolicyView {
 }
 
 impl EffectivePolicy {
+    pub fn narrowed(mut self, source: &'static str, scope: &PolicyScope) -> Self {
+        let scope = merged_scope(Some(scope));
+        self.source.push_str(&format!(" + {source}"));
+        self.permissive = false;
+        self.filesystem = self.filesystem.restrict(source, scope.as_ref());
+        if scope
+            .as_ref()
+            .and_then(|scope| scope.filesystem.as_ref())
+            .is_some_and(|filesystem| filesystem.read.is_empty())
+        {
+            self.filesystem.read_layers.push((source, Vec::new()));
+        }
+        self.commands = self.commands.restrict(scope.as_ref());
+        self.network = self.network.restrict(scope.as_ref());
+        self.environment = self.environment.restrict(scope.as_ref());
+        self.git = self.git.restrict(scope.as_ref());
+        self.tools = self.tools.restrict(scope.as_ref());
+        self
+    }
+
     pub fn view(&self) -> PolicyView {
         let filesystem_mode = self.filesystem.mode_name();
         PolicyView {
             source: self.source.clone(),
             permissive: self.permissive,
             filesystem_mode: filesystem_mode.to_string(),
-            read_scopes: self.filesystem.read_scopes().to_vec(),
+            read_scopes: self
+                .filesystem
+                .read_scopes()
+                .iter()
+                .cloned()
+                .chain(
+                    self.filesystem
+                        .read_layers
+                        .iter()
+                        .flat_map(|(label, scopes)| {
+                            if scopes.is_empty() {
+                                vec![format!("({label}) no paths")]
+                            } else {
+                                scopes
+                                    .iter()
+                                    .map(|scope| format!("({label}) {scope}"))
+                                    .collect()
+                            }
+                        }),
+                )
+                .collect(),
             write_scopes: self.filesystem.effective_write_scopes(),
             deny_write_scopes: self.filesystem.deny_scopes().to_vec(),
             commands_mode: match self.commands.mode {
