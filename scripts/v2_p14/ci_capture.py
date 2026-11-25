@@ -10,6 +10,7 @@ import signal
 import subprocess
 import threading
 import time
+from time import sleep
 
 
 MAX_LOG = 16 * 1024 * 1024
@@ -138,7 +139,7 @@ def capture(argv, log: Path, *, cwd, environment, timeout, limit=MAX_LOG, superv
                     if time.monotonic() - started >= timeout:
                         problem = "TIMEOUT"
                         break
-                    time.sleep(0.025)
+                    sleep(0.025)
                 problem = problem or (errors[0] if errors else None)
             except KeyboardInterrupt:
                 problem = "INTERRUPTED"

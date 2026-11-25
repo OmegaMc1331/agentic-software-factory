@@ -248,7 +248,7 @@ class PrivacyContracts(unittest.TestCase):
         outcome, public = self.execute(f"import time; print({API_KEY!r}, flush=True); time.sleep(30)", timeout=0.5)
         self.assertEqual(outcome["classification"], "TIMEOUT")
         self.assertNotIn(API_KEY, public)
-        with patch("ci_capture.time.sleep", side_effect=KeyboardInterrupt):
+        with patch("ci_capture.sleep", side_effect=KeyboardInterrupt):
             outcome, public = self.execute("import time; time.sleep(30)", step="interruption")
         self.assertEqual(outcome["classification"], "INTERRUPTED")
         self.assertNotIn(API_KEY, public)
