@@ -41,17 +41,15 @@ jobs:
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
         with:
           node-version-file: .node-version
-          cache: npm
-          cache-dependency-path: apps/dashboard/package-lock.json
+          package-manager-cache: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
         with:
           python-version: '3.14.5'
-      - run: npm install --global --ignore-scripts npm@12.0.2
-      - run: npm ci
-        working-directory: apps/dashboard
-      - run: python -B scripts/v2_p14/run.py frontend --output .factory/v2/p14/frontend
-      - run: python -B scripts/v2_p14/run.py frontend-tests --output .factory/v2/p14/frontend
-      - run: python -B scripts/v2_p14/run.py contracts --output .factory/v2/p14/frontend
+      - run: python -B scripts/v2_p14/ci.py install-npm
+      - run: python -B scripts/v2_p14/ci.py npm-ci
+      - run: python -B scripts/v2_p14/ci.py frontend
+      - run: python -B scripts/v2_p14/ci.py frontend-tests
+      - run: python -B scripts/v2_p14/ci.py contracts
 
   native:
     name: Native ${{ matrix.target }}
@@ -81,33 +79,40 @@ jobs:
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
         with:
           node-version-file: .node-version
+          package-manager-cache: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
         with:
           python-version: '3.14.5'
       - name: Verify native host and pinned Rust
-        run: python -B scripts/v2_p14/package.py host --target ${{ matrix.target }}
-      - run: npm install --global --ignore-scripts npm@12.0.2
-      - run: npm ci
-        working-directory: apps/dashboard
-      - run: npm run build
-        working-directory: apps/dashboard
-      - run: python -B scripts/v2_p14/run.py rust --output .factory/v2/p14/native
-      - run: python -B scripts/v2_p14/run.py normal --output .factory/v2/p14/native
-      - run: python -B scripts/v2_p14/run.py contracts --output .factory/v2/p14/native
-      - run: python -B scripts/v2_p14/run.py build --output .factory/v2/p14/native
-      - run: python -B scripts/v2_p14/run.py embedded-tests --output .factory/v2/p14/native
+        run: python -B scripts/v2_p14/ci.py host --target ${{ matrix.target }}
+      - run: python -B scripts/v2_p14/ci.py install-npm
+      - run: python -B scripts/v2_p14/ci.py npm-ci
+      - run: python -B scripts/v2_p14/ci.py frontend-build
+      - run: python -B scripts/v2_p14/ci.py rust
+      - run: python -B scripts/v2_p14/ci.py normal
+      - run: python -B scripts/v2_p14/ci.py contracts
+      - run: python -B scripts/v2_p14/ci.py build
+      - run: python -B scripts/v2_p14/ci.py embedded-tests
       - name: Package actual native executable
-        run: python -B scripts/v2_p14/package.py build --target ${{ matrix.target }} --output .factory/v2/p14/packages
+        run: python -B scripts/v2_p14/ci.py native-package --target ${{ matrix.target }}
       - name: Test unpacked package outside checkout
-        run: python -B scripts/v2_p14/smoke.py --package-dir .factory/v2/p14/packages --output .factory/v2/p14/native/packaged-smoke.json
+        run: python -B scripts/v2_p14/ci.py native-smoke
       - name: Independently verify archive checksum
-        run: node scripts/release-checksums.mjs verify .factory/v2/p14/packages/${{ matrix.archive }}
-      - name: Retain explicitly requested candidate evidence
-        if: (inputs.retain_artifacts || (github.event_name == 'push' && github.ref == 'refs/heads/codex/v2-p14-release-qualification')) && always()
+        run: python -B scripts/v2_p14/ci.py native-checksum --target ${{ matrix.target }}
+      - name: Screen native package contents
+        run: python -B scripts/v2_p14/ci.py stage-native --target ${{ matrix.target }}
+      - name: Reverify sealed native upload bytes
+        id: native_privacy
+        run: python -B scripts/v2_p14/ci.py approve-native --target ${{ matrix.target }}
+      - name: Retain screened native package
+        if: success() && steps.native_privacy.outputs.approved == 'true' && (inputs.retain_artifacts || (github.event_name == 'push' && github.ref == 'refs/heads/codex/v2-p14-release-qualification'))
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
-          name: candidate-${{ matrix.target }}-${{ github.sha }}
-          path: .factory/v2/p14/
+          name: candidate-native-${{ matrix.target }}-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/asf-p14/public/${{ matrix.archive }}
+            ${{ runner.temp }}/asf-p14/public/${{ matrix.archive }}.sha256
+            ${{ runner.temp }}/asf-p14/public/privacy-receipt.json
           if-no-files-found: error
           retention-days: 14
 
@@ -123,26 +128,42 @@ jobs:
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
         with:
           node-version-file: .node-version
+          package-manager-cache: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
         with:
           python-version: '3.14.5'
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
-          pattern: candidate-*-${{ github.sha }}
-          path: .factory/v2/p14/downloaded
+          pattern: candidate-native-*-${{ github.sha }}
+          path: ${{ runner.temp }}/asf-p14/private/downloaded
       - name: Verify native identities and assemble exact inventory
-        run: python -B scripts/v2_p14/assemble.py --input .factory/v2/p14/downloaded --output .factory/v2/p14/assembled --source ${{ github.sha }}
+        run: python -B scripts/v2_p14/ci.py assemble
       - name: Verify the exact release artifact inventory
-        run: node scripts/release-checksums.mjs verify-release .factory/v2/p14/assembled
+        run: python -B scripts/v2_p14/ci.py verify-inventory
       - name: Generate and verify the consolidated manifest
-        run: node scripts/release-checksums.mjs finalize-release .factory/v2/p14/assembled
+        run: python -B scripts/v2_p14/ci.py finalize-inventory
       - name: Independently verify consolidated manifest
-        run: sha256sum -c SHA256SUMS.txt
-        working-directory: .factory/v2/p14/assembled
+        run: python -B scripts/v2_p14/ci.py inventory-checksum
+      - name: Stage verified archive and checksum inventory
+        run: python -B scripts/v2_p14/ci.py stage-inventory
+      - name: Reverify sealed inventory upload bytes
+        id: inventory_privacy
+        run: python -B scripts/v2_p14/ci.py approve-inventory
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: success() && steps.inventory_privacy.outputs.approved == 'true'
         with:
           name: verified-candidate-inventory-${{ github.sha }}
-          path: .factory/v2/p14/assembled/
+          path: |
+            ${{ runner.temp }}/asf-p14/public/factory-windows-x86_64.zip
+            ${{ runner.temp }}/asf-p14/public/factory-windows-x86_64.zip.sha256
+            ${{ runner.temp }}/asf-p14/public/factory-linux-x86_64.tar.gz
+            ${{ runner.temp }}/asf-p14/public/factory-linux-x86_64.tar.gz.sha256
+            ${{ runner.temp }}/asf-p14/public/factory-macos-aarch64.tar.gz
+            ${{ runner.temp }}/asf-p14/public/factory-macos-aarch64.tar.gz.sha256
+            ${{ runner.temp }}/asf-p14/public/factory-macos-x86_64.tar.gz
+            ${{ runner.temp }}/asf-p14/public/factory-macos-x86_64.tar.gz.sha256
+            ${{ runner.temp }}/asf-p14/public/SHA256SUMS.txt
+            ${{ runner.temp }}/asf-p14/public/privacy-receipt.json
           if-no-files-found: error
           retention-days: 14
 
@@ -156,15 +177,14 @@ jobs:
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
         with:
           node-version-file: .node-version
+          package-manager-cache: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
         with:
           python-version: '3.14.5'
-      - run: npm install --global --ignore-scripts npm@12.0.2
-      - run: npm ci
-        working-directory: apps/dashboard
-      - run: npm audit --audit-level=high
-        working-directory: apps/dashboard
-      - run: python -B scripts/v2_p14/dependencies.py --output .factory/v2/p14/dependencies
+      - run: python -B scripts/v2_p14/ci.py install-npm
+      - run: python -B scripts/v2_p14/ci.py npm-ci
+      - run: python -B scripts/v2_p14/ci.py npm-audit
+      - run: python -B scripts/v2_p14/ci.py dependencies
 
   browsers:
     needs: native
@@ -176,10 +196,6 @@ jobs:
       max-parallel: 1
       matrix:
         engine: [chromium, firefox, webkit]
-    env:
-      ASF_BROWSER_ENGINE: ${{ matrix.engine }}
-      ASF_P13_BINARY: ${{ github.workspace }}/.factory/v2/p14/browser-package/factory
-      ASF_P13_OUTPUT: ${{ github.workspace }}/.factory/v2/p14/browsers/${{ matrix.engine }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
@@ -187,25 +203,17 @@ jobs:
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
         with:
           node-version-file: .node-version
+          package-manager-cache: false
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
         with:
           python-version: '3.14.5'
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
-          name: candidate-x86_64-unknown-linux-gnu-${{ github.sha }}
-          path: .factory/v2/p14/downloaded-linux
+          name: candidate-native-x86_64-unknown-linux-gnu-${{ github.sha }}
+          path: ${{ runner.temp }}/asf-p14/private/downloaded-linux
       - name: Unpack verified native application
-        run: python -B -c "import sys; from pathlib import Path; sys.path.insert(0, 'scripts/v2_p14'); from package import unpack; unpack(Path('.factory/v2/p14/downloaded-linux/packages/factory-linux-x86_64.tar.gz'), Path('.factory/v2/p14/browser-package'))"
-      - run: npm install --global --ignore-scripts npm@12.0.2
-      - run: npm ci
-        working-directory: apps/dashboard
-      - run: npx playwright install --with-deps chromium firefox webkit
-        working-directory: apps/dashboard
-      - run: node scripts/v2_p13/browser.mjs
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
-        if: always()
-        with:
-          name: candidate-browser-${{ matrix.engine }}-${{ github.sha }}
-          path: .factory/v2/p14/browsers/
-          if-no-files-found: error
-          retention-days: 14
+        run: python -B scripts/v2_p14/ci.py browser-unpack
+      - run: python -B scripts/v2_p14/ci.py install-npm
+      - run: python -B scripts/v2_p14/ci.py npm-ci
+      - run: python -B scripts/v2_p14/ci.py playwright-install
+      - run: python -B scripts/v2_p14/ci.py browser --engine ${{ matrix.engine }}

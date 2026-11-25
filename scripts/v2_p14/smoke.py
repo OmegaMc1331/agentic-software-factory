@@ -90,7 +90,7 @@ def main():
             response = error
         data = response.read(4_000_001)
         if response.code != expected or len(data) > 4_000_000:
-            raise AssertionError(f"{method} {path}: expected {expected}, got {response.code}")
+            raise AssertionError(f"HTTP assertion expected {expected}, got {response.code}")
         return response, data
 
     def api(path, method="GET", body=None, expected=200, **options):
@@ -144,6 +144,7 @@ def main():
             data = request("/" + asset["path"], auth=False, token=False)[1]
             if hashlib.sha256(data).hexdigest() != asset["sha256"]:
                 raise AssertionError("Embedded asset differs from build inventory: " + asset["path"])
+        result["verifiedEmbeddedAssets"] = len(manifest["embeddedAssets"])
         result["checks"].append("BUILD-04: every embedded asset matches its build hash; V1 and V2 entries served")
         api("/api/projects", expected=401, auth=False, token=False)
         api("/api/projects/register", "POST", {}, expected=403, token=False)
@@ -205,6 +206,7 @@ def main():
     except Exception as error:
         result["result"] = "FAIL"
         result["error"] = str(error)
+        result["failureCode"] = "SMOKE_ASSERTION" if isinstance(error, AssertionError) else "SMOKE_EXECUTION"
     finally:
         if child is not None and child.poll() is None:
             child.kill()
@@ -213,7 +215,7 @@ def main():
         if allocated_console:
             ctypes.windll.kernel32.FreeConsole()
         args.output.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
-    print(json.dumps({"result": result["result"], "checks": len(result["checks"]), "evidence": str(args.output), "error": result.get("error")}))
+    print(json.dumps({"result": result["result"], "checks": len(result["checks"]), "failureCode": result.get("failureCode")}))
     raise SystemExit(0 if result["result"] == "PASS" else 1)
 
 

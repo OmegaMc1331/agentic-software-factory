@@ -20,6 +20,22 @@ python -B scripts/v2_p14/dependencies.py --output .factory/v2/p14/dependencies
 
 Freeze/commit source before the release build. Run commands serially under low RAM.
 `run.py` records actual source fingerprints before/after and refuses changed inputs.
+
+### Hosted qualification output
+
+The qualification workflow invokes the fixed recipes in `ci.py`. Raw stdout,
+stderr and diagnostics stay under the job's temporary directory. The public
+log contains a structured step result, exact source SHA, exit, timing and any
+validated test counts. The browser journey still runs its complete assertions
+with screenshots disabled in hosted qualification.
+
+The only artifact publishers are the native package and consolidated inventory
+steps. Each uploader enumerates exact files and requires a successful final
+privacy approval. Native screening checks package and build identity, actual
+archive members, binary and frontend strings, and the native smoke receipt.
+Approval checks the staged files against a private hash seal. Browser and
+failed-step diagnostics stay runner-local. A missing or changed file blocks
+approval.
 Build records include binary and embedded-asset hashes; package creation requires
 that exact successful build record and native host. Select fresh output directories
 to preserve failed attempts. `CARGO_TARGET_DIR` may point at an explicitly owned

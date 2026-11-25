@@ -539,35 +539,31 @@ test("finalize-release rejects duplicate inventory entries", (t) => {
 
 test("candidate workflow verifies checksums before artifact retention and prevents publication", () => {
   const workflow = readText(WORKFLOW_PATH);
-  assert.match(workflow, /node scripts\/release-checksums\.mjs verify/);
-  assert.match(
-    workflow,
-    /node scripts\/release-checksums\.mjs verify-release .factory\/v2\/p14\/assembled/,
-  );
-  assert.match(
-    workflow,
-    /node scripts\/release-checksums\.mjs finalize-release .factory\/v2\/p14\/assembled/,
-  );
-  assert.match(workflow, /sha256sum -c SHA256SUMS\.txt/);
+  const driver = readText(fileURLToPath(new URL("./v2_p14/ci.py", import.meta.url)));
+  assert.match(driver, /node\(checksums, "verify", archive\)/);
+  assert.match(driver, /node\(checksums, "verify-release", assembled\)/);
+  assert.match(driver, /node\(checksums, "finalize-release", assembled\)/);
+  assert.match(driver, /\["sha256sum", "-c", artifacts\.CHECKSUMS\]/);
   assert.doesNotMatch(workflow, /cat release\/\*\.sha256/);
   assert.doesNotMatch(workflow, /release\/\*/);
-  const verifyIndex = workflow.indexOf(
-    "node scripts/release-checksums.mjs verify",
-  );
+  const verifyIndex = workflow.indexOf("ci.py native-checksum");
+  const screenIndex = workflow.indexOf("ci.py stage-native");
+  const approveIndex = workflow.indexOf("ci.py approve-native");
   const uploadIndex = workflow.indexOf("uses: actions/upload-artifact@");
-  const inventoryIndex = workflow.indexOf(
-    "node scripts/release-checksums.mjs verify-release .factory/v2/p14/assembled",
-  );
-  const contentIndex = workflow.indexOf("scripts/v2_p14/assemble.py");
-  const finalizeIndex = workflow.indexOf(
-    "node scripts/release-checksums.mjs finalize-release .factory/v2/p14/assembled",
-  );
-  const checkIndex = workflow.indexOf("sha256sum -c SHA256SUMS.txt");
+  const inventoryIndex = workflow.indexOf("ci.py verify-inventory");
+  const contentIndex = workflow.indexOf("ci.py assemble");
+  const finalizeIndex = workflow.indexOf("ci.py finalize-inventory");
+  const checkIndex = workflow.indexOf("ci.py inventory-checksum");
+  const sealIndex = workflow.indexOf("ci.py approve-inventory");
+  const inventoryUploadIndex = workflow.lastIndexOf("uses: actions/upload-artifact@");
   assert.ok(verifyIndex >= 0);
-  assert.ok(verifyIndex < uploadIndex);
+  assert.ok(verifyIndex < screenIndex && screenIndex < approveIndex && approveIndex < uploadIndex);
   assert.ok(contentIndex >= 0 && contentIndex < inventoryIndex);
   assert.ok(inventoryIndex < finalizeIndex);
-  assert.ok(finalizeIndex < checkIndex);
+  assert.ok(finalizeIndex < checkIndex && checkIndex < sealIndex && sealIndex < inventoryUploadIndex);
+  assert.doesNotMatch(workflow, /always\(\)/);
+  assert.match(workflow, /success\(\) && steps\.native_privacy\.outputs\.approved == 'true'/);
+  assert.match(workflow, /success\(\) && steps\.inventory_privacy\.outputs\.approved == 'true'/);
   const launcher = readText(fileURLToPath(new URL("../.github/workflows/release.yml", import.meta.url)));
   for (const file of [workflow, launcher]) {
     assert.doesNotMatch(file, /gh release create|contents: write|pull_request_target|git push/);

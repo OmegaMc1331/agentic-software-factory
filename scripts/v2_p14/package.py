@@ -23,6 +23,13 @@ TARGETS = {
     "aarch64-apple-darwin": ("Darwin", "arm64", "factory-macos-aarch64.tar.gz", "factory"),
     "x86_64-apple-darwin": ("Darwin", "x86_64", "factory-macos-x86_64.tar.gz", "factory"),
 }
+DOCUMENTS = ("INSTALLATION.md", "UPGRADE.md", "SECURITY.md", "KNOWN-ISSUES.md", "USER-GUIDE.md")
+DEPENDENCY_FILES = ("THIRD-PARTY-NOTICES.txt", "sbom.cdx.json", "license-review.json")
+LOCKFILES = ("Cargo.lock", "apps/dashboard/package-lock.json", "rust-toolchain.toml", ".node-version")
+
+
+def launcher_name(target):
+    return "start-workspace.ps1" if TARGETS[target][0] == "Windows" else "start-workspace.sh"
 
 
 def git(*args):
@@ -129,16 +136,25 @@ def build(args):
         raise ValueError("Binary version does not match source")
     inventory(args.output / "dependencies")
     files = {executable: (binary.read_bytes(), 0o755), "LICENSE": ((ROOT / "LICENSE").read_bytes(), 0o644)}
-    for document in ["INSTALLATION.md", "UPGRADE.md", "SECURITY.md", "KNOWN-ISSUES.md", "USER-GUIDE.md"]:
+    for document in DOCUMENTS:
         files[document] = ((ROOT / "docs/v2/release" / document).read_bytes(), 0o644)
-    for document in ["THIRD-PARTY-NOTICES.txt", "sbom.cdx.json", "license-review.json"]:
+    for document in DEPENDENCY_FILES:
         files[document] = ((args.output / "dependencies" / document).read_bytes(), 0o644)
-    launcher = ROOT / "scripts/v2_p14" / ("start-workspace.ps1" if os.name == "nt" else "start-workspace.sh")
+    launcher = ROOT / "scripts/v2_p14" / launcher_name(args.target)
     files[launcher.name] = (launcher.read_bytes(), 0o755)
     epoch = int(git("show", "-s", "--format=%ct", "HEAD"))
-    manifest = {"schemaVersion": 1, "version": version, "sourceCommit": git("rev-parse", "HEAD"), "sourceTree": git("rev-parse", "HEAD^{tree}"), "sourceFingerprint": build_record["sourceFingerprint"], "target": args.target, "buildProfile": "release with LTO", "sourceDateEpoch": epoch, "signing": "UNSIGNED", "notarization": "NOT QUALIFIED", "embeddedAssets": build_record["embeddedAssets"], "lockfiles": {file: sha(ROOT / file) for file in ["Cargo.lock", "apps/dashboard/package-lock.json", "rust-toolchain.toml", ".node-version"]}, "files": [{"path": name, "sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data), "mode": mode} for name, (data, mode) in sorted(files.items())]}
+    manifest = {"schemaVersion": 1, "version": version, "sourceCommit": git("rev-parse", "HEAD"), "sourceTree": git("rev-parse", "HEAD^{tree}"), "sourceFingerprint": build_record["sourceFingerprint"], "target": args.target, "buildProfile": "release with LTO", "sourceDateEpoch": epoch, "signing": "UNSIGNED", "notarization": "NOT QUALIFIED", "embeddedAssets": build_record["embeddedAssets"], "lockfiles": {file: sha(ROOT / file) for file in LOCKFILES}, "files": [{"path": name, "sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data), "mode": mode} for name, (data, mode) in sorted(files.items())]}
     files["PACKAGE-MANIFEST.json"] = ((json.dumps(manifest, indent=2) + "\n").encode(), 0o644)
-    if name.endswith(".zip"):
+    write_archive(archive, files, epoch)
+    archive_sha256 = sha(archive)
+    archive.with_name(archive.name + ".sha256").write_bytes(f"{archive_sha256}  {archive.name}\n".encode("ascii"))
+    record = {"schemaVersion": 1, "artifact": archive.name, "sha256": archive_sha256, "bytes": archive.stat().st_size, **manifest}
+    (args.output / "artifact.json").write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+    print(json.dumps({key: record[key] for key in ["artifact", "target", "sha256", "bytes", "sourceCommit"]}))
+
+
+def write_archive(archive, files, epoch):
+    if archive.suffix == ".zip":
         with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as package:
             for name, (data, mode) in sorted(files.items()):
                 info = zipfile.ZipInfo(name, time.gmtime(max(315532800, epoch))[:6])
@@ -152,11 +168,6 @@ def build(args):
                 info = tarfile.TarInfo(name)
                 info.size, info.mode, info.mtime = len(data), mode, epoch
                 package.addfile(info, io.BytesIO(data))
-    archive_sha256 = sha(archive)
-    archive.with_name(archive.name + ".sha256").write_bytes(f"{archive_sha256}  {archive.name}\n".encode("ascii"))
-    record = {"schemaVersion": 1, "artifact": archive.name, "sha256": archive_sha256, "bytes": archive.stat().st_size, **manifest}
-    (args.output / "artifact.json").write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
-    print(json.dumps({key: record[key] for key in ["artifact", "target", "sha256", "bytes", "sourceCommit"]}))
 
 
 if __name__ == "__main__":
