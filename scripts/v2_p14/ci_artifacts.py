@@ -228,7 +228,7 @@ def stage_native(packages, smoke, publish, seal, target, source, root, scratch):
         raise PrivacyError("Native archive checksum mismatch")
     binary, asset_count = inspect_distribution(files[name], target, source, root, scratch)
     proof = parse(bounded_read(smoke, JSON_LIMIT))
-    if (proof.get("result"), proof.get("sourceCommit"), proof.get("archiveSha256"),
+    if (proof.get("result"), proof.get("sourceCommit"), proof.get("artifactSha256"),
             proof.get("binarySha256"), proof.get("verifiedEmbeddedAssets")) != (
             "PASS", source.commit, digest(files[name]), binary, asset_count):
         raise PrivacyError("Missing matching native smoke verification")

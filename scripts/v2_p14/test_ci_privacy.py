@@ -144,7 +144,7 @@ class PrivacyContracts(unittest.TestCase):
         archive = packages / name
         package.write_archive(archive, files, SOURCE.epoch)
         smoke = self.seal.parent / (target + "-smoke.json")
-        smoke.write_bytes(encode({"result": "PASS", "sourceCommit": SOURCE.commit, "archiveSha256": package.sha(archive),
+        smoke.write_bytes(encode({"result": "PASS", "sourceCommit": SOURCE.commit, "artifactSha256": package.sha(archive),
                                   "binarySha256": digest(files[executable][0]), "verifiedEmbeddedAssets": len(assets)}))
         (packages / (name + ".sha256")).write_bytes(artifacts.checksum(name, archive.read_bytes()))
         return fixture, packages, archive, smoke
