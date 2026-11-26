@@ -578,9 +578,9 @@ test("release artifact inventory is explicit and complete", () => {
   assert.deepEqual(inventory, ARCHIVES);
 });
 
-test("release build matrix matches the explicit artifact inventory", () => {
+test("native producers match the explicit artifact inventory", () => {
   const workflow = readText(WORKFLOW_PATH);
-  const archives = [...workflow.matchAll(/^\s+archive: (\S+)$/gm)].map(
+  const archives = [...workflow.matchAll(/^\s+(?:archive|ASF_NATIVE_ARCHIVE): (factory-\S+)$/gm)].map(
     (match) => match[1],
   );
   assert.deepEqual(archives.sort(), [...ARCHIVES].sort());

@@ -8,19 +8,26 @@ from pathlib import Path
 import platform
 import re
 import signal
+import stat
+import subprocess
 import sys
+from tempfile import TemporaryDirectory
 
 import ci_artifacts as artifacts
 from ci_capture import MAX_LOG, capture
-from ci_privacy import JSON_LIMIT, PrivacyError, bounded_read, parse
+from ci_privacy import JSON_LIMIT, PrivacyError, bounded_read, is_link, parse
 from ci_results import browser_details, classify, count, mode_details, smoke_details
+from ci_rust import CargoDiagnostics, checkout_inventory
 import package
+from run import MODES as COMMANDS
 
 
 ROOT = Path(__file__).resolve().parents[2]
 DASHBOARD = ROOT / "apps/dashboard"
 BROWSERS = ("chromium", "firefox", "webkit")
 LINUX = "x86_64-unknown-linux-gnu"
+INTEL_MAC = "x86_64-apple-darwin"
+RUST_MODES = {"rust", "normal", "build", "embedded-tests"}
 MODES = {
     "frontend": ("BUILD_FAILURE", 1500), "frontend-tests": ("TEST_FAILURE", 1500),
     "contracts": ("TEST_FAILURE", 900), "rust": ("TEST_FAILURE", 6600),
@@ -57,6 +64,16 @@ def node(script, *args):
     return ["node", *map(str, (script, *args))]
 
 
+def mode_recipes(private, target):
+    result = {}
+    for name, (kind, seconds) in MODES.items():
+        if name == "embedded-tests" and target == INTEL_MAC:
+            seconds = 9000
+        argv = python("run", name, "--output", private, "--capture-timeout", seconds)
+        result[name] = Run(argv, kind, seconds + 60 if name in RUST_MODES else seconds)
+    return result
+
+
 def recipes(private, target, source):
     archive = private / "packages" / package.TARGETS[target][2] if target else None
     checksums = "scripts/release-checksums.mjs"
@@ -80,13 +97,13 @@ def recipes(private, target, source):
         "inventory-checksum": Run(["sha256sum", "-c", artifacts.CHECKSUMS], "SCREENING_ERROR", cwd=assembled),
         "playwright-install": Run(["npx", "playwright", "install", "--with-deps", *BROWSERS], "DEPENDENCY_FAILURE", 1200, DASHBOARD),
         "browser": Run(node("scripts/v2_p13/browser.mjs"), "TEST_FAILURE", 1500),
-        **{name: Run(python("run", name, "--output", private), kind, seconds) for name, (kind, seconds) in MODES.items()},
+        **mode_recipes(private, target),
     }
 
 
-def project(step, raw, private, source, status, default):
+def project(step, raw, private, source, status, default, targets=None):
     if step in MODES:
-        return mode_details(private, step, source, status, default)
+        return mode_details(private, step, source, status, default, targets)
     if step == "browser":
         return browser_details(private / "browser/results.json", status), None
     if step == "native-smoke":
@@ -100,15 +117,55 @@ def project(step, raw, private, source, status, default):
     return {}, None
 
 
+def diagnostic_targets(step, private, environment):
+    log = private / (step + "-cargo-metadata.log")
+    result = capture(["cargo", "metadata", "--no-deps", "--locked", "--format-version", "1"],
+                     log, cwd=ROOT, environment=environment, timeout=30, limit=JSON_LIMIT)
+    if result.exit or result.problem:
+        return {}
+    try:
+        return checkout_inventory(ROOT, bounded_read(log, JSON_LIMIT))
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, subprocess.SubprocessError):
+        return {}
+
+
+def mode_progress(step, private, targets):
+    commands = COMMANDS[step]
+    for index, command in reversed(list(enumerate(commands, 1))):
+        log = private / f"{step}-{index}.log"
+        try:
+            info = log.lstat()
+            if is_link(info) or not stat.S_ISREG(info.st_mode) or info.st_size > MAX_LOG:
+                break
+            with log.open("rb") as child:
+                raw = child.read(MAX_LOG + 1)
+            if len(raw) > MAX_LOG:
+                break
+            cargo = CargoDiagnostics(ROOT, targets, command).accept(raw, partial=True)
+            return {"commandIndex": index, **cargo.fields()}
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError):
+            break
+    return {"phase": "preparing"}
+
+
 def execute(step, recipe, private, source, environment, limit=MAX_LOG):
     log = private / (step + "-outer.log")
-    captured = capture(recipe.argv, log, cwd=recipe.cwd, environment=environment, timeout=recipe.timeout, limit=limit)
+    targets = diagnostic_targets(step, private, environment) if step in RUST_MODES else None
+
+    def report_progress(elapsed):
+        publish_result(step, source, {"event": "progress", "elapsedSeconds": round(elapsed, 1),
+                                     **mode_progress(step, private, targets)})
+
+    captured = capture(recipe.argv, log, cwd=recipe.cwd, environment=environment, timeout=recipe.timeout,
+                       limit=limit, progress=report_progress if targets is not None else None)
     problem = captured.problem
     details = {}
     if not problem:
         try:
             raw = bounded_read(log, MAX_LOG)
-            details, report_problem = project(step, raw, private, source, captured.exit, recipe.category)
+            details, report_problem = project(step, raw, private, source, captured.exit, recipe.category, targets)
             if captured.exit:
                 problem = report_problem or classify(raw, recipe.category)
         except (OSError, ValueError, KeyError, TypeError, AttributeError):
@@ -121,6 +178,8 @@ def execute(step, recipe, private, source, environment, limit=MAX_LOG):
                     problem = classified
                 except (OSError, ValueError):
                     pass
+    elif targets is not None and problem in {"TIMEOUT", "INTERRUPTED", "OUTPUT_LIMIT"}:
+        details = {"partial": mode_progress(step, private, targets)}
     return {"exit": captured.exit, "seconds": captured.seconds, "classification": problem or "PASS", **details}
 
 
@@ -136,6 +195,11 @@ def publish_result(step, source, result):
 
 def invalidated(_signal, _frame):
     raise KeyboardInterrupt
+
+
+def result_exit(result):
+    status = result["exit"]
+    return 0 if result["classification"] == "PASS" and status == 0 else (status if 0 < status < 256 else 1)
 
 
 def approve(publish, seal, source, scope):
@@ -170,9 +234,17 @@ def run(args, source):
         approve(publish, private / "seal.json", source.commit, "inventory")
     elif step == "browser-unpack":
         downloaded = private / "downloaded-linux"
-        artifacts.read_screened(downloaded, source.commit, LINUX)
-        manifest = package.unpack(downloaded / package.TARGETS[LINUX][2], private / "browser-package")
-        if manifest["sourceCommit"] != source.commit or manifest["target"] != LINUX:
+        files = artifacts.read_screened(downloaded, source.commit, LINUX)
+        name = package.TARGETS[LINUX][2]
+        if files[name + ".sha256"] != artifacts.checksum(name, files[name]):
+            raise PrivacyError("Browser archive checksum mismatch")
+        with TemporaryDirectory(prefix="browser-archive-", dir=private) as scratch:
+            verified = Path(scratch) / name
+            verified.write_bytes(files[name])
+            manifest = package.unpack(verified, private / "browser-package")
+        if (manifest["sourceCommit"], manifest["sourceTree"], manifest["version"], manifest["target"]) != (
+            source.commit, source.tree, source.version, LINUX
+        ):
             raise PrivacyError("Unexpected browser package identity")
     else:
         if step == "assemble":
@@ -208,8 +280,7 @@ def main():
     except Exception:
         result = {"exit": 1, "classification": "SCREENING_ERROR"}
     publish_result(step, source, result)
-    exit_code = result["exit"]
-    return 0 if result["classification"] == "PASS" and exit_code == 0 else (exit_code if 0 < exit_code < 256 else 1)
+    return result_exit(result)
 
 
 if __name__ == "__main__":

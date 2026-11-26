@@ -8,6 +8,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 import zipfile
@@ -365,6 +366,39 @@ class PrivacyContracts(unittest.TestCase):
             artifacts.stage_inventory(assembled, screened, self.root / "unsafe", self.raw / "unsafe-seal", SOURCE.commit)
         self.assertFalse((self.root / "unsafe").exists())
 
+    def browser_unpack(self):
+        with patch.dict(os.environ, {"RUNNER_TEMP": str(self.root)}):
+            return ci.run(SimpleNamespace(step="browser-unpack", target=None), SOURCE)
+
+    def browser_download(self, *, source=SOURCE.commit, replace_checksum=False):
+        _root, _packages, archive, _smoke = self.fixture(ci.LINUX)
+        files = {archive.name: archive.read_bytes(), archive.name + ".sha256": artifacts.checksum(archive.name, archive.read_bytes())}
+        if replace_checksum:
+            files[archive.name + ".sha256"] = b"wrong checksum\n"
+        artifacts.stage(files, self.root / "asf-p14/private/downloaded-linux", self.seal, source, ci.LINUX)
+
+    def test_same_source_screened_linux_download_unpacks_for_browser(self):
+        self.browser_download()
+        self.assertEqual(self.browser_unpack()["classification"], "PASS")
+        self.assertTrue((self.root / "asf-p14/private/browser-package/factory").is_file())
+
+    def test_browser_rejects_missing_linux_artifact(self):
+        with self.assertRaises((OSError, PrivacyError)):
+            self.browser_unpack()
+        self.assertFalse((self.root / "asf-p14/private/browser-package").exists())
+
+    def test_browser_rejects_artifact_receipt_for_another_sha(self):
+        self.browser_download(source="d" * 40)
+        with self.assertRaises(PrivacyError):
+            self.browser_unpack()
+        self.assertFalse((self.root / "asf-p14/private/browser-package").exists())
+
+    def test_browser_rejects_inconsistent_archive_checksum_before_unpack(self):
+        self.browser_download(replace_checksum=True)
+        with self.assertRaises(PrivacyError):
+            self.browser_unpack()
+        self.assertFalse((self.root / "asf-p14/private/browser-package").exists())
+
 
 class WorkflowPrivacyContracts(unittest.TestCase):
     def test_package_manager_keeps_colon_script_names(self):
@@ -383,8 +417,9 @@ class WorkflowPrivacyContracts(unittest.TestCase):
         self.assertNotIn("secrets.", text)
         self.assertEqual(text.count("persist-credentials: false"), 5)
         self.assertEqual(text.count("package-manager-cache: false"), 5)
-        for runner in ("windows-2025", "ubuntu-24.04", "macos-15", "macos-15-intel"):
+        for runner in ("windows-2025", "macos-15", "macos-15-intel"):
             self.assertIn("os: " + runner, text)
+        self.assertIn("runs-on: ubuntu-24.04", text)
         for step in ("frontend", "frontend-tests", "rust", "normal", "build", "embedded-tests", "dependencies",
                      "native-package", "native-smoke", "native-checksum", "inventory-checksum", "browser"):
             self.assertTrue(any(run.split()[3] == step for run in runs), step)
@@ -407,6 +442,41 @@ class WorkflowPrivacyContracts(unittest.TestCase):
         self.assertIn("uses: ./.github/workflows/ci.yml", manual)
         self.assertIn("retain_artifacts: true", manual)
         self.assertIn("if: inputs.authorization == 'QUALIFY ONLY'", manual)
+
+    def test_linux_browser_dependencies_and_full_inventory_transitions(self):
+        workflow = (package.ROOT / ".github/workflows/ci.yml").read_text()
+        jobs = {}
+        for job in ("browsers", "integrity"):
+            fields = workflow.split(f"\n  {job}:\n", 1)[1].splitlines()
+            needs, guard = (line.strip().split(": ", 1)[1] for line in fields[:2])
+            self.assertTrue(guard.startswith("success() && !cancelled() && ("))
+            self.assertIn("inputs.retain_artifacts", guard)
+            jobs[job] = needs.strip("[]").split(", ")
+        self.assertEqual(jobs["browsers"], ["linux_native"])
+        self.assertEqual(jobs["integrity"], ["linux_native", "native"])
+        self.assertIn("steps: &native_steps", workflow)
+        self.assertIn("steps: *native_steps", workflow)
+
+        scenarios = (
+            ("Windows failed", "success", "failure", False, True, False),
+            ("macOS failed", "success", "failure", False, True, False),
+            ("Linux screening failed", "failure", "success", False, False, False),
+            ("all native targets passed", "success", "success", False, True, True),
+            ("workflow cancelled", "success", "success", True, False, False),
+        )
+        for name, linux, other, cancelled, browsers, integrity in scenarios:
+            with self.subTest(scenario=name):
+                conclusions = {"linux_native": linux, "native": other}
+                runnable = {job: not cancelled and all(conclusions[item] == "success" for item in dependencies)
+                            for job, dependencies in jobs.items()}
+                self.assertEqual(runnable, {"browsers": browsers, "integrity": integrity})
+
+        browser = workflow.split("\n  browsers:\n", 1)[1]
+        self.assertIn("candidate-native-x86_64-unknown-linux-gnu-${{ github.sha }}", browser)
+        self.assertNotIn("run-id:", browser)
+        self.assertNotIn("pattern:", browser)
+        self.assertLess(browser.index("actions/download-artifact@"), browser.index("ci.py browser-unpack"))
+        self.assertLess(browser.index("ci.py browser-unpack"), browser.index("ci.py browser --engine"))
 
 
 if __name__ == "__main__":

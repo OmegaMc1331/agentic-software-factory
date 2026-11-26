@@ -14,6 +14,7 @@ from time import sleep
 
 
 MAX_LOG = 16 * 1024 * 1024
+PROGRESS_INTERVAL = 30
 RUNNER_CHANNELS = {
     "GITHUB_ENV", "GITHUB_OUTPUT", "GITHUB_PATH", "GITHUB_STATE", "GITHUB_STEP_SUMMARY",
     "GITHUB_TOKEN", "GH_TOKEN", "NODE_AUTH_TOKEN", "ACTIONS_RUNTIME_TOKEN",
@@ -96,7 +97,7 @@ def command_args(argv):
     return argv
 
 
-def capture(argv, log: Path, *, cwd, environment, timeout, limit=MAX_LOG, supervise=True):
+def capture(argv, log: Path, *, cwd, environment, timeout, limit=MAX_LOG, supervise=True, progress=None):
     started = time.monotonic()
     errors = []
     finished = threading.Event()
@@ -108,7 +109,7 @@ def capture(argv, log: Path, *, cwd, environment, timeout, limit=MAX_LOG, superv
         if supervise and os.name == "nt":
             job = WindowsJob()
         kwargs = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {"start_new_session": supervise}
-        with log.open("xb") as private:
+        with log.open("xb", buffering=0) as private:
             process = subprocess.Popen(
                 command_args(argv), cwd=cwd, env=child_environment(environment),
                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, **kwargs,
@@ -124,7 +125,9 @@ def capture(argv, log: Path, *, cwd, environment, timeout, limit=MAX_LOG, superv
                             if len(chunk) > remaining:
                                 errors.append("OUTPUT_LIMIT")
                                 return
-                            private.write(chunk)
+                            if private.write(chunk) != len(chunk):
+                                errors.append("SCREENING_ERROR")
+                                return
                             remaining -= len(chunk)
                     except (OSError, ValueError):
                         errors.append("SCREENING_ERROR")
@@ -133,12 +136,17 @@ def capture(argv, log: Path, *, cwd, environment, timeout, limit=MAX_LOG, superv
 
                 reader = threading.Thread(target=drain, daemon=True)
                 reader.start()
+                next_report = 0
                 while not (finished.is_set() and process.poll() is not None):
                     if errors:
                         break
-                    if time.monotonic() - started >= timeout:
+                    elapsed = time.monotonic() - started
+                    if elapsed >= timeout:
                         problem = "TIMEOUT"
                         break
+                    if progress and elapsed >= next_report:
+                        progress(elapsed)
+                        next_report = elapsed + PROGRESS_INTERVAL
                     sleep(0.025)
                 problem = problem or (errors[0] if errors else None)
             except KeyboardInterrupt:

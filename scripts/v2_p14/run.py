@@ -62,13 +62,17 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("mode", choices=MODES)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--capture-timeout", type=int, default=6600)
     args = parser.parse_args()
+    if not 0 < args.capture_timeout <= 9000:
+        parser.error("Capture deadline outside qualification bounds")
     args.output.mkdir(parents=True, exist_ok=True)
     record = args.output / (args.mode + "-results.json")
     if record.exists():
         raise SystemExit("Preserve prior evidence; choose a new output directory")
     result = {"schemaVersion": 1, "testId": args.mode, "sourceCommit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(), "startedAt": datetime.datetime.now(datetime.UTC).isoformat(), "environment": {"platform": platform.platform(), "architecture": platform.machine()}, "sourceFingerprint": tracked_fingerprint(), "commands": []}
     public_ci = os.environ.get("ASF_P14_PUBLIC_CI") == "1"
+    deadline = time.monotonic() + args.capture_timeout
     final_exit = 1
     try:
         for number, command in enumerate(MODES[args.mode], 1):
@@ -88,7 +92,12 @@ def main():
                 environment["CARGO_PROFILE_RELEASE_LTO"] = "true"
             problem = None
             if public_ci:
-                captured = capture(actual, log, cwd=cwd, environment=environment, timeout=6600, supervise=False)
+                if command[:2] in (["cargo", "test"], ["cargo", "build"]):
+                    # Keep features, profiles and test arguments intact. Cargo's
+                    # machine-readable build events precede libtest output.
+                    actual.insert(2, "--message-format=json")
+                captured = capture(actual, log, cwd=cwd, environment=environment,
+                                   timeout=max(0, deadline - time.monotonic()), supervise=False)
                 exit_code, problem = captured.exit, captured.problem
             else:
                 with log.open("wb") as stream:

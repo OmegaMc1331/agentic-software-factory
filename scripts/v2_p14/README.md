@@ -26,8 +26,25 @@ Freeze/commit source before the release build. Run commands serially under low R
 The qualification workflow invokes the fixed recipes in `ci.py`. Raw stdout,
 stderr and diagnostics stay under the job's temporary directory. The public
 log contains a structured step result, exact source SHA, exit, timing and any
-validated test counts. The browser journey still runs its complete assertions
-with screenshots disabled in hosted qualification.
+validated test counts. Rust commands emit a progress record at most every 30
+seconds during capture. A Cargo build completion event distinguishes the
+build (including linking) from test discovery and execution. Cargo artifact
+counts distinguish newly generated outputs from reused ones. Test progress
+counts completed suites, with ignored cases separate. When libtest supplies
+durations, the result includes the sum of the completed suites' durations.
+
+The wrapper resolves failing test names against checked-in declarations and
+binds them to a Cargo test target. Unexpected names, doctest paths and unknown
+binaries get a generic identifier. A timeout or interruption reports the last
+observed phase and completed test count when available. Assert messages,
+command configuration and paths stay private.
+
+Chromium, Firefox and WebKit use only the screened Linux package from the
+current run and run their full assertions with screenshots disabled. The
+inventory still depends on all four native targets. The Intel macOS job uses a
+240-minute ceiling. Its embedded command has a 150-minute inner limit, with one
+minute for outer capture and cleanup. The embedded test recipe and release
+profile remain as configured in the repository.
 
 The only artifact publishers are the native package and consolidated inventory
 steps. Each uploader enumerates exact files and requires a successful final
