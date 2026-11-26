@@ -107,12 +107,44 @@ fn concurrent_registration_and_open_share_one_runtime() {
         .all(|context| Arc::ptr_eq(context, &contexts[0])));
     assert_eq!(app.list().unwrap().len(), 1);
     let id = contexts[0].project_id.clone();
-    assert!(app.close(&id).is_err());
+    assert!(
+        app.close(&id).is_err(),
+        "ASF_QA_CHECKPOINT:ownership.concurrent.live_context"
+    );
     drop(contexts);
-    app.close(&id).unwrap();
-    let second_owner = factory_runtime::Runtime::new(&root).unwrap();
+    app.close(&id)
+        .expect("ASF_QA_CHECKPOINT:ownership.concurrent.close");
+    let second_owner = factory_runtime::Runtime::new(&root)
+        .expect("ASF_QA_CHECKPOINT:ownership.concurrent.second_owner");
     drop(second_owner);
-    app.open(&id).unwrap();
+    app.open(&id)
+        .expect("ASF_QA_CHECKPOINT:ownership.concurrent.reopen");
+}
+
+#[test]
+fn managers_can_alternate_ownership_immediately_after_close() {
+    let temp = TempDir::new().unwrap();
+    let root = repository(temp.path(), "A");
+    let first = manager(temp.path());
+    let second = manager(temp.path());
+    let entry = first.register(&root, None).unwrap();
+
+    for _ in 0..8 {
+        for (current, other) in [(&first, &second), (&second, &first)] {
+            let context = current.open(&entry.project_id).unwrap();
+            assert!(matches!(
+                other.open(&entry.project_id),
+                Err(ProjectError::Runtime(error))
+                    if matches!(*error, factory_runtime::RuntimeError::ProjectAlreadyLocked { .. })
+            ));
+            assert!(matches!(
+                current.close(&entry.project_id),
+                Err(ProjectError::Conflict(_))
+            ));
+            drop(context);
+            current.close(&entry.project_id).unwrap();
+        }
+    }
 }
 
 #[test]
@@ -612,13 +644,24 @@ fn registry_mutations_cannot_relink_or_remove_a_runtime_owned_by_another_manager
     let two = manager(temp.path());
     let entry = one.register(&a, None).unwrap();
     let context = one.open(&entry.project_id).unwrap();
-    assert!(two.remove(&entry.project_id).is_err());
-    assert!(two.relink(&entry.project_id, &other, true).is_err());
+    assert!(
+        two.remove(&entry.project_id).is_err(),
+        "ASF_QA_CHECKPOINT:ownership.relink.remove_locked"
+    );
+    assert!(
+        two.relink(&entry.project_id, &other, true).is_err(),
+        "ASF_QA_CHECKPOINT:ownership.relink.relink_locked"
+    );
     assert_eq!(one.context(&entry.project_id).unwrap().root, context.root);
     drop(context);
-    one.close(&entry.project_id).unwrap();
-    two.relink(&entry.project_id, &other, true).unwrap();
-    assert!(two.open(&entry.project_id).is_ok());
+    one.close(&entry.project_id)
+        .expect("ASF_QA_CHECKPOINT:ownership.relink.close");
+    two.relink(&entry.project_id, &other, true)
+        .expect("ASF_QA_CHECKPOINT:ownership.relink.after_close");
+    assert!(
+        two.open(&entry.project_id).is_ok(),
+        "ASF_QA_CHECKPOINT:ownership.relink.open_relinked"
+    );
 }
 
 #[test]

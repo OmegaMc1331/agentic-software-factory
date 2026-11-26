@@ -39,6 +39,13 @@ binaries get a generic identifier. A timeout or interruption reports the last
 observed phase and completed test count when available. Assert messages,
 command configuration and paths stay private.
 
+Selected Rust failures also carry a checkpoint from a fixed allowlist bound
+to the suite and test. The Python contract steps use buffered verbose unittest output
+inside private capture. Public summaries include counts and failing case
+identifiers validated against tracked test declarations. Missing completion
+evidence blocks a passing result, and an unrecognized case uses a generic
+identifier. Contract progress uses the same 30-second heartbeat.
+
 Chromium, Firefox and WebKit use only the screened Linux package from the
 current run and run their full assertions with screenshots disabled. The
 inventory still depends on all four native targets. The Intel macOS job uses a

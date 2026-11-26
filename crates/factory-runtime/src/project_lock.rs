@@ -9,7 +9,7 @@ use crate::RuntimeError;
 pub(crate) const PROJECT_LOCK_FILE: &str = "runtime.lock";
 
 pub(crate) struct ProjectLock {
-    _file: File,
+    file: File,
 }
 
 impl ProjectLock {
@@ -52,7 +52,16 @@ impl ProjectLock {
         }
 
         let _ = write_lock_metadata(&mut file, requested_root);
-        Ok(Self { _file: file })
+        Ok(Self { file })
+    }
+}
+
+impl Drop for ProjectLock {
+    fn drop(&mut self) {
+        // An open file description can outlive this handle, for example during
+        // a concurrent fork before exec closes inherited descriptors.
+        // Release the lease at the end of its logical ownership.
+        let _ = fs4::FileExt::unlock(&self.file);
     }
 }
 
@@ -97,5 +106,33 @@ impl ProjectOwnership {
             _project: project,
             _git: git,
         })
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dropping_the_owner_releases_the_lock_while_a_descriptor_alias_is_open() {
+        let workspace = tempfile::tempdir().unwrap();
+        let path = workspace.path().join("lease");
+        let try_acquire = || ProjectLock::acquire_file(path.clone(), workspace.path());
+        let owner = try_acquire().unwrap();
+        let descriptor_alias = owner.file.try_clone().unwrap();
+
+        assert!(matches!(
+            try_acquire(),
+            Err(RuntimeError::ProjectAlreadyLocked { .. })
+        ));
+        drop(owner);
+        let next_owner = try_acquire().unwrap();
+        drop(descriptor_alias);
+        assert!(matches!(
+            try_acquire(),
+            Err(RuntimeError::ProjectAlreadyLocked { .. })
+        ));
+        drop(next_owner);
+        assert!(try_acquire().is_ok());
     }
 }

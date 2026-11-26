@@ -5,6 +5,7 @@ import io
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -12,6 +13,7 @@ from unittest.mock import patch
 
 import ci
 from ci_privacy import PrivacyError, digest
+from ci_python import contract_details, contract_selector
 from ci_results import mode_details
 from ci_rust import CargoDiagnostics, Target, absolute, declared_tests, target_key, unit_tests
 from run import MODES
@@ -92,9 +94,13 @@ fn plain() {}
         self.assertEqual(declared_tests(source, ("memory",)), {"memory::" + SAFE_TEST, "memory::plain"})
 
     def test_checkout_identifiers_cover_raw_strings_and_explicit_module_paths(self):
-        source = self.raw / "lib.rs"
-        service = self.raw / "service.rs"
-        child = self.raw / "cases.rs"
+        self.check_explicit_module_paths(self.raw)
+
+    def check_explicit_module_paths(self, directory):
+        directory = directory.resolve(strict=True)
+        source = directory / "lib.rs"
+        service = directory / "service.rs"
+        child = directory / "cases.rs"
         contents = {
             source: "mod service;\n",
             service: """#[cfg(test)]
@@ -110,6 +116,26 @@ fn real_declaration() {}
 """,
         }
         self.assertEqual(unit_tests(source, contents), {"service::tests::real_declaration"})
+
+    def test_explicit_module_paths_under_nested_aliases_with_spaces_and_unicode(self):
+        canonical = self.raw / "module fixture café"
+        canonical.mkdir()
+        alias = self.raw / "module alias"
+        second = self.raw / "nested module alias"
+        for link, destination in ((alias, canonical), (second, alias)):
+            if os.name == "nt":
+                subprocess.run(
+                    ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+                     "$ErrorActionPreference='Stop'; New-Item -ItemType Junction "
+                     "-Path $env:ASF_CONTRACT_LINK -Target $env:ASF_CONTRACT_DEST | Out-Null"],
+                    env={**os.environ, "ASF_CONTRACT_LINK": str(link), "ASF_CONTRACT_DEST": str(destination)},
+                    capture_output=True, check=True, timeout=20,
+                )
+            else:
+                link.symlink_to(destination, target_is_directory=True)
+        for directory in (canonical, alias, second):
+            with self.subTest(alias=directory != canonical):
+                self.check_explicit_module_paths(directory)
 
     def test_failure_preserves_scoped_static_id_counts_duration_and_actual_exit(self):
         raw = (
@@ -141,6 +167,37 @@ fn real_declaration() {}
         case = self.project(raw + summary(0, 1, 0), 101)["commands"][0]
         failure = case["failedTests"][0]
         self.assertEqual(failure, {"suite": {"package": "unknown", "target": "unknown", "kind": "unknown"}, "testId": "unknown"})
+
+    def test_rust_checkpoint_requires_reviewed_test_and_target(self):
+        test = "concurrent_registration_and_open_share_one_runtime"
+        target = Target("factory-projects", "projects", "test", frozenset({test}))
+        metadata = {**TARGET, "name": target.name}
+        key = target_key(KEY[0], metadata, CHECKOUT)
+        for actual_suite, token, expected in (
+            (target, "ownership.concurrent.second_owner", True),
+            (target, "private_source_fragment", False),
+            (SUITE, "ownership.concurrent.second_owner", False),
+        ):
+            with self.subTest(approved=expected):
+                examples = (API_KEY, PRIVATE_WIN, PRIVATE_UNIX, "https://git.example.invalid/private-demo",
+                            "fictional conversation record", "private_source_fragment")
+                raw = (compiled().replace(b'"name": "fixture"', b'"name": "projects"') + start(1)
+                       + f"test {test} ... FAILED\nfailures:\n---- {test} stdout ----\n".encode()
+                       + f"ASF_QA_CHECKPOINT:{token}: {examples!r}\n".encode()
+                       + summary(0, 1, 0))
+                diagnostic = CargoDiagnostics(CHECKOUT, {key: actual_suite}, COMMAND).accept(raw)
+                failed = diagnostic.fields()["failedTests"][0]
+                self.assertEqual("checkpoint" in failed, expected)
+                if expected:
+                    self.assertEqual(failed["checkpoint"], token)
+                    self.assertEqual(failed["classification"], "ASSERTION_FAILURE")
+                view = json.dumps(diagnostic.fields())
+                for private in examples:
+                    self.assertNotIn(private, view)
+                partial = CargoDiagnostics(CHECKOUT, {key: actual_suite}, COMMAND).accept(raw, partial=True)
+                heartbeat = json.dumps(partial.fields())
+                for private in examples:
+                    self.assertNotIn(private, heartbeat)
 
     def test_compilation_and_link_failures_have_no_test_count_or_message(self):
         for message, phase in (("could not compile " + PRIVATE_WIN, "build"), ("linking with compiler failed " + API_KEY, "linking")):
@@ -221,6 +278,74 @@ fn real_declaration() {}
         linux = ci.mode_recipes(self.raw, ci.LINUX)["embedded-tests"]
         self.assertEqual((intel.argv[-2:], intel.timeout), (["--capture-timeout", "9000"], 9060))
         self.assertEqual((linux.argv[-2:], linux.timeout), (["--capture-timeout", "6600"], 6660))
+
+
+class PythonDiagnosticsContracts(unittest.TestCase):
+    def test_noisy_contracts_keep_case_records_and_failure_payloads_private(self):
+        case = "test_contract.Demo.test_ready"
+        fixture = (
+            "import sys\nimport unittest\n\n"
+            "class Demo(unittest.TestCase):\n"
+            "    def test_ready(self):\n"
+            f"        print({PRIVATE_UNIX!r}, file=sys.stderr)\n"
+            "        self.assertTrue(PASSES)\n"
+        )
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "test_contract.py"
+            for passes in (True, False):
+                with self.subTest(passes=passes):
+                    path.write_text(fixture.replace("PASSES", str(passes)), encoding="utf-8")
+                    attempt = subprocess.run(
+                        [sys.executable, "-B", "-m", "unittest", "discover", "-s", folder,
+                         "-p", "test_contract.py", "-v", "-b"],
+                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=20,
+                    )
+                    self.assertEqual(attempt.returncode, 0 if passes else 1)
+                    details, problem = contract_details(attempt.stdout, {case}, attempt.returncode)
+                    self.assertEqual(problem, None if passes else "TEST_FAILURE")
+                    self.assertEqual(details["completedTestCount"], 1)
+                    self.assertEqual(details["tests"], 1)
+                    if not passes:
+                        self.assertIn(PRIVATE_UNIX.encode(), attempt.stdout)
+                        self.assertEqual(details["failedContracts"][0]["testId"], case)
+                    self.assertNotIn(PRIVATE_UNIX, json.dumps(details))
+
+    def test_python_summary_and_progress_validate_known_cases_and_keep_payloads_private(self):
+        case = "test_contract.Demo.test_ready"
+        unknown = "test_contract.Demo.test_unknown_source"
+        samples = (API_KEY, PRIVATE_WIN, PRIVATE_UNIX, "https://git.example.invalid/private-demo",
+                   "fictional conversation record", "unrecognized assertion message")
+        raw = (f"test_ready ({case}) ... FAIL\n"
+               f"test_unknown_source ({unknown}) ... ERROR\n"
+               f"FAIL: test_ready ({case})\nERROR: test_unknown_source ({unknown})\n"
+               f"{samples!r}\n"
+               "Ran 2 tests in 0.041s\n\nFAILED (failures=1, errors=1)\n").encode()
+        approved = {case}
+        partial, problem = contract_details(raw, approved)
+        self.assertIsNone(problem)
+        self.assertEqual(partial, {"phase": "python-contracts", "completedTestCount": 1})
+        complete, problem = contract_details(raw, approved, 1)
+        self.assertEqual(problem, "TEST_FAILURE")
+        self.assertEqual(complete["tests"], 2)
+        self.assertEqual(complete["failedContracts"], [
+            {"testId": case, "classification": "ASSERTION_FAILURE"},
+            {"testId": "unknown", "classification": "CONTRACT_ERROR"},
+        ])
+        projected = json.dumps([partial, complete])
+        for private in (*samples, unknown):
+            self.assertNotIn(private, projected)
+
+    def test_python_process_exit_and_incomplete_evidence_are_distinct(self):
+        case = "test_contract.Demo.test_ready"
+        success = f"test_ready ({case}) ... ok\nRan 1 test in 0.010s\n\nOK\n".encode()
+        self.assertIsNone(contract_details(success, {case}, 0)[1])
+        self.assertEqual(contract_details(success, set(), 0)[1], "INCOMPLETE_EVIDENCE")
+        self.assertEqual(contract_details(b"cannot import fixtures\n", {case}, 2)[1], "PROCESS_FAILURE")
+        self.assertEqual(contract_details(b"", {case}, 0)[1], "INCOMPLETE_EVIDENCE")
+        self.assertEqual(contract_details(success * 2, {case}, 0)[1], "INCOMPLETE_EVIDENCE")
+        self.assertIsNotNone(contract_selector(MODES["contracts"][2]))
+        self.assertIsNotNone(contract_selector(MODES["contracts"][3]))
+        self.assertIsNone(contract_selector(MODES["contracts"][2][:-1] + ["*.py"]))
 
 
 if __name__ == "__main__":

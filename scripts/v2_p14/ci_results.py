@@ -4,6 +4,7 @@ import re
 
 from ci_capture import MAX_LOG
 from ci_privacy import JSON_LIMIT, PrivacyError, bounded_read, digest, parse
+from ci_python import checkout_contracts, contract_details, contract_selector
 from ci_rust import CargoDiagnostics
 from run import MODES, ROOT
 
@@ -91,16 +92,21 @@ def mode_details(folder, mode, source, exit_code, kind, targets=None):
             parsed = test_counts(argv, raw, status)
         item = {"commandIndex": index + 1, "exit": status,
                 "seconds": count_duration(row["durationSeconds"]), **parsed, **diagnostic}
-        if mode == "contracts" and not status:
-            # TAP and unittest summaries can be projected without test names.
-            found = re.search(rb"(?m)^(?:# tests |Ran )(\d+)(?: tests?\b|$)", ANSI.sub(b"", raw))
+        contract_problem = None
+        selector = contract_selector(argv) if mode == "contracts" else None
+        if selector:
+            observed, contract_problem = contract_details(ANSI.sub(b"", raw), checkout_contracts(ROOT, selector),
+                                                          None if row.get("captureProblem") else status)
+            item.update(observed)
+        elif mode == "contracts" and not status:
+            found = re.search(rb"(?m)^# tests (\d+)\b", ANSI.sub(b"", raw))
             item["tests"] = count(int(found[1])) if found else 0
-        if row.get("captureProblem") in PROBLEMS or status or parsed.get("failed"):
+        if row.get("captureProblem") in PROBLEMS or status or parsed.get("failed") or contract_problem:
             problem = row.get("captureProblem") if row.get("captureProblem") in PROBLEMS else (
-                "TEST_FAILURE" if parsed.get("failed") else classify(raw, kind)
+                contract_problem or ("TEST_FAILURE" if parsed.get("failed") else classify(raw, kind))
             )
             item["failureCategory"] = problem
-        if not exit_code and problem:
+        if not exit_code and problem and problem != "INCOMPLETE_EVIDENCE":
             raise PrivacyError("Inconsistent successful driver result")
         details.append(item)
     return {"commands": details}, problem

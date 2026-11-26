@@ -353,6 +353,9 @@ class PrivacyContracts(unittest.TestCase):
             handoff = self.raw / "handoff" / f"candidate-native-{target}-{SOURCE.commit}"
             artifacts.stage(files, handoff, self.raw / (target + "-seal.json"), SOURCE.commit, target)
             screened.update(files)
+            if len(screened) < len(package.TARGETS) * 2:
+                with self.assertRaises(PrivacyError):
+                    artifacts.received_inventory(self.raw / "handoff", SOURCE.commit)
         self.assertEqual(artifacts.received_inventory(self.raw / "handoff", SOURCE.commit), screened)
         assembled = self.root / "assembled"
         assembled.mkdir()
@@ -458,9 +461,11 @@ class WorkflowPrivacyContracts(unittest.TestCase):
         self.assertIn("steps: *native_steps", workflow)
 
         scenarios = (
+            ("Linux ready while native matrix is running", "success", "in_progress", False, True, False),
             ("Windows failed", "success", "failure", False, True, False),
             ("macOS failed", "success", "failure", False, True, False),
             ("Linux screening failed", "failure", "success", False, False, False),
+            ("Linux skipped", "skipped", "success", False, False, False),
             ("all native targets passed", "success", "success", False, True, True),
             ("workflow cancelled", "success", "success", True, False, False),
         )

@@ -333,6 +333,19 @@ fn a_cloned_runtime_keeps_ownership_until_the_last_handle_is_dropped() {
 }
 
 #[test]
+fn another_process_can_acquire_after_local_owner_ends() {
+    let dir = init_project();
+    let former_owner = Runtime::new(dir.path()).unwrap();
+    drop(former_owner);
+
+    let mut child = Holder::spawn(dir.path(), false);
+    child.wait_ready();
+    assert_already_locked(Runtime::new(dir.path()));
+    child.stop_and_wait();
+    Runtime::new(dir.path()).unwrap();
+}
+
+#[test]
 fn a_path_alias_cannot_bypass_the_project_lock() {
     let dir = init_project();
     let mut holder = Holder::spawn(dir.path(), false);

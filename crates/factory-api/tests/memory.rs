@@ -27,13 +27,17 @@ async fn shutdown_cancels_an_owned_manual_memory_extractor_without_waiting_for_i
         .app
         .projects
         .context(&factory_projects::ProjectId::parse(&f.a).unwrap())
-        .unwrap();
+        .expect("ASF_QA_CHECKPOINT:memory.shutdown.context");
     let script = context.root.join(".factory/shutdown-extractor.py");
+    let ready_file = script.with_extension("ready");
     std::fs::write(
         &script,
-        "import sys,time\nsys.stdin.read()\ntime.sleep(30)\nprint('{\"candidates\":[]}')\n",
+        "import sys,time\nfrom pathlib import Path\n\
+         assert sys.stdin.buffer.read()\n\
+         Path(__file__).with_suffix('.ready').write_bytes(b'ready')\n\
+         time.sleep(30)\nprint('{\"candidates\":[]}')\n",
     )
-    .unwrap();
+    .expect("ASF_QA_CHECKPOINT:memory.shutdown.fixture_script");
     let mut config = factory_core::Config::default();
     config.agents.insert("shutdown-extractor".into(), serde_json::from_value(json!({"kind":"custom","command":if cfg!(windows) {"python"} else {"python3"},"args":[script],"env":{"PYTHONDONTWRITEBYTECODE":"1"}})).unwrap());
     config.role_assignments.push(factory_core::RoleAssignment {
@@ -41,12 +45,15 @@ async fn shutdown_cancels_an_owned_manual_memory_extractor_without_waiting_for_i
         agent: "shutdown-extractor".into(),
         preferred: true,
     });
-    config.write_atomic(&context.root).unwrap();
+    config
+        .write_atomic(&context.root)
+        .expect("ASF_QA_CHECKPOINT:memory.shutdown.fixture_config");
     let (_, mut settings) = f.call(&f.a, "/settings", "GET", json!({})).await;
     settings["extractionMode"] = json!("review");
     assert_eq!(
         f.call(&f.a, "/settings", "PUT", settings).await.0,
-        StatusCode::OK
+        StatusCode::OK,
+        "ASF_QA_CHECKPOINT:memory.shutdown.settings"
     );
     let source = json!({"projectId":f.a,"reference":{"kind":"repository_file","rootId":context.files.primary_root().id,"path":"ARCHITECTURE.md","revision":null}});
     let client = f.clone();
@@ -55,32 +62,35 @@ async fn shutdown_cancels_an_owned_manual_memory_extractor_without_waiting_for_i
             .call(&client.a, "/extract", "POST", json!({"sources":[source]}))
             .await
     });
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
-        let started = context
-            .db
-            .lock()
-            .unwrap()
-            .list_agent_sessions(None)
-            .unwrap()
-            .iter()
-            .any(|session| {
-                session.role == "planner"
-                    && session.status == "running"
-                    && session
-                        .output_meta
-                        .as_ref()
-                        .is_some_and(|metadata| metadata.process_tree_supervised)
-            });
-        if started {
-            break;
+    // The owned child acknowledges nonempty stdin and EOF before shutdown.
+    // The session receipt also proves the extractor is live and supervised.
+    let ready = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !extraction.is_finished() {
+            if std::fs::read(&ready_file).is_ok_and(|value| value == b"ready")
+                && context
+                    .db
+                    .lock()
+                    .unwrap()
+                    .list_agent_sessions(None)
+                    .unwrap()
+                    .iter()
+                    .any(|session| {
+                        session.role == "planner"
+                            && session.status == "running"
+                            && session
+                                .output_meta
+                                .as_ref()
+                                .is_some_and(|metadata| metadata.process_tree_supervised)
+                    })
+            {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "owned extractor did not start"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
+        false
+    })
+    .await
+    .unwrap_or(false);
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let server = tokio::spawn(factory_api::serve_application_with_shutdown(
         f.app.clone(),
@@ -91,48 +101,63 @@ async fn shutdown_cancels_an_owned_manual_memory_extractor_without_waiting_for_i
     ));
     stop.send(()).unwrap();
     let timely = tokio::time::timeout(std::time::Duration::from_secs(8), &mut extraction).await;
-    let cancelled_promptly = timely.is_ok();
-    let (status, body) = match timely {
-        Ok(result) => result.unwrap(),
-        Err(_) => extraction.await.unwrap(),
-    };
     let shutdown = tokio::time::timeout(std::time::Duration::from_secs(45), server)
         .await
-        .unwrap()
-        .unwrap();
-    assert!(
-        cancelled_promptly,
-        "application shutdown ignored the extractor cancellation boundary"
+        .expect("ASF_QA_CHECKPOINT:memory.shutdown.deadline")
+        .expect("ASF_QA_CHECKPOINT:memory.shutdown.server_join");
+    assert!(ready, "ASF_QA_CHECKPOINT:memory.shutdown.child_ready");
+    let (status, _) = timely
+        .expect("ASF_QA_CHECKPOINT:memory.shutdown.cancellation")
+        .expect("ASF_QA_CHECKPOINT:memory.shutdown.extraction_join");
+    assert!(shutdown.is_ok(), "ASF_QA_CHECKPOINT:memory.shutdown.server");
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "ASF_QA_CHECKPOINT:memory.shutdown.interrupted_status"
     );
-    assert!(shutdown.is_ok(), "{shutdown:?}");
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     let sessions = context
         .db
         .lock()
         .unwrap()
         .list_agent_sessions(None)
         .unwrap();
-    assert_eq!(sessions.len(), 1);
-    assert_ne!(sessions[0].status, "running");
+    assert_eq!(
+        sessions.len(),
+        1,
+        "ASF_QA_CHECKPOINT:memory.shutdown.session_count"
+    );
+    assert!(
+        sessions[0].status != "running",
+        "ASF_QA_CHECKPOINT:memory.shutdown.session_terminal"
+    );
     assert!(
         sessions[0]
             .output_meta
             .as_ref()
-            .unwrap()
-            .process_tree_cleanup_confirmed
+            .is_some_and(|meta| meta.process_tree_cleanup_confirmed),
+        "ASF_QA_CHECKPOINT:memory.shutdown.process_cleanup"
     );
     let records = context.db.lock().unwrap().memory_extractions(&f.a).unwrap();
-    assert_eq!(records.len(), 1);
-    assert_eq!(records[0].state, "failed");
-    assert!(records[0]
-        .error
-        .as_ref()
-        .unwrap()
-        .starts_with("INTERRUPTED"));
+    assert_eq!(
+        records.len(),
+        1,
+        "ASF_QA_CHECKPOINT:memory.shutdown.record_count"
+    );
+    assert!(
+        records[0].state == "failed",
+        "ASF_QA_CHECKPOINT:memory.shutdown.record_state"
+    );
+    assert!(
+        records[0]
+            .error
+            .as_ref()
+            .is_some_and(|error| error.starts_with("INTERRUPTED")),
+        "ASF_QA_CHECKPOINT:memory.shutdown.record_interrupted"
+    );
 }
 impl Fixture {
     async fn new() -> Self {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("ASF_QA_CHECKPOINT:memory.fixture.tempdir");
         let app = Arc::new(
             FactoryApplication::new(ApplicationOptions {
                 registry_path: dir.path().join("registry.sqlite3"),
@@ -142,7 +167,7 @@ impl Fixture {
                 limits: ProjectLimits::default(),
                 api: ApiOptions::default(),
             })
-            .unwrap(),
+            .expect("ASF_QA_CHECKPOINT:memory.fixture.application"),
         );
         let mut ids = vec![];
         for name in ["A", "B"] {
@@ -160,19 +185,28 @@ impl Fixture {
                 &["add", "."],
                 &["commit", "-qm", "baseline"],
             ] {
-                assert!(std::process::Command::new("git")
-                    .arg("-C")
-                    .arg(&path)
-                    .args(args)
-                    .output()
-                    .unwrap()
-                    .status
-                    .success());
+                assert!(
+                    std::process::Command::new("git")
+                        .arg("-C")
+                        .arg(&path)
+                        .args(args)
+                        .output()
+                        .expect("ASF_QA_CHECKPOINT:memory.fixture.git_spawn")
+                        .status
+                        .success(),
+                    "ASF_QA_CHECKPOINT:memory.fixture.git_status"
+                );
             }
             factory_core::Factory::init(&path).unwrap();
             factory_core::Config::default().write_atomic(&path).unwrap();
-            let id = app.projects.register(&path, None).unwrap().project_id;
-            app.projects.open(&id).unwrap();
+            let id = app
+                .projects
+                .register(&path, None)
+                .expect("ASF_QA_CHECKPOINT:memory.fixture.register")
+                .project_id;
+            app.projects
+                .open(&id)
+                .expect("ASF_QA_CHECKPOINT:memory.fixture.open");
             ids.push(id.to_string());
         }
         let router = application_router(app.clone());
@@ -190,7 +224,11 @@ impl Fixture {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "ASF_QA_CHECKPOINT:memory.fixture.auth"
+        );
         let cookie = response
             .headers()
             .get_all("set-cookie")
@@ -408,31 +446,69 @@ async fn mem_crud_cas_disable_search_and_genuine_deletion_are_backend_operations
 #[tokio::test]
 async fn settings_are_revisioned_extraction_is_disabled_and_source_reads_use_p05() {
     let f = Fixture::new().await;
-    let (_, settings) = f.call(&f.a, "/settings", "GET", json!({})).await;
-    assert_eq!(settings["extractionMode"], "disabled");
+    let (status, settings) = f.call(&f.a, "/settings", "GET", json!({})).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "ASF_QA_CHECKPOINT:memory.settings.read"
+    );
+    assert!(
+        settings["extractionMode"] == "disabled",
+        "ASF_QA_CHECKPOINT:memory.settings.default"
+    );
     let (s, _) = f
         .call(&f.a, "/extract", "POST", json!({"sources":[]}))
         .await;
-    assert_eq!(s, StatusCode::FORBIDDEN);
+    assert_eq!(
+        s,
+        StatusCode::FORBIDDEN,
+        "ASF_QA_CHECKPOINT:memory.settings.disabled"
+    );
     let mut changed = settings.clone();
     changed["maxContextBytes"] = json!(2000);
     let (s, n) = f.call(&f.a, "/settings", "PUT", changed).await;
-    assert_eq!(s, StatusCode::OK);
-    assert_eq!(n["revision"], 1);
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "ASF_QA_CHECKPOINT:memory.settings.update"
+    );
+    assert!(
+        n["revision"] == 1,
+        "ASF_QA_CHECKPOINT:memory.settings.revision"
+    );
     assert_eq!(
         f.call(&f.a, "/settings", "PUT", settings).await.0,
-        StatusCode::CONFLICT
+        StatusCode::CONFLICT,
+        "ASF_QA_CHECKPOINT:memory.settings.stale"
     );
     let context = f
         .app
         .projects
         .context(&factory_projects::ProjectId::parse(&f.a).unwrap())
-        .unwrap();
+        .expect("ASF_QA_CHECKPOINT:memory.settings.context");
     let root = context.files.primary_root().id;
-    let (_,p)=f.call(&f.a,"/sources/resolve","POST",json!({"projectId":f.a,"reference":{"kind":"repository_file","rootId":root,"path":"ARCHITECTURE.md","revision":null}})).await;
-    assert!(!p["sourceRevision"].as_str().unwrap().is_empty());
+    assert!(
+        !root.is_empty(),
+        "ASF_QA_CHECKPOINT:memory.settings.p05_root"
+    );
+    let (s,p)=f.call(&f.a,"/sources/resolve","POST",json!({"projectId":f.a,"reference":{"kind":"repository_file","rootId":root,"path":"ARCHITECTURE.md","revision":null}})).await;
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "ASF_QA_CHECKPOINT:memory.settings.source_resolution"
+    );
+    assert!(
+        p["sourceRevision"]
+            .as_str()
+            .is_some_and(|revision| !revision.is_empty()),
+        "ASF_QA_CHECKPOINT:memory.settings.source_revision"
+    );
     for path in [".factory/config.toml", ".git/config", "../outside"] {
         let (s,_)=f.call(&f.a,"/sources/resolve","POST",json!({"projectId":f.a,"reference":{"kind":"repository_file","rootId":root,"path":path,"revision":null}})).await;
-        assert_eq!(s, StatusCode::FORBIDDEN);
+        assert_eq!(
+            s,
+            StatusCode::FORBIDDEN,
+            "ASF_QA_CHECKPOINT:memory.settings.source_denied"
+        );
     }
 }

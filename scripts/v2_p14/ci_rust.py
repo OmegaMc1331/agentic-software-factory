@@ -26,6 +26,30 @@ BUILD_DURATION = re.compile(rb"Finished .* target\(s\) in (?:(\d{1,4})m )?(\d{1,
 SUITE_START = re.compile(rb"running ([0-9]{1,7}) tests?")
 FAILURE = re.compile(rb"test (.{1,256}) \.\.\. FAILED")
 MAX_FAILURES = 16
+TEST_OUTPUT = re.compile(rb"---- (.{1,256}) stdout ----")
+CHECKPOINT = re.compile(
+    rb"(?:assertion .* failed: )?ASF_QA_CHECKPOINT:([a-z0-9._]{1,80})(?:$|: )"
+)
+MEMORY_FIXTURE = frozenset("memory.fixture." + name for name in (
+    "tempdir", "application", "git_spawn", "git_status", "register", "open", "auth",
+))
+CHECKPOINTS = {
+    ("factory-api", "memory", "settings_are_revisioned_extraction_is_disabled_and_source_reads_use_p05"):
+        MEMORY_FIXTURE | {"memory.settings." + name for name in (
+            "read", "default", "disabled", "update", "revision", "stale", "context",
+            "p05_root", "source_resolution", "source_revision", "source_denied",
+        )},
+    ("factory-api", "memory", "shutdown_cancels_an_owned_manual_memory_extractor_without_waiting_for_its_timeout"):
+        MEMORY_FIXTURE | {"memory.shutdown." + name for name in (
+            "context", "fixture_script", "fixture_config", "settings", "child_ready", "extraction_join",
+            "deadline", "server_join", "cancellation", "server", "interrupted_status", "session_count",
+            "session_terminal", "process_cleanup", "record_count", "record_state", "record_interrupted",
+        )},
+    ("factory-projects", "projects", "concurrent_registration_and_open_share_one_runtime"):
+        {"ownership.concurrent." + name for name in ("live_context", "close", "second_owner", "reopen")},
+    ("factory-projects", "projects", "registry_mutations_cannot_relink_or_remove_a_runtime_owned_by_another_manager"):
+        {"ownership.relink." + name for name in ("remove_locked", "relink_locked", "close", "after_close", "open_relinked")},
+}
 
 
 def portable_name(value):
@@ -158,6 +182,8 @@ class CargoDiagnostics:
         self.expected = None
         self.in_failure_output = False
         self.failed_symbols = []
+        self.failure_output_test = None
+        self.checkpoints = {}
         self.pending_failure = None
         self.failures = []
         self.omitted = 0
@@ -225,6 +251,16 @@ class CargoDiagnostics:
     def test_line(self, line):
         if line == b"failures:":
             self.in_failure_output = True
+            self.failure_output_test = None
+        if self.in_failure_output and self.suite:
+            if output := TEST_OUTPUT.fullmatch(line):
+                test = output[1].decode("ascii", errors="replace")
+                self.failure_output_test = test if test != "unknown" and test in self.failed_symbols else None
+            elif self.failure_output_test and (checkpoint := CHECKPOINT.match(line)):
+                key = (self.suite.package, self.suite.name, self.failure_output_test)
+                marker = checkpoint[1].decode("ascii")
+                if marker in CHECKPOINTS.get(key, ()):
+                    self.checkpoints.setdefault(self.failure_output_test, marker)
         if result := RESULT.fullmatch(line):
             passed, failed, ignored = map(int, result.groups()[1:4])
             if passed + failed + ignored != self.expected or (result[1] == b"ok") == bool(failed):
@@ -252,11 +288,17 @@ class CargoDiagnostics:
             symbols = self.failed_symbols if len(self.failed_symbols) == failed else ["unknown"] * min(failed, MAX_FAILURES)
             count = min(len(symbols), MAX_FAILURES)
             suite = (self.suite or UNKNOWN_TARGET).identifier()
-            self.failures.extend({"suite": suite, "testId": symbol} for symbol in symbols[:count])
+            for symbol in symbols[:count]:
+                entry = {"suite": suite, "testId": symbol}
+                if checkpoint := self.checkpoints.get(symbol):
+                    entry.update(checkpoint=checkpoint, classification="ASSERTION_FAILURE")
+                self.failures.append(entry)
             self.omitted = failed - count
         self.expected = None
         self.launch_observed = False
         self.failed_symbols = []
+        self.failure_output_test = None
+        self.checkpoints = {}
         self.phase = "test-execution" if failed else "between-test-suites"
 
     def fields(self):

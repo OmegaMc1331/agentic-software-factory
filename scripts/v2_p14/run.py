@@ -9,6 +9,7 @@ import subprocess
 import time
 
 from ci_capture import capture
+from ci_python import contract_selector
 
 ROOT = Path(__file__).resolve().parents[2]
 MODES = {
@@ -92,6 +93,10 @@ def main():
                 environment["CARGO_PROFILE_RELEASE_LTO"] = "true"
             problem = None
             if public_ci:
+                if args.mode == "contracts" and contract_selector(command):
+                    # Keep test warnings and stdout from splitting unittest's
+                    # case records. Failure payloads stay in private capture.
+                    actual.extend(("-v", "-b"))
                 if command[:2] in (["cargo", "test"], ["cargo", "build"]):
                     # Keep features, profiles and test arguments intact. Cargo's
                     # machine-readable build events precede libtest output.

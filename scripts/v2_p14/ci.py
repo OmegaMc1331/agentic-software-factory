@@ -16,7 +16,8 @@ from tempfile import TemporaryDirectory
 import ci_artifacts as artifacts
 from ci_capture import MAX_LOG, capture
 from ci_privacy import JSON_LIMIT, PrivacyError, bounded_read, is_link, parse
-from ci_results import browser_details, classify, count, mode_details, smoke_details
+from ci_python import checkout_contracts, contract_details, contract_selector
+from ci_results import ANSI, browser_details, classify, count, mode_details, smoke_details
 from ci_rust import CargoDiagnostics, checkout_inventory
 import package
 from run import MODES as COMMANDS
@@ -141,11 +142,17 @@ def mode_progress(step, private, targets):
                 raw = child.read(MAX_LOG + 1)
             if len(raw) > MAX_LOG:
                 break
-            cargo = CargoDiagnostics(ROOT, targets, command).accept(raw, partial=True)
-            return {"commandIndex": index, **cargo.fields()}
+            if step == "contracts":
+                selector = contract_selector(command)
+                fields = {"phase": "contracts"}
+                if selector:
+                    fields, _ = contract_details(ANSI.sub(b"", raw), checkout_contracts(ROOT, selector))
+            else:
+                fields = CargoDiagnostics(ROOT, targets, command).accept(raw, partial=True).fields()
+            return {"commandIndex": index, **fields}
         except FileNotFoundError:
             continue
-        except (OSError, ValueError):
+        except (OSError, ValueError, subprocess.SubprocessError):
             break
     return {"phase": "preparing"}
 
@@ -153,22 +160,22 @@ def mode_progress(step, private, targets):
 def execute(step, recipe, private, source, environment, limit=MAX_LOG):
     log = private / (step + "-outer.log")
     targets = diagnostic_targets(step, private, environment) if step in RUST_MODES else None
+    show_progress = targets is not None or step == "contracts"
 
     def report_progress(elapsed):
         publish_result(step, source, {"event": "progress", "elapsedSeconds": round(elapsed, 1),
                                      **mode_progress(step, private, targets)})
 
     captured = capture(recipe.argv, log, cwd=recipe.cwd, environment=environment, timeout=recipe.timeout,
-                       limit=limit, progress=report_progress if targets is not None else None)
+                       limit=limit, progress=report_progress if show_progress else None)
     problem = captured.problem
     details = {}
     if not problem:
         try:
             raw = bounded_read(log, MAX_LOG)
             details, report_problem = project(step, raw, private, source, captured.exit, recipe.category, targets)
-            if captured.exit:
-                problem = report_problem or classify(raw, recipe.category)
-        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            problem = report_problem or (classify(raw, recipe.category) if captured.exit else None)
+        except (OSError, ValueError, KeyError, TypeError, AttributeError, subprocess.SubprocessError):
             # Preserve the command exit even if its evidence is missing or
             # malformed. A successful command without required evidence fails.
             problem = "SCREENING_ERROR"
@@ -178,7 +185,7 @@ def execute(step, recipe, private, source, environment, limit=MAX_LOG):
                     problem = classified
                 except (OSError, ValueError):
                     pass
-    elif targets is not None and problem in {"TIMEOUT", "INTERRUPTED", "OUTPUT_LIMIT"}:
+    elif show_progress and problem in {"TIMEOUT", "INTERRUPTED", "OUTPUT_LIMIT"}:
         details = {"partial": mode_progress(step, private, targets)}
     return {"exit": captured.exit, "seconds": captured.seconds, "classification": problem or "PASS", **details}
 
