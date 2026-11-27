@@ -1,0 +1,85 @@
+name: P14-D8 targeted diagnostics
+
+on:
+  push:
+    branches: [codex/v2-p14-d8-diagnostics]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: p14-d8-diagnostics
+  cancel-in-progress: false
+
+env:
+  ASF_D8_PARENT: '36e5921f221cb8499f35c7490adf7885bcfb738b'
+  CARGO_INCREMENTAL: '0'
+  CARGO_BUILD_JOBS: '1'
+  CARGO_PROFILE_DEV_DEBUG: '0'
+  CARGO_PROFILE_TEST_DEBUG: '0'
+  PYTHONDONTWRITEBYTECODE: '1'
+
+jobs:
+  diagnose:
+    if: github.event_name == 'push' && github.repository_id == '1331414491' && github.ref == 'refs/heads/codex/v2-p14-d8-diagnostics'
+    name: D8 ${{ matrix.lane }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - lane: Windows
+            runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            minutes: 60
+          - lane: Intel
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+            minutes: 90
+          - lane: ARM64
+            runner: macos-15
+            target: aarch64-apple-darwin
+            minutes: 120
+          - lane: Firefox
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            minutes: 90
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: ${{ matrix.minutes }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 2
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.14.5'
+      - name: Verify exact diagnostic source
+        run: python -B scripts/v2_p14/ci.py d8-preflight
+      - name: Verify native host
+        run: python -B scripts/v2_p14/ci.py host --target ${{ matrix.target }}
+      - if: matrix.lane == 'Windows'
+        run: python -B scripts/v2_p14/ci.py d8-memory --target ${{ matrix.target }}
+      - if: matrix.lane == 'Intel'
+        run: python -B scripts/v2_p14/ci.py d8-pty --target ${{ matrix.target }}
+      - if: matrix.lane == 'ARM64' || matrix.lane == 'Firefox'
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version-file: .node-version
+          package-manager-cache: false
+      - if: matrix.lane == 'ARM64' || matrix.lane == 'Firefox'
+        run: python -B scripts/v2_p14/ci.py install-npm
+      - if: matrix.lane == 'ARM64' || matrix.lane == 'Firefox'
+        run: python -B scripts/v2_p14/ci.py npm-ci
+      - if: matrix.lane == 'ARM64' || matrix.lane == 'Firefox'
+        run: python -B scripts/v2_p14/ci.py frontend-build
+      - if: matrix.lane == 'ARM64' || matrix.lane == 'Firefox'
+        run: python -B scripts/v2_p14/ci.py build --target ${{ matrix.target }}
+      - if: matrix.lane == 'ARM64'
+        run: python -B scripts/v2_p14/ci.py embedded-compile --target ${{ matrix.target }}
+      - if: matrix.lane == 'ARM64'
+        run: python -B scripts/v2_p14/ci.py embedded-tests --target ${{ matrix.target }}
+      - if: matrix.lane == 'Firefox'
+        run: python -B scripts/v2_p14/ci.py d8-firefox-install
+      - if: matrix.lane == 'Firefox'
+        run: python -B scripts/v2_p14/ci.py d8-firefox --target ${{ matrix.target }}
