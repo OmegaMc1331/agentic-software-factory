@@ -6,7 +6,7 @@ mod service;
 mod store;
 mod types;
 
-pub use error::{FileError, Result};
+pub use error::{FileError, FileReadFailure, FileReadPhase, Result};
 pub use path::validate_path;
 pub use search::{SearchHit, SearchRequest, SearchResponse};
 pub use service::FileService;

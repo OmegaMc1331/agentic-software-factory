@@ -81,7 +81,9 @@ def mode_details(folder, mode, source, exit_code, kind, targets=None):
         if targets is not None:
             cargo = CargoDiagnostics(ROOT, targets, argv).accept(raw, partial=bool(row.get("captureProblem")))
             diagnostic = cargo.fields()
-            if argv[:2] == ["cargo", "test"]:
+            if "--no-run" in argv and not status and not cargo.build_complete:
+                raise PrivacyError("Missing successful Cargo compile receipt")
+            if argv[:2] == ["cargo", "test"] and "--no-run" not in argv:
                 if not status and (not cargo.completed_suites or cargo.expected is not None
                                    or cargo.totals["failed"] or cargo.launch_observed):
                     raise PrivacyError("Incomplete cargo test execution")
@@ -118,6 +120,31 @@ def count_duration(value):
     return round(value, 3)
 
 
+KEYBOARD_CASE = "A11Y keyboard-only project, editor, settings, conversation and notification journey"
+KEYBOARD_STAGES = frozenset((
+    "palette_activation", "palette_focus", "palette_query", "palette_selection", "project_switch",
+    "quick_open_search", "root_ready", "result_selection", "editor_focus", "editor_input",
+    "disk_save", "editor_tab_mode", "settings_search", "settings_category", "settings_category_focus",
+    "preference_update", "save_focus_restore", "conversation_create", "composer_focus",
+    "project_return", "notification_navigation",
+))
+KEYBOARD_ROLES = {"search", "editor", "result", "settings", "button", "composer", "none"}
+KEYBOARD_ACTIONS = {"switch_project", "quick_open", "settings", "conversation", "return_project", "notifications", "none"}
+
+
+def keyboard_projection(test):
+    if test.get("name") != KEYBOARD_CASE or type(test.get("error")) is not dict:
+        return None
+    item = test["error"].get("keyboard")
+    if (type(item) is dict and set(item) == {"checkpoint", "role", "action", "focusReached", "tabCount"}
+            and all(type(item[key]) is str for key in ("checkpoint", "role", "action"))
+            and item["checkpoint"] in KEYBOARD_STAGES and item["role"] in KEYBOARD_ROLES
+            and item["action"] in KEYBOARD_ACTIONS and type(item["focusReached"]) is bool
+            and type(item["tabCount"]) is int and 0 <= item["tabCount"] <= 180):
+        return item
+    return None
+
+
 def browser_details(file, exit_code):
     receipt = parse(bounded_read(file, JSON_LIMIT))
     states = [test["status"] for test in receipt["tests"]]
@@ -129,6 +156,8 @@ def browser_details(file, exit_code):
     details = {"tests": count(len(states)), "passed": states.count("PASS"), "failed": states.count("FAILED"), "ignored": 0}
     if "FAILED" in states:
         details["failedTestIndex"] = states.index("FAILED") + 1
+        if keyboard := keyboard_projection(receipt["tests"][details["failedTestIndex"] - 1]):
+            details["keyboard"] = keyboard
     failure = receipt.get("error")
     if type(failure) is dict and failure.get("code") in {"HTTP_STATUS", "BROWSER_ASSERTION", "BROWSER_EXECUTION"}:
         details["assertionCode"] = failure["code"]

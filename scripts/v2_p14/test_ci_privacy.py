@@ -86,7 +86,7 @@ class PrivacyContracts(unittest.TestCase):
             stdin=subprocess.DEVNULL, capture_output=True, timeout=20,
         )
         self.assertEqual(result.returncode, 0)
-        self.assertIn(b"# pass 1", result.stdout)
+        self.assertIn(b"ok 1 - PRIV-07 authenticated error projects status alone\n", result.stdout.replace(b"\r\n", b"\n"))
         self.assertNotIn(b"synthetic-private-response-body", result.stdout + result.stderr)
         self.assertFalse(self.publish.exists())
 
@@ -478,8 +478,14 @@ class WorkflowPrivacyContracts(unittest.TestCase):
 
         browser = workflow.split("\n  browsers:\n", 1)[1]
         self.assertIn("candidate-native-x86_64-unknown-linux-gnu-${{ github.sha }}", browser)
-        self.assertNotIn("run-id:", browser)
-        self.assertNotIn("pattern:", browser)
+        self.assertEqual(browser.count("actions/download-artifact@"), 1)
+        download = browser.split("actions/download-artifact@", 1)[1].split("\n      - ", 1)[0]
+        inputs = [line.strip() for line in download.splitlines()[2:]]
+        self.assertEqual(inputs, [
+            "name: candidate-native-x86_64-unknown-linux-gnu-${{ github.sha }}",
+            "path: ${{ runner.temp }}/asf-p14/private/downloaded-linux",
+        ])
+        self.assertIn("engine: [chromium, firefox, webkit]", browser)
         self.assertLess(browser.index("actions/download-artifact@"), browser.index("ci.py browser-unpack"))
         self.assertLess(browser.index("ci.py browser-unpack"), browser.index("ci.py browser --engine"))
 

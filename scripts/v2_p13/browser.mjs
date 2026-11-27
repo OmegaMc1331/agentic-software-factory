@@ -6,7 +6,7 @@ import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { createRequire } from 'node:module';
-import { browserFailure, requireHttpOk } from './browser-diagnostics.mjs';
+import { browserFailure, KEYBOARD_CASE, requireHttpOk } from './browser-diagnostics.mjs';
 const root=process.cwd(), binary=process.env.ASF_P13_BINARY, output=process.env.ASF_P13_OUTPUT;
 const publicCi=process.env.ASF_P14_PUBLIC_CI==='1';
 assert.ok(binary&&output,'Select a copied embedded binary and a fresh evidence directory');
@@ -19,12 +19,13 @@ const axe=require('axe-core');
 const hash=b=>createHash('sha256').update(b).digest('hex');
 const result={schema:1,mode:'production-product-browser-controlled-failure-no-model',startedAt:new Date().toISOString(),binarySha256:hash(await fs.readFile(binary)),fixture:await fs.mkdtemp(path.join(os.tmpdir(),'asf-p13-ui-')),tests:[],screenshots:[],accessibility:[],timings:[],pageErrors:[],mutations:[],modelInvocations:0,remoteWrites:0};
 let child,browser,context,page,inspector,base,csrf;
+let keyboardState;
 const persist=()=>fs.writeFile(path.join(output,'results.json'),JSON.stringify(result,null,2)+'\n');
 function git(args,cwd){const r=spawnSync('git',args,{cwd,windowsHide:true,encoding:'utf8',timeout:60000});assert.equal(r.status,0,r.stderr);return r.stdout.trim();}
 async function until(fn,what,ms=45000){const start=performance.now();while(performance.now()-start<ms){const v=await fn();if(v)return v;await new Promise(r=>setTimeout(r,200));}throw Error('Timed out: '+what);}
 async function api(url,method='GET',data){const r=await inspector.fetch(base+'/api'+url,{method,headers:{Origin:base,'X-Factory-CSRF':csrf},...(data===undefined?{}:{data})});requireHttpOk(r);return r.json();}
 const get=(p,s)=>api(`/projects/${p.id}/${s}`);
-async function test(name,fn){const at=performance.now();try{await fn();result.tests.push({name,status:'PASS',ms:performance.now()-at});}catch(e){result.tests.push({name,status:'FAILED',error:browserFailure(e)});throw e;}finally{await persist();}}
+async function test(name,fn){const at=performance.now();try{await fn();result.tests.push({name,status:'PASS',ms:performance.now()-at});}catch(e){result.tests.push({name,status:'FAILED',ms:performance.now()-at,error:browserFailure(e, name===KEYBOARD_CASE?keyboardState:undefined)});throw e;}finally{await persist();}}
 async function shot(name){if(publicCi)return;const file=`screenshots/${name}.png`;await page.screenshot({path:path.join(output,file)});result.screenshots.push({file,sha256:hash(await fs.readFile(path.join(output,file)))});await persist();}
 async function settled(){await until(async()=>(await page.locator('.ws-status').innerText()).includes('Workspace saved'),'durable workspace presentation');}
 async function view(name){await page.getByRole('button',{name:'Views',exact:true}).click();await page.getByRole('menuitem',{name,exact:true}).click();}
@@ -45,7 +46,7 @@ try{
   const a=result.projects.A,b=result.projects.B;
   await test('CMD keyboard palette focus, reference and real context',async()=>{const button=page.getByRole('button',{name:'Commands',exact:true});await button.focus();await page.keyboard.press('Control+Shift+p');await page.getByLabel('Search commands').waitFor();await page.getByLabel('Search commands').fill('settings');await shot('command-palette');await page.getByLabel('Search commands').press('Escape');await until(()=>button.evaluate(e=>document.activeElement===e),'palette focus restoration');await command('Open Settings');const settings=page.locator('.product-settings:visible').last();await settings.getByLabel('Search settings').fill('indentation');await settings.getByRole('button',{name:/Editor Application/}).click();await settings.getByLabel('Editor font size').fill('16');await settings.getByRole('button',{name:'Save application preferences',exact:true}).click();await settings.getByText('Application preferences saved by the server.',{exact:true}).waitFor();assert.equal((await api('/application/preferences')).preferences.editor_font_size,16);await shot('settings-search-editor');});
   await test('UX CodeMirror save, preferences and real Source Control',async()=>{await openFile('sample.py');const editor=page.getByRole('textbox',{name:'Source editor sample.py',exact:true}).last();result.fontBefore=await editor.evaluate(e=>Array.from({length:4},()=>{const row={class:e.className,font:getComputedStyle(e).fontSize};e=e.parentElement;return row}));await persist();await until(()=>editor.evaluate(e=>getComputedStyle(e).fontSize==='16px'),'acknowledged editor font preference',16000);a.changed=(await fs.readFile(path.join(a.root,'sample.py'),'utf8')).replace('VALUE_2 = 2','VALUE_2 = 200').replace('VALUE_30 = 30','VALUE_30 = 3000');await editor.click();await editor.press('Control+a');await page.keyboard.insertText(a.changed);await editor.press('Control+s');await until(async()=>(await fs.readFile(path.join(a.root,'sample.py'),'utf8'))===a.changed,'actual saved disk text');await command('Open Source Control');const sc=page.locator('.asf-source:visible').last();await sc.getByRole('button',{name:'Refresh repository',exact:true}).click();await sc.getByRole('button',{name:/M\s*sample.py/}).click();await sc.getByRole('button',{name:'Stage hunk 1',exact:true}).first().click();await until(()=>git(['diff','--cached'],a.root).includes('VALUE_2 = 200'),'first selected hunk staged');assert.ok(git(['diff'],a.root).includes('VALUE_30 = 3000'));await sc.getByText('1 staged paths \u00b7 only index contents will be committed',{exact:true}).waitFor();await shot('source-control-hunk');await sc.getByLabel('Commit message',{exact:true}).fill('P13 exact staged hunk');await sc.getByRole('button',{name:'Commit staged changes',exact:true}).click();await until(()=>git(['rev-parse','HEAD'],a.root)!==a.head,'actual local commit');a.localCommit=git(['rev-parse','HEAD'],a.root);assert.ok(!git(['show','HEAD:sample.py'],a.root).includes('VALUE_30 = 3000'));});
-  await test('NOTIF actual failed Planner, durable event, scoped deep link and read state',async()=>{await command('New mission');const chat=page.locator('.chat-panel:visible').last();await chat.getByLabel('Mission objective',{exact:true}).fill('Controlled unavailable-provider product acceptance. Do not modify source or publish.');const response=page.waitForResponse(r=>r.request().method()==='POST'&&r.url().endsWith('/messages'));await chat.getByRole('button',{name:'Plan and start mission',exact:true}).click();const posted=await response;assert.equal(posted.status(),202,await posted.text());a.sessionId=posted.request().postDataJSON().workspace_session_id;await until(async()=>{const runs=await get(a,'runs');const entries=Array.isArray(runs)?runs:runs.items;const failed=entries?.find(r=>r.status==='failed');if(failed)a.runId=failed.id;return failed;},'actual failed Planner mission');const feed=await until(async()=>{const p=await get(a,'notifications?limit=50');return p.items.some(n=>n.run_id===a.runId)&&p;},'durable failed mission notification');a.notification=feed.items.find(n=>n.run_id===a.runId);assert.equal((await get(b,'notifications')).unread,0);await command('Open notifications');const center=page.getByRole('region',{name:'Notification center'});await center.getByRole('button',{name:'Refresh notifications',exact:true}).click();await center.getByText('Mission failed',{exact:true}).waitFor();await shot('failed-mission-notification');await center.getByRole('button',{name:'Open related mission',exact:true}).first().click();await until(async()=>(await get(a,'notifications')).items.find(n=>n.id===a.notification.id)?.read_at,'acknowledged notification read state');await page.getByText('Run status: failed',{exact:true}).last().waitFor();const target=page.locator('.ws-view:visible').filter({has:page.getByRole('heading',{name:/^Controlled unavailable-provider product acceptance\./})}).last();await target.waitFor();assert.equal(await target.getAttribute('data-project-id'),a.id);await shot('notification-target-mission');});
+  await test('NOTIF actual failed Planner, durable event, scoped deep link and read state',async()=>{await command('New mission');const chat=page.locator('.chat-panel:visible').last();await chat.getByLabel('Mission objective',{exact:true}).fill('Controlled unavailable-provider product acceptance. Do not modify source or publish.');const [posted]=await Promise.all([page.waitForResponse(r=>r.request().method()==='POST'&&r.url().endsWith('/messages')),chat.getByRole('button',{name:'Plan and start mission',exact:true}).click()]);assert.equal(posted.status(),202);a.sessionId=posted.request().postDataJSON().workspace_session_id;await until(async()=>{const runs=await get(a,'runs');const entries=Array.isArray(runs)?runs:runs.items;const failed=entries?.find(r=>r.status==='failed');if(failed)a.runId=failed.id;return failed;},'actual failed Planner mission');const feed=await until(async()=>{const p=await get(a,'notifications?limit=50');return p.items.some(n=>n.run_id===a.runId)&&p;},'durable failed mission notification');a.notification=feed.items.find(n=>n.run_id===a.runId);assert.equal((await get(b,'notifications')).unread,0);await command('Open notifications');const center=page.getByRole('region',{name:'Notification center'});await center.getByRole('button',{name:'Refresh notifications',exact:true}).click();await center.getByText('Mission failed',{exact:true}).waitFor();await shot('failed-mission-notification');await center.getByRole('button',{name:'Open related mission',exact:true}).first().click();await until(async()=>(await get(a,'notifications')).items.find(n=>n.id===a.notification.id)?.read_at,'acknowledged notification read state');await page.getByText('Run status: failed',{exact:true}).last().waitFor();const target=page.locator('.ws-view:visible').filter({has:page.getByRole('heading',{name:/^Controlled unavailable-provider product acceptance\./})}).last();await target.waitFor();assert.equal(await target.getAttribute('data-project-id'),a.id);await shot('notification-target-mission');});
   await test('UX cross-project switch, all presets and current views',async()=>{for(const name of ['Agents','Memory','Extensions','Development terminal']){await view(name);await shot(name.toLowerCase().replaceAll(' ','-'));}for(const name of ['Focus','Code','Agents','Review']){await page.getByRole('button',{name,exact:true}).first().click();await settled();await shot('preset-'+name.toLowerCase());}await select(b);await command('Open notifications');await page.getByText('No notifications on this page',{exact:true}).waitFor();await shot('project-b-isolation');await select(a);});
   await test('SET backend persistence, safe reload and no replayed mission',async()=>{const before=await get(a,`runs/${a.runId}`),head=git(['rev-parse','HEAD'],a.root);await settled();const restoreBegan=performance.now();await page.reload();await settled();result.timings.push({name:'populated workspace reload through durable presentation save',ms:performance.now()-restoreBegan});assert.equal((await api('/application/preferences')).preferences.editor_font_size,16);const after=await get(a,`runs/${a.runId}`);assert.deepEqual(after.sessions.map(s=>s.id),before.sessions.map(s=>s.id));assert.equal(git(['rev-parse','HEAD'],a.root),head);assert.ok((await get(a,'notifications')).items.find(n=>n.id===a.notification.id)?.read_at);await shot('restored-workspace');});
   await test('SET acknowledged default layout applies to a new session and preserves existing sessions',async()=>{await command('Open Settings');const settings=page.locator('.product-settings:visible').last();await settings.getByLabel('Search settings').fill('General');await settings.getByRole('button',{name:/General Application/}).click();await settings.getByLabel('Default layout for new sessions').selectOption('Review');await settings.getByRole('button',{name:'Save application preferences',exact:true}).click();await until(async()=>(await api('/application/preferences')).preferences.default_layout==='Review','default layout acknowledged');const docs=await api('/workspaces');const before=await api('/workspaces/'+docs[0].id);const count=before.document.sessions.length;await page.getByRole('button',{name:'New workspace session',exact:true}).click();await settled();const after=await api('/workspaces/'+docs[0].id);assert.equal(after.document.sessions.length,count+1);assert.equal(after.document.sessions.find(s=>s.id===after.document.activeSessionId).preset,'Review');for(const session of before.document.sessions)assert.ok(after.document.sessions.some(s=>s.id===session.id));});
@@ -53,14 +54,132 @@ try{
   await test('A11Y actual major workspace surfaces',async()=>{for(const name of ['Explorer','Agents','Memory','Source Control','Extensions','Progress','Orchestrator','Development terminal']){await view(name);await page.waitForTimeout(750);await audit(name);assert.equal(await page.getByText('This view could not be displayed',{exact:true}).count(),0);}});
   result.resourceSamples=[];for(let i=0;i<6;i++){const at=performance.now();await command('Open Settings');await command('Open Memory');await command('Open notifications');result.timings.push({name:'three warm panel navigations',ms:performance.now()-at});result.resourceSamples.push(await page.evaluate(()=>({heap:performance.memory?.usedJSHeapSize,domNodes:document.getElementsByTagName('*').length})));}
   result.openCloseSamples=[];for(let i=0;i<6;i++){await command('Open Memory');await page.locator('.asf-memory:visible').last().waitFor();await command('Close current presentation tab');await until(async()=>(await page.locator('.asf-memory:visible').count())===0,'memory view unmounted after explicit presentation close');result.openCloseSamples.push(await page.evaluate(()=>({heap:performance.memory?.usedJSHeapSize,domNodes:document.getElementsByTagName('*').length})));}
-  await test('A11Y keyboard-only project, editor, settings, conversation and notification journey',async()=>{
-    const tabTo=async locator=>{for(let n=0;n<180;n++){if(await locator.count()&&await locator.first().evaluate(e=>e===document.activeElement))return;await page.keyboard.press('Tab');}throw Error('Keyboard target was not reachable');};
-    const keys=async query=>{await page.keyboard.press('Control+Shift+p');await page.getByLabel('Search commands').waitFor();await until(()=>page.getByLabel('Search commands').evaluate(e=>document.activeElement===e),'palette keyboard focus');await page.keyboard.type(query);await until(()=>page.getByLabel('Search commands').inputValue().then(value=>value===query),'typed palette query');const titles=await page.getByRole('listbox',{name:'Workspace commands'}).locator('[role="option"] strong').allTextContents();const selected=titles.indexOf(query);assert.ok(selected>=0,'Actual command is searchable: '+query);for(let n=0;n<selected;n++)await page.keyboard.press('ArrowDown');await until(()=>page.getByRole('listbox',{name:'Workspace commands'}).getByRole('option').nth(selected).getAttribute('aria-selected').then(value=>value==='true'),'keyboard selected command');result.keyboardTrace??=[];result.keyboardTrace.push({query,titles,selected});await persist();await page.keyboard.press('Enter');};
-    await keys('Switch project: B');await until(()=>page.locator('#project-'+b.id).getAttribute('aria-selected').then(value=>value==='true'),'keyboard project switch');
-    await keys('Quick open file');const search=page.locator('.files-search:visible').last();await tabTo(search.getByLabel('Find file',{exact:true}));await page.keyboard.type('sample.py');await until(()=>search.getByRole('button',{name:'Search',exact:true}).isEnabled(),'authorized search root and query ready');await page.keyboard.press('Enter');const hit=search.locator('.files-search-hit').filter({hasText:'sample.py'}).first();await hit.waitFor();await tabTo(hit);await page.keyboard.press('Enter');const editor=page.getByRole('textbox',{name:'Source editor sample.py',exact:true}).last();await editor.waitFor();await tabTo(editor);await page.keyboard.press('Control+End');await page.keyboard.press('Enter');await page.keyboard.type('# Keyboard-only saved draft');await page.keyboard.press('Control+s');await until(async()=>(await fs.readFile(path.join(b.root,'sample.py'),'utf8')).includes('# Keyboard-only saved draft'),'keyboard save reaches project B disk');await page.keyboard.press('Control+m');
-    await keys('Open Settings');const settings=page.locator('.product-settings:visible').last();await tabTo(settings.getByLabel('Search settings'));await page.keyboard.type('indentation');const category=settings.getByRole('button',{name:/Editor Application/});await tabTo(category);await page.keyboard.press('Enter');await until(()=>settings.getByLabel('Editor font size').evaluate(e=>e===document.activeElement),'settings category moves focus');await page.keyboard.press('Control+a');await page.keyboard.type('17');await tabTo(settings.getByRole('button',{name:'Save application preferences',exact:true}));await page.keyboard.press('Enter');await until(async()=>(await api('/application/preferences')).preferences.editor_font_size===17,'keyboard setting acknowledgement');await page.getByText('Application preferences saved by the server.',{exact:true}).waitFor();await until(()=>settings.getByLabel('Editor font size').evaluate(e=>document.activeElement===e),'focus restored after save action removal');
-    await keys('Focus orchestrator conversation');const createConversation=page.locator('.chat-panel:visible').last().getByRole('button',{name:'New conversation',exact:true});await tabTo(createConversation);await page.keyboard.press('Enter');const composer=page.getByLabel('Message to orchestrator',{exact:true}).last();await composer.waitFor();await tabTo(composer);await page.keyboard.type('Keyboard journey draft. Do not send.');
-    await keys('Switch project: A very long registered project name for product acceptance');await until(()=>page.locator('#project-'+a.id).getAttribute('aria-selected').then(value=>value==='true'),'keyboard return to owning project');await keys('Open notifications');const open=page.getByRole('button',{name:'Open related mission',exact:true}).last();await open.waitFor();await tabTo(open);await page.keyboard.press('Enter');await page.getByText('Run status: failed',{exact:true}).last().waitFor();await shot('keyboard-only-completed');
+  await test(KEYBOARD_CASE, async () => {
+    let action = 'none';
+    const mark = (checkpoint, role = 'none') => {
+      keyboardState = { checkpoint, role, action, focusReached: false, tabCount: 0 };
+    };
+    const tabTo = async locator => {
+      await locator.first().waitFor();
+      for (let n = 0; n < 180; n++) {
+        keyboardState.tabCount = n;
+        if (await locator.evaluateAll(elements => elements[0] === document.activeElement)) {
+          keyboardState.focusReached = true;
+          return;
+        }
+        await page.keyboard.press('Tab');
+      }
+      keyboardState.tabCount = 180;
+      throw Error('Keyboard target was not reachable');
+    };
+    const keys = async (commandAction, query) => {
+      action = commandAction;
+      mark('palette_activation', 'search');
+      await page.keyboard.press('Control+Shift+p');
+      const search = page.getByLabel('Search commands');
+      await search.waitFor();
+      mark('palette_focus', 'search');
+      await until(() => search.evaluate(e => document.activeElement === e), 'palette keyboard focus');
+      keyboardState.focusReached = true;
+      mark('palette_query', 'search');
+      await page.keyboard.type(query);
+      await until(() => search.inputValue().then(value => value === query), 'typed palette query');
+      mark('palette_selection', 'search');
+      const list = page.getByRole('listbox', { name: 'Workspace commands' });
+      const titles = await list.locator('[role="option"] strong').allTextContents();
+      const selected = titles.indexOf(query);
+      assert.ok(selected >= 0, 'Actual command is searchable');
+      for (let n = 0; n < selected; n++) await page.keyboard.press('ArrowDown');
+      await until(() => list.getByRole('option').nth(selected).getAttribute('aria-selected').then(
+        value => value === 'true'), 'keyboard selected command');
+      result.keyboardTrace ??= [];
+      result.keyboardTrace.push({ query, titles, selected });
+      await persist();
+      await page.keyboard.press('Enter');
+    };
+
+    await keys('switch_project', 'Switch project: B');
+    mark('project_switch');
+    await until(() => page.locator('#project-' + b.id).getAttribute('aria-selected').then(
+      value => value === 'true'), 'keyboard project switch');
+
+    await keys('quick_open', 'Quick open file');
+    const search = page.locator('.files-search:visible').last();
+    mark('quick_open_search', 'search');
+    await tabTo(search.getByLabel('Find file', {exact: true}));
+    await page.keyboard.type('sample.py');
+    mark('root_ready', 'search');
+    await until(() => search.getByRole('button', {name: 'Search', exact: true}).isEnabled(),
+      'authorized search root and query ready');
+    await page.keyboard.press('Enter');
+    mark('result_selection', 'result');
+    const hit = search.locator('.files-search-hit').filter({hasText: 'sample.py'}).first();
+    await hit.waitFor();
+    await tabTo(hit);
+    await page.keyboard.press('Enter');
+    mark('editor_focus', 'editor');
+    const editor = page.getByRole('textbox', {name: 'Source editor sample.py', exact: true}).last();
+    await editor.waitFor();
+    await tabTo(editor);
+    mark('editor_input', 'editor');
+    await page.keyboard.press('Control+End');
+    await page.keyboard.press('Enter');
+    await page.keyboard.type('# Keyboard-only saved draft');
+    mark('disk_save', 'editor');
+    await page.keyboard.press('Control+s');
+    await until(async () => (await fs.readFile(path.join(b.root, 'sample.py'), 'utf8'))
+      .includes('# Keyboard-only saved draft'), 'keyboard save reaches project B disk');
+    mark('editor_tab_mode', 'editor');
+    await page.keyboard.press('Control+m');
+
+    await keys('settings', 'Open Settings');
+    const settings = page.locator('.product-settings:visible').last();
+    mark('settings_search', 'search');
+    await tabTo(settings.getByLabel('Search settings'));
+    await page.keyboard.type('indentation');
+    const category = settings.getByRole('button', {name: /Editor Application/});
+    mark('settings_category', 'button');
+    await tabTo(category);
+    await page.keyboard.press('Enter');
+    mark('settings_category_focus', 'settings');
+    const size = settings.getByLabel('Editor font size');
+    await until(() => size.evaluate(e => e === document.activeElement), 'settings category moves focus');
+    keyboardState.focusReached = true;
+    mark('preference_update', 'settings');
+    await page.keyboard.press('Control+a');
+    await page.keyboard.type('17');
+    await tabTo(settings.getByRole('button', {name: 'Save application preferences', exact: true}));
+    await page.keyboard.press('Enter');
+    await until(async () => (await api('/application/preferences')).preferences.editor_font_size === 17,
+      'keyboard setting acknowledgement');
+    mark('save_focus_restore', 'settings');
+    await page.getByText('Application preferences saved by the server.', {exact: true}).waitFor();
+    await until(() => size.evaluate(e => e === document.activeElement), 'focus restored after save action removal');
+
+    await keys('conversation', 'Focus orchestrator conversation');
+    mark('conversation_create', 'button');
+    const create = page.locator('.chat-panel:visible').last().getByRole('button',
+      {name: 'New conversation', exact: true});
+    await tabTo(create);
+    await page.keyboard.press('Enter');
+    mark('composer_focus', 'composer');
+    const composer = page.getByLabel('Message to orchestrator', {exact: true}).last();
+    await composer.waitFor();
+    await tabTo(composer);
+    await page.keyboard.type('Keyboard journey draft. Do not send.');
+
+    await keys('return_project', 'Switch project: A very long registered project name for product acceptance');
+    mark('project_return');
+    await until(() => page.locator('#project-' + a.id).getAttribute('aria-selected').then(
+      value => value === 'true'), 'keyboard return to owning project');
+    await keys('notifications', 'Open notifications');
+    mark('notification_navigation', 'button');
+    const open = page.getByRole('button', {name: 'Open related mission', exact: true}).last();
+    await open.waitFor();
+    await tabTo(open);
+    await page.keyboard.press('Enter');
+    await page.getByText('Run status: failed', {exact: true}).last().waitFor();
+    await shot('keyboard-only-completed');
   });
   const violations=result.accessibility.flatMap(a=>a.violations);assert.deepEqual(violations,[],'Automated accessibility violations must be resolved or specifically explained before qualification');assert.deepEqual(result.pageErrors,[]);assert.equal(result.mutations.filter(r=>/\/source-control\/(delivery|github)/.test(r.path)).length,0);result.status='PASS';
 }catch(e){result.status='FAILED';result.error=browserFailure(e);if(page)await shot('failure').catch(()=>{});process.exitCode=1;}

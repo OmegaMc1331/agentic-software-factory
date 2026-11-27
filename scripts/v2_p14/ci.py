@@ -15,12 +15,14 @@ from tempfile import TemporaryDirectory
 
 import ci_artifacts as artifacts
 from ci_capture import MAX_LOG, capture
-from ci_privacy import JSON_LIMIT, PrivacyError, bounded_read, is_link, parse
+from ci_privacy import JSON_LIMIT, MEMBER_LIMIT, PrivacyError, bounded_read, digest, is_link, parse
 from ci_python import checkout_contracts, contract_details, contract_selector
 from ci_results import ANSI, browser_details, classify, count, mode_details, smoke_details
+from ci_resources import sample
 from ci_rust import CargoDiagnostics, checkout_inventory
 import package
 from run import MODES as COMMANDS
+from run import RELEASE_MODES
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -28,19 +30,20 @@ DASHBOARD = ROOT / "apps/dashboard"
 BROWSERS = ("chromium", "firefox", "webkit")
 LINUX = "x86_64-unknown-linux-gnu"
 INTEL_MAC = "x86_64-apple-darwin"
-RUST_MODES = {"rust", "normal", "build", "embedded-tests"}
+RUST_MODES = {"rust", "normal", "d8-memory", "d8-pty"} | RELEASE_MODES
 MODES = {
     "frontend": ("BUILD_FAILURE", 1500), "frontend-tests": ("TEST_FAILURE", 1500),
     "contracts": ("TEST_FAILURE", 900), "rust": ("TEST_FAILURE", 6600),
     "normal": ("TEST_FAILURE", 6600), "build": ("BUILD_FAILURE", 6600),
-    "embedded-tests": ("TEST_FAILURE", 6600),
+    "embedded-tests": ("TEST_FAILURE", 6600), "embedded-compile": ("BUILD_FAILURE", 5700),
+    "d8-memory": ("TEST_FAILURE", 3000), "d8-pty": ("TEST_FAILURE", 4200),
 }
 ID = re.compile(r"[a-z][a-z0-9-]{0,39}")
 STEPS = set(MODES) | {
     "install-npm", "npm-ci", "frontend-build", "npm-audit", "dependencies", "host", "native-package",
     "native-smoke", "native-checksum", "assemble", "verify-inventory", "finalize-inventory", "inventory-checksum",
     "playwright-install", "browser", "stage-native", "approve-native", "stage-inventory", "approve-inventory",
-    "browser-unpack",
+    "browser-unpack", "d8-preflight", "d8-firefox-install", "d8-firefox",
 }
 
 
@@ -97,7 +100,9 @@ def recipes(private, target, source):
         "finalize-inventory": Run(node(checksums, "finalize-release", assembled), "SCREENING_ERROR"),
         "inventory-checksum": Run(["sha256sum", "-c", artifacts.CHECKSUMS], "SCREENING_ERROR", cwd=assembled),
         "playwright-install": Run(["npx", "playwright", "install", "--with-deps", *BROWSERS], "DEPENDENCY_FAILURE", 1200, DASHBOARD),
+        "d8-firefox-install": Run(["npx", "playwright", "install", "--with-deps", "firefox"], "DEPENDENCY_FAILURE", 1200, DASHBOARD),
         "browser": Run(node("scripts/v2_p13/browser.mjs"), "TEST_FAILURE", 1500),
+        "d8-firefox": Run(node("scripts/v2_p13/browser.mjs"), "TEST_FAILURE", 1500),
         **mode_recipes(private, target),
     }
 
@@ -105,7 +110,7 @@ def recipes(private, target, source):
 def project(step, raw, private, source, status, default, targets=None):
     if step in MODES:
         return mode_details(private, step, source, status, default, targets)
-    if step == "browser":
+    if step in {"browser", "d8-firefox"}:
         return browser_details(private / "browser/results.json", status), None
     if step == "native-smoke":
         return smoke_details(private / "packaged-smoke.json", source, status), None
@@ -161,10 +166,17 @@ def execute(step, recipe, private, source, environment, limit=MAX_LOG):
     log = private / (step + "-outer.log")
     targets = diagnostic_targets(step, private, environment) if step in RUST_MODES else None
     show_progress = targets is not None or step == "contracts"
+    resources = {}
 
     def report_progress(elapsed):
+        fields = mode_progress(step, private, targets)
+        if step in RELEASE_MODES:
+            current = sample(ROOT, environment)
+            for name, value in current.items():
+                resources[name] = min(resources.get(name, value), value)
+            fields["resources"] = current
         publish_result(step, source, {"event": "progress", "elapsedSeconds": round(elapsed, 1),
-                                     **mode_progress(step, private, targets)})
+                                     **fields})
 
     captured = capture(recipe.argv, log, cwd=recipe.cwd, environment=environment, timeout=recipe.timeout,
                        limit=limit, progress=report_progress if show_progress else None)
@@ -187,6 +199,8 @@ def execute(step, recipe, private, source, environment, limit=MAX_LOG):
                     pass
     elif show_progress and problem in {"TIMEOUT", "INTERRUPTED", "OUTPUT_LIMIT"}:
         details = {"partial": mode_progress(step, private, targets)}
+    if resources:
+        details["minimumResourceSamples"] = resources
     return {"exit": captured.exit, "seconds": captured.seconds, "classification": problem or "PASS", **details}
 
 
@@ -219,6 +233,25 @@ def approve(publish, seal, source, scope):
         out.write("approved=true\n")
 
 
+def require_diagnostic_source(source):
+    """Require the single workflow-only commit on the dedicated D8 branch."""
+    expected = os.environ.get("ASF_D8_PARENT", "")
+    if (os.environ.get("GITHUB_EVENT_NAME") != "push"
+            or os.environ.get("GITHUB_REF") != "refs/heads/codex/v2-p14-d8-diagnostics"
+            or os.environ.get("GITHUB_REPOSITORY_ID") != "1331414491"
+            or os.environ.get("GITHUB_SHA") != source
+            or not re.fullmatch(r"[0-9a-f]{40}", expected)):
+        raise PrivacyError("Wrong diagnostic event or source")
+    parents = subprocess.check_output(
+        ["git", "rev-list", "--parents", "-n", "1", source], cwd=ROOT, timeout=15, stderr=subprocess.DEVNULL
+    ).split()
+    changed = subprocess.check_output(
+        ["git", "diff", "--name-only", "-z", expected, source], cwd=ROOT, timeout=15, stderr=subprocess.DEVNULL
+    )
+    if parents != [source.encode("ascii"), expected.encode("ascii")] or changed != b".github/workflows/p14-d8.yml\0":
+        raise PrivacyError("Wrong diagnostic ancestry or diff")
+
+
 def run(args, source):
     base = Path(os.environ["RUNNER_TEMP"]) / "asf-p14"
     private = base / "private"
@@ -229,7 +262,9 @@ def run(args, source):
     if step in {"host", "native-package", "native-checksum", "stage-native", "approve-native"} and not target:
         raise PrivacyError("Native target required")
     publish = base / "public"
-    if step == "stage-native":
+    if step == "d8-preflight":
+        require_diagnostic_source(source.commit)
+    elif step == "stage-native":
         artifacts.stage_native(private / "packages", private / "packaged-smoke.json",
                                publish, private / "seal.json", target, source, ROOT, private)
     elif step == "approve-native":
@@ -257,9 +292,21 @@ def run(args, source):
         if step == "assemble":
             artifacts.received_inventory(private / "downloaded", source.commit)
         env = {**os.environ, "ASF_P14_PUBLIC_CI": "1", "PYTHONUTF8": "1", "NO_COLOR": "1"}
-        if step == "browser":
-            env.update(ASF_P13_BINARY=str(private / "browser-package/factory"),
-                       ASF_P13_OUTPUT=str(private / "browser"), ASF_BROWSER_ENGINE=args.engine)
+        if step in {"browser", "d8-firefox"}:
+            binary = private / "browser-package/factory"
+            engine = args.engine
+            if step == "d8-firefox":
+                # The diagnostic job builds locally on the checked-out SHA.
+                # It cannot consume a stale archive or publish a package.
+                package.host(LINUX)
+                build = parse(bounded_read(private / "build-results.json", JSON_LIMIT))
+                binary = ROOT / "target/release/factory"
+                if (build.get("sourceCommit") != source.commit or build.get("result") != "PASS"
+                        or build.get("sourceUnchanged") is not True
+                        or build.get("binary", {}).get("sha256") != digest(bounded_read(binary, MEMBER_LIMIT))):
+                    raise PrivacyError("Diagnostic browser build proof is incomplete")
+                engine = "firefox"
+            env.update(ASF_P13_BINARY=str(binary), ASF_P13_OUTPUT=str(private / "browser"), ASF_BROWSER_ENGINE=engine)
         return execute(step, recipes(private, target, source.commit)[step], private, source.commit, env)
     return {"exit": 0, "classification": "PASS"}
 

@@ -56,7 +56,7 @@ impl IntoResponse for Error {
             FactoryError::Memory(MemoryError::Invalid(_)) => {
                 (StatusCode::BAD_REQUEST, "invalid_memory")
             }
-            FactoryError::Memory(MemoryError::Source) => {
+            FactoryError::Memory(MemoryError::Source | MemoryError::RepositorySource(_)) => {
                 (StatusCode::FORBIDDEN, "invalid_memory_source")
             }
             FactoryError::Memory(MemoryError::Sensitive) => {
@@ -96,11 +96,17 @@ impl IntoResponse for Error {
                 "memory_storage_or_execution_unavailable",
             ),
         };
-        (
+        let mut response = (
             status,
             Json(json!({"error":self.0.to_string(),"code":code})),
         )
-            .into_response()
+            .into_response();
+        // Response extensions are in-process metadata. The network status
+        // and JSON maintain the existing Memory API error contract.
+        if let FactoryError::Memory(MemoryError::RepositorySource(detail)) = self.0 {
+            response.extensions_mut().insert(detail);
+        }
+        response
     }
 }
 async fn operation(

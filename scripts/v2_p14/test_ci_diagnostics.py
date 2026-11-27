@@ -12,10 +12,12 @@ import unittest
 from unittest.mock import patch
 
 import ci
+import ci_resources
+import run as qualifier
 from ci_privacy import PrivacyError, digest
 from ci_python import contract_details, contract_selector
-from ci_results import mode_details
-from ci_rust import CargoDiagnostics, Target, absolute, declared_tests, target_key, unit_tests
+from ci_results import keyboard_projection, KEYBOARD_CASE, mode_details
+from ci_rust import CargoDiagnostics, PTY_TEST, SETTINGS_TEST, Target, absolute, declared_tests, target_key, unit_tests
 from run import MODES
 from test_ci_privacy import API_KEY, PRIVATE_UNIX, PRIVATE_WIN, SOURCE
 
@@ -210,6 +212,37 @@ fn real_declaration() {}
                 self.assertEqual(command["completedTestCount"], 0)
                 self.assertNotIn("failedTests", command)
 
+    def test_r8_observations_disallow_unknown_values_and_cross_test_fields(self):
+        for scope, fields in (
+            (SETTINGS_TEST, {"memory.source.status": 403, "memory.source.phase": "open"}),
+            (PTY_TEST, {"pty.burst_bytes": 2293760, "pty.healthy_overflow": 0}),
+        ):
+            target = Target(scope[0], scope[1], "test", frozenset({scope[2]}))
+            metadata = {**TARGET, "name": target.name}
+            key = target_key(KEY[0], metadata, CHECKOUT)
+            allowed = "".join(f"ASF_QA_DETAIL:{k}={v}\n" for k, v in fields.items())
+            bad = (f"ASF_QA_DETAIL:memory.source.category={PRIVATE_WIN}\n"
+                   f"ASF_QA_DETAIL:pty.bytes={API_KEY}\n"
+                   "ASF_QA_DETAIL:memory.source.fixture_git=21\n"
+                   "ASF_QA_DETAIL:pty.slow_overflow=500\n"
+                   "ASF_QA_DETAIL:other=secret\n")
+            raw = (compiled().replace(b'"name": "fixture"', f'"name": "{target.name}"'.encode())
+                   + start(1) + f"test {scope[2]} ... FAILED\nfailures:\n---- {scope[2]} stdout ----\n".encode()
+                   + (allowed + bad).encode() + summary(0, 1, 0))
+            projection = CargoDiagnostics(CHECKOUT, {key: target}, COMMAND).accept(raw).fields()
+            self.assertEqual(projection["failedTests"][0]["observations"], fields)
+            self.assert_private(json.dumps(projection))
+
+    def test_keyboard_diagnostics_require_the_frozen_case_and_allowlisted_values(self):
+        fields = {"checkpoint": "editor_focus", "role": "editor", "action": "quick_open",
+                  "focusReached": False, "tabCount": 180}
+        case = {"name": KEYBOARD_CASE, "error": {"keyboard": fields}}
+        self.assertEqual(keyboard_projection(case), fields)
+        self.assertIsNone(keyboard_projection({**case, "name": "unexpected test"}))
+        for changes in ({"checkpoint": PRIVATE_UNIX}, {"role": API_KEY}, {"tabCount": 181}, {"selector": PRIVATE_WIN}):
+            case["error"]["keyboard"] = fields | changes
+            self.assertIsNone(keyboard_projection(case))
+
     def test_progress_counts_completed_suites_and_ignores_partial_lines(self):
         raw = compiled() + start(2) + summary(1, 0, 1)
         partial = raw + start(1) + f"test {SAFE_TEST} ... FAILED".encode()
@@ -278,6 +311,59 @@ fn real_declaration() {}
         linux = ci.mode_recipes(self.raw, ci.LINUX)["embedded-tests"]
         self.assertEqual((intel.argv[-2:], intel.timeout), (["--capture-timeout", "9000"], 9060))
         self.assertEqual((linux.argv[-2:], linux.timeout), (["--capture-timeout", "6600"], 6660))
+
+
+class ReleaseBuildContracts(unittest.TestCase):
+    def test_d8_source_restricts_event_parent_and_workflow_only_diff(self):
+        source, base = "a" * 40, "b" * 40
+        environment = {
+            "ASF_D8_PARENT": base,
+            "GITHUB_EVENT_NAME": "push",
+            "GITHUB_REF": "refs/heads/codex/v2-p14-d8-diagnostics",
+            "GITHUB_REPOSITORY_ID": "1331414491",
+            "GITHUB_SHA": source,
+        }
+        parent = f"{source} {base}\n".encode()
+        workflow = b".github/workflows/p14-d8.yml\0"
+        with patch.dict(os.environ, environment, clear=True):
+            with patch.object(ci.subprocess, "check_output", side_effect=(parent, workflow)):
+                ci.require_diagnostic_source(source)
+            with patch.object(ci.subprocess, "check_output", side_effect=(parent, workflow + b"Cargo.lock\0")):
+                with self.assertRaises(PrivacyError):
+                    ci.require_diagnostic_source(source)
+            with patch.object(ci.subprocess, "check_output", side_effect=(source.encode(), workflow)):
+                with self.assertRaises(PrivacyError):
+                    ci.require_diagnostic_source(source)
+        with patch.dict(os.environ, {**environment, "GITHUB_EVENT_NAME": "workflow_dispatch"}, clear=True):
+            with self.assertRaises(PrivacyError):
+                ci.require_diagnostic_source(source)
+
+    def test_production_and_release_test_compilation_share_one_environment(self):
+        original = {"RUSTFLAGS": "external input", "CARGO_TARGET_DIR": "local-target"}
+        with patch.object(qualifier, "release_rustflags", return_value="controlled-flags"):
+            environment = qualifier.release_environment(original, "42")
+        self.assertEqual(qualifier.RELEASE_MODES, {"build", "embedded-compile", "embedded-tests"})
+        self.assertEqual(environment, {
+            "SOURCE_DATE_EPOCH": "42",
+            "CARGO_ENCODED_RUSTFLAGS": "controlled-flags",
+            "CARGO_PROFILE_RELEASE_LTO": "true",
+            "CARGO_TARGET_DIR": "local-target",
+        })
+        self.assertIn("RUSTFLAGS", original)
+        self.assertIn("--no-run", MODES["embedded-compile"][0])
+        self.assertNotIn("--no-run", MODES["embedded-tests"][0])
+        for mode in qualifier.RELEASE_MODES:
+            self.assertIn("--release", MODES[mode][0])
+            self.assertIn("--locked", MODES[mode][0])
+            self.assertIn("embedded-dashboard", MODES[mode][0])
+
+    def test_unavailable_resource_counters_are_absent(self):
+        with patch.object(ci_resources, "memory_sample", side_effect=OSError(PRIVATE_WIN)):
+            with patch.object(ci_resources.shutil, "disk_usage", side_effect=OSError(PRIVATE_UNIX)):
+                values = ci_resources.sample(CHECKOUT, {})
+        self.assertEqual(set(values) - {"cpuConcurrency"}, set())
+        self.assertNotIn(PRIVATE_WIN, json.dumps(values))
+        self.assertNotIn(PRIVATE_UNIX, json.dumps(values))
 
 
 class PythonDiagnosticsContracts(unittest.TestCase):

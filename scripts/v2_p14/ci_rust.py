@@ -30,16 +30,20 @@ TEST_OUTPUT = re.compile(rb"---- (.{1,256}) stdout ----")
 CHECKPOINT = re.compile(
     rb"(?:assertion .* failed: )?ASF_QA_CHECKPOINT:([a-z0-9._]{1,80})(?:$|: )"
 )
+DETAIL = re.compile(rb"ASF_QA_DETAIL:([a-z0-9._]{1,80})=([a-z0-9_]{1,48})")
+SETTINGS_TEST = ("factory-api", "memory", "settings_are_revisioned_extraction_is_disabled_and_source_reads_use_p05")
+SHUTDOWN_TEST = ("factory-api", "memory", "shutdown_cancels_an_owned_manual_memory_extractor_without_waiting_for_its_timeout")
+PTY_TEST = ("factory-runtime", "factory_runtime", "tests::slow_terminal_subscriber_does_not_stop_the_pty_or_healthy_stream")
 MEMORY_FIXTURE = frozenset("memory.fixture." + name for name in (
     "tempdir", "application", "git_spawn", "git_status", "register", "open", "auth",
 ))
 CHECKPOINTS = {
-    ("factory-api", "memory", "settings_are_revisioned_extraction_is_disabled_and_source_reads_use_p05"):
+    SETTINGS_TEST:
         MEMORY_FIXTURE | {"memory.settings." + name for name in (
             "read", "default", "disabled", "update", "revision", "stale", "context",
             "p05_root", "source_resolution", "source_revision", "source_denied",
         )},
-    ("factory-api", "memory", "shutdown_cancels_an_owned_manual_memory_extractor_without_waiting_for_its_timeout"):
+    SHUTDOWN_TEST:
         MEMORY_FIXTURE | {"memory.shutdown." + name for name in (
             "context", "fixture_script", "fixture_config", "settings", "child_ready", "extraction_join",
             "deadline", "server_join", "cancellation", "server", "interrupted_status", "session_count",
@@ -49,7 +53,55 @@ CHECKPOINTS = {
         {"ownership.concurrent." + name for name in ("live_context", "close", "second_owner", "reopen")},
     ("factory-projects", "projects", "registry_mutations_cannot_relink_or_remove_a_runtime_owned_by_another_manager"):
         {"ownership.relink." + name for name in ("remove_locked", "relink_locked", "close", "after_close", "open_relinked")},
+    PTY_TEST: {"pty." + name for name in (
+        "fixture.executor", "child_start", "subscribe", "cursor", "ready", "start", "burst",
+        "slow_overflow", "healthy_continuity", "byte_count", "resume", "alive",
+        "disconnected", "persisted", "persisted_output",
+    )},
 }
+
+MEMORY_RESPONSE = {
+    "status": (100, 599),
+    "code": frozenset((
+        "invalid_memory_source", "sensitive_memory_content", "memory_policy_denied", "memory_limit",
+        "memory_busy_or_limit", "stale_memory_revision", "memory_provider_unavailable",
+        "memory_storage_or_execution_unavailable", "ok", "unknown",
+    )),
+    "phase": frozenset(("root", "reference", "parent", "open", "canonicalize", "containment", "snapshot", "revision", "content")),
+    "category": frozenset((
+        "invalid_file_reference", "unknown_workspace_root", "file_path_forbidden", "file_not_found",
+        "file_revision_conflict", "file_limit", "file_resource_busy", "file_access_denied",
+        "unsupported_file_content", "filesystem_error",
+    )),
+}
+SOURCE_DETAIL = {f"memory.source.{field}": rule for field, rule in MEMORY_RESPONSE.items()} | {
+    "memory.source.revision": (0, 1),
+    "memory.source.fixture_git": (0, 1),
+    "memory.source.fixture_head": (0, 1),
+}
+OBSERVATIONS = {
+    SETTINGS_TEST: SOURCE_DETAIL,
+    SHUTDOWN_TEST: SOURCE_DETAIL | {f"memory.extract.{field}": rule for field, rule in MEMORY_RESPONSE.items()} | {
+        "memory.ready." + name: (0, 1) for name in (
+            "admitted", "sources_resolved", "planner_registered", "spawn_observed", "spawn_completed",
+            "running_session", "supervised", "input", "eof_ack", "early_response",
+            "cancel_requested", "cancel_resolved", "cleanup_confirmed",
+        )
+    },
+    PTY_TEST: {"pty." + name: (0, 1) for name in (
+        "cursor_answered", "start_sent", "resume_sent", "alive_seen", "healthy_overflow", "slow_overflow",
+    )} | {"pty.bytes": (0, 16_777_216), "pty.burst_bytes": (0, 16_777_216)},
+}
+
+
+def approved_observation(scope, field, value):
+    rule = OBSERVATIONS.get(scope, {}).get(field)
+    if isinstance(rule, tuple) and len(value) <= 8 and value.isdecimal():
+        number = int(value)
+        return number if rule[0] <= number <= rule[1] else None
+    if isinstance(rule, frozenset) and value in rule:
+        return value
+    return None
 
 
 def portable_name(value):
@@ -171,7 +223,7 @@ class CargoDiagnostics:
     def __init__(self, root, targets, command):
         self.root = root
         self.targets = targets
-        self.testing = command[1] == "test"
+        self.testing = command[1] == "test" and "--no-run" not in command
         self.phase = {"fmt": "formatting", "clippy": "analysis"}.get(command[1], "build")
         self.build_complete = False
         self.build_seconds = None
@@ -184,6 +236,7 @@ class CargoDiagnostics:
         self.failed_symbols = []
         self.failure_output_test = None
         self.checkpoints = {}
+        self.observations = {}
         self.pending_failure = None
         self.failures = []
         self.omitted = 0
@@ -256,11 +309,17 @@ class CargoDiagnostics:
             if output := TEST_OUTPUT.fullmatch(line):
                 test = output[1].decode("ascii", errors="replace")
                 self.failure_output_test = test if test != "unknown" and test in self.failed_symbols else None
-            elif self.failure_output_test and (checkpoint := CHECKPOINT.match(line)):
+            elif self.failure_output_test:
                 key = (self.suite.package, self.suite.name, self.failure_output_test)
-                marker = checkpoint[1].decode("ascii")
-                if marker in CHECKPOINTS.get(key, ()):
-                    self.checkpoints.setdefault(self.failure_output_test, marker)
+                if checkpoint := CHECKPOINT.match(line):
+                    marker = checkpoint[1].decode("ascii")
+                    if marker in CHECKPOINTS.get(key, ()):
+                        self.checkpoints.setdefault(self.failure_output_test, marker)
+                elif detail := DETAIL.fullmatch(line):
+                    field, value = (part.decode("ascii") for part in detail.groups())
+                    approved = approved_observation(key, field, value)
+                    if approved is not None:
+                        self.observations.setdefault(self.failure_output_test, {}).setdefault(field, approved)
         if result := RESULT.fullmatch(line):
             passed, failed, ignored = map(int, result.groups()[1:4])
             if passed + failed + ignored != self.expected or (result[1] == b"ok") == bool(failed):
@@ -292,6 +351,8 @@ class CargoDiagnostics:
                 entry = {"suite": suite, "testId": symbol}
                 if checkpoint := self.checkpoints.get(symbol):
                     entry.update(checkpoint=checkpoint, classification="ASSERTION_FAILURE")
+                if observations := self.observations.get(symbol):
+                    entry["observations"] = observations
                 self.failures.append(entry)
             self.omitted = failed - count
         self.expected = None
@@ -299,6 +360,7 @@ class CargoDiagnostics:
         self.failed_symbols = []
         self.failure_output_test = None
         self.checkpoints = {}
+        self.observations = {}
         self.phase = "test-execution" if failed else "between-test-suites"
 
     def fields(self):

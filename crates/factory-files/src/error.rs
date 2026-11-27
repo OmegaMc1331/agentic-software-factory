@@ -76,3 +76,38 @@ impl From<std::io::Error> for FileError {
 }
 
 pub type Result<T> = std::result::Result<T, FileError>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileReadPhase {
+    Reference,
+    Parent,
+    Open,
+    Canonicalize,
+    Containment,
+    Snapshot,
+}
+
+impl FileReadPhase {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Reference => "reference",
+            Self::Parent => "parent",
+            Self::Open => "open",
+            Self::Canonicalize => "canonicalize",
+            Self::Containment => "containment",
+            Self::Snapshot => "snapshot",
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct FileReadFailure {
+    pub phase: FileReadPhase,
+    pub error: FileError,
+}
+
+impl FileReadFailure {
+    pub(crate) fn at(phase: FileReadPhase) -> impl FnOnce(FileError) -> Self {
+        move |error| Self { phase, error }
+    }
+}

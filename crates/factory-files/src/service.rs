@@ -14,8 +14,8 @@ use crate::path::{protected_component, split, Guard};
 use crate::store::Store;
 use crate::types::{hash, nonce, valid_token};
 use crate::{
-    native, validate_path, Draft, DraftEnvelope, FileError, FileRef, FileSnapshot, Limits,
-    MoveResult, Recovery, Result, RootInfo,
+    native, validate_path, Draft, DraftEnvelope, FileError, FileReadFailure, FileReadPhase,
+    FileRef, FileSnapshot, Limits, MoveResult, Recovery, Result, RootInfo,
 };
 
 pub(crate) struct Root {
@@ -240,14 +240,28 @@ impl FileService {
     }
 
     fn canonical_ref(&self, root: &Root, path: &Path) -> Result<FileRef> {
-        let canonical = fs::canonicalize(path)?;
+        self.canonical_read_ref(root, path)
+            .map_err(|failure| failure.error)
+    }
+
+    fn canonical_read_ref(
+        &self,
+        root: &Root,
+        path: &Path,
+    ) -> std::result::Result<FileRef, FileReadFailure> {
+        let canonical = fs::canonicalize(path)
+            .map_err(FileError::from)
+            .map_err(FileReadFailure::at(FileReadPhase::Canonicalize))?;
         let relative = canonical
             .strip_prefix(&root.path)
-            .map_err(|_| FileError::Forbidden)?
-            .to_str()
-            .ok_or(FileError::Forbidden)?
+            .ok()
+            .and_then(Path::to_str)
+            .ok_or(FileReadFailure {
+                phase: FileReadPhase::Containment,
+                error: FileError::Forbidden,
+            })?
             .replace('\\', "/");
-        validate_path(&relative, false)?;
+        validate_path(&relative, false).map_err(FileReadFailure::at(FileReadPhase::Containment))?;
         Ok(self.reference(root, &relative))
     }
 
@@ -263,8 +277,23 @@ impl FileService {
     }
 
     pub fn read(&self, reference: &FileRef) -> Result<FileSnapshot> {
-        let root = self.resolve(reference)?;
-        Ok(self.read_raw(&root, reference)?.snapshot)
+        self.read_diagnosed(reference)
+            .map_err(|failure| failure.error)
+    }
+
+    pub fn read_diagnosed(
+        &self,
+        reference: &FileRef,
+    ) -> std::result::Result<FileSnapshot, FileReadFailure> {
+        let root = self
+            .resolve(reference)
+            .map_err(FileReadFailure::at(FileReadPhase::Reference))?;
+        let parent = self
+            .parent(&root, &reference.path)
+            .map_err(FileReadFailure::at(FileReadPhase::Parent))?;
+        Ok(self
+            .read_at_diagnosed(&root, &parent, split(&reference.path).1)?
+            .snapshot)
     }
 
     /// Check a selection using the same file and snapshot checks as `read`.
@@ -439,9 +468,22 @@ impl FileService {
     }
 
     fn read_at(&self, root: &Root, parent: &Guard, name: &str) -> Result<Raw> {
-        let file = parent.file(name)?;
-        let canonical = self.canonical_ref(root, &parent.absolute.join(name))?;
+        self.read_at_diagnosed(root, parent, name)
+            .map_err(|failure| failure.error)
+    }
+
+    fn read_at_diagnosed(
+        &self,
+        root: &Root,
+        parent: &Guard,
+        name: &str,
+    ) -> std::result::Result<Raw, FileReadFailure> {
+        let file = parent
+            .file(name)
+            .map_err(FileReadFailure::at(FileReadPhase::Open))?;
+        let canonical = self.canonical_read_ref(root, &parent.absolute.join(name))?;
         self.snapshot(root, canonical, file)
+            .map_err(FileReadFailure::at(FileReadPhase::Snapshot))
     }
 
     fn snapshot(&self, root: &Root, reference: FileRef, file: File) -> Result<Raw> {

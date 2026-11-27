@@ -1469,6 +1469,35 @@ mod tests {
     }
 
     #[test]
+    fn terminal_receiver_wakes_for_data_then_drains_after_close() {
+        let output = new_terminal_output();
+        let mut subscription = subscribe(&output);
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        executor.block_on(async {
+            let pending = tokio::spawn(async move {
+                let data = subscription.receiver.recv().await.unwrap();
+                assert_eq!(&*data, b"first");
+                let data = subscription.receiver.recv().await.unwrap();
+                assert_eq!(&*data, b"last");
+                assert!(subscription.receiver.recv().await.is_none());
+                assert!(!subscription.receiver.overflowed());
+            });
+            tokio::task::yield_now().await;
+            publish(&output, b"first");
+            tokio::task::yield_now().await;
+            publish(&output, b"last");
+            output.lock().unwrap().close_subscribers();
+            tokio::time::timeout(std::time::Duration::from_secs(2), pending)
+                .await
+                .unwrap()
+                .unwrap();
+        });
+    }
+
+    #[test]
     fn subscribing_after_terminal_close_returns_the_snapshot_and_disconnects() {
         let output = new_terminal_output();
         publish(&output, b"final-output");
@@ -1743,156 +1772,118 @@ mod tests {
         let runtime = Runtime::new(dir.path()).unwrap();
         let session = runtime
             .start_interactive_session("terminal-stream-test", 90, 24)
-            .unwrap();
-        let slow = runtime.subscribe_terminal(session.id).unwrap();
-        let mut healthy = runtime.subscribe_terminal(session.id).unwrap();
+            .expect("ASF_QA_CHECKPOINT:pty.child_start");
+        let slow = runtime
+            .subscribe_terminal(session.id)
+            .expect("ASF_QA_CHECKPOINT:pty.subscribe");
+        let mut healthy = runtime
+            .subscribe_terminal(session.id)
+            .expect("ASF_QA_CHECKPOINT:pty.subscribe");
 
-        struct DrainState {
-            output: Vec<u8>,
-            answered_cursor_query: bool,
-            started: bool,
-            resumed: bool,
-        }
-        impl DrainState {
-            fn summary(&self) -> String {
-                let text = String::from_utf8_lossy(&self.output);
-                let head: String = text.chars().take(120).collect();
-                let tail: String = text
-                    .chars()
-                    .rev()
-                    .take(120)
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .rev()
-                    .collect();
-                format!(
-                    "bytes={} answered={} started={} resumed={} head={head:?} tail={tail:?}",
-                    self.output.len(),
-                    self.answered_cursor_query,
-                    self.started,
-                    self.resumed,
-                )
-            }
-        }
-        let state = Arc::new(Mutex::new(DrainState {
-            output: healthy.snapshot.clone(),
-            answered_cursor_query: false,
-            started: false,
-            resumed: false,
-        }));
-        let (drained_tx, drained_rx) = std_mpsc::channel::<Result<bool, String>>();
-        let drain_runtime = runtime.clone();
-        let drain_state = Arc::clone(&state);
-        let drain_session_id = session.id;
-        std::thread::spawn(move || {
-            // A healthy subscriber drains continuously; polling with sleeps
-            // lets a fast PTY burst fill the bounded queue and evict the very
-            // subscriber that is supposed to survive the stream.
-            let outcome = (move || {
-                let mut state = drain_state.lock().expect("terminal drain state poisoned");
-                // Markers are scanned incrementally over newly received bytes
-                // with an 11-byte overlap for markers straddling chunks; a
-                // rescan of the whole stream would make the drainer too slow
-                // to keep its queue below the eviction cap during a burst.
+        // Use the same notification-driven receiver as real clients. The
+        // test thread owns its state and both deadlines, so a failed handshake
+        // cannot leave a polling thread holding state needed by the timeout.
+        let async_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("ASF_QA_CHECKPOINT:pty.fixture.executor");
+        let mut output = std::mem::take(&mut healthy.snapshot);
+        let mut answered = false;
+        let mut started = false;
+        let mut resumed = false;
+        let mut observed_alive = false;
+        let stream = async_runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(75), async {
                 const OVERLAP: usize = 11;
                 let mut scanned = 0_usize;
                 loop {
-                    let mut received = 0;
-                    while let Ok(chunk) = healthy.receiver.try_recv() {
-                        state.output.extend_from_slice(&chunk);
-                        received += 1;
+                    let fresh = &output[scanned.saturating_sub(OVERLAP)..];
+                    let cursor = !answered && fresh.windows(4).any(|window| window == b"\x1b[6n");
+                    let start =
+                        !started && fresh.windows(12).any(|window| window == b"STREAM_READY");
+                    let done = !resumed && fresh.windows(11).any(|window| window == b"STREAM_DONE");
+                    let alive = fresh.windows(12).any(|window| window == b"STREAM_ALIVE");
+                    scanned = output.len();
+                    if cursor {
+                        runtime
+                            .write_terminal(session.id, b"\x1b[1;1R")
+                            .map_err(|_| "pty.cursor")?;
+                        answered = true;
                     }
-                    let (query_seen, ready_seen, alive_seen, done_seen) = {
-                        let fresh = &state.output[scanned.saturating_sub(OVERLAP)..];
-                        (
-                            !state.answered_cursor_query
-                                && fresh.windows(4).any(|window| window == b"\x1b[6n"),
-                            !state.started
-                                && fresh.windows(12).any(|window| window == b"STREAM_READY"),
-                            fresh.windows(12).any(|window| window == b"STREAM_ALIVE"),
-                            !state.resumed
-                                && fresh.windows(11).any(|window| window == b"STREAM_DONE"),
-                        )
-                    };
-                    scanned = state.output.len();
-                    if query_seen {
-                        drain_runtime
-                            .write_terminal(drain_session_id, b"\x1b[1;1R")
-                            .unwrap();
-                        state.answered_cursor_query = true;
+                    if start {
+                        runtime
+                            .write_terminal(session.id, b"g\r")
+                            .map_err(|_| "pty.start")?;
+                        started = true;
                     }
-                    if ready_seen {
-                        drain_runtime
-                            .write_terminal(drain_session_id, b"g\r")
-                            .unwrap();
-                        state.started = true;
+                    if alive {
+                        observed_alive = true;
+                        return Ok(());
                     }
-                    if alive_seen {
-                        break;
+                    if done {
+                        runtime
+                            .write_terminal(session.id, b"r\r")
+                            .map_err(|_| "pty.resume")?;
+                        resumed = true;
                     }
-                    if done_seen {
-                        drain_runtime
-                            .write_terminal(drain_session_id, b"r\r")
-                            .unwrap();
-                        state.resumed = true;
-                    }
-                    if received == 0 {
-                        drop(state);
-                        std::thread::yield_now();
-                        state = drain_state.lock().expect("terminal drain state poisoned");
-                    }
+                    let bytes = healthy
+                        .receiver
+                        .recv()
+                        .await
+                        .ok_or("pty.healthy_continuity")?;
+                    output.extend_from_slice(&bytes);
                 }
-                drop(state);
-                let close_deadline = Instant::now() + std::time::Duration::from_secs(10);
-                loop {
-                    match healthy.receiver.try_recv() {
-                        Ok(_) => {}
-                        Err(TerminalTryRecvError::Disconnected) => break,
-                        Err(TerminalTryRecvError::Empty) => {
-                            if Instant::now() >= close_deadline {
-                                return Err(
-                                    "terminal subscription did not close after process exit".into(),
-                                );
-                            }
-                            std::thread::sleep(std::time::Duration::from_millis(10));
-                        }
-                    }
-                }
-                Ok(healthy.receiver.overflowed())
-            })();
-            let _ = drained_tx.send(outcome);
+            })
+            .await
         });
-        let drain_summary = |state: &Arc<Mutex<DrainState>>| {
-            state
-                .lock()
-                .expect("terminal drain state poisoned")
-                .summary()
-        };
-        let healthy_overflowed = match drained_rx.recv_timeout(std::time::Duration::from_secs(75)) {
-            Ok(Ok(healthy_overflowed)) => healthy_overflowed,
-            Ok(Err(message)) => panic!("{message}"),
-            Err(std_mpsc::RecvTimeoutError::Timeout) => {
-                let summary = drain_summary(&state);
-                panic!("PTY stream did not complete; {summary}")
-            }
-            Err(std_mpsc::RecvTimeoutError::Disconnected) => {
-                let summary = drain_summary(&state);
-                panic!("terminal drain thread exited unexpectedly; {summary}")
-            }
-        };
-        let (started, resumed, x_count) = {
-            let state = state.lock().expect("terminal drain state poisoned");
+        let x_count = output.iter().filter(|byte| **byte == b'x').count();
+        for (field, count) in [
+            ("bytes", output.len()),
+            ("burst_bytes", x_count),
+            ("cursor_answered", usize::from(answered)),
+            ("start_sent", usize::from(started)),
+            ("resume_sent", usize::from(resumed)),
+            ("alive_seen", usize::from(observed_alive)),
             (
-                state.started,
-                state.resumed,
-                state.output.iter().filter(|byte| **byte == b'x').count(),
-            )
+                "healthy_overflow",
+                usize::from(healthy.receiver.overflowed()),
+            ),
+            ("slow_overflow", usize::from(slow.receiver.overflowed())),
+        ] {
+            eprintln!("ASF_QA_DETAIL:pty.{field}={count}");
+        }
+        let failure = match stream {
+            Ok(Ok(())) => None,
+            Ok(Err(checkpoint)) => Some(checkpoint),
+            Err(_) if !started => Some("pty.ready"),
+            Err(_) if !resumed => Some("pty.burst"),
+            Err(_) => Some("pty.alive"),
         };
-        assert!(started);
-        assert!(slow.receiver.overflowed());
-        assert!(!healthy_overflowed);
-        assert!(x_count >= 280 * 8192);
-        assert!(resumed);
+        if let Some(checkpoint) = failure {
+            let _ = runtime.stop_interactive_session(session.id);
+            panic!("ASF_QA_CHECKPOINT:{checkpoint}");
+        }
+        let disconnected = async_runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while healthy.receiver.recv().await.is_some() {}
+            })
+            .await
+        });
+        if disconnected.is_err() {
+            let _ = runtime.stop_interactive_session(session.id);
+        }
+        disconnected.expect("ASF_QA_CHECKPOINT:pty.disconnected");
+        assert!(started, "ASF_QA_CHECKPOINT:pty.start");
+        assert!(
+            slow.receiver.overflowed(),
+            "ASF_QA_CHECKPOINT:pty.slow_overflow"
+        );
+        assert!(
+            !healthy.receiver.overflowed(),
+            "ASF_QA_CHECKPOINT:pty.healthy_continuity"
+        );
+        assert!(x_count >= 280 * 8192, "ASF_QA_CHECKPOINT:pty.byte_count");
+        assert!(resumed, "ASF_QA_CHECKPOINT:pty.resume");
 
         let db = FactoryDb::open(&dir.path().join(".factory").join("db.sqlite3")).unwrap();
         let mut saved = db.get_agent_session(session.id).unwrap().unwrap();
@@ -1903,8 +1894,11 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(25));
             saved = db.get_agent_session(session.id).unwrap().unwrap();
         }
-        assert_eq!(saved.status, "success");
-        assert!(saved.stdout.unwrap_or_default().contains("STREAM_ALIVE"));
+        assert_eq!(saved.status, "success", "ASF_QA_CHECKPOINT:pty.persisted");
+        assert!(
+            saved.stdout.unwrap_or_default().contains("STREAM_ALIVE"),
+            "ASF_QA_CHECKPOINT:pty.persisted_output"
+        );
         drop(slow.receiver);
     }
 

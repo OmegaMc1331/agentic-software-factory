@@ -21,8 +21,20 @@ MODES = {
     "frontend-tests": [["npm", "test"]],
     "build": [["cargo", "build", "--release", "--locked", "--features", "embedded-dashboard", "-p", "factory-cli", "-j", "1"]],
     "embedded-tests": [["cargo", "test", "--release", "--locked", "-p", "factory-api", "--features", "embedded-dashboard", "-j", "1", "--", "--test-threads=1"]],
+    "embedded-compile": [["cargo", "test", "--release", "--locked", "-p", "factory-api", "--features", "embedded-dashboard", "-j", "1", "--no-run"]],
+    "d8-memory": [
+        ["cargo", "test", "--locked", "-p", "factory-api", "--test", "memory", "-j", "1", "--", "--test-threads=1"],
+        ["cargo", "test", "--locked", "-p", "factory-files", "-j", "1"],
+        ["cargo", "test", "--locked", "-p", "factory-memory", "-j", "1"],
+        ["cargo", "test", "--locked", "-p", "factory-agent", "-j", "1"],
+    ],
+    "d8-pty": [
+        ["cargo", "test", "--locked", "-p", "factory-runtime", "--lib", "-j", "1", "terminal"]
+        for _ in range(3)
+    ],
     "contracts": [["node", "--test", "--test-reporter=tap", "scripts/release-checksums.test.mjs"], ["python", "-B", "scripts/v2_baseline.py", "inventory", "--check"], ["python", "-B", "-m", "unittest", "discover", "-s", "scripts", "-p", "test_v2_baseline.py"], ["python", "-B", "-m", "unittest", "discover", "-s", "scripts/v2_p14", "-p", "test_*.py"]],
 }
+RELEASE_MODES = {"build", "embedded-tests", "embedded-compile"}
 
 
 def tracked_fingerprint():
@@ -59,6 +71,15 @@ def release_rustflags(environment):
     return "\x1f".join(flags)
 
 
+def release_environment(base, source_epoch):
+    environment = dict(base)
+    environment["SOURCE_DATE_EPOCH"] = source_epoch
+    environment.pop("RUSTFLAGS", None)
+    environment["CARGO_ENCODED_RUSTFLAGS"] = release_rustflags(environment)
+    environment["CARGO_PROFILE_RELEASE_LTO"] = "true"
+    return environment
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("mode", choices=MODES)
@@ -73,9 +94,23 @@ def main():
         raise SystemExit("Preserve prior evidence; choose a new output directory")
     result = {"schemaVersion": 1, "testId": args.mode, "sourceCommit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(), "startedAt": datetime.datetime.now(datetime.UTC).isoformat(), "environment": {"platform": platform.platform(), "architecture": platform.machine()}, "sourceFingerprint": tracked_fingerprint(), "commands": []}
     public_ci = os.environ.get("ASF_P14_PUBLIC_CI") == "1"
+    environment = {**os.environ, "CARGO_INCREMENTAL": "0"}
     deadline = time.monotonic() + args.capture_timeout
     final_exit = 1
     try:
+        if args.mode in RELEASE_MODES:
+            epoch = subprocess.check_output(
+                ["git", "show", "-s", "--format=%ct", "HEAD"], cwd=ROOT, text=True
+            ).strip()
+            environment = release_environment(environment, epoch)
+            # Compare release inputs without publishing flags or paths.
+            target = Path(environment.get("CARGO_TARGET_DIR", ROOT / "target"))
+            result["releaseInputs"] = {
+                "sourceDateEpoch": epoch,
+                "profile": "release with LTO",
+                "encodedRustflagsSha256": hashlib.sha256(environment["CARGO_ENCODED_RUSTFLAGS"].encode()).hexdigest(),
+                "targetDirectorySha256": hashlib.sha256(str(target.resolve()).encode()).hexdigest(),
+            }
         for number, command in enumerate(MODES[args.mode], 1):
             cwd = ROOT / "apps/dashboard" if command[0] == "npm" else ROOT
             actual = command.copy()
@@ -85,12 +120,6 @@ def main():
                 actual[0] = os.sys.executable
             log = args.output / f"{args.mode}-{number}.log"
             began = time.monotonic()
-            environment = {**os.environ, "CARGO_INCREMENTAL": "0"}
-            if args.mode == "build":
-                environment["SOURCE_DATE_EPOCH"] = subprocess.check_output(["git", "show", "-s", "--format=%ct", "HEAD"], cwd=ROOT, text=True).strip()
-                environment.pop("RUSTFLAGS", None)
-                environment["CARGO_ENCODED_RUSTFLAGS"] = release_rustflags(environment)
-                environment["CARGO_PROFILE_RELEASE_LTO"] = "true"
             problem = None
             if public_ci:
                 if args.mode == "contracts" and contract_selector(command):

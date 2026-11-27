@@ -16,6 +16,8 @@ pub enum Error {
     Invalid(String),
     #[error("Memory source is unavailable, changed, protected or outside this project")]
     Source,
+    #[error("Memory source is unavailable, changed, protected or outside this project")]
+    RepositorySource(RepositorySourceDiagnostic),
     #[error("Memory content contains a known credential or credential pattern; remove sensitive material")]
     Sensitive,
     #[error("Memory policy denies extraction, category or source access")]
@@ -28,6 +30,26 @@ pub enum Error {
     Db(#[from] DbError),
 }
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[derive(Debug, Clone, Copy)]
+pub struct RepositorySourceDiagnostic {
+    phase: &'static str,
+    category: &'static str,
+}
+
+impl RepositorySourceDiagnostic {
+    pub fn phase(self) -> &'static str {
+        self.phase
+    }
+
+    pub fn category(self) -> &'static str {
+        self.category
+    }
+}
+
+fn repository_source_error(phase: &'static str, category: &'static str) -> Error {
+    Error::RepositorySource(RepositorySourceDiagnostic { phase, category })
+}
 
 pub struct MemoryService<'a> {
     db: &'a FactoryDb,
@@ -237,7 +259,7 @@ impl<'a> MemoryService<'a> {
                     path: path.clone(),
                 };
                 if root_id != &self.files.primary_root().id {
-                    return Err(Error::Source);
+                    return Err(repository_source_error("root", "unknown_workspace_root"));
                 }
                 let ignored = self
                     .ignores
@@ -269,13 +291,21 @@ impl<'a> MemoryService<'a> {
                 {
                     return Err(Error::Source);
                 }
-                let snapshot = self.files.read(&file).map_err(|_| Error::Source)?;
-                if snapshot.size > 32768
-                    || expected.as_ref().is_some_and(|r| r != &snapshot.revision)
-                {
-                    return Err(Error::Source);
+                let snapshot = self.files.read_diagnosed(&file).map_err(|failure| {
+                    repository_source_error(failure.phase.code(), failure.error.code())
+                })?;
+                if snapshot.size > 32768 {
+                    return Err(repository_source_error("content", "file_limit"));
                 }
-                let text = snapshot.content.ok_or(Error::Source)?;
+                if expected.as_ref().is_some_and(|r| r != &snapshot.revision) {
+                    return Err(repository_source_error(
+                        "revision",
+                        "file_revision_conflict",
+                    ));
+                }
+                let text = snapshot.content.ok_or_else(|| {
+                    repository_source_error("content", "unsupported_file_content")
+                })?;
                 revision = snapshot.revision.clone();
                 actual.reference = MemorySourceRef::RepositoryFile {
                     root_id: root_id.clone(),

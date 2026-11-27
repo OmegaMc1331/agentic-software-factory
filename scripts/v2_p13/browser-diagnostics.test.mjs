@@ -39,3 +39,19 @@ test("PRIV-07 authenticated error projects status alone", async () => {
     await once(server, "close");
   }
 });
+
+test("keyboard failure emits bounded enum fields without private browser details", () => {
+  const synthetic = "synthetic-private-focus-description";
+  const state = { checkpoint: "root_ready", role: "search", action: "quick_open",
+    focusReached: false, tabCount: 7 };
+  const error = new Error(synthetic);
+  const projected = browserFailure(error, { ...state, focusLabel: synthetic });
+  assert.deepEqual(projected, { code: "BROWSER_EXECUTION", keyboard: state });
+  assert.ok(!JSON.stringify(projected).includes(synthetic));
+  for (const unchecked of [
+    { checkpoint: synthetic }, { action: synthetic }, { role: synthetic },
+    { focusReached: synthetic }, { tabCount: Infinity }, { tabCount: 181 },
+  ]) {
+    assert.deepEqual(browserFailure(error, { ...state, ...unchecked }), { code: "BROWSER_EXECUTION" });
+  }
+});
